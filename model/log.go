@@ -561,6 +561,15 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 
 const logSearchCountLimit = 10000
 
+const mysqlUserLogIndexHint = "/*+ INDEX(logs idx_logs_user_created_type) */ logs.*"
+
+func selectUserLogColumns(tx *gorm.DB) *gorm.DB {
+	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+		return tx.Select(mysqlUserLogIndexHint)
+	}
+	return tx
+}
+
 func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
@@ -616,7 +625,7 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("logs.")
 	}
-	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
+	err = selectUserLogColumns(tx).Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")

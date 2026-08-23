@@ -81,3 +81,24 @@ func TestGetUserLogsAppliesTypeFilterToFinalOutcome(t *testing.T) {
 	require.Len(t, result, 1)
 	assert.Equal(t, "visible failure", result[0].Content)
 }
+
+func TestSelectUserLogColumnsAddsSafeMySQLOptimizerHint(t *testing.T) {
+	db := setupUserLogViewTestDB(t)
+	common.SetLogDatabaseType(common.DatabaseTypeMySQL)
+
+	var logs []*Log
+	query := selectUserLogColumns(db.Session(&gorm.Session{DryRun: true}).Table("logs"))
+	statement := query.Find(&logs).Statement
+
+	assert.Contains(t, statement.SQL.String(), "SELECT /*+ INDEX(logs idx_logs_user_created_type) */ logs.* FROM `logs`")
+}
+
+func TestSelectUserLogColumnsLeavesOtherDatabasesUnchanged(t *testing.T) {
+	db := setupUserLogViewTestDB(t)
+
+	var logs []*Log
+	query := selectUserLogColumns(db.Session(&gorm.Session{DryRun: true}).Table("logs"))
+	statement := query.Find(&logs).Statement
+
+	assert.NotContains(t, statement.SQL.String(), "INDEX(logs idx_logs_user_created_type)")
+}
