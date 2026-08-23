@@ -590,6 +590,23 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if group != "" {
 		tx = tx.Where("logs."+logGroupCol+" = ?", group)
 	}
+	// Keep the complete retry/fallback chain in the admin log view, but expose
+	// only the final outcome of each request to the requesting user. The
+	// relational log stores use an auto-incrementing id, so a greater id is the
+	// authoritative later attempt even when multiple attempts share a timestamp.
+	// ClickHouse display ids are synthesized after querying and cannot provide
+	// this ordering guarantee.
+	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		tx = tx.Where(`
+			logs.request_id = '' OR NOT EXISTS (
+				SELECT 1
+				FROM logs AS newer_logs
+				WHERE newer_logs.request_id = logs.request_id
+				  AND newer_logs.user_id = logs.user_id
+				  AND newer_logs.id > logs.id
+			)
+		`)
+	}
 	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
 	if err != nil {
 		common.SysError("failed to count user logs: " + err.Error())
