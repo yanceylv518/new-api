@@ -36,6 +36,7 @@ type DynamicPriceOptions = {
   priceRate?: number
   usdExchangeRate?: number
   groupRatioMultiplier?: number
+  discountMultiplier?: number
 }
 
 export type DynamicPriceEntry = {
@@ -161,7 +162,12 @@ export function getDynamicPricingSummary(
 
   const tiers = getDynamicPricingTiers(model)
   const tier = tiers[0] || null
-  const entries = getDynamicPriceEntries(tier, options)
+  // 分层表达式保存公开价格，由调用方通过 discountMultiplier 选择公开或用户视图。
+  const entries = getDynamicPriceEntries(tier, {
+    ...options,
+    groupRatioMultiplier:
+      (options.groupRatioMultiplier ?? 1) * (options.discountMultiplier ?? 1),
+  })
   const rawExpression = model.billing_expr || ''
 
   return {

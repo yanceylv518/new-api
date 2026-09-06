@@ -35,6 +35,12 @@ func (user *UserBase) WriteContext(c *gin.Context) {
 	common.SetContextKey(c, constant.ContextKeyUserSetting, user.GetSetting())
 }
 
+// WriteContextWithModelDiscounts 将独立表中的折扣快照写入专用上下文键，避免伪装成用户偏好。
+func (user *UserBase) WriteContextWithModelDiscounts(c *gin.Context, discounts map[string]int) {
+	user.WriteContext(c)
+	common.SetContextKey(c, constant.ContextKeyUserModelDiscounts, discounts)
+}
+
 func (user *UserBase) GetSetting() dto.UserSetting {
 	setting := dto.UserSetting{}
 	if user.Setting != "" {

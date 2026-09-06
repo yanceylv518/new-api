@@ -167,6 +167,14 @@ export function parseLogOther(other: string): LogOtherData | null {
   }
 }
 
+/** 读取后端写入的折扣快照；无效或旧日志返回 1。 */
+export function getUserModelDiscountFactor(
+  other: LogOtherData | null | undefined
+): number {
+  const factor = Number(other?.user_model_discount)
+  return Number.isFinite(factor) && factor > 0 && factor < 1 ? factor : 1
+}
+
 /**
  * Get time color based on duration (in seconds)
  */

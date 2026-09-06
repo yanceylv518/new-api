@@ -453,7 +453,14 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 
-		userCache.WriteContext(c)
+		discounts, err := model.GetUserModelDiscountBPS(token.UserId)
+		if err != nil {
+			common.SysLog(fmt.Sprintf("TokenAuth GetUserModelDiscountBPS error for user %d: %v", token.UserId, err))
+			abortWithOpenAiMessage(c, http.StatusInternalServerError,
+				common.TranslateMessage(c, i18n.MsgDatabaseError))
+			return
+		}
+		userCache.WriteContextWithModelDiscounts(c, discounts)
 
 		userGroup := userCache.Group
 		tokenGroup := token.Group

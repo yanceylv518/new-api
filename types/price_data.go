@@ -7,6 +7,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// UserModelDiscountRatioKey 标识计费快照和日志中的不可变用户模型折扣。
+const UserModelDiscountRatioKey = "user_model_discount"
+
 type GroupRatioInfo struct {
 	GroupRatio        float64
 	GroupSpecialRatio float64
@@ -33,6 +36,10 @@ type PriceData struct {
 }
 
 func (p *PriceData) AddOtherRatio(key string, ratio float64) {
+	// 用户模型折扣是保留倍率，只能表示不高于原价的折扣，避免被通用倍率乘积误当成加价。
+	if key == UserModelDiscountRatioKey && ratio > 1 {
+		return
+	}
 	if !isValidOtherRatio(ratio) {
 		return
 	}
@@ -79,6 +86,14 @@ func (p *PriceData) OtherRatioMultiplier() float64 {
 		}
 	}
 	return multiplier
+}
+
+// UserModelDiscountMultiplier 返回经过校验的用户模型倍率，缺省时使用公开价格。
+func (p *PriceData) UserModelDiscountMultiplier() float64 {
+	if ratio, ok := p.otherRatios[UserModelDiscountRatioKey]; ok && isValidOtherRatio(ratio) && ratio <= 1 {
+		return ratio
+	}
+	return 1
 }
 
 func (p *PriceData) ApplyOtherRatiosToFloat(value float64) float64 {

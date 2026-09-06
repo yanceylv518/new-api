@@ -28,6 +28,7 @@ import {
   ShieldAlert,
   Link2,
   CreditCard,
+  BadgePercent,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -58,6 +59,7 @@ import {
 import { getUserActionMessage } from '../lib'
 import type { User, ManageUserAction } from '../types'
 import { UserBindingDialog } from './dialogs/user-binding-dialog'
+import { UserModelPricingDialog } from './dialogs/user-model-pricing-dialog'
 import { useUsers } from './users-provider'
 
 interface DataTableRowActionsProps {
@@ -72,6 +74,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const [resetTwoFAOpen, setResetTwoFAOpen] = useState(false)
   const [bindingDialogOpen, setBindingDialogOpen] = useState(false)
   const [subscriptionsDialogOpen, setSubscriptionsDialogOpen] = useState(false)
+  const [modelPricingDialogOpen, setModelPricingDialogOpen] = useState(false)
 
   const handleEdit = () => {
     setCurrentRow(user)
@@ -201,6 +204,19 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         <DropdownMenuItem
           onSelect={(event) => {
             event.preventDefault()
+            setModelPricingDialogOpen(true)
+          }}
+          disabled={isRoot}
+        >
+          {t('User model pricing')}
+          <DropdownMenuShortcut>
+            <BadgePercent size={16} />
+          </DropdownMenuShortcut>
+        </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={(event) => {
+            event.preventDefault()
             setBindingDialogOpen(true)
           }}
         >
@@ -300,6 +316,13 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         onOpenChange={setSubscriptionsDialogOpen}
         user={{ id: user.id, username: user.username }}
         onSuccess={triggerRefresh}
+      />
+
+      {/* 对话框自行加载数据，关闭时用户列表行无需承担查询开销。 */}
+      <UserModelPricingDialog
+        open={modelPricingDialogOpen}
+        onOpenChange={setModelPricingDialogOpen}
+        user={{ id: user.id, username: user.username }}
       />
     </div>
   )

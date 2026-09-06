@@ -41,6 +41,19 @@ const claudeCacheCreation1hMultiplier = 6 / 3.75
 // the pre-consumed quota still reflects a plausible output cost in paid groups.
 const defaultTieredPreConsumeMaxTokens = 8192
 
+// addUserModelDiscount 将匹配到的用户规则冻结到 PriceData，供后续所有计费阶段复用。
+func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.PriceData) {
+	if info == nil || priceData == nil || info.IsChannelTest {
+		return
+	}
+	modelName := ratio_setting.FormatMatchingModelName(info.OriginModelName)
+	discountBPS, ok := info.UserModelDiscountBPS[modelName]
+	if !ok || discountBPS < 1 || discountBPS >= 10000 {
+		return
+	}
+	priceData.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, float64(discountBPS)/10000)
+}
+
 // HandleGroupRatio checks for "auto_group" in the context and updates the group ratio and relayInfo.UsingGroup if present
 func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hosttypes.GroupRatioInfo {
 	groupRatioInfo := hosttypes.GroupRatioInfo{
@@ -117,10 +130,19 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		imageRatio, _ = ratio_setting.GetImageRatio(info.OriginModelName)
 		audioRatio = ratio_setting.GetAudioRatio(info.OriginModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(info.OriginModelName)
-		ratio := modelRatio * groupRatioInfo.GroupRatio
-		quota, err := common.QuotaFromFloatStrict(float64(preConsumedTokens) * ratio)
+		discountRatio := 1.0
+		if discountBPS := info.UserModelDiscountBPS[ratio_setting.FormatMatchingModelName(info.OriginModelName)]; discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
+			discountRatio = float64(discountBPS) / 10000
+		}
+		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio
+		preConsumeValue := float64(preConsumedTokens) * ratio
+		quota, err := common.QuotaFromFloatStrict(preConsumeValue)
 		if err != nil {
 			return hosttypes.PriceData{}, err
+		}
+		// 折后仍为正的请求至少预留数据库的最小额度单位。
+		if preConsumeValue > 0 && quota == 0 {
+			quota = 1
 		}
 		preConsumedQuota = quota
 	} else {
@@ -166,12 +188,23 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	}
 	if usePrice {
 		for name, ratio := range meta.BillingRatios {
+			// 用户折扣是独立表快照，不能由请求倍率或适配器输入伪造。
+			if name == hosttypes.UserModelDiscountRatioKey {
+				continue
+			}
 			priceData.AddOtherRatio(name, ratio)
 		}
+	}
+	// 管理员折扣是保留倍率，必须在适配器附加倍率写入后重新冻结，防止同名参数覆盖。
+	addUserModelDiscount(info, &priceData)
+	if usePrice {
 		quotaToPreConsume := priceData.ApplyOtherRatiosToFloat(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		quota, err := common.QuotaFromFloatStrict(quotaToPreConsume)
 		if err != nil {
 			return hosttypes.PriceData{}, err
+		}
+		if quotaToPreConsume > 0 && quota == 0 {
+			quota = 1
 		}
 		priceData.QuotaToPreConsume = quota
 	}
@@ -249,6 +282,7 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 		Quota:          quota,
 		GroupRatioInfo: groupRatioInfo,
 	}
+	addUserModelDiscount(info, &priceData)
 	return priceData, nil
 }
 
@@ -293,9 +327,15 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 
 	// Expression coefficients are $/1M tokens prices; convert to quota the same way per-call billing does.
 	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
-	preConsumedQuota, err := billingexpr.QuotaRoundStrict(quotaBeforeGroup * groupRatioInfo.GroupRatio)
+	priceData := hosttypes.PriceData{GroupRatioInfo: groupRatioInfo}
+	addUserModelDiscount(info, &priceData)
+	preConsumeValue := quotaBeforeGroup * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
+	preConsumedQuota, err := billingexpr.QuotaRoundStrict(preConsumeValue)
 	if err != nil {
 		return hosttypes.PriceData{}, err
+	}
+	if preConsumeValue > 0 && preConsumedQuota == 0 {
+		preConsumedQuota = 1
 	}
 
 	freeModel := false
@@ -324,11 +364,8 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	info.TieredBillingSnapshot = snapshot
 	info.BillingRequestInput = &requestInput
 
-	priceData := hosttypes.PriceData{
-		FreeModel:         freeModel,
-		GroupRatioInfo:    groupRatioInfo,
-		QuotaToPreConsume: preConsumedQuota,
-	}
+	priceData.FreeModel = freeModel
+	priceData.QuotaToPreConsume = preConsumedQuota
 
 	logger.LogDebug(c, "model_price_helper_tiered result: model=%s preConsume=%d quotaBeforeGroup=%.2f groupRatio=%.2f tier=%s", info.OriginModelName, preConsumedQuota, quotaBeforeGroup, groupRatioInfo.GroupRatio, trace.MatchedTier)
 

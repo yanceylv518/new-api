@@ -645,6 +645,28 @@ func TestComposeTieredTextQuotaFallbackKeepsToolCallSurcharges(t *testing.T) {
 	require.Equal(t, 13750, quota)
 }
 
+func TestComposeTieredTextQuotaKeepsPositiveMinimumAfterDiscount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	relayInfo := &relaycommon.RelayInfo{
+		PriceData: hosttypes.PriceData{},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode: "tiered_expr",
+			GroupRatio:  1,
+		},
+	}
+	relayInfo.PriceData.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, 0.01)
+
+	quota := composeTieredTextQuota(
+		relayInfo,
+		textQuotaSummary{ToolCallSurchargeQuota: decimal.NewFromFloat(0.1)},
+		1,
+		&billingexpr.TieredResult{ActualQuotaBeforeGroup: 0.1},
+	)
+
+	// 正费用经折扣和附加费合计仍小于一个额度单位时，不能结算为零。
+	require.Equal(t, 1, quota)
+}
+
 func TestComposeTieredTextQuotaErrorFallbackUsesPreConsumedQuota(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -939,6 +961,33 @@ func TestCalculateTextQuotaSummaryDoesNotApplyRequestMultipliersToToolSurcharge(
 	expected := decimal.NewFromFloat(10.0 / 1000).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
 	assert.True(t, expected.Equal(summary.ToolCallSurchargeQuota))
 	assert.Equal(t, common.QuotaFromDecimal(expected), summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryDiscountsModelUsageButNotToolSurcharge(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "o1",
+		PriceData: hosttypes.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  hosttypes.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {CallCount: 1},
+			},
+		},
+	}
+	relayInfo.PriceData.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, 0.5)
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{
+		PromptTokens: 1000,
+		TotalTokens:  1000,
+	})
+
+	// 模型用量按 1000 * 0.5 计算，工具调用附加费仍按每 1000 美元收取 5000 额度。
+	assert.Equal(t, 5500, summary.Quota)
 }
 
 func TestCalculateTextToolCallSurchargeGeminiGoogleSearch(t *testing.T) {

@@ -43,6 +43,7 @@ import {
   type RequestRuleGroup,
   type TierCondition,
 } from '../lib/billing-expr'
+import { DiscountedPrice } from './discounted-price'
 
 type DynamicPricingBreakdownProps = {
   billingExpr: string | null | undefined
@@ -64,6 +65,8 @@ type DynamicPricingBreakdownProps = {
    * icon header and uses the dialog's small text sizes. Defaults to false.
    */
   compact?: boolean
+  /** 已认证用户看到的公开单价倍率。 */
+  priceMultiplier?: number
 }
 
 const VAR_LABELS: Record<string, string> = {
@@ -158,6 +161,7 @@ export function DynamicPricingBreakdown({
   matchedTierLabel,
   hideCacheColumns = false,
   compact = false,
+  priceMultiplier = 1,
 }: DynamicPricingBreakdownProps) {
   const { t } = useTranslation()
   const expr = billingExpr || ''
@@ -191,6 +195,53 @@ export function DynamicPricingBreakdown({
   const normalizedMatchedTierLabel = normalizeTierLabel(
     matchedTierLabel ?? undefined
   )
+  const effectivePriceMultiplier =
+    Number.isFinite(priceMultiplier) && priceMultiplier > 0
+      ? Math.min(priceMultiplier, 1)
+      : 1
+
+  // 解析结果没有持久化 ID，用内容加出现次数生成不会重复的行键。
+  const makeUniqueKey = (base: string, counts: Map<string, number>) => {
+    const occurrence = counts.get(base) ?? 0
+    counts.set(base, occurrence + 1)
+    return `${base}-${occurrence}`
+  }
+  const tierKeyCounts = new Map<string, number>()
+  const tierKeys = new Map<ParsedTier, string>()
+  for (const tier of tiers) {
+    tierKeys.set(
+      tier,
+      makeUniqueKey(
+        `tier-${tier.label}-${JSON.stringify(tier.conditions)}`,
+        tierKeyCounts
+      )
+    )
+  }
+  const ruleGroupKeyCounts = new Map<string, number>()
+  const ruleGroupKeys = new Map<RequestRuleGroup, string>()
+  for (const group of ruleGroups) {
+    ruleGroupKeys.set(
+      group,
+      makeUniqueKey(
+        `rule-group-${JSON.stringify(group.conditions)}-${group.multiplier}`,
+        ruleGroupKeyCounts
+      )
+    )
+  }
+
+  // 动态表达式中的原价保持可见，折扣用户同时看到划线原价和实际价格。
+  const renderDynamicPrice = (value: number, className?: string) => {
+    const original = `${symbol}${(value * rate).toFixed(4)}`
+    const effective = `${symbol}${(value * effectivePriceMultiplier * rate).toFixed(4)}`
+    return (
+      <DiscountedPrice
+        discounted={effectivePriceMultiplier < 1}
+        original={original}
+        effective={effective}
+        effectiveClassName={className}
+      />
+    )
+  }
 
   if (!expr) return null
 
@@ -260,7 +311,7 @@ export function DynamicPricingBreakdown({
             {t('Tiered price table')}
           </div>
           <div className='space-y-1.5 sm:hidden'>
-            {tiers.map((tier, i) => {
+            {tiers.map((tier) => {
               const condSummary = formatConditionSummary(tier.conditions, t)
               const isMatched =
                 matchedTierLabel != null &&
@@ -268,7 +319,7 @@ export function DynamicPricingBreakdown({
                 tier.label === matchedTierLabel
               return (
                 <div
-                  key={`tier-mobile-${i}`}
+                  key={tierKeys.get(tier)}
                   className={cn(
                     'rounded-md border p-2',
                     isMatched && 'border-emerald-500/40 bg-emerald-500/10'
@@ -312,7 +363,10 @@ export function DynamicPricingBreakdown({
                             )}
                           >
                             {value > 0
-                              ? `${symbol}${(value * rate).toFixed(4)}`
+                              ? renderDynamicPrice(
+                                  value,
+                                  compact ? undefined : 'font-semibold'
+                                )
                               : '-'}
                           </div>
                         </div>
@@ -332,7 +386,7 @@ export function DynamicPricingBreakdown({
             }
             headerRowClassName='hover:bg-transparent'
             data={tiers}
-            getRowKey={(_tier, index) => `tier-${index}`}
+            getRowKey={(tier) => tierKeys.get(tier) ?? 'tier'}
             getRowClassName={(tier) => {
               const isMatched =
                 normalizedMatchedTierLabel !== '' &&
@@ -401,7 +455,10 @@ export function DynamicPricingBreakdown({
                   )
                   return value > 0 ? (
                     <span className={cn(!compact && 'font-semibold')}>
-                      {`${symbol}${(value * rate).toFixed(4)}`}
+                      {renderDynamicPrice(
+                        value,
+                        compact ? undefined : 'font-semibold'
+                      )}
                     </span>
                   ) : (
                     '-'
@@ -425,9 +482,9 @@ export function DynamicPricingBreakdown({
             {t('Conditional multipliers')}
           </div>
           <ul className='space-y-1.5'>
-            {ruleGroups.map((group, gi) => (
+            {ruleGroups.map((group) => (
               <li
-                key={`group-${gi}`}
+                key={ruleGroupKeys.get(group)}
                 className='bg-muted/50 flex items-center justify-between gap-3 rounded-md px-3 py-2'
               >
                 <span

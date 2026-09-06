@@ -74,6 +74,9 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 		UsedQuota:    20,
 		RequestCount: 3,
 	}
+	user.SetSetting(dto.UserSetting{
+		Language: "en",
+	})
 	require.NoError(t, DB.Create(&user).Error)
 
 	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Updates(map[string]interface{}{
@@ -90,6 +93,139 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 	assert.Equal(t, 270, got.UsedQuota)
 	assert.Equal(t, 4, got.RequestCount)
 	assert.Equal(t, "zh", got.GetSetting().Language)
+}
+
+func TestReplaceUserModelPricingPreservesOtherSettings(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 3, Username: "discount-user", Password: "password", Status: common.UserStatusEnabled}
+	user.SetSetting(dto.UserSetting{Language: "zh", BillingPreference: "wallet"})
+	require.NoError(t, DB.Create(&user).Error)
+
+	_, revision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	_, err = ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, revision)
+	require.NoError(t, err)
+
+	var got User
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	setting := got.GetSetting()
+	assert.Equal(t, "zh", setting.Language)
+	assert.Equal(t, "wallet", setting.BillingPreference)
+	discounts, _, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"gpt-4o": 8000}, discounts)
+}
+
+// 运行时折扣必须只来自独立表，旧 users.setting 中的同名字段不能影响计费规则读取。
+func TestGetUserModelDiscountBPSIgnoresLegacyUserSetting(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 4, Username: "legacy-discount-user", Password: "password", Status: common.UserStatusEnabled}
+	// 直接保留历史 JSON，确认旧字段即使仍存在于数据库也不会进入运行时折扣查询。
+	user.Setting = `{"model_discount_bps":{"gpt-4o":1000}}`
+	require.NoError(t, DB.Create(&user).Error)
+	require.NoError(t, DB.Create(&UserModelPricing{
+		UserId: user.Id, ModelName: "gpt-4o", DiscountBPS: 8000,
+	}).Error)
+
+	discounts, err := GetUserModelDiscountBPS(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"gpt-4o": 8000}, discounts)
+}
+
+func TestUpdateUserSettingDoesNotAffectModelPricing(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 5, Username: "setting-isolated-user", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+
+	_, revision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	_, err = ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, revision)
+	require.NoError(t, err)
+	require.NoError(t, UpdateUserSetting(user.Id, dto.UserSetting{Language: "zh"}))
+
+	discounts, _, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"gpt-4o": 8000}, discounts)
+}
+
+func TestReplaceUserModelPricingRejectsStaleRevisionAndIncrementsOnClear(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 6, Username: "pricing-revision-user", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+
+	discounts, revision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Empty(t, discounts)
+	updatedRevision, err := ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, revision)
+	require.NoError(t, err)
+	assert.Equal(t, revision+1, updatedRevision)
+
+	_, err = ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 6000}, revision)
+	require.ErrorIs(t, err, ErrUserModelPricingRevisionConflict)
+
+	currentDiscounts, currentRevision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"gpt-4o": 8000}, currentDiscounts)
+	assert.Equal(t, updatedRevision, currentRevision)
+
+	clearedRevision, err := ReplaceUserModelPricing(user.Id, map[string]int{}, currentRevision)
+	require.NoError(t, err)
+	assert.Equal(t, currentRevision+1, clearedRevision)
+	currentDiscounts, currentRevision, err = GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Empty(t, currentDiscounts)
+	assert.Equal(t, clearedRevision, currentRevision)
+
+}
+
+func TestReplaceUserModelPricingRejectsZeroRevision(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 7, Username: "pricing-legacy-client", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+
+	_, err := ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, 0)
+	require.ErrorIs(t, err, ErrUserModelPricingInvalid)
+}
+
+func TestModelPricingRejectsDuplicateCanonicalAliases(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 10, Username: "pricing-alias-conflict-user", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	_, revision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+
+	_, err = ReplaceUserModelPricing(user.Id, map[string]int{
+		"gemini-2.5-pro-thinking-1024": 8000,
+		"gemini-2.5-pro-thinking-2048": 8000,
+	}, revision)
+	require.ErrorIs(t, err, ErrUserModelPricingInvalid)
+}
+
+func TestUserUpdateDoesNotOverwriteModelPricingRevision(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{Id: 11, Username: "pricing-stale-user", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	_, revision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	_, err = ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, revision)
+	require.NoError(t, err)
+
+	staleUser, err := GetUserById(user.Id, true)
+	require.NoError(t, err)
+	staleUser.DisplayName = "updated-from-stale-snapshot"
+	require.NoError(t, staleUser.Update(false))
+
+	discounts, currentRevision, err := GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"gpt-4o": 8000}, discounts)
+	assert.Equal(t, revision+1, currentRevision)
 }
 
 func TestEnsureEmailAvailableRejectsExistingEmailCaseInsensitive(t *testing.T) {

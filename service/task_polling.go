@@ -636,7 +636,7 @@ func truncateBase64(s string) string {
 }
 
 // settleTaskBillingOnComplete 任务完成时的统一计费调整。
-// 优先级：1. adaptor.AdjustBillingOnComplete 返回正数 → 使用 adaptor 计算的额度
+// 优先级：1. adaptor.AdjustBillingOnComplete 返回折前实际额度，统一应用快照折扣
 //
 //  2. taskResult.TotalTokens > 0 → 按 token 重算
 //  3. 都不满足 → 保持预扣额度不变
@@ -648,7 +648,15 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 	}
 	// 1. 优先让 adaptor 决定最终额度
 	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, "adaptor计费调整")
+		var clamp *common.QuotaClamp
+		if priceData := taskBillingContextPriceData(task.PrivateData.BillingContext); priceData != nil {
+			discountedQuota := float64(actualQuota) * priceData.UserModelDiscountMultiplier()
+			actualQuota, clamp = common.QuotaFromFloatChecked(discountedQuota)
+			if discountedQuota > 0 && actualQuota == 0 {
+				actualQuota = 1
+			}
+		}
+		RecalculateTaskQuota(ctx, task, actualQuota, "adaptor计费调整", clamp)
 		return
 	}
 	// 2. 回退到 token 重算

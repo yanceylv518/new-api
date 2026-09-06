@@ -569,6 +569,17 @@ func TestTryTieredSettle_GroupRatioScaling(t *testing.T) {
 	}
 }
 
+func TestTryTieredSettleAppliesFrozenUserModelDiscount(t *testing.T) {
+	info := makeRelayInfo(flatExpr, 1.5, 1000, 500)
+	info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.5)
+
+	ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{P: 1000, C: 500})
+
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.Equal(t, 2625, quota)
+}
+
 func TestTryTieredSettle_GroupRatioZero(t *testing.T) {
 	info := makeRelayInfo(flatExpr, 0, 1000, 500)
 

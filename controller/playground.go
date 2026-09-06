@@ -43,7 +43,12 @@ func Playground(c *gin.Context) {
 		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		return
 	}
-	userCache.WriteContext(c)
+	discounts, err := model.GetUserModelDiscountBPS(userId)
+	if err != nil {
+		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+		return
+	}
+	userCache.WriteContextWithModelDiscounts(c, discounts)
 
 	tempToken := &model.Token{
 		UserId: userId,

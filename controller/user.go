@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/QuantumNous/new-api/constant"
 
@@ -395,6 +397,110 @@ func GetUser(c *gin.Context) {
 		"data":    user,
 	})
 	return
+}
+
+type userModelPricingItem struct {
+	ModelName   string `json:"model_name"`
+	DiscountBPS int    `json:"discount_bps"`
+}
+
+type updateUserModelPricingRequest struct {
+	Items []userModelPricingItem `json:"items"`
+	// 必须携带读取时的正版本号，缺失版本不能绕过并发覆盖保护。
+	Revision *int64 `json:"revision"`
+}
+
+// getManageableUser 复用其他用户管理接口的角色边界校验。
+func getManageableUser(c *gin.Context) (*model.User, bool) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return nil, false
+	}
+	user, err := model.GetUserById(id, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return nil, false
+	}
+	if !canManageTargetRole(c.GetInt("role"), user.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		return nil, false
+	}
+	return user, true
+}
+
+// GetUserModelPricing 返回目标用户归一化后的模型折扣规则。
+func GetUserModelPricing(c *gin.Context) {
+	user, ok := getManageableUser(c)
+	if !ok {
+		return
+	}
+	discounts, revision, err := model.GetUserModelPricing(user.Id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	items := make([]userModelPricingItem, 0, len(discounts))
+	for modelName, discountBPS := range discounts {
+		items = append(items, userModelPricingItem{ModelName: modelName, DiscountBPS: discountBPS})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ModelName < items[j].ModelName })
+	common.ApiSuccess(c, gin.H{"user_id": user.Id, "items": items, "revision": revision})
+}
+
+// UpdateUserModelPricing 归一化模型别名后替换完整规则集。
+func UpdateUserModelPricing(c *gin.Context) {
+	user, ok := getManageableUser(c)
+	if !ok {
+		return
+	}
+	var req updateUserModelPricingRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Items) > 1000 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	if req.Revision == nil || *req.Revision <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	// 10000 表示原价，持久化时省略该规则以保持设置精简。
+	discounts := make(map[string]int, len(req.Items))
+	seenModels := make(map[string]struct{}, len(req.Items))
+	for _, item := range req.Items {
+		modelName := ratio_setting.FormatMatchingModelName(strings.TrimSpace(item.ModelName))
+		if modelName == "" || len(modelName) > 128 || item.DiscountBPS < 1 || item.DiscountBPS > 10000 {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		// 思考预算和 Gizmo 别名可能归一化到同一个模型，重复规则必须显式拒绝，避免静默覆盖。
+		if _, exists := seenModels[modelName]; exists {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		seenModels[modelName] = struct{}{}
+		if item.DiscountBPS < 10000 {
+			discounts[modelName] = item.DiscountBPS
+		}
+	}
+	revision, err := model.ReplaceUserModelPricing(user.Id, discounts, *req.Revision)
+	if err != nil {
+		if errors.Is(err, model.ErrUserModelPricingRevisionConflict) {
+			c.JSON(http.StatusConflict, gin.H{
+				"success": false,
+				"code":    "USER_MODEL_PRICING_CONFLICT",
+				"message": "model pricing was changed by another administrator",
+			})
+			return
+		}
+		if errors.Is(err, model.ErrUserModelPricingInvalid) {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"revision": revision})
 }
 
 func GenerateAccessToken(c *gin.Context) {

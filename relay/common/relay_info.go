@@ -111,12 +111,14 @@ type RelayInfo struct {
 	AudioUsage             bool
 	ReasoningEffort        string
 	UserSetting            dto.UserSetting
-	UserEmail              string
-	UserQuota              int
-	RelayFormat            types.RelayFormat
-	SendResponseCount      int
-	ReceivedResponseCount  int
-	FinalPreConsumedQuota  int // 最终预消耗的配额
+	// UserModelDiscountBPS 是鉴权阶段从独立表读取的本次请求折扣快照。
+	UserModelDiscountBPS  map[string]int
+	UserEmail             string
+	UserQuota             int
+	RelayFormat           types.RelayFormat
+	SendResponseCount     int
+	ReceivedResponseCount int
+	FinalPreConsumedQuota int // 最终预消耗的配额
 	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
 	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
 	// 必须在提交前锁定全额。
@@ -520,6 +522,10 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	userSetting, ok := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
 	if ok {
 		info.UserSetting = userSetting
+	}
+	// 折扣属于计费上下文，单独读取以确保旧 users.setting 数据永远不会参与计费。
+	if discounts, ok := common.GetContextKeyType[map[string]int](c, constant.ContextKeyUserModelDiscounts); ok {
+		info.UserModelDiscountBPS = discounts
 	}
 
 	return info

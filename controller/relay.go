@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -590,11 +591,13 @@ func RelayTask(c *gin.Context) {
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
 		task.PrivateData.NodeName = common.NodeName
+		// 任务轮询需要使用提交时的折扣快照；即使是原价，也显式保存倍率以区分新旧任务。
+		taskOtherRatios := buildTaskBillingOtherRatios(&relayInfo.PriceData)
 		task.PrivateData.BillingContext = &model.TaskBillingContext{
 			ModelPrice:      relayInfo.PriceData.ModelPrice,
 			GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
 			ModelRatio:      relayInfo.PriceData.ModelRatio,
-			OtherRatios:     relayInfo.PriceData.OtherRatios(),
+			OtherRatios:     taskOtherRatios,
 			OriginModelName: relayInfo.OriginModelName,
 			PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
 		}
@@ -609,6 +612,23 @@ func RelayTask(c *gin.Context) {
 	if taskErr != nil {
 		respondTaskError(c, taskErr)
 	}
+}
+
+// buildTaskBillingOtherRatios 创建异步任务的计费快照。
+// PriceData.OtherRatios 在没有附加倍率时会返回 nil；这里必须先初始化可写 Map，
+// 以便即使按原价计费也能持久化用户折扣倍率，避免任务提交成功后在落库阶段 panic。
+func buildTaskBillingOtherRatios(priceData *hosttypes.PriceData) map[string]float64 {
+	// 通过 PriceData 重新接收倍率，确保任务快照不会绕过统一的有限值和正数校验。
+	snapshot := hosttypes.PriceData{}
+	if priceData != nil {
+		for key, ratio := range priceData.OtherRatios() {
+			snapshot.AddOtherRatio(key, ratio)
+		}
+		snapshot.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, priceData.UserModelDiscountMultiplier())
+	} else {
+		snapshot.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, 1)
+	}
+	return snapshot.OtherRatios()
 }
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）

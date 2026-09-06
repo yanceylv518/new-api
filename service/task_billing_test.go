@@ -151,11 +151,13 @@ func TestPriceDataOtherRatiosFilterAndSnapshot(t *testing.T) {
 	priceData.AddOtherRatio("inf", math.Inf(1))
 	priceData.AddOtherRatio("one", 1)
 	priceData.AddOtherRatio("positive", 2.5)
+	priceData.AddOtherRatio(types.UserModelDiscountRatioKey, 2)
 
 	ratios := priceData.OtherRatios()
 	require.Len(t, ratios, 2)
 	assert.Equal(t, 1.0, ratios["one"])
 	assert.Equal(t, 2.5, ratios["positive"])
+	assert.NotContains(t, ratios, types.UserModelDiscountRatioKey)
 	assert.True(t, priceData.HasOtherRatio("one"))
 	assert.False(t, priceData.HasOtherRatio("zero"))
 
@@ -847,4 +849,55 @@ func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+}
+
+func TestSettleNonPerCallBillingAppliesSnapshotUserModelDiscount(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 33, 33, 33
+	const initQuota, preConsumed, tokenRemain = 10000, 5000, 8000
+	seedUser(t, userID, initQuota)
+	seedToken(t, tokenID, userID, "sk-discounted-adjust", tokenRemain)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.PrivateData.BillingContext.OtherRatios = map[string]float64{
+		types.UserModelDiscountRatioKey: 0.5,
+	}
+
+	settleTaskBillingOnComplete(
+		ctx,
+		&mockAdaptor{adjustReturn: 3000},
+		task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess},
+	)
+
+	assert.Equal(t, 1500, task.Quota)
+	assert.Equal(t, initQuota+3500, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain+3500, getTokenRemainQuota(t, tokenID))
+}
+
+// token 重算必须使用任务提交时的模型与分组倍率，即使当前全局配置已经发生变化。
+func TestRecalculateTaskQuotaByTokensUsesBillingSnapshot(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, channelID = 34, 34
+	const initQuota, preConsumed = 10000, 1000
+	seedUser(t, userID, initQuota)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, preConsumed, 0, BillingSourceWallet, 0)
+	task.PrivateData.BillingContext.ModelRatio = 2
+	task.PrivateData.BillingContext.GroupRatio = 0.5
+	task.PrivateData.BillingContext.OtherRatios = map[string]float64{
+		types.UserModelDiscountRatioKey: 0.5,
+	}
+
+	RecalculateTaskQuotaByTokens(ctx, task, 1000)
+
+	// 1000 tokens × 2 × 0.5 × 0.5 = 500，结果与当前 ratio_setting 无关。
+	assert.Equal(t, 500, task.Quota)
+	assert.Equal(t, initQuota+500, getUserQuota(t, userID))
 }

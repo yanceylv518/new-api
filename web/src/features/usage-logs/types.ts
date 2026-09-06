@@ -176,6 +176,8 @@ export interface LogOtherData {
   model_ratio?: number
   completion_ratio?: number
   model_price?: number
+	// 消费日志中冻结的实际计费倍率（例如 0.8）。
+  user_model_discount?: number
   group_ratio?: number
   user_group_ratio?: number
   cache_ratio?: number

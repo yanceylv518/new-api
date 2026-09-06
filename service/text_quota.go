@@ -207,9 +207,15 @@ func composeTieredTextQuota(relayInfo *relaycommon.RelayInfo, summary textQuotaS
 
 	if tieredResult != nil {
 		if snap := relayInfo.TieredBillingSnapshot; snap != nil {
-			quota, clamp := common.QuotaFromDecimalChecked(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup).
+			quotaValue := decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup).
 				Mul(decimal.NewFromFloat(snap.GroupRatio)).
-				Add(summary.ToolCallSurchargeQuota))
+				Mul(decimal.NewFromFloat(relayInfo.PriceData.UserModelDiscountMultiplier())).
+				Add(summary.ToolCallSurchargeQuota)
+			quota, clamp := common.QuotaFromDecimalChecked(quotaValue)
+			// 正费用即使舍入为零，也必须保留一个可持久化的额度单位。
+			if quotaValue.IsPositive() && quota == 0 {
+				quota = 1
+			}
 			noteQuotaClamp(relayInfo, clamp)
 			return quota
 		}
@@ -218,9 +224,11 @@ func composeTieredTextQuota(relayInfo *relaycommon.RelayInfo, summary textQuotaS
 	// Saturate the final sum, not just the surcharge: tieredQuota can be near
 	// MaxQuota and adding the surcharge could push the total past the int32
 	// quota policy bound (persisted quota columns are 32-bit).
-	total, clamp := common.QuotaFromDecimalChecked(
-		decimal.NewFromInt(int64(tieredQuota)).Add(summary.ToolCallSurchargeQuota),
-	)
+	totalValue := decimal.NewFromInt(int64(tieredQuota)).Add(summary.ToolCallSurchargeQuota)
+	total, clamp := common.QuotaFromDecimalChecked(totalValue)
+	if totalValue.IsPositive() && total == 0 {
+		total = 1
+	}
 	noteQuotaClamp(relayInfo, clamp)
 	return total
 }
@@ -377,7 +385,9 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 
 	if !summary.hasBillableUsage() {
 		summary.Quota = 0
-	} else if !ratio.IsZero() && summary.Quota == 0 {
+	} else if summary.Quota == 0 &&
+		(!ratio.IsZero() || (relayInfo.PriceData.UsePrice && summary.ModelPrice > 0 && summary.GroupRatio > 0)) {
+		// 模型折后费用仍为正时，至少写入一个持久化额度单位。
 		summary.Quota = 1
 	}
 
@@ -436,7 +446,8 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		))
 	}
 	if summary.AudioInputPrice > 0 && summary.AudioTokens > 0 {
-		q := decimal.NewFromFloat(summary.AudioInputPrice).Div(decimal.NewFromInt(1000000)).Mul(decimal.NewFromInt(int64(summary.AudioTokens))).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+		// 音频单独计价仍属于模型用量，Content 中的额度要同步应用用户折扣。
+		q := decimal.NewFromFloat(summary.AudioInputPrice).Div(decimal.NewFromInt(1000000)).Mul(decimal.NewFromInt(int64(summary.AudioTokens))).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).Mul(decimal.NewFromFloat(relayInfo.PriceData.UserModelDiscountMultiplier()))
 		extraContent = append(extraContent, fmt.Sprintf("Audio Input 花费 %s", logger.LogQuota(common.QuotaFromDecimal(q))))
 	}
 

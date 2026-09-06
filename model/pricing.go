@@ -36,6 +36,7 @@ type Pricing struct {
 	BillingMode            string                  `json:"billing_mode,omitempty"`
 	BillingExpr            string                  `json:"billing_expr,omitempty"`
 	PricingVersion         string                  `json:"pricing_version,omitempty"`
+	UserModelDiscountBPS   int                     `json:"user_model_discount_bps,omitempty"` // 仅返回给当前已认证用户。
 }
 
 type PricingVendor struct {

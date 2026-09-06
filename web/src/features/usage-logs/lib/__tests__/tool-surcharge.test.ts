@@ -20,7 +20,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import type { LogOtherData } from '../../types'
-import { hasToolSurcharge } from '../format'
+import { getUserModelDiscountFactor, hasToolSurcharge } from '../format'
 
 describe('tool surcharge detection', () => {
   test('shows the marker for a charged structured tool surcharge', () => {
@@ -95,5 +95,19 @@ describe('tool surcharge detection', () => {
     for (const other of invalidCases) {
       assert.equal(hasToolSurcharge(other), false)
     }
+  })
+})
+
+describe('user model discount log snapshot', () => {
+  test('returns the stored factor for discounted consume logs', () => {
+    assert.equal(
+      getUserModelDiscountFactor({ user_model_discount: 0.75 }),
+      0.75
+    )
+  })
+
+  test('uses public price for legacy or invalid snapshots', () => {
+    assert.equal(getUserModelDiscountFactor({}), 1)
+    assert.equal(getUserModelDiscountFactor({ user_model_discount: 1.2 }), 1)
   })
 })

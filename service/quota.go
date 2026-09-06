@@ -37,6 +37,7 @@ type QuotaInfo struct {
 	ModelPrice    float64
 	ModelRatio    float64
 	GroupRatio    float64
+	ModelDiscount float64 // 已在 PriceData 中冻结的用户模型倍率。
 }
 
 func hasCustomModelRatio(modelName string, currentRatio float64) bool {
@@ -48,13 +49,21 @@ func hasCustomModelRatio(modelName string, currentRatio float64) bool {
 }
 
 func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
+	discount := info.ModelDiscount
+	if discount <= 0 || discount > 1 {
+		discount = 1
+	}
 	if info.UsePrice {
 		modelPrice := decimal.NewFromFloat(info.ModelPrice)
 		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 		groupRatio := decimal.NewFromFloat(info.GroupRatio)
 
-		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio)
-		return common.QuotaFromDecimalChecked(quota)
+		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio).Mul(decimal.NewFromFloat(discount))
+		result, clamp := common.QuotaFromDecimalChecked(quota)
+		if quota.IsPositive() && result == 0 {
+			result = 1
+		}
+		return result, clamp
 	}
 
 	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(info.ModelName))
@@ -76,14 +85,18 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 	quota = quota.Add(inputAudioTokens.Mul(audioRatio))
 	quota = quota.Add(outputAudioTokens.Mul(audioRatio).Mul(audioCompletionRatio))
 
-	quota = quota.Mul(ratio)
+	quota = quota.Mul(ratio).Mul(decimal.NewFromFloat(discount))
 
 	// If ratio is not zero and quota is less than or equal to zero, set quota to 1
 	if !ratio.IsZero() && quota.LessThanOrEqual(decimal.Zero) {
 		quota = decimal.NewFromInt(1)
 	}
 
-	return common.QuotaFromDecimalChecked(quota)
+	result, clamp := common.QuotaFromDecimalChecked(quota)
+	if quota.IsPositive() && result == 0 {
+		result = 1
+	}
+	return result, clamp
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
@@ -130,10 +143,11 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  modelName,
-		UsePrice:   relayInfo.UsePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: actualGroupRatio,
+		ModelName:     modelName,
+		UsePrice:      relayInfo.UsePrice,
+		ModelRatio:    modelRatio,
+		GroupRatio:    actualGroupRatio,
+		ModelDiscount: relayInfo.PriceData.UserModelDiscountMultiplier(),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -194,10 +208,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  modelName,
-		UsePrice:   usePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		ModelName:     modelName,
+		UsePrice:      usePrice,
+		ModelRatio:    modelRatio,
+		GroupRatio:    groupRatio,
+		ModelDiscount: relayInfo.PriceData.UserModelDiscountMultiplier(),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -212,7 +227,8 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		logContent = fmt.Sprintf("模型倍率 %.2f，补全倍率 %.2f，音频倍率 %.2f，音频补全倍率 %.2f，分组倍率 %.2f",
 			modelRatio, completionRatio.InexactFloat64(), audioRatio.InexactFloat64(), audioCompletionRatio.InexactFloat64(), groupRatio)
 	} else {
-		logContent = fmt.Sprintf("模型价格 %.2f，分组倍率 %.2f", modelPrice, groupRatio)
+		// 固定价格模型的日志内容也要记录用户实际承担的折后价格。
+		logContent = fmt.Sprintf("模型价格 %.2f，分组倍率 %.2f", modelPrice*relayInfo.PriceData.UserModelDiscountMultiplier(), groupRatio)
 	}
 
 	// record all the consume log even if quota is 0
@@ -317,10 +333,11 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  relayInfo.OriginModelName,
-		UsePrice:   usePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		ModelName:     relayInfo.OriginModelName,
+		UsePrice:      usePrice,
+		ModelRatio:    modelRatio,
+		GroupRatio:    groupRatio,
+		ModelDiscount: relayInfo.PriceData.UserModelDiscountMultiplier(),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -335,7 +352,8 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		logContent = fmt.Sprintf("模型倍率 %.2f，补全倍率 %.2f，音频倍率 %.2f，音频补全倍率 %.2f，分组倍率 %.2f",
 			modelRatio, completionRatio.InexactFloat64(), audioRatio.InexactFloat64(), audioCompletionRatio.InexactFloat64(), groupRatio)
 	} else {
-		logContent = fmt.Sprintf("模型价格 %.2f，分组倍率 %.2f", modelPrice, groupRatio)
+		// 固定价格模型的日志内容也要记录用户实际承担的折后价格。
+		logContent = fmt.Sprintf("模型价格 %.2f，分组倍率 %.2f", modelPrice*relayInfo.PriceData.UserModelDiscountMultiplier(), groupRatio)
 	}
 
 	// record all the consume log even if quota is 0

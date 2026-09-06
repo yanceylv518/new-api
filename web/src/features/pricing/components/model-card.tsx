@@ -30,11 +30,17 @@ import {
   getDynamicPricingSummary,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getUserModelDiscountMultiplier,
+  hasUserModelDiscount,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import type { PricingModel, TokenUnit } from '../types'
+import { DiscountedPrice } from './discounted-price'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
 import { ModelPerfBadge, type ModelPerfBadgeData } from './model-perf-badge'
+import { UserPricingBadge } from './user-pricing-badge'
 
 export interface ModelCardProps {
   model: PricingModel
@@ -66,18 +72,28 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
     props.model.billing_mode === 'tiered_expr' &&
     Boolean(props.model.billing_expr)
   const hasCachedPrice = isTokenBased && props.model.cache_ratio != null
+  const hasDiscount = hasUserModelDiscount(props.model)
+  const discountMultiplier = getUserModelDiscountMultiplier(props.model)
+  const baseDynamicPriceOptions = {
+    tokenUnit,
+    showRechargePrice,
+    priceRate,
+    usdExchangeRate,
+    groupRatioMultiplier: getDynamicDisplayGroupRatio(
+      props.model,
+      props.selectedGroup
+    ),
+  }
   const dynamicSummary = isDynamicPricing
     ? getDynamicPricingSummary(props.model, {
-        tokenUnit,
-        showRechargePrice,
-        priceRate,
-        usdExchangeRate,
-        groupRatioMultiplier: getDynamicDisplayGroupRatio(
-          props.model,
-          props.selectedGroup
-        ),
+        ...baseDynamicPriceOptions,
+        discountMultiplier,
       })
     : null
+  const baseDynamicSummary =
+    hasDiscount && isDynamicPricing
+      ? getDynamicPricingSummary(props.model, baseDynamicPriceOptions)
+      : null
 
   const primaryGroup = groups[0]
   const bottomTags = [...endpoints.slice(0, 2), ...tags.slice(0, 2)]
@@ -107,17 +123,28 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
     } else if (dynamicSummary.primaryEntries.length > 0) {
       priceSummary = (
         <>
-          {dynamicSummary.primaryEntries.map((entry) => (
-            <span
-              key={entry.key}
-              className='text-muted-foreground whitespace-nowrap'
-            >
-              {t(entry.shortLabel)}{' '}
-              <span className='text-foreground font-mono font-semibold'>
-                {entry.formatted}
+          {dynamicSummary.primaryEntries.map((entry) => {
+            const baseEntry = baseDynamicSummary?.entries.find(
+              (candidate) => candidate.key === entry.key
+            )
+            return (
+              <span
+                key={entry.key}
+                className='text-muted-foreground whitespace-nowrap'
+              >
+                {t(entry.shortLabel)}{' '}
+                <DiscountedPrice
+                  discounted={hasDiscount}
+                  original={baseEntry?.formatted}
+                  effective={
+                    <span className='text-foreground font-mono font-semibold'>
+                      {entry.formatted}
+                    </span>
+                  }
+                />
               </span>
-            </span>
-          ))}
+            )
+          })}
         </>
       )
     } else {
@@ -128,41 +155,77 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
       )
     }
   } else if (isTokenBased) {
+    const inputPrice = formatPrice(
+      props.model,
+      'input',
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup,
+      discountMultiplier
+    )
+    const baseInputPrice = formatPrice(
+      props.model,
+      'input',
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup
+    )
+    const outputPrice = formatPrice(
+      props.model,
+      'output',
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup,
+      discountMultiplier
+    )
+    const baseOutputPrice = formatPrice(
+      props.model,
+      'output',
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup
+    )
+
     priceSummary = (
       <>
         <span className='text-muted-foreground whitespace-nowrap'>
           {t('Input')}{' '}
-          <span className='text-foreground font-mono font-semibold'>
-            {formatPrice(
-              props.model,
-              'input',
-              tokenUnit,
-              showRechargePrice,
-              priceRate,
-              usdExchangeRate,
-              props.selectedGroup
-            )}
-          </span>
+          <DiscountedPrice
+            discounted={hasDiscount}
+            original={baseInputPrice}
+            effective={
+              <span className='text-foreground font-mono font-semibold'>
+                {inputPrice}
+              </span>
+            }
+          />
         </span>
         <span className='text-muted-foreground whitespace-nowrap'>
           {t('Output')}{' '}
-          <span className='text-foreground font-mono font-semibold'>
-            {formatPrice(
-              props.model,
-              'output',
-              tokenUnit,
-              showRechargePrice,
-              priceRate,
-              usdExchangeRate,
-              props.selectedGroup
-            )}
-          </span>
+          <DiscountedPrice
+            discounted={hasDiscount}
+            original={baseOutputPrice}
+            effective={
+              <span className='text-foreground font-mono font-semibold'>
+                {outputPrice}
+              </span>
+            }
+          />
         </span>
         {hasCachedPrice && (
           <span className='text-muted-foreground whitespace-nowrap'>
             {t('Cached')}{' '}
-            <span className='text-foreground font-mono font-semibold'>
-              {formatPrice(
+            <DiscountedPrice
+              discounted={hasDiscount}
+              original={formatPrice(
                 props.model,
                 'cache',
                 tokenUnit,
@@ -171,23 +234,53 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
                 usdExchangeRate,
                 props.selectedGroup
               )}
-            </span>
+              effective={
+                <span className='text-foreground font-mono font-semibold'>
+                  {formatPrice(
+                    props.model,
+                    'cache',
+                    tokenUnit,
+                    showRechargePrice,
+                    priceRate,
+                    usdExchangeRate,
+                    props.selectedGroup,
+                    discountMultiplier
+                  )}
+                </span>
+              }
+            />
           </span>
         )}
       </>
     )
   } else {
+    const price = formatRequestPrice(
+      props.model,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup,
+      discountMultiplier
+    )
+    const basePrice = formatRequestPrice(
+      props.model,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      props.selectedGroup
+    )
+
     priceSummary = (
       <span className='text-muted-foreground whitespace-nowrap'>
-        <span className='text-foreground font-mono font-semibold'>
-          {formatRequestPrice(
-            props.model,
-            showRechargePrice,
-            priceRate,
-            usdExchangeRate,
-            props.selectedGroup
-          )}
-        </span>{' '}
+        <DiscountedPrice
+          discounted={hasDiscount}
+          original={basePrice}
+          effective={
+            <span className='text-foreground font-mono font-semibold'>
+              {price}
+            </span>
+          }
+        />{' '}
         / {t('request')}
       </span>
     )
@@ -211,9 +304,12 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
             )}
           </div>
           <div className='min-w-0'>
-            <h3 className='text-foreground truncate font-mono text-[15px] leading-tight font-bold'>
-              {props.model.model_name}
-            </h3>
+            <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
+              <h3 className='text-foreground min-w-0 truncate font-mono text-[15px] leading-tight font-bold'>
+                {props.model.model_name}
+              </h3>
+              <UserPricingBadge model={props.model} />
+            </div>
             <div className='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm sm:mt-1 sm:gap-x-3'>
               {priceSummary}
             </div>

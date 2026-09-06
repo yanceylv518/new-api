@@ -3,6 +3,7 @@ package service
 import (
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -108,10 +109,13 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 		return snap, nil
 	}
 
-	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio
+	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio * relayInfo.PriceData.UserModelDiscountMultiplier()
 	estimatedQuota, err := billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
 	if err != nil {
 		return nil, err
+	}
+	if estimatedQuotaAfterGroup > 0 && estimatedQuota == 0 {
+		estimatedQuota = 1
 	}
 	snap.GroupRatio = groupRatio
 	snap.EstimatedQuotaAfterGroup = estimatedQuota
@@ -178,6 +182,14 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 			quota = snap.EstimatedQuotaAfterGroup
 		}
 		return true, quota, nil
+	}
+	discountRatio := relayInfo.PriceData.UserModelDiscountMultiplier()
+	if discountRatio != 1 {
+		discountedQuota := tr.ActualQuotaBeforeGroup * snap.GroupRatio * discountRatio
+		tr.ActualQuotaAfterGroup, tr.Clamp = common.QuotaRoundChecked(discountedQuota)
+		if discountedQuota > 0 && tr.ActualQuotaAfterGroup == 0 {
+			tr.ActualQuotaAfterGroup = 1
+		}
 	}
 
 	// Surface any int32 saturation from settlement onto RelayInfo so the

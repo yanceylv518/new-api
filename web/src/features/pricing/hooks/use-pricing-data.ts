@@ -20,16 +20,22 @@ import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 
 import { useStatus } from '@/hooks/use-status'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getPricing } from '../api'
 
-export function usePricingData() {
+export function usePricingData(enabled = true) {
   const { status } = useStatus()
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const sessionId = useAuthStore((state) => state.auth.session?.sid)
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['pricing'],
+    // 个性化定价不能复用其他账号的缓存响应。
+    queryKey: ['pricing', userId ?? 'anonymous', sessionId ?? 'anonymous'],
     queryFn: getPricing,
-    staleTime: 5 * 60 * 1000,
+    enabled,
+    // 用户折扣可由其他管理员随时更新，重新进入页面时必须重新读取。
+    staleTime: 0,
   })
 
   // Ensure rates never reach zero to prevent division errors

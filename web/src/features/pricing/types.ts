@@ -56,6 +56,8 @@ export type PricingModel = {
   billing_expr?: string
   /** Pricing version returned by backend, useful for cache busting */
   pricing_version?: string
+  /** 已认证用户的折扣比例基点（8500 表示按原价的 85% 计费）。 */
+  user_model_discount_bps?: number
   /**
    * Optional model metadata fields reserved for backend-provided catalog data.
    * Keep them data-driven; do not synthesize display values on the client.
