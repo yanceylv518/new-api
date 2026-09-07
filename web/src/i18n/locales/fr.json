@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "Prix des modèles réinitialisés avec succès",
     "Model Pricing": "Tarification des modèles",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "La tarification du modèle a été modifiée par un autre administrateur. Les dernières règles ont été rechargées.",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "Un autre administrateur a modifié les tarifs. Vos modifications sont conservées. Rouvrez la fenêtre pour charger les dernières règles.",
     "Model pricing saved": "Remises de modèle enregistrées",
     "Model pull failed: {{msg}}": "Échec du téléchargement du modèle : {{msg}}",
     "Model ratio": "Ratio modèle",

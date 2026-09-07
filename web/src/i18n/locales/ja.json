@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "モデル価格が正常にリセットされました",
     "Model Pricing": "モデル料金",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "モデル価格が別の管理者によって変更されました。最新のルールを再読み込みしました。",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "他の管理者がモデル料金を変更しました。編集中の内容は保持されています。最新のルールを読み込むにはダイアログを開き直してください。",
     "Model pricing saved": "モデル割引を保存しました",
     "Model pull failed: {{msg}}": "モデルのプルに失敗しました： __ PH_0 __",
     "Model ratio": "モデル倍率",

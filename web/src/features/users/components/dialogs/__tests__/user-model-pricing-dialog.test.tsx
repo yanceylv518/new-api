@@ -76,11 +76,13 @@ reactTestGlobals.IS_REACT_ACT_ENVIRONMENT = true
 type ApiMethod = (url: string, data?: unknown) => Promise<{ data: unknown }>
 type MockableApi = {
   get: ApiMethod
+  put: ApiMethod
 }
 type RenderedDialog = {
   host: HTMLDivElement
   queryClient: InstanceType<typeof QueryClient>
   root: ReturnType<typeof createRoot>
+  renderOpen: (open: boolean) => Promise<void>
 }
 
 const models = Array.from({ length: 30 }, (_, index) => ({
@@ -94,6 +96,7 @@ const models = Array.from({ length: 30 }, (_, index) => ({
 
 const apiClient = api as unknown as MockableApi
 const originalGet = apiClient.get
+const originalPut = apiClient.put
 let renderedDialog: RenderedDialog | null = null
 
 // 为组件测试提供稳定的定价、状态和已有折扣数据，避免依赖真实后端。
@@ -163,28 +166,31 @@ async function renderDialog(expectedInputCount = 25) {
   document.body.append(host)
   const root = createRoot(host)
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false }, mutations: { gcTime: 0 } },
   })
   queryClient.setQueryData(
     ['status'],
     { price: 1, usd_exchange_rate: 1 },
     { updatedAt: Date.now() + 60_000 }
   )
-  renderedDialog = { host, queryClient, root }
-
-  await act(async () =>
-    root.render(
-      <QueryClientProvider client={queryClient}>
-        <I18nextProvider i18n={i18n}>
-          <UserModelPricingDialog
-            open
-            onOpenChange={() => undefined}
-            user={{ id: 42, username: 'pricing-user' }}
-          />
-        </I18nextProvider>
-      </QueryClientProvider>
+  // 保留同一组件实例，验证受控关闭与重新打开时草稿会话的生命周期。
+  const renderOpen = async (open: boolean) => {
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <I18nextProvider i18n={i18n}>
+            <UserModelPricingDialog
+              open={open}
+              onOpenChange={() => undefined}
+              user={{ id: 42, username: 'pricing-user' }}
+            />
+          </I18nextProvider>
+        </QueryClientProvider>
+      )
     )
-  )
+  }
+  renderedDialog = { host, queryClient, root, renderOpen }
+  await renderOpen(true)
   await act(
     async () =>
       await waitForCondition(
@@ -257,6 +263,7 @@ async function selectDiscountFilter(label: string) {
 
 afterEach(async () => {
   apiClient.get = originalGet
+  apiClient.put = originalPut
   if (renderedDialog) {
     await act(async () => renderedDialog?.root.unmount())
     renderedDialog.queryClient.clear()
@@ -271,6 +278,124 @@ after(() => {
 })
 
 describe('user model pricing dialog', () => {
+  // 重新打开失败时不能把旧缓存当成最新会话，重试成功后再恢复编辑。
+  test('blocks editing cached rules when reopening fails and recovers on retry', async () => {
+    installApiFixtures(models.slice(0, 3))
+    await renderDialog(3)
+    assert.ok(renderedDialog)
+    await renderedDialog.renderOpen(false)
+    const fixtureGet = apiClient.get
+    apiClient.get = async (url) => {
+      if (url === '/api/user/42/model-pricing') throw new Error('unavailable')
+      return fixtureGet(url)
+    }
+    await renderedDialog.renderOpen(true)
+    await act(async () =>
+      waitForCondition(
+        () =>
+          document.body.textContent?.includes('Failed to load model pricing') ??
+          false,
+        'load failure was not shown'
+      )
+    )
+    const save = document.querySelector<HTMLButtonElement>(
+      'button[type="submit"][form="user-model-pricing-form"]'
+    )
+    assert.ok(save)
+    assert.equal(save.disabled, true)
+    assert.equal(document.querySelector('input[type="number"]'), null)
+    apiClient.get = fixtureGet
+    const retry = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Retry')
+    assert.ok(retry)
+    await act(async () => retry.click())
+    await act(async () =>
+      waitForCondition(
+        () => visibleModelNames().length === 3,
+        'retry did not restore editing'
+      )
+    )
+    assert.equal(getModelInput('model-03').value, '80')
+    assert.equal(save.disabled, false)
+  })
+
+  // 后台规则和模型目录变化不能覆盖草稿，也不能让旧草稿携带新 revision 绕过冲突检查。
+  test('keeps draft and original revision through refetch and a save conflict', async () => {
+    installApiFixtures()
+    await renderDialog()
+    assert.ok(renderedDialog)
+    await changeInput(getModelInput('model-03'), '55')
+    const initialNames = visibleModelNames()
+    const fixtureGet = apiClient.get
+    apiClient.get = async (url) => {
+      if (url === '/api/user/42/model-pricing') {
+        return {
+          data: {
+            success: true,
+            data: {
+              user_id: 42,
+              revision: 2,
+              items: [{ model_name: 'model-01', discount_bps: 7000 }],
+            },
+          },
+        }
+      }
+      return fixtureGet(url)
+    }
+    await act(async () => {
+      await renderedDialog?.queryClient.refetchQueries({
+        queryKey: ['user-model-pricing', 42],
+      })
+      const response = await fixtureGet('/api/pricing')
+      renderedDialog?.queryClient.setQueriesData(
+        { queryKey: ['pricing'] },
+        {
+          ...(response.data as object),
+          data: models.slice(5),
+        }
+      )
+    })
+    assert.equal(getModelInput('model-03').value, '55')
+    assert.deepEqual(visibleModelNames(), initialNames)
+    let submitted: unknown
+    const { AxiosError } = await import('axios')
+    apiClient.put = async (_url, payload) => {
+      submitted = payload
+      const error = new AxiosError('conflict')
+      error.response = { status: 409 } as NonNullable<typeof error.response>
+      throw error
+    }
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () => {
+      form.dispatchEvent(
+        new domWindow.Event('submit', {
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event
+      )
+    })
+    assert.deepEqual(submitted, {
+      revision: 1,
+      items: [{ model_name: 'model-03', discount_bps: 5500 }],
+    })
+    assert.equal(getModelInput('model-03').value, '55')
+    // 重新打开才加载最新完整快照，避免后台自动合并造成其他管理员的规则被覆盖。
+    await renderedDialog.renderOpen(false)
+    await renderedDialog.renderOpen(true)
+    await act(async () =>
+      waitForCondition(
+        () => visibleModelNames()[0] === 'model-01',
+        'latest rules were not loaded'
+      )
+    )
+    assert.equal(getModelInput('model-01').value, '70')
+    assert.equal(getModelInput('model-03').value, '100')
+  })
+
   test('lists enabled models, preserves configured values, searches, and paginates', async () => {
     installApiFixtures()
     await renderDialog()

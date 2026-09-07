@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "Đã đặt lại giá mô hình thành công",
     "Model Pricing": "Định giá mô hình",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "Định giá mô hình đã được quản trị viên khác thay đổi. Các quy tắc mới nhất đã được tải lại.",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "Quản trị viên khác đã thay đổi giá mô hình. Các chỉnh sửa của bạn vẫn được giữ lại. Mở lại hộp thoại để tải quy tắc mới nhất.",
     "Model pricing saved": "Đã lưu giảm giá mô hình",
     "Model pull failed: {{msg}}": "Tải mô hình thất bại: {{msg}}",
     "Model ratio": "Tỷ lệ mô hình",

@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "Model prices reset successfully",
     "Model Pricing": "Model Pricing",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "Model pricing changed by another administrator. The latest rules were reloaded.",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.",
     "Model pricing saved": "Discount pricing saved",
     "Model pull failed: {{msg}}": "Model pull failed: {{msg}}",
     "Model ratio": "Model ratio",

@@ -99,47 +99,68 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   })
 
   const collection = query.data?.data
+  // 编辑会话冻结规则、目录与 revision，后台查询更新不得重建行索引或覆盖未保存草稿。
+  const [editorSnapshot, setEditorSnapshot] = useState<{
+    userId: number
+    collection: NonNullable<typeof collection>
+    rows: ReturnType<typeof buildUserModelPricingRows>
+  } | null>(null)
+  // 仅在打开且初次查询完成时建立会话，条件更新在渲染提交前完成，避免 effect 连锁重置。
+  if (!props.open && editorSnapshot) {
+    setEditorSnapshot(null)
+  } else if (
+    props.open &&
+    editorSnapshot?.userId !== props.user.id &&
+    collection &&
+    query.isSuccess &&
+    query.data.success &&
+    !query.isFetching &&
+    !pricing.isLoading &&
+    !pricing.error
+  ) {
+    setEditorSnapshot({
+      userId: props.user.id,
+      collection,
+      rows: buildUserModelPricingRows(pricing.models, collection.items),
+    })
+  }
+  const activeSnapshot =
+    editorSnapshot?.userId === props.user.id ? editorSnapshot : null
   // 复用归一化后的折扣规则判断模型是否已经配置过专属折扣。
   const configuredDiscounts = useMemo(() => {
     const discounts = new Map<string, number>()
-    for (const item of collection?.items ?? []) {
+    for (const item of activeSnapshot?.collection.items ?? []) {
       discounts.set(
         normalizeUserModelPricingModelName(item.model_name),
         item.discount_bps / 100
       )
     }
     return discounts
-  }, [collection])
+  }, [activeSnapshot])
 
   const pricingRows = useMemo(
-    () => buildUserModelPricingRows(pricing.models, collection?.items ?? []),
-    [collection?.items, pricing.models]
+    () => activeSnapshot?.rows ?? [],
+    [activeSnapshot]
   )
 
   useEffect(() => {
-    if (!props.open || !collection || pricing.isLoading || pricing.error) {
-      return
-    }
-
+    if (!activeSnapshot) return
+    const discounts = new Map(
+      activeSnapshot.collection.items.map((item) => [
+        normalizeUserModelPricingModelName(item.model_name),
+        item.discount_bps / 100,
+      ])
+    )
     form.reset({
       // 所有启用模型都展示，未配置专属折扣时默认按原价计费。
-      items: pricingRows.map((model) => ({
+      items: activeSnapshot.rows.map((model) => ({
         model_name: model.model_name,
         discount_percent:
-          configuredDiscounts.get(
-            normalizeUserModelPricingModelName(model.model_name)
-          ) ?? 100,
+          discounts.get(normalizeUserModelPricingModelName(model.model_name)) ??
+          100,
       })),
     })
-  }, [
-    collection,
-    configuredDiscounts,
-    form,
-    pricing.error,
-    pricing.isLoading,
-    pricingRows,
-    props.open,
-  ])
+  }, [activeSnapshot, form])
 
   const handleOpenChange = (open: boolean) => {
     if (!open) {
@@ -155,7 +176,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     mutationFn: (values: UserModelPricingFormValues) =>
       replaceUserModelPricing(props.user.id, {
         ...buildUserModelPricingPayload(values),
-        revision: collection?.revision ?? 0,
+        revision: activeSnapshot?.collection.revision ?? 0,
       }),
     onSuccess: async (response) => {
       if (!response.success) {
@@ -176,7 +197,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         })
         toast.error(
           t(
-            'Model pricing changed by another administrator. The latest rules were reloaded.'
+            'Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.'
           )
         )
         return
@@ -185,11 +206,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     },
   })
 
-  const isLoading = query.isLoading || query.isFetching || pricing.isLoading
+  const isLoading =
+    !activeSnapshot &&
+    (query.isLoading || query.isFetching || pricing.isLoading)
   const hasLoadError =
-    query.isError ||
-    pricing.error != null ||
-    (query.data !== undefined && (!query.data.success || !query.data.data))
+    !activeSnapshot &&
+    (query.isError ||
+      pricing.error != null ||
+      (query.data !== undefined && (!query.data.success || !query.data.data)))
 
   // 预先缓存小写模型名，搜索时只扫描稳定的行索引，减少重复字符串处理和对象创建。
   const modelRows = useMemo(
@@ -302,7 +326,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
           <Button
             type='submit'
             form='user-model-pricing-form'
-            disabled={mutation.isPending || isLoading || hasLoadError}
+            disabled={
+              mutation.isPending || !activeSnapshot || isLoading || hasLoadError
+            }
           >
             {mutation.isPending && <Loader2 className='animate-spin' />}
             {t('Save')}

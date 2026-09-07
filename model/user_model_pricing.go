@@ -19,10 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 package model
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"gorm.io/gorm"
@@ -41,12 +46,50 @@ var (
 	ErrUserModelPricingRevisionConflict = errors.New("user model pricing revision conflict")
 )
 
-// UserModelPricing 保存单个用户的规范化模型折扣，避免与 users.setting 中的其他偏好共用 JSON 字段。
+// UserModelPricing 在独立表中保存单个用户的规范化模型折扣。
 type UserModelPricing struct {
 	Id          int    `json:"id" gorm:"primaryKey"`
-	UserId      int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_model_pricing_user_model,priority:1"`
-	ModelName   string `json:"model_name" gorm:"type:varchar(128);not null;uniqueIndex:idx_user_model_pricing_user_model,priority:2"`
+	UserId      int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_model_pricing_user_key,priority:1"`
+	ModelName   string `json:"model_name" gorm:"type:varchar(128);not null"`
+	ModelKey    string `json:"-" gorm:"size:64;uniqueIndex:idx_user_model_pricing_user_key,priority:2"`
 	DiscountBPS int    `json:"discount_bps" gorm:"type:int;not null"`
+}
+
+// BeforeCreate 用规范化模型名的固定长度哈希隔离数据库排序规则，保留大小写语义。
+func (rule *UserModelPricing) BeforeCreate(_ *gorm.DB) error {
+	rule.ModelName = ratio_setting.FormatMatchingModelName(strings.TrimSpace(rule.ModelName))
+	_, err := normalizeUserModelDiscounts(map[string]int{rule.ModelName: rule.DiscountBPS})
+	if err != nil {
+		return err
+	}
+	rule.ModelKey = fmt.Sprintf("%x", sha256.Sum256([]byte(rule.ModelName)))
+	return nil
+}
+
+// InitializeUserModelPricingKeys 在新索引生效后分批回填旧行，最后移除依赖排序规则的旧索引。
+func InitializeUserModelPricingKeys() error {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		var rows []UserModelPricing
+		if err := tx.Where("model_key IS NULL OR model_key = ?", "").FindInBatches(&rows, 100, func(batch *gorm.DB, _ int) error {
+			for _, row := range rows {
+				key := fmt.Sprintf("%x", sha256.Sum256([]byte(row.ModelName)))
+				if err := tx.Model(&UserModelPricing{}).Where("id = ?", row.Id).UpdateColumn("model_key", key).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}).Error; err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	// MySQL DDL 会隐式提交，索引切换必须放在数据回填事务之外，允许失败后再次启动重试。
+	if DB.Migrator().HasIndex(&UserModelPricing{}, "idx_user_model_pricing_user_model") {
+		return DB.Migrator().DropIndex(&UserModelPricing{}, "idx_user_model_pricing_user_model")
+	}
+	return nil
 }
 
 func (UserModelPricing) TableName() string {
@@ -94,51 +137,78 @@ func readUserModelPricing(tx *gorm.DB, userId int) (map[string]int, error) {
 
 // GetUserModelPricing 在同一事务内锁定用户行，再读取规则和 revision，保证管理页面拿到同一版本的完整快照。
 func GetUserModelPricing(userId int) (map[string]int, int64, error) {
+	return GetUserModelPricingContext(context.Background(), userId)
+}
+
+// GetUserModelPricingContext 将管理查询和缓存回源绑定到调用方取消信号及统一时间预算。
+func GetUserModelPricingContext(ctx context.Context, userId int) (map[string]int, int64, error) {
+	snapshot, err := loadUserModelPricingSnapshot(ctx, userId, false)
+	return snapshot.discounts, snapshot.revision, err
+}
+
+// loadUserModelPricingSnapshot 在同一用户锁内读取规则和发布缓存版本，防止迟到的回源复活旧版本。
+func loadUserModelPricingSnapshot(ctx context.Context, userId int, publishVersion bool) (userModelPricingSnapshot, error) {
+	var snapshot userModelPricingSnapshot
 	if userId <= 0 {
-		return nil, 0, errors.New("id 为空！")
+		return snapshot, ErrUserModelPricingInvalid
 	}
 
-	var discounts map[string]int
-	var revision int64
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
+	defer cancel()
+	expiresAt := time.Now().Add(userModelPricingCacheTTL)
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// SQLite 的读事务不阻止 WAL 写入，用无值变化的更新持有写锁直到版本发布完成。
+		if publishVersion && common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			if err := tx.Model(&User{}).Where("id = ?", userId).UpdateColumn("model_pricing_version", gorm.Expr("model_pricing_version")).Error; err != nil {
+				return err
+			}
+		}
 		var user User
 		if err := lockForUpdate(tx).Select("id", "model_pricing_version").First(&user, userId).Error; err != nil {
 			return err
 		}
-		revision = user.ModelPricingVersion
-		if revision < 1 {
-			revision = 1
+		snapshot.revision = user.ModelPricingVersion
+		if snapshot.revision < 1 {
+			snapshot.revision = 1
 		}
 
 		var err error
-		discounts, err = readUserModelPricing(tx, userId)
-		return err
+		snapshot.discounts, err = readUserModelPricing(tx, userId)
+		if err != nil {
+			return err
+		}
+		if publishVersion && publishUserModelPricingVersion(ctx, userId, snapshot.revision, false) == nil {
+			snapshot.expiresAt = expiresAt
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, 0, err
+		return userModelPricingSnapshot{}, err
 	}
-	return discounts, revision, nil
+	return snapshot, nil
 }
 
-// GetUserModelDiscountBPS 读取运行时计费使用的规则，不锁定用户行以避免请求之间互相阻塞。
+// GetUserModelDiscountBPS 读取运行时规则；缓存命中时不访问数据库。
 func GetUserModelDiscountBPS(userId int) (map[string]int, error) {
-	if userId <= 0 {
-		return nil, errors.New("id 为空！")
-	}
-	return readUserModelPricing(DB, userId)
+	return GetUserModelDiscountBPSContext(context.Background(), userId)
 }
 
 // ReplaceUserModelPricing 原子替换完整规则集，并校验调用方读取时的 revision。
 func ReplaceUserModelPricing(userId int, discounts map[string]int, expectedRevision int64) (int64, error) {
+	return ReplaceUserModelPricingContext(context.Background(), userId, discounts, expectedRevision)
+}
+
+// ReplaceUserModelPricingContext 限制整个替换事务的生命周期，客户端取消时停止等待和写入。
+func ReplaceUserModelPricingContext(ctx context.Context, userId int, discounts map[string]int, expectedRevision int64) (int64, error) {
 	if expectedRevision <= 0 {
 		return 0, ErrUserModelPricingInvalid
 	}
-	return replaceUserModelPricing(userId, discounts, &expectedRevision)
+	return replaceUserModelPricing(ctx, userId, discounts, &expectedRevision)
 }
 
 // replaceUserModelPricing 在同一事务中完成版本校验、规则替换和版本递增。
 // expectedRevision 为 nil 时仅供内部更新入口使用，对外替换必须携带正 revision。
-func replaceUserModelPricing(userId int, discounts map[string]int, expectedRevision *int64) (int64, error) {
+func replaceUserModelPricing(ctx context.Context, userId int, discounts map[string]int, expectedRevision *int64) (int64, error) {
 	if userId <= 0 || (expectedRevision != nil && *expectedRevision <= 0) {
 		return 0, ErrUserModelPricingInvalid
 	}
@@ -147,8 +217,10 @@ func replaceUserModelPricing(userId int, discounts map[string]int, expectedRevis
 		return 0, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
+	defer cancel()
 	var nextRevision int64
-	err = DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// SQLite 不支持行锁，必须先用带版本条件的原子更新抢占本次写入权，避免两个管理员同时通过旧快照校验。
 		revisionQuery := tx.Model(&User{}).Where("id = ?", userId)
 		if expectedRevision != nil {
@@ -179,6 +251,12 @@ func replaceUserModelPricing(userId int, discounts map[string]int, expectedRevis
 			nextRevision = user.ModelPricingVersion
 		}
 
+		// 提交前建立跨节点屏障；失败则回滚，禁止仍可能命中旧缓存时提交新价格。
+		if common.RedisEnabled {
+			if err := publishUserModelPricingVersion(ctx, userId, nextRevision, true); err != nil {
+				return err
+			}
+		}
 		if err := tx.Where("user_id = ?", userId).Delete(&UserModelPricing{}).Error; err != nil {
 			return err
 		}
@@ -202,5 +280,6 @@ func replaceUserModelPricing(userId int, discounts map[string]int, expectedRevis
 	if err != nil {
 		return 0, err
 	}
+	// 保留提交前屏障，由下一次持有用户锁的回源发布已提交版本，避免事务外迟到发布。
 	return nextRevision, nil
 }

@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "模型价格重置成功",
     "Model Pricing": "模型定价",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "模型折扣已被其他管理员修改，已重新加载最新规则。",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "其他管理员已修改模型定价。你的编辑已保留，请重新打开弹窗以加载最新规则。",
     "Model pricing saved": "折扣定价已保存",
     "Model pull failed: {{msg}}": "模型拉取失败：{{msg}}",
     "Model ratio": "模型倍率",

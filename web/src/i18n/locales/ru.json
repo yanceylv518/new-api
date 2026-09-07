@@ -2757,6 +2757,7 @@
     "Model prices reset successfully": "Цены моделей успешно сброшены",
     "Model Pricing": "Тарификация моделей",
     "Model pricing changed by another administrator. The latest rules were reloaded.": "Цены на модели изменены другим администратором. Последние правила загружены повторно.",
+    "Model pricing changed by another administrator. Your edits were kept. Reopen the dialog to load the latest rules.": "Другой администратор изменил цены моделей. Ваши правки сохранены в форме. Откройте окно заново, чтобы загрузить актуальные правила.",
     "Model pricing saved": "Скидки на модели сохранены",
     "Model pull failed: {{msg}}": "Ошибка тяги модели: {{msg}}",
     "Model ratio": "Коэффициент модели",

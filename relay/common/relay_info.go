@@ -523,7 +523,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	if ok {
 		info.UserSetting = userSetting
 	}
-	// 折扣属于计费上下文，单独读取以确保旧 users.setting 数据永远不会参与计费。
+	// 折扣从独立定价上下文读取，冻结为本次请求使用的计费快照。
 	if discounts, ok := common.GetContextKeyType[map[string]int](c, constant.ContextKeyUserModelDiscounts); ok {
 		info.UserModelDiscountBPS = discounts
 	}

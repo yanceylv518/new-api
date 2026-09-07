@@ -1,0 +1,37 @@
+# 仅用于隔离验证；不挂载生产数据，不开放公网端口，停止后移除测试容器即可清理数据。
+name: newapi-pricing-review
+services:
+  mysql:
+    image: mysql:5.7.44
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: pricing_review
+    command: ['--character-set-server=utf8mb4', '--collation-server=utf8mb4_general_ci']
+    ports: ['127.0.0.1:13316:3306']
+    tmpfs: ['/var/lib/mysql']
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1']
+      interval: 2s
+      timeout: 2s
+      retries: 45
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: pricing_review
+    ports: ['127.0.0.1:15417:5432']
+    tmpfs: ['/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres', '-d', 'pricing_review']
+      interval: 2s
+      timeout: 2s
+      retries: 45
+  redis:
+    image: redis:8-alpine
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports: ['127.0.0.1:16379:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 20

@@ -43,7 +43,7 @@ func Playground(c *gin.Context) {
 		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		return
 	}
-	discounts, err := model.GetUserModelDiscountBPS(userId)
+	discounts, err := model.GetUserModelDiscountBPSContext(c.Request.Context(), userId)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		return
