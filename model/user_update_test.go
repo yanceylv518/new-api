@@ -117,13 +117,12 @@ func TestReplaceUserModelPricingPreservesOtherSettings(t *testing.T) {
 	assert.Equal(t, map[string]int{"gpt-4o": 8000}, discounts)
 }
 
-// 运行时折扣必须只来自独立表，旧 users.setting 中的同名字段不能影响计费规则读取。
-func TestGetUserModelDiscountBPSIgnoresLegacyUserSetting(t *testing.T) {
+// 运行时折扣来自独立表，并与用户的语言偏好相互独立。
+func TestGetUserModelDiscountBPSReadsIndependentRules(t *testing.T) {
 	setupUserUpdateTestState(t)
 
-	user := User{Id: 4, Username: "legacy-discount-user", Password: "password", Status: common.UserStatusEnabled}
-	// 直接保留历史 JSON，确认旧字段即使仍存在于数据库也不会进入运行时折扣查询。
-	user.Setting = `{"model_discount_bps":{"gpt-4o":1000}}`
+	user := User{Id: 4, Username: "independent-discount-user", Password: "password", Status: common.UserStatusEnabled}
+	user.SetSetting(dto.UserSetting{Language: "zh"})
 	require.NoError(t, DB.Create(&user).Error)
 	require.NoError(t, DB.Create(&UserModelPricing{
 		UserId: user.Id, ModelName: "gpt-4o", DiscountBPS: 8000,
@@ -185,7 +184,7 @@ func TestReplaceUserModelPricingRejectsStaleRevisionAndIncrementsOnClear(t *test
 func TestReplaceUserModelPricingRejectsZeroRevision(t *testing.T) {
 	setupUserUpdateTestState(t)
 
-	user := User{Id: 7, Username: "pricing-legacy-client", Password: "password", Status: common.UserStatusEnabled}
+	user := User{Id: 7, Username: "pricing-missing-revision", Password: "password", Status: common.UserStatusEnabled}
 	require.NoError(t, DB.Create(&user).Error)
 
 	_, err := ReplaceUserModelPricing(user.Id, map[string]int{"gpt-4o": 8000}, 0)

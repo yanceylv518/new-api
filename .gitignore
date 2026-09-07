@@ -41,3 +41,6 @@ service/relayconvert/chat_responses_live_local_test.go
 service/openaicompat/chat_responses_live_local_test.go
 go.work
 go.work.sum
+
+# 本机压测数据及实测报告，保留工具和回归测试源码。
+/tools/pricing-load/results/

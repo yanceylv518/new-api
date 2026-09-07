@@ -60,7 +60,7 @@ func GetPricing(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		modelDiscountBPS, err = model.GetUserModelDiscountBPS(userID)
+		modelDiscountBPS, err = model.GetUserModelDiscountBPSContext(c.Request.Context(), userID)
 		if err != nil {
 			common.ApiError(c, err)
 			return

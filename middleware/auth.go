@@ -453,7 +453,7 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 
-		discounts, err := model.GetUserModelDiscountBPS(token.UserId)
+		discounts, err := model.GetUserModelDiscountBPSContext(c.Request.Context(), token.UserId)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserModelDiscountBPS error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,

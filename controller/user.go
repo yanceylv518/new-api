@@ -435,7 +435,7 @@ func GetUserModelPricing(c *gin.Context) {
 	if !ok {
 		return
 	}
-	discounts, revision, err := model.GetUserModelPricing(user.Id)
+	discounts, revision, err := model.GetUserModelPricingContext(c.Request.Context(), user.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -483,7 +483,7 @@ func UpdateUserModelPricing(c *gin.Context) {
 			discounts[modelName] = item.DiscountBPS
 		}
 	}
-	revision, err := model.ReplaceUserModelPricing(user.Id, discounts, *req.Revision)
+	revision, err := model.ReplaceUserModelPricingContext(c.Request.Context(), user.Id, discounts, *req.Revision)
 	if err != nil {
 		if errors.Is(err, model.ErrUserModelPricingRevisionConflict) {
 			c.JSON(http.StatusConflict, gin.H{
