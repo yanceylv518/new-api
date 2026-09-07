@@ -16,6 +16,7 @@ export default defineConfig(({ envMode }) => {
     'http://localhost:3000'
 
   const isProd = envMode === 'production'
+  const isRemoteDev = process.env.NEW_API_REMOTE_DEV === 'true'
   const devProxy = Object.fromEntries(
     (['/api', '/mj', '/pg'] as const).map((key) => [
       key,
@@ -24,6 +25,8 @@ export default defineConfig(({ envMode }) => {
   ) as Record<string, { target: string; changeOrigin: boolean }>
 
   return {
+    // 远程测试站使用优化后的构建模式，由开发服务器继续监听并推送源码变更。
+    mode: isRemoteDev ? 'production' : undefined,
     plugins: [pluginReact(), pluginTailwindcss({ optimize: false })],
     // Rsbuild 2: replaces deprecated `performance.chunkSplit` (RSPack 2 aligned)
     splitChunks: {
@@ -70,9 +73,14 @@ export default defineConfig(({ envMode }) => {
       strictPort: false,
       proxy: devProxy,
     },
+    dev: {
+      // 生产构建模式下预编译路由，避免懒编译产生新 hash 后触发循环刷新。
+      lazyCompilation: isRemoteDev ? false : undefined,
+    },
     output: {
-      // Production optimizations
-      minify: isProd,
+      // 远程测试站保留 HMR，同时缩小公网加载和解析的开发脚本。
+      minify: isProd || isRemoteDev,
+      sourceMap: isRemoteDev ? false : undefined,
       target: 'web',
       distPath: {
         root: 'dist',
@@ -91,9 +99,8 @@ export default defineConfig(({ envMode }) => {
         plugins: [
           tanstackRouter({
             target: 'react',
-            // Dev: avoid per-route async chunks (reduces white flash on navigation + faster HMR feedback).
-            // Prod: keep route-based code splitting.
-            autoCodeSplitting: isProd,
+            // 远程测试站按路由拆包，避免首次访问下载完整后台代码。
+            autoCodeSplitting: isProd || isRemoteDev,
           }),
         ],
       },

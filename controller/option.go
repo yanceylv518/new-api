@@ -105,6 +105,11 @@ func GetOptions(c *gin.Context) {
 		}
 	}
 	common.OptionMapRWMutex.Unlock()
+	privateAssetOSSSettings := system_setting.GetPrivateAssetOSSSettings()
+	options = append(options, &model.Option{
+		Key:   system_setting.PrivateAssetOSSSecretConfiguredKey,
+		Value: strconv.FormatBool(privateAssetOSSSettings.AccessKeySecret != ""),
+	})
 	options = append(options, &model.Option{
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),
@@ -119,6 +124,78 @@ func GetOptions(c *gin.Context) {
 type OptionUpdateRequest struct {
 	Key   string `json:"key"`
 	Value any    `json:"value"`
+}
+
+type privateAssetOSSSettingsRequest struct {
+	Region          string `json:"region"`
+	Endpoint        string `json:"endpoint"`
+	Bucket          string `json:"bucket"`
+	Prefix          string `json:"prefix"`
+	AccessKeyID     string `json:"access_key_id"`
+	AccessKeySecret string `json:"access_key_secret"`
+}
+
+// UpdatePrivateAssetOSSSettings 原子更新 OSS 连接信息，Secret 留空时保留当前值。
+func UpdatePrivateAssetOSSSettings(c *gin.Context) {
+	var request privateAssetOSSSettingsRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		common.ApiErrorI18n(c, "invalid_params")
+		return
+	}
+
+	current := system_setting.GetPrivateAssetOSSSettings()
+	candidate := system_setting.PrivateAssetOSSSettings{
+		Region:          request.Region,
+		Endpoint:        request.Endpoint,
+		Bucket:          request.Bucket,
+		Prefix:          request.Prefix,
+		AccessKeyID:     request.AccessKeyID,
+		AccessKeySecret: request.AccessKeySecret,
+	}
+	if strings.TrimSpace(candidate.AccessKeySecret) == "" {
+		candidate.AccessKeySecret = current.AccessKeySecret
+	}
+	normalized, err := system_setting.NormalizeAndValidatePrivateAssetOSSSettings(candidate)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+
+	// 存量对象依赖原 Bucket 和地域；切换存储位置前必须先清空素材库。
+	storageLocationChanged := normalized.Region != current.Region ||
+		normalized.Endpoint != current.Endpoint ||
+		normalized.Bucket != current.Bucket
+	if storageLocationChanged {
+		var storedAssetCount int64
+		if err := model.DB.Model(&model.SeedanceAsset{}).Where("object_key <> ?", "").Count(&storedAssetCount).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if storedAssetCount > 0 {
+			common.ApiErrorMsg(c, "OSS Region, Endpoint, and Bucket cannot be changed while stored private assets exist")
+			return
+		}
+	}
+
+	updates := system_setting.PrivateAssetOSSOptionValues(normalized)
+	if strings.TrimSpace(request.AccessKeySecret) == "" {
+		delete(updates, system_setting.PrivateAssetOSSAccessKeySecretKey)
+	}
+	if err := model.UpdateOptionsBulk(updates); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "option.private_asset_oss.update", map[string]interface{}{
+		"keys": []string{
+			system_setting.PrivateAssetOSSRegionKey,
+			system_setting.PrivateAssetOSSEndpointKey,
+			system_setting.PrivateAssetOSSBucketKey,
+			system_setting.PrivateAssetOSSPrefixKey,
+			system_setting.PrivateAssetOSSAccessKeyIDKey,
+		},
+		"secret_updated": strings.TrimSpace(request.AccessKeySecret) != "",
+	})
+	common.ApiSuccess(c, nil)
 }
 
 func UpdateOption(c *gin.Context) {
@@ -140,6 +217,10 @@ func UpdateOption(c *gin.Context) {
 		option.Value = common.Interface2String(option.Value.(int))
 	default:
 		option.Value = fmt.Sprintf("%v", option.Value)
+	}
+	if strings.HasPrefix(option.Key, system_setting.PrivateAssetOSSOptionPrefix) {
+		common.ApiErrorMsg(c, "private asset OSS settings must be updated together")
+		return
 	}
 	switch option.Key {
 	case "QuotaForInviter", "QuotaForInvitee":

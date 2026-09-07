@@ -176,7 +176,7 @@ export interface LogOtherData {
   model_ratio?: number
   completion_ratio?: number
   model_price?: number
-	// 消费日志中冻结的实际计费倍率（例如 0.8）。
+  // 消费日志中冻结的实际计费倍率（例如 0.8）。
   user_model_discount?: number
   group_ratio?: number
   user_group_ratio?: number
@@ -299,6 +299,7 @@ export interface TaskLog {
   progress?: string
   progress_message_en?: string
   data?: string // JSON string
+  result_url?: string // 成功任务的结果 URL（视频下载地址等）
   fail_reason?: string
   status: string // NOT_START, SUBMITTED, IN_PROGRESS, SUCCESS, FAILURE, QUEUED, UNKNOWN
   other?: string

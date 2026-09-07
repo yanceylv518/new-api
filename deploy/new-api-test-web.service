@@ -1,0 +1,21 @@
+# 测试站点前端由 Rsbuild 提供 HMR，页面变化无需重新构建 API 容器。
+[Unit]
+Description=new-api rc23 test frontend
+After=network-online.target new-api-test.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/new-api-hot/web
+Environment=VITE_REACT_APP_SERVER_URL=http://127.0.0.1:3001
+Environment=VITE_REACT_APP_VERSION=v1.0.0-rc.23-custom.test.1
+Environment=NEW_API_REMOTE_DEV=true
+Environment=PATH=/opt/nodejs/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/nodejs/bin/node /opt/new-api-hot/web/node_modules/@rsbuild/core/bin/rsbuild.js dev --host 127.0.0.1 --port 5173
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

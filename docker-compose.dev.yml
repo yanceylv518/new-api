@@ -1,12 +1,15 @@
-# Frontend Development - Backend built from local source
+# Frontend Development - Backend can run from the host source tree or the optional container
 #
 # Usage:
 #   1. docker compose -f docker-compose.dev.yml up -d
-#   2. make dev-web
-#   3. Open http://localhost:5173 (Rsbuild dev server, API auto-proxied to :3000)
+#   2. air -c .air.toml
+#   3. make dev-web
+#   4. Open http://localhost:5173 (Rsbuild dev server, API auto-proxied to :3000)
 #
 # Rebuild backend after Go code changes:
 #   docker compose -f docker-compose.dev.yml up -d --build new-api
+# Air rebuilds and restarts the host backend after Go code changes. The
+# new-api container remains available under the explicit `container` profile.
 #
 # Stop:
 #   docker compose -f docker-compose.dev.yml down
@@ -16,6 +19,7 @@
 
 services:
   new-api:
+    profiles: ["container"]
     build:
       context: .
       dockerfile: Dockerfile.dev
@@ -48,6 +52,8 @@ services:
     image: redis:7-alpine
     container_name: new-api-dev-redis
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
     networks:
       - dev-network
 
@@ -55,6 +61,8 @@ services:
     image: postgres:15-alpine
     container_name: new-api-dev-pg
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: root
       POSTGRES_PASSWORD: 123456

@@ -1,0 +1,23 @@
+# 测试站点后端由 Air 监听源码并自动重启，不使用 new-api 应用容器。
+[Unit]
+Description=new-api rc23 test backend
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/new-api-hot
+EnvironmentFile=/opt/new-api-hot/.env.host
+Environment=PORT=3001
+Environment=VERSION=v1.0.0-rc.23-custom.test.1
+Environment=NODE_NAME=new-api-rc23-test-1
+ExecStart=/usr/local/bin/air -c /opt/new-api-hot/.air.toml
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
