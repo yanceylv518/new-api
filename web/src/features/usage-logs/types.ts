@@ -232,6 +232,9 @@ export interface LogOtherData {
   is_task?: boolean
   task_id?: string
   reason?: string
+  // 任务完成后的差额结算快照，失败退款不包含这两个字段。
+  pre_consumed_quota?: number
+  actual_quota?: number
   // Subscription billing fields
   subscription_plan_id?: string
   subscription_plan_title?: string
