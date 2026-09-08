@@ -59,10 +59,10 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	}
 	ttl := userCacheTTLSeconds()
 	const script = `
-local incoming = tonumber(ARGV[1])
-local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
-local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
-local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
+	local incoming = tonumber(ARGV[1])
+	local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
+	local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
+	local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
 if pending > incoming or committed > incoming or current > incoming then
   return 0
 end

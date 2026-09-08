@@ -176,6 +176,10 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
+	// 私域素材 OSS 以环境变量作为启动默认值，数据库 Option 可在初始化后覆盖。
+	for key, value := range system_setting.PrivateAssetOSSOptionValues(system_setting.DefaultPrivateAssetOSSSettings()) {
+		common.OptionMap[key] = value
+	}
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
@@ -263,6 +267,22 @@ func UpdateOptionsBulk(values map[string]string) error {
 	})
 	if err != nil {
 		return err
+	}
+	// OSS 连接参数必须作为一个快照切换，避免并发上传读到新旧配置的混合值。
+	privateAssetOSSOnly := true
+	for key := range values {
+		if !strings.HasPrefix(key, system_setting.PrivateAssetOSSOptionPrefix) {
+			privateAssetOSSOnly = false
+			break
+		}
+	}
+	if privateAssetOSSOnly {
+		common.OptionMapRWMutex.Lock()
+		for key, value := range values {
+			common.OptionMap[key] = value
+		}
+		common.OptionMapRWMutex.Unlock()
+		return nil
 	}
 	for k, v := range values {
 		if err := updateOptionMap(k, v); err != nil {

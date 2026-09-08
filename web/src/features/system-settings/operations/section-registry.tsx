@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { SystemBehaviorSection } from '../general/system-behavior-section'
 import { EmailSettingsSection } from '../integrations/email-settings-section'
 import { MonitoringSettingsSection } from '../integrations/monitoring-settings-section'
+import { PrivateAssetOSSSettingsSection } from '../integrations/private-asset-oss-settings-section'
 import { WorkerSettingsSection } from '../integrations/worker-settings-section'
 import { LogSettingsSection } from '../maintenance/log-settings-section'
 import { PerformanceSection } from '../maintenance/performance-section'
@@ -89,6 +90,23 @@ const OPERATIONS_SECTIONS = [
           WorkerAllowHttpImageRequestEnabled:
             settings.WorkerAllowHttpImageRequestEnabled,
         }}
+      />
+    ),
+  },
+  {
+    id: 'private-asset-oss',
+    titleKey: 'Private Asset OSS',
+    build: (settings: OperationsSettings) => (
+      <PrivateAssetOSSSettingsSection
+        defaultValues={{
+          region: settings['private_asset_oss.region'],
+          endpoint: settings['private_asset_oss.endpoint'],
+          bucket: settings['private_asset_oss.bucket'],
+          prefix: settings['private_asset_oss.prefix'],
+          accessKeyId: settings['private_asset_oss.access_key_id'],
+          accessKeySecret: '',
+        }}
+        secretConfigured={settings['private_asset_oss.secret_configured']}
       />
     ),
   },

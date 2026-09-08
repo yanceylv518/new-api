@@ -329,7 +329,7 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
                                     {t('Example')}
                                   </div>
                                   <code className='bg-muted block rounded-md px-2 py-1.5 font-mono text-[11px] break-all'>
-                                    NODE_NAME=new-api-master-1
+                                    NODE_NAME=new-api-rc23-test-1
                                   </code>
                                 </div>
                                 <p className='text-muted-foreground'>

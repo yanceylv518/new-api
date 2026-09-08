@@ -35,6 +35,9 @@ token_estimator_test.go
 skills-lock.json
 .playwright-mcp
 
+# 本地项目代码导读，不纳入版本控制。
+/docs/project-code-guide.zh-CN.md
+
 # Local-only live probes and scratch test workspaces.
 .local-tests/
 service/relayconvert/chat_responses_live_local_test.go

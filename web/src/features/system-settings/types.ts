@@ -349,6 +349,12 @@ export type OperationsSettings = {
   WorkerUrl: string
   WorkerValidKey: string
   WorkerAllowHttpImageRequestEnabled: boolean
+  'private_asset_oss.region': string
+  'private_asset_oss.endpoint': string
+  'private_asset_oss.bucket': string
+  'private_asset_oss.prefix': string
+  'private_asset_oss.access_key_id': string
+  'private_asset_oss.secret_configured': boolean
   LogConsumeEnabled: boolean
   'performance_setting.disk_cache_enabled': boolean
   'performance_setting.disk_cache_threshold_mb': number
@@ -362,6 +368,15 @@ export type OperationsSettings = {
   'perf_metrics_setting.flush_interval': number
   'perf_metrics_setting.bucket_time': 'hour' | 'minute' | '5min'
   'perf_metrics_setting.retention_days': number
+}
+
+export type PrivateAssetOSSSettingsRequest = {
+  region: string
+  endpoint: string
+  bucket: string
+  prefix: string
+  access_key_id: string
+  access_key_secret?: string
 }
 
 export type SecuritySettings = {

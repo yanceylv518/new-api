@@ -15,6 +15,41 @@
     />
 
     <meta name="theme-color" content="#fff" />
+    <!-- 首屏脚本加载完成前提供稳定反馈，React 挂载内容后 :empty 自动失效。 -->
+    <style>
+      #root:empty::before {
+        position: fixed;
+        inset: 0;
+        width: 28px;
+        height: 28px;
+        box-sizing: border-box;
+        border: 3px solid #d4d4d8;
+        border-top-color: #18181b;
+        border-radius: 50%;
+        content: '';
+        margin: auto;
+        animation: initial-loading-spin 0.8s linear infinite;
+      }
+
+      @keyframes initial-loading-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @media (prefers-color-scheme: dark) {
+        #root:empty::before {
+          border-color: #3f3f46;
+          border-top-color: #fafafa;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #root:empty::before {
+          animation: none;
+        }
+      }
+    </style>
     <!--umami-->
     <!--Google Analytics-->
   </head>
