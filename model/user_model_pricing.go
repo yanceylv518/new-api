@@ -96,6 +96,29 @@ func (UserModelPricing) TableName() string {
 	return "user_model_pricings"
 }
 
+// GetUserModelPricingModelNames 返回所有分组的启用模型，不使用操作者或目标用户分组过滤。
+func GetUserModelPricingModelNames(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
+	defer cancel()
+	var channelModels []string
+	// 在 Go 中去重，避免 MySQL 的大小写不敏感 DISTINCT 合并不同模型名。
+	if err := DB.WithContext(ctx).Model(&Ability{}).Where("enabled = ?", true).Pluck("model", &channelModels).Error; err != nil {
+		return nil, err
+	}
+	names := make(map[string]struct{}, len(channelModels))
+	for _, name := range channelModels {
+		if name = strings.TrimSpace(name); name != "" {
+			names[name] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
 // normalizeUserModelDiscounts 在所有写入边界统一模型名和折扣范围。
 // 10000 表示原价，保持旧接口语义但不落入独立表，以免产生无效规则。
 func normalizeUserModelDiscounts(discounts map[string]int) (map[string]int, error) {

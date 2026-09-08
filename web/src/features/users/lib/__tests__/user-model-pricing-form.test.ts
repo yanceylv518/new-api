@@ -159,15 +159,12 @@ describe('user model pricing form', () => {
     })
   })
 
-  test('groups aliases into one editable rule and keeps historical rules visible', () => {
-    const rows = buildUserModelPricingRows(
-      [
-        { model_name: 'gemini-2.5-pro-thinking-1024' },
-        { model_name: 'gemini-2.5-pro-thinking-2048' },
-        { model_name: 'gpt-4o' },
-      ],
-      [{ model_name: 'retired-model' }]
-    )
+  test('groups enabled aliases into one editable rule', () => {
+    const rows = buildUserModelPricingRows([
+      { model_name: 'gemini-2.5-pro-thinking-1024' },
+      { model_name: 'gemini-2.5-pro-thinking-2048' },
+      { model_name: 'gpt-4o' },
+    ])
 
     assert.deepEqual(rows, [
       {
@@ -176,10 +173,22 @@ describe('user model pricing form', () => {
           'gemini-2.5-pro-thinking-1024',
           'gemini-2.5-pro-thinking-2048',
         ],
-        historical: false,
       },
-      { model_name: 'gpt-4o', aliases: [], historical: false },
-      { model_name: 'retired-model', aliases: [], historical: true },
+      { model_name: 'gpt-4o', aliases: [] },
+    ])
+  })
+
+  // 未启用模型不在可编辑行中，保存其他模型时仍保留它已有的折扣。
+  test('preserves hidden discounts while resetting visible models to full price', () => {
+    const payload = buildUserModelPricingPayload(
+      { items: [{ model_name: 'enabled-model', discount_percent: 100 }] },
+      [
+        { model_name: 'disabled-model', discount_bps: 8000 },
+        { model_name: 'enabled-model', discount_bps: 7000 },
+      ]
+    )
+    assert.deepEqual(payload.items, [
+      { model_name: 'disabled-model', discount_bps: 8000 },
     ])
   })
 

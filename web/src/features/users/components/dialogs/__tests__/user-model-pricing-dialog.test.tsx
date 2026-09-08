@@ -105,18 +105,6 @@ function installApiFixtures(pricingModels = models) {
     switch (url) {
       case '/api/status':
         return { data: { data: { price: 1, usd_exchange_rate: 1 } } }
-      case '/api/pricing':
-        return {
-          data: {
-            success: true,
-            data: pricingModels,
-            vendors: [],
-            group_ratio: { default: 1 },
-            usable_group: { default: { desc: 'Default', ratio: 1 } },
-            supported_endpoint: {},
-            auto_groups: [],
-          },
-        }
       case '/api/user/42/model-pricing':
         return {
           data: {
@@ -125,6 +113,7 @@ function installApiFixtures(pricingModels = models) {
               user_id: 42,
               items: [{ model_name: 'model-03', discount_bps: 8000 }],
               revision: 1,
+              model_names: pricingModels.map((model) => model.model_name),
             },
           },
         }
@@ -278,6 +267,55 @@ after(() => {
 })
 
 describe('user model pricing dialog', () => {
+  // 停用模型不显示，但完整替换提交仍须保留其历史折扣。
+  test('shows only enabled models and preserves hidden discounts on save', async () => {
+    installApiFixtures(models.slice(0, 3))
+    const fixtureGet = apiClient.get
+    apiClient.get = async (url) => {
+      if (url === '/api/user/42/model-pricing') {
+        return {
+          data: {
+            success: true,
+            data: {
+              user_id: 42,
+              revision: 1,
+              model_names: models.slice(0, 3).map((model) => model.model_name),
+              items: [
+                { model_name: 'disabled-model', discount_bps: 6000 },
+                { model_name: 'model-03', discount_bps: 8000 },
+              ],
+            },
+          },
+        }
+      }
+      return fixtureGet(url)
+    }
+    await renderDialog(3)
+    assert.equal(visibleModelNames().includes('disabled-model'), false)
+    await changeInput(getModelInput('model-03'), '100')
+    let submitted: unknown
+    apiClient.put = async (_url, payload) => {
+      submitted = payload
+      return { data: { success: true } }
+    }
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () => {
+      form.dispatchEvent(
+        new domWindow.Event('submit', {
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event
+      )
+    })
+    assert.deepEqual(submitted, {
+      revision: 1,
+      items: [{ model_name: 'disabled-model', discount_bps: 6000 }],
+    })
+  })
+
   // 重新打开失败时不能把旧缓存当成最新会话，重试成功后再恢复编辑。
   test('blocks editing cached rules when reopening fails and recovers on retry', async () => {
     installApiFixtures(models.slice(0, 3))
@@ -336,6 +374,9 @@ describe('user model pricing dialog', () => {
             data: {
               user_id: 42,
               revision: 2,
+              model_names: [models[0], ...models.slice(2)].map(
+                (model) => model.model_name
+              ),
               items: [{ model_name: 'model-01', discount_bps: 7000 }],
             },
           },
@@ -347,14 +388,6 @@ describe('user model pricing dialog', () => {
       await renderedDialog?.queryClient.refetchQueries({
         queryKey: ['user-model-pricing', 42],
       })
-      const response = await fixtureGet('/api/pricing')
-      renderedDialog?.queryClient.setQueriesData(
-        { queryKey: ['pricing'] },
-        {
-          ...(response.data as object),
-          data: models.slice(5),
-        }
-      )
     })
     assert.equal(getModelInput('model-03').value, '55')
     assert.deepEqual(visibleModelNames(), initialNames)

@@ -155,6 +155,7 @@ export interface UserModelPricingCollection {
   user_id: number
   items: UserModelPricingItem[]
   revision: number
+  model_names: string[]
 }
 
 export interface UserModelPricingReplacePayload {

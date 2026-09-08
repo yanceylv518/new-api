@@ -50,7 +50,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { getUserModelPricing, replaceUserModelPricing } from '../../api'
@@ -78,7 +77,6 @@ const MODEL_PAGE_SIZE = 25
 export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const pricing = usePricingData(props.open)
   const [searchTerm, setSearchTerm] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [discountFilter, setDiscountFilter] = useState<DiscountFilter>('all')
@@ -115,13 +113,15 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     query.isSuccess &&
     query.data.success &&
     !query.isFetching &&
-    !pricing.isLoading &&
-    !pricing.error
+    Array.isArray(collection.model_names)
   ) {
     setEditorSnapshot({
       userId: props.user.id,
       collection,
-      rows: buildUserModelPricingRows(pricing.models, collection.items),
+      // 目录与规则由同一管理接口返回，加载失败时一次重试即可恢复整个编辑会话。
+      rows: buildUserModelPricingRows(
+        collection.model_names.map((model_name) => ({ model_name }))
+      ),
     })
   }
   const activeSnapshot =
@@ -175,7 +175,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const mutation = useMutation({
     mutationFn: (values: UserModelPricingFormValues) =>
       replaceUserModelPricing(props.user.id, {
-        ...buildUserModelPricingPayload(values),
+        ...buildUserModelPricingPayload(
+          values,
+          activeSnapshot?.collection.items
+        ),
         revision: activeSnapshot?.collection.revision ?? 0,
       }),
     onSuccess: async (response) => {
@@ -206,14 +209,12 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     },
   })
 
-  const isLoading =
-    !activeSnapshot &&
-    (query.isLoading || query.isFetching || pricing.isLoading)
+  const isLoading = !activeSnapshot && (query.isLoading || query.isFetching)
   const hasLoadError =
     !activeSnapshot &&
     (query.isError ||
-      pricing.error != null ||
-      (query.data !== undefined && (!query.data.success || !query.data.data)))
+      (query.data !== undefined &&
+        (!query.data.success || !Array.isArray(collection?.model_names))))
 
   // 预先缓存小写模型名，搜索时只扫描稳定的行索引，减少重复字符串处理和对象创建。
   const modelRows = useMemo(

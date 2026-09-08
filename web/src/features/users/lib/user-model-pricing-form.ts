@@ -32,7 +32,6 @@ export interface UserModelPricingOption {
 export interface UserModelPricingDisplayRow {
   model_name: string
   aliases: string[]
-  historical: boolean
 }
 
 // 未配置专属折扣时按原价展示；提交时原价不会写入独立表。
@@ -129,8 +128,7 @@ export function createUserModelPricingFormSchema(t: TFunction) {
 
 /** 将实际模型别名聚合为一个可编辑的规范化定价规则。 */
 export function buildUserModelPricingRows(
-  models: readonly { model_name: string }[],
-  persistedItems: readonly { model_name: string }[]
+  models: readonly { model_name: string }[]
 ): UserModelPricingDisplayRow[] {
   const rows = new Map<string, UserModelPricingDisplayRow>()
   for (const model of models) {
@@ -148,20 +146,9 @@ export function buildUserModelPricingRows(
     rows.set(modelName, {
       model_name: modelName,
       aliases: model.model_name === modelName ? [] : [model.model_name],
-      historical: false,
     })
   }
 
-  // 目录下线后的规则仍然可见，管理员可以明确清空它，而不会被保存操作静默删除。
-  for (const item of persistedItems) {
-    const modelName = normalizeUserModelPricingModelName(item.model_name)
-    if (rows.has(modelName)) continue
-    rows.set(modelName, {
-      model_name: modelName,
-      aliases: [],
-      historical: true,
-    })
-  }
   return [...rows.values()]
 }
 
@@ -176,14 +163,24 @@ type UserModelPricingFormPayload = Omit<
 
 /** 将规范化模型行转换为后端规则集，原价不会产生专属计费规则。 */
 export function buildUserModelPricingPayload(
-  values: UserModelPricingFormValues
+  values: UserModelPricingFormValues,
+  persistedItems: readonly UserModelPricingItem[] = []
 ): UserModelPricingFormPayload {
   const itemsByModel = new Map<string, UserModelPricingItem>()
+
+  // 弹窗仅展示启用模型，完整替换时必须保留不可见模型已有的折扣。
+  for (const item of persistedItems) {
+    const modelName = normalizeUserModelPricingModelName(item.model_name)
+    itemsByModel.set(modelName, { ...item, model_name: modelName })
+  }
 
   for (const item of values.items) {
     const modelName = normalizeUserModelPricingModelName(item.model_name)
     const discountBPS = Math.round(item.discount_percent * 100)
-    if (discountBPS === fullPriceDiscountBPS) continue
+    if (discountBPS === fullPriceDiscountBPS) {
+      itemsByModel.delete(modelName)
+      continue
+    }
 
     itemsByModel.set(modelName, {
       model_name: modelName,

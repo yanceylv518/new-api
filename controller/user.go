@@ -445,7 +445,13 @@ func GetUserModelPricing(c *gin.Context) {
 		items = append(items, userModelPricingItem{ModelName: modelName, DiscountBPS: discountBPS})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ModelName < items[j].ModelName })
-	common.ApiSuccess(c, gin.H{"user_id": user.Id, "items": items, "revision": revision})
+	// 已完成目标用户管理权限校验，返回跨全部分组的启用模型目录。
+	modelNames, err := model.GetUserModelPricingModelNames(c.Request.Context())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"user_id": user.Id, "items": items, "revision": revision, "model_names": modelNames})
 }
 
 // UpdateUserModelPricing 归一化模型别名后替换完整规则集。
