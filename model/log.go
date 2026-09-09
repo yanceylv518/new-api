@@ -557,6 +557,14 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 
 const logSearchCountLimit = 10000
 
+// rc35 按用户和日志 ID 排序，复用现有索引；不支持该优化提示的 MySQL 会忽略注释。
+func selectUserLogColumns(tx *gorm.DB) *gorm.DB {
+	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+		return tx.Select("/*+ INDEX(logs idx_user_id_id) */ logs.*")
+	}
+	return tx
+}
+
 func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
@@ -586,6 +594,15 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if group != "" {
 		tx = tx.Where("logs."+logGroupCol+" = ?", group)
 	}
+	// 用户只看同一请求的最后结果；子查询不继承外层筛选，避免筛选错误类型时复活中间失败。
+	// ClickHouse 的展示 ID 不是持久化顺序，保留原查询；无 request_id 的历史日志逐条展示。
+	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		tx = tx.Where(`logs.request_id = '' OR logs.request_id IS NULL OR NOT EXISTS (
+			SELECT 1 FROM logs AS newer_logs
+			WHERE newer_logs.request_id = logs.request_id
+			AND newer_logs.user_id = logs.user_id AND newer_logs.id > logs.id
+		)`)
+	}
 	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
 	if err != nil {
 		common.SysError("failed to count user logs: " + err.Error())
@@ -595,7 +612,7 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("logs.")
 	}
-	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
+	err = selectUserLogColumns(tx).Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")

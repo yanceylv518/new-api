@@ -209,6 +209,55 @@ describe('quota adjustment log localization', () => {
     }
   )
 
+  // 即使旧日志仍含上游映射字段，自助视图也不能显示它；管理员全量视图保留诊断信息。
+  test.each([false, true])(
+    'limits model mapping to admin view: %s',
+    async (isAdmin) => {
+      const i18n = createInstance()
+      await i18n.init({ lng: 'en', resources: { en } })
+      const log: UsageLog = {
+        id: 1,
+        user_id: 1,
+        created_at: 1,
+        type: 2,
+        content: '',
+        username: 'user',
+        token_name: '',
+        model_name: 'public-model',
+        quota: 1,
+        prompt_tokens: 1,
+        completion_tokens: 0,
+        use_time: 0,
+        is_stream: false,
+        channel: 0,
+        channel_name: '',
+        token_id: 0,
+        group: '',
+        ip: '',
+        request_id: 'mapping',
+        upstream_request_id: '',
+        other: JSON.stringify({
+          is_model_mapped: true,
+          upstream_model_name: 'private-upstream',
+        }),
+      }
+      render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={queryClient}>
+            <DetailsDialog
+              log={log}
+              isAdmin={isAdmin}
+              isRoot={false}
+              open
+              onOpenChange={() => undefined}
+            />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+      expect(screen.queryByText('private-upstream') !== null).toBe(isAdmin)
+    }
+  )
+
   test('preserves legacy formatted quota parameters and unknown-action fallback', async () => {
     const i18n = createInstance()
     await i18n.init({ lng: 'en', resources: { en } })

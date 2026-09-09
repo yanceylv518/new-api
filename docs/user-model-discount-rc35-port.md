@@ -1,6 +1,6 @@
 # 用户模型折扣移植设计与验收说明
 
-文档日期：2026-09-09。状态：移植实施和本轮验证已完成，未提交/推送/部署。实际通过、失败和未验证边界见第 11 节；不将基线检查失败或压力轮丢弃表述为通过。
+文档日期：2026-09-09。折扣移植已提交为 `65d2bd225`，后续日志适配作为独立提交，见第 12 节；未推送或部署。实际通过、失败和未验证边界见第 11 节；不将基线检查失败或压力轮丢弃表述为通过。
 
 本文是实施与审查依据，不是功能完成证明，也不授权提交、推送或部署。表名和新增接口内部结构属于建议设计；实施中若改变业务语义、缓存一致性或迁移范围，必须更新本文并明确差异。
 
@@ -365,4 +365,14 @@ bun run build
 
 鉴权相关复核参照 [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)，以及稳定发布 ASVS 5.0.0 的 [V7](https://github.com/OWASP/ASVS/blob/v5.0.0_release/5.0/en/0x16-V7-Session-Management.md) / [V8](https://github.com/OWASP/ASVS/blob/v5.0.0_release/5.0/en/0x17-V8-Authorization.md)。相关控制范围为服务端授权（8.2.1、8.2.2、8.3.1）、删除账户后的会话失效（7.4.2）及敏感响应缓存隔离。对应证据为管理接口权限测试、Pipeline 鉴权屏障测试、硬删除墓碑/缓存清理测试、用户与会话隔离的价格缓存键和 `private, no-store` 响应。未对整个系统进行 ASVS 合规认证。
 
-最终未提交文件均保留在 `custom/rc35-user-model-discount`，HEAD 仍为 `bee45b58a3c0b77e8dc81e6b5aeb4474aa9058d1`。`git diff --check` 通过。原版归档、压力工具、二进制和 JSON 报告保留在已忽略的 `tools/`，用于复查。本次 `newapi-rc35-pricing-review` 的三个临时容器及网络已移除，其他环境未操作。
+折扣验收时工作树位于 `custom/rc35-user-model-discount`，基线为 `bee45b58a3c0b77e8dc81e6b5aeb4474aa9058d1`；后续提交见第 12 节。`git diff --check` 通过。原版归档、压力工具、二进制和 JSON 报告保留在已忽略的 `tools/`，用于复查。本次 `newapi-rc35-pricing-review` 的三个临时容器及网络已移除，其他环境未操作。
+
+## 12. 独立日志适配提交
+
+折扣功能先单独提交 `65d2bd225`。按用户后续要求，将远端 `custom/rc23` 的以下三个提交适配为当前分支的另一个提交；已通过 fetch 和祖先关系检查确认来源。
+
+- `eaea656769ab1b8fb0c50ccd7415d563e0737c3a`：日志默认时间窗口改为当前时刻前后一小时；用户自助视图不显示模型映射，管理员全量视图继续显示。这是 UI 显示范围调整，保留 rc35 现有 API 权限分层。
+- `c40e9df6e2863e4ae19e34e0c0631a05ce30d46b`：关系型数据库的用户日志按用户/request_id 只显示 ID 最大的最终记录，管理员保留完整链。筛选和计数共用相同条件；空串和 NULL 请求 ID 的历史行独立保留。ClickHouse 展示 ID 不具备此顺序，因此沿用原行为。
+- `3d1eaf61fa6524a5d5d3ecf263067774c232ec11`：rc35 没有源提交引用的 `idx_logs_user_created_type`，改用现有 `idx_user_id_id` 的 MySQL 优化器注释提示，匹配用户条件和 ID 排序，不增加日志大表索引。MySQL 5.7 等不支持该提示的版本会忽略注释；兼容测试不等于这些版本已获得强制索引效果。
+
+验证：`PRICING_EXTERNAL_TESTS=1 go test ./model -run '^TestUserLogFinalOutcomeDatabaseMatrix$' -v -count=1 -timeout=3m` 在 SQLite 3.50.4、MySQL 5.7.44、PostgreSQL 17.11 通过；覆盖分页、类型/模型筛选不复活中间错误、跨用户同 request_id、空/NULL 请求 ID、管理员完整链。`go test ./model -count=1 -timeout=3m` 和 `go build ./...` 通过。前端 `bun run typecheck` 通过；`bun run test src/features/usage-logs --maxWorkers=2` 为 13 个文件、114 项全部通过。
