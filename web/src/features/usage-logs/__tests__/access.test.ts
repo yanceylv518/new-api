@@ -17,13 +17,28 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
-import { describe, test } from 'vitest'
+
+import { describe, test, vi } from 'vitest'
 
 import { ROLE } from '@/lib/roles'
 
 import { resolveLogsViewAccess } from '../components/usage-logs-provider'
+import { getDefaultTimeRange } from '../lib/utils'
 
 describe('usage log access tier', () => {
+  // 默认窗口以当前时刻为中心，跨日也不能回退到当天零点。
+  test('defaults to one hour before and after now', () => {
+    vi.useFakeTimers()
+    try {
+      const now = new Date('2026-09-09T00:15:00Z')
+      vi.setSystemTime(now)
+      const range = getDefaultTimeRange()
+      assert.equal(range.start.getTime(), now.getTime() - 3600000)
+      assert.equal(range.end.getTime(), now.getTime() + 3600000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   test('keeps users and elevated self views on the self tier', () => {
     assert.equal(resolveLogsViewAccess(ROLE.USER, 'all'), 'self')
     assert.equal(resolveLogsViewAccess(ROLE.ADMIN, 'self'), 'self')
