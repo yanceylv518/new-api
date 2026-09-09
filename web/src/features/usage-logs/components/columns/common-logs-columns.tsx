@@ -48,7 +48,6 @@ import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { taskUsageUnitLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
-import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -60,6 +59,7 @@ import {
   getTieredBillingSummary,
   isTaskBillingLog,
   hasAnyCacheTokens,
+  getUserModelDiscountFactor,
   parseLogOther,
   isViolationFeeLog,
   renderAuditContent,
@@ -69,7 +69,6 @@ import {
   isDisplayableLogType,
   isTimingLogType,
   getLogTypeConfig,
-  isPerCallBilling,
 } from '../../lib/utils'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
@@ -181,6 +180,13 @@ function buildTypeDetailSegments(
   if (!other) return []
 
   const segments: DetailSegment[] = []
+  const discountFactor = getUserModelDiscountFactor(other)
+  const discountLabel =
+    discountFactor < 1
+      ? t('Discount {{percent}}%', {
+          percent: (discountFactor * 100).toFixed(2).replace(/\.?0+$/, ''),
+        })
+      : null
 
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
   const formatPrice = (price: number) =>
@@ -210,11 +216,11 @@ function buildTypeDetailSegments(
         const definition = usageSchema?.[field]
         const unitKey = getTaskUsagePriceUnitLabelKey(definition?.unit)
         const unitLabel = taskUsageUnitLabel(definition, language, t(unitKey))
-        return `${field} ${formatTaskUsageUnitPrice(price, { tokenUnit: 'M' })}/${unitLabel}`
+        return `${field} ${formatTaskUsageUnitPrice(price * discountFactor, { tokenUnit: 'M' })}/${unitLabel}`
       })
       if (tier.constant > 0) {
         prices.push(
-          `${t('Additional charge')} ${formatTaskUsageUnitPrice(tier.constant, { tokenUnit: 'M' })}/${t('request')}`
+          `${t('Additional charge')} ${formatTaskUsageUnitPrice(tier.constant * discountFactor, { tokenUnit: 'M' })}/${t('request')}`
         )
       }
       segments.push({
@@ -231,7 +237,7 @@ function buildTypeDetailSegments(
     if (tieredSummary) {
       const baseEntries = tieredSummary.priceEntries
         .filter((entry) => ['inputPrice', 'outputPrice'].includes(entry.field))
-        .map((entry) => formatPriceCompact(entry.price))
+        .map((entry) => formatPriceCompact(entry.price * discountFactor))
       if (baseEntries.length > 0) {
         const tierLabel = tieredSummary.tier.label || t('Default')
         segments.push({
@@ -246,7 +252,7 @@ function buildTypeDetailSegments(
           )
         )
         .map((entry) => {
-          return formatPriceCompact(entry.price)
+          return formatPriceCompact(entry.price * discountFactor)
         })
       if (cacheEntries.length > 0) {
         segments.push({
@@ -268,8 +274,8 @@ function buildTypeDetailSegments(
         )
         .map((entry) =>
           entry.unit
-            ? `${tieredSummary.tier.label || t('Default')} · ${t(entry.shortLabel)} ${formatPriceCompact(entry.price)}/${t(entry.unit)}`
-            : `${t(entry.shortLabel)} ${formatPrice(entry.price)}`
+            ? `${tieredSummary.tier.label || t('Default')} · ${t(entry.shortLabel)} ${formatPriceCompact(entry.price * discountFactor)}/${t(entry.unit)}`
+            : `${t(entry.shortLabel)} ${formatPrice(entry.price * discountFactor)}`
         )
       if (otherEntries.length > 0) {
         segments.push({
@@ -288,14 +294,16 @@ function buildTypeDetailSegments(
     const isPerCall = isPerCallBilling(modelPrice)
     if (isPerCall && modelPrice != null) {
       segments.push({
-        text: `${t('Per-call')} · ${formatBillingCurrencyFromUSD(modelPrice, priceOpts)}`,
+        text: `${t('Per-call')} · ${formatBillingCurrencyFromUSD(modelPrice * discountFactor, priceOpts)}`,
       })
     } else if (other.model_ratio != null) {
       const inputPriceUSD = other.model_ratio * 2.0
-      const baseEntries = [formatPriceCompact(inputPriceUSD)]
+      const baseEntries = [formatPriceCompact(inputPriceUSD * discountFactor)]
       if (other.completion_ratio != null) {
         baseEntries.push(
-          formatPriceCompact(inputPriceUSD * other.completion_ratio)
+          formatPriceCompact(
+            inputPriceUSD * other.completion_ratio * discountFactor
+          )
         )
       }
       segments.push({
@@ -305,14 +313,20 @@ function buildTypeDetailSegments(
       if (hasAnyCacheTokens(other)) {
         const cacheEntries = [
           other.cache_ratio != null && other.cache_ratio !== 1
-            ? formatPriceCompact(inputPriceUSD * other.cache_ratio)
+              ? formatPriceCompact(
+                  inputPriceUSD * other.cache_ratio * discountFactor
+                )
             : null,
           other.cache_creation_ratio != null && other.cache_creation_ratio !== 1
-            ? formatPriceCompact(inputPriceUSD * other.cache_creation_ratio)
+              ? formatPriceCompact(
+                  inputPriceUSD * other.cache_creation_ratio * discountFactor
+                )
             : null,
           other.cache_creation_ratio_1h != null &&
           other.cache_creation_ratio_1h !== 0
-            ? formatPriceCompact(inputPriceUSD * other.cache_creation_ratio_1h)
+            ? formatPriceCompact(
+                inputPriceUSD * other.cache_creation_ratio_1h * discountFactor
+              )
             : null,
         ].filter(Boolean) as string[]
 
@@ -341,6 +355,10 @@ function buildTypeDetailSegments(
         })
       }
     }
+  }
+
+  if (discountLabel) {
+    segments.unshift({ text: discountLabel })
   }
 
   if (other.is_system_prompt_overwritten) {

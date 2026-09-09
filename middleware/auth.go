@@ -450,7 +450,7 @@ func TokenAuth() func(c *gin.Context) {
 			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
 		}
 
-		userCache, err := model.GetUserCache(token.UserId)
+		userCache, discounts, err := model.GetUserCacheWithModelDiscounts(c.Request.Context(), token.UserId)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,
@@ -463,7 +463,7 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 
-		userCache.WriteContext(c)
+		userCache.WriteContextWithModelDiscounts(c, discounts)
 
 		userGroup := userCache.Group
 		tokenGroup := token.Group

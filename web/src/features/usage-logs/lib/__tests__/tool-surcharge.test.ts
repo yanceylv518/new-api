@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { describe, expect, test } from 'vitest'
 
 import type { LogOtherData } from '../../types'
-import { hasToolSurcharge } from '../format'
+import { getUserModelDiscountFactor, hasToolSurcharge } from '../format'
 
 describe('tool surcharge detection', () => {
   test('shows the marker for a charged structured tool surcharge', () => {
@@ -93,5 +93,16 @@ describe('tool surcharge detection', () => {
     for (const other of invalidCases) {
       expect(hasToolSurcharge(other)).toBe(false)
     }
+  })
+})
+
+describe('user model discount log snapshot', () => {
+  test('returns the stored factor for discounted consume logs', () => {
+    expect(getUserModelDiscountFactor({ user_model_discount: 0.75 })).toBe(0.75)
+  })
+
+  test('uses public price for legacy or invalid snapshots', () => {
+    expect(getUserModelDiscountFactor({})).toBe(1)
+    expect(getUserModelDiscountFactor({ user_model_discount: 1.2 })).toBe(1)
   })
 })

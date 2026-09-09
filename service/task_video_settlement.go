@@ -8,14 +8,20 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	hosttypes "github.com/QuantumNous/new-api/types"
 )
 
 // FinalizeVideoTaskBilling 仅在主库原子结算获胜后写一次差额日志，失败不结束任务。
-func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous model.TaskStatus, actual int, reason string, clamp *common.QuotaClamp) (bool, error) {
+func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous model.TaskStatus, actual int, reason string, clamp *common.QuotaClamp, amounts ...*hosttypes.DiscountAmounts) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("video task is required")
 	}
 	reserved := task.Quota
+	if len(amounts) > 0 && amounts[0] != nil {
+		task.PrivateData.DiscountAmounts = amounts[0]
+	} else if actual == 0 && task.PrivateData.DiscountAmounts != nil {
+		task.PrivateData.DiscountAmounts = hosttypes.NewDiscountAmounts(0, 0)
+	}
 	delta := actual - reserved
 	logType, quota := model.LogTypeConsume, delta
 	if delta < 0 {
@@ -25,6 +31,10 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 	other.SetPublic("pre_consumed_quota", reserved)
 	other.SetPublic("actual_quota", actual)
 	other.SetPublic("reason", reason)
+	if task.PrivateData.DiscountAmounts != nil && actual > 0 {
+		task.PrivateData.DiscountAmounts.AddToLog(other)
+		other.SetPublic("discount_cost_scope", "task_total")
+	}
 	attachQuotaSaturationToOther(other, clamp)
 	var adjustment *model.Log
 	if delta != 0 && (logType != model.LogTypeConsume || common.LogConsumeEnabled) {
@@ -88,6 +98,7 @@ func atomicVideoTask(task *model.Task) bool {
 func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, previous model.TaskStatus, result *relaycommon.TaskInfo) error {
 	actual, reason := task.Quota, "video task settlement"
 	var clamp *common.QuotaClamp
+	var amounts *hosttypes.DiscountAmounts
 	bc := task.PrivateData.BillingContext
 	switch {
 	case task.Status == model.TaskStatusFailure:
@@ -97,24 +108,47 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 		if err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("task %s pricing failed; retaining reserve: %v", task.TaskID, err))
 		} else {
-			actual, clamp = priced.ActualQuotaAfterGroup, priced.Clamp
+			before, after := priced.ActualQuotaAfterGroup, priced.ActualQuotaAfterGroup
+			if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
+				var beforeClamp *common.QuotaClamp
+				before, beforeClamp = common.QuotaRoundChecked(priced.ActualQuotaBeforeGroup * bc.TieredSnapshot.GroupRatio)
+				after, clamp = common.QuotaRoundChecked(float64(before) * price.UserModelDiscountMultiplier())
+				if before > 0 && after == 0 {
+					after = 1
+				}
+				if clamp == nil {
+					clamp = beforeClamp
+				}
+			}
+			actual, amounts = after, hosttypes.NewDiscountAmounts(before, after)
+			if clamp == nil {
+				clamp = priced.Clamp
+			}
 			bc.TieredSnapshot.UsageFacts, bc.TieredSnapshot.EstimatedTier = facts, priced.MatchedTier
 		}
 	case bc != nil && bc.PerCallBilling:
 		// 按次价格在提交时已固定，终态只提交状态。
 	default:
 		if adjusted := adaptor.AdjustBillingOnComplete(task, result); adjusted > 0 {
+			before := adjusted
 			actual = adjusted
+			if price := taskBillingContextPriceData(task.PrivateData.BillingContext); price != nil {
+				actual, clamp = common.QuotaFromFloatChecked(float64(before) * price.UserModelDiscountMultiplier())
+				if before > 0 && actual == 0 {
+					actual = 1
+				}
+			}
+			amounts = hosttypes.NewDiscountAmounts(before, actual)
 		} else {
 			tokens := result.TotalTokens
 			if tokens == 0 {
 				tokens = result.CompletionTokens
 			}
-			if quota, description, saturation, ok := taskQuotaByTokens(task, tokens); ok {
-				actual, reason, clamp = quota, description, saturation
+			if quota, description, saturation, calculatedAmounts, ok := taskQuotaByTokens(task, tokens); ok {
+				actual, reason, clamp, amounts = quota, description, saturation, calculatedAmounts
 			}
 		}
 	}
-	_, err := FinalizeVideoTaskBilling(ctx, task, previous, actual, reason, clamp)
+	_, err := FinalizeVideoTaskBilling(ctx, task, previous, actual, reason, clamp, amounts)
 	return err
 }

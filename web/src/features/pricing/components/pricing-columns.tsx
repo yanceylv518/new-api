@@ -33,6 +33,7 @@ import type { PricingModel } from '../types'
 import { CachedPriceCell } from './cached-price-cell'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
 import { ModelPriceCell, type ModelPriceCellOptions } from './model-price-cell'
+import { UserPricingBadge } from './user-pricing-badge'
 
 // ----------------------------------------------------------------------------
 // Pricing Table Columns
@@ -64,6 +65,7 @@ export function usePricingColumns(
             <span className='truncate font-mono text-sm font-medium'>
               {model.model_name}
             </span>
+            <UserPricingBadge model={model} />
           </div>
         )
       },

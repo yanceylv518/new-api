@@ -18,6 +18,7 @@ import (
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -777,7 +778,20 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		}
 		bc.TieredSnapshot.UsageFacts = usageFacts
 		bc.TieredSnapshot.EstimatedTier = result.MatchedTier
-		RecalculateTaskQuota(ctx, task, result.ActualQuotaAfterGroup, "任务用量表达式结算", result.Clamp)
+		// 终态表达式使用提交时折扣，折前和折后都从本次表达式结果计算。
+		before, after := result.ActualQuotaAfterGroup, result.ActualQuotaAfterGroup
+		if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
+			value := result.ActualQuotaBeforeGroup * bc.TieredSnapshot.GroupRatio * price.UserModelDiscountMultiplier()
+			var clamp *common.QuotaClamp
+			after, clamp = common.QuotaRoundChecked(value)
+			if result.Clamp == nil {
+				result.Clamp = clamp
+			}
+			if before > 0 && after == 0 {
+				after = 1
+			}
+		}
+		RecalculateTaskQuotaWithAmounts(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), "任务用量表达式结算", result.Clamp)
 		return true
 	}
 	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
@@ -787,7 +801,16 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 	}
 	// 优先让 adaptor 决定最终额度。
 	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, "adaptor计费调整")
+		before := actualQuota
+		var clamp *common.QuotaClamp
+		if price := taskBillingContextPriceData(task.PrivateData.BillingContext); price != nil {
+			value := float64(before) * price.UserModelDiscountMultiplier()
+			actualQuota, clamp = common.QuotaFromFloatChecked(value)
+			if value > 0 && actualQuota == 0 {
+				actualQuota = 1
+			}
+		}
+		RecalculateTaskQuotaWithAmounts(ctx, task, actualQuota, hosttypes.NewDiscountAmounts(before, actualQuota), "adaptor计费调整", clamp)
 		return true
 	}
 	// 回退到 token 重算。

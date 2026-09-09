@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -210,6 +211,15 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 			Description: err.Error(),
 		}
 	}
+	discountedQuota := float64(priceData.Quota) * priceData.UserModelDiscountMultiplier()
+	originalQuota := priceData.Quota
+	priceData.Quota, info.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	if discountedQuota > 0 && priceData.Quota == 0 {
+		priceData.Quota = 1
+	}
+	priceData.DiscountAmounts = hosttypes.NewDiscountAmounts(originalQuota, priceData.Quota)
+	// 持久化计费入口从 RelayInfo 读取快照，必须同步本次实际计算结果。
+	info.PriceData = priceData
 
 	userQuota, err := model.GetUserQuota(info.UserId, false)
 	if err != nil {
@@ -284,7 +294,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 			Other:     other,
 		})
 		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, midjourneyTask.Quota)
-		model.UpdateChannelUsedQuota(billingChannelId, midjourneyTask.Quota)
+		model.UpdateChannelUsedQuota(billingChannelId, priceData.DiscountAmounts.ChannelQuota(midjourneyTask.Quota))
 	}
 	c.Writer.WriteHeader(mjResp.StatusCode)
 	respBody, err := json.Marshal(midjResponse)
@@ -523,6 +533,15 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			Description: err.Error(),
 		}
 	}
+	discountedQuota := float64(priceData.Quota) * priceData.UserModelDiscountMultiplier()
+	originalQuota := priceData.Quota
+	priceData.Quota, relayInfo.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	if discountedQuota > 0 && priceData.Quota == 0 {
+		priceData.Quota = 1
+	}
+	priceData.DiscountAmounts = hosttypes.NewDiscountAmounts(originalQuota, priceData.Quota)
+	// MJ 提交和后续退款共享同一持久化金额来源。
+	relayInfo.PriceData = priceData
 
 	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
 	if err != nil {
@@ -649,7 +668,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			Other:     other,
 		})
 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, midjourneyTask.Quota)
-		model.UpdateChannelUsedQuota(billingChannelId, midjourneyTask.Quota)
+		model.UpdateChannelUsedQuota(billingChannelId, priceData.DiscountAmounts.ChannelQuota(midjourneyTask.Quota))
 	}
 
 	if midjResponse.Code == 22 { //22-排队中，说明任务已存在

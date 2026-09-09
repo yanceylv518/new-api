@@ -28,9 +28,14 @@ import {
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getUserModelDiscountMultiplier,
+  hasUserModelDiscount,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
 import { formatPrice, stripTrailingZeros } from '../lib/price'
 import type { PricingModel } from '../types'
+import { DiscountedPrice } from './discounted-price'
 import type { ModelPriceCellOptions } from './model-price-cell'
 
 export function CachedPriceCell(props: {
@@ -49,6 +54,8 @@ export function CachedPriceCell(props: {
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
 
   const model = props.model
+  const discountMultiplier = getUserModelDiscountMultiplier(model)
+  const hasDiscount = hasUserModelDiscount(model)
   const currency = useSystemConfigStore((state) => state.config.currency)
   const billingTime = useBillingTime(model.billing_expr)
   const dynamicSummary = useMemo(
@@ -59,6 +66,7 @@ export function CachedPriceCell(props: {
         showRechargePrice,
         priceRate,
         usdExchangeRate,
+        discountMultiplier,
         groupRatioMultiplier: getDynamicDisplayGroupRatio(model, selectedGroup),
       }),
     // Currency is read indirectly by the price formatter.
@@ -71,6 +79,35 @@ export function CachedPriceCell(props: {
       usdExchangeRate,
       selectedGroup,
       billingTime,
+      currency,
+      discountMultiplier,
+    ]
+  )
+  const baseDynamicSummary = useMemo(
+    () =>
+      hasDiscount
+        ? getDynamicPricingSummary(model, {
+            now: billingTime === undefined ? undefined : new Date(billingTime),
+            tokenUnit,
+            showRechargePrice,
+            priceRate,
+            usdExchangeRate,
+            groupRatioMultiplier: getDynamicDisplayGroupRatio(
+              model,
+              selectedGroup
+            ),
+            discountMultiplier: 1,
+          })
+        : null,
+    [
+      model,
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      selectedGroup,
+      billingTime,
+      hasDiscount,
       currency,
     ]
   )
@@ -107,7 +144,15 @@ export function CachedPriceCell(props: {
               </span>
             )}
             <span className='font-mono text-sm tabular-nums'>
-              {stripTrailingZeros(entry.formatted)}
+              <DiscountedPrice
+                discounted={hasDiscount}
+                original={
+                  baseDynamicSummary?.entries.find(
+                    (item) => item.field === entry.field
+                  )?.formatted
+                }
+                effective={stripTrailingZeros(entry.formatted)}
+              />
             </span>
           </div>
         ))}
@@ -136,13 +181,33 @@ export function CachedPriceCell(props: {
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      selectedGroup
+      selectedGroup,
+      discountMultiplier,
+      false
+    )
+  )
+  const baseCachedPrice = stripTrailingZeros(
+    formatPrice(
+      model,
+      'cache',
+      tokenUnit,
+      showRechargePrice,
+      priceRate,
+      usdExchangeRate,
+      selectedGroup,
+      false
     )
   )
 
   return (
     <div className='max-w-full min-w-0'>
-      <span className='font-mono text-sm tabular-nums'>{cachedPrice}</span>
+      <span className='font-mono text-sm tabular-nums'>
+        <DiscountedPrice
+          discounted={hasDiscount}
+          original={baseCachedPrice}
+          effective={cachedPrice}
+        />
+      </span>
       <div className='text-muted-foreground/50 text-[10px]'>
         / {tokenUnitLabel}
       </div>

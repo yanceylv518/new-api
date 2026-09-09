@@ -178,8 +178,10 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			task.Status = responseItem.Status
 			task.FailReason = responseItem.FailReason
 			if responseItem.Properties != nil {
-				propertiesStr, _ := common.Marshal(responseItem.Properties)
-				task.Properties = string(propertiesStr)
+				if err := task.SetUpstreamProperties(responseItem.Properties); err != nil {
+					logger.LogError(ctx, fmt.Sprintf("更新 Midjourney 属性失败 task %s: %s", task.MjId, err))
+					continue
+				}
 			}
 			if responseItem.Buttons != nil {
 				buttonStr, _ := common.Marshal(responseItem.Buttons)

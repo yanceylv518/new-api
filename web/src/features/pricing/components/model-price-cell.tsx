@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { getCurrencyLabel } from '@/lib/currency'
@@ -30,10 +30,15 @@ import {
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getUserModelDiscountMultiplier,
+  hasUserModelDiscount,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import { taskUsageUnitLabel } from '../lib/task-price-display'
 import type { PricingModel, TokenUnit } from '../types'
+import { DiscountedPrice } from './discounted-price'
 
 export type ModelPriceCellOptions = {
   tokenUnit?: TokenUnit
@@ -55,6 +60,8 @@ export function ModelPriceCell(props: {
   const options = props.options ?? {}
   const tokenUnit = options.tokenUnit ?? DEFAULT_TOKEN_UNIT
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
+  const discountMultiplier = getUserModelDiscountMultiplier(props.model)
+  const hasDiscount = hasUserModelDiscount(props.model)
   const billingTime = useBillingTime(props.model.billing_expr)
   const dynamic = useMemo(
     () =>
@@ -64,6 +71,7 @@ export function ModelPriceCell(props: {
         showRechargePrice: options.showRechargePrice,
         now: billingTime === undefined ? undefined : new Date(billingTime),
         tokenUnit,
+        discountMultiplier,
         showCurrencySymbol: false,
         groupRatioMultiplier: getDynamicDisplayGroupRatio(
           props.model,
@@ -80,10 +88,40 @@ export function ModelPriceCell(props: {
       options.showRechargePrice,
       options.selectedGroup,
       billingTime,
+      discountMultiplier,
       currency,
     ]
   )
-  let metrics: Array<{ label: string; value: string }>
+  const baseDynamic = useMemo(
+    () =>
+      hasDiscount
+        ? getDynamicPricingSummary(props.model, {
+            priceRate: options.priceRate,
+            usdExchangeRate: options.usdExchangeRate,
+            showRechargePrice: options.showRechargePrice,
+            now: billingTime === undefined ? undefined : new Date(billingTime),
+            tokenUnit,
+            showCurrencySymbol: false,
+            groupRatioMultiplier: getDynamicDisplayGroupRatio(
+              props.model,
+              options.selectedGroup
+            ),
+            discountMultiplier: 1,
+          })
+        : null,
+    [
+      props.model,
+      tokenUnit,
+      options.priceRate,
+      options.usdExchangeRate,
+      options.showRechargePrice,
+      options.selectedGroup,
+      billingTime,
+      hasDiscount,
+      currency,
+    ]
+  )
+  let metrics: Array<{ label: string; value: ReactNode }>
   const providerCaption = dynamic?.providerCount
     ? t('{{count}} providers', { count: dynamic.providerCount })
     : ''
@@ -138,7 +176,22 @@ export function ModelPriceCell(props: {
             entry.labelKind === 'schema'
               ? entry.shortLabel
               : t(entry.shortLabel),
-          value: `${entry.formattedRange ?? entry.formatted}${suffix}`,
+          value: (
+            <>
+              <DiscountedPrice
+                discounted={hasDiscount}
+                original={
+                  baseDynamic?.entries.find(
+                    (item) => item.key === entry.key
+                  )?.formattedRange ??
+                  baseDynamic?.entries.find((item) => item.key === entry.key)
+                    ?.formatted
+                }
+                effective={entry.formattedRange ?? entry.formatted}
+              />
+              {suffix}
+            </>
+          ),
         }
       })
     if (metrics.length === 0) {
@@ -191,28 +244,60 @@ export function ModelPriceCell(props: {
       metrics = [
         {
           label: t('Input'),
-          value: formatPrice(
-            props.model,
-            'input',
-            tokenUnit,
-            options.showRechargePrice,
-            options.priceRate,
-            options.usdExchangeRate,
-            options.selectedGroup,
-            false
+          value: (
+            <DiscountedPrice
+              discounted={hasDiscount}
+              original={formatPrice(
+                props.model,
+                'input',
+                tokenUnit,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                false
+              )}
+              effective={formatPrice(
+                props.model,
+                'input',
+                tokenUnit,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                discountMultiplier,
+                false
+              )}
+            />
           ),
         },
         {
           label: t('Output'),
-          value: formatPrice(
-            props.model,
-            'output',
-            tokenUnit,
-            options.showRechargePrice,
-            options.priceRate,
-            options.usdExchangeRate,
-            options.selectedGroup,
-            false
+          value: (
+            <DiscountedPrice
+              discounted={hasDiscount}
+              original={formatPrice(
+                props.model,
+                'output',
+                tokenUnit,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                false
+              )}
+              effective={formatPrice(
+                props.model,
+                'output',
+                tokenUnit,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                discountMultiplier,
+                false
+              )}
+            />
           ),
         },
       ]
@@ -220,13 +305,27 @@ export function ModelPriceCell(props: {
       metrics = [
         {
           label: t('Per-request'),
-          value: formatRequestPrice(
-            props.model,
-            options.showRechargePrice,
-            options.priceRate,
-            options.usdExchangeRate,
-            options.selectedGroup,
-            false
+          value: (
+            <DiscountedPrice
+              discounted={hasDiscount}
+              original={formatRequestPrice(
+                props.model,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                false
+              )}
+              effective={formatRequestPrice(
+                props.model,
+                options.showRechargePrice,
+                options.priceRate,
+                options.usdExchangeRate,
+                options.selectedGroup,
+                discountMultiplier,
+                false
+              )}
+            />
           ),
         },
       ]
@@ -251,7 +350,6 @@ export function ModelPriceCell(props: {
             </span>
             <span
               className='min-w-0 font-mono text-sm break-words whitespace-normal tabular-nums'
-              title={metric.value}
             >
               {metric.value}
             </span>

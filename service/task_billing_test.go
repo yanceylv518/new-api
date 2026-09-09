@@ -579,6 +579,7 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 
 	const userID, tokenID, billingChannelID, executionChannelID = 50, 50, 50, 51
 	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
+	const beforeDiscount = 3750
 	seedUser(t, userID, initialUserQuota)
 	seedToken(t, tokenID, userID, "sk-midjourney", initialTokenQuota)
 	seedChannel(t, billingChannelID)
@@ -590,6 +591,7 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 		TokenKey:   "sk-midjourney",
 		UserQuota:  initialUserQuota,
 		UsingGroup: "default",
+		PriceData:  types.PriceData{DiscountAmounts: types.NewDiscountAmounts(beforeDiscount, chargedQuota)},
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelId: billingChannelID,
 		},
@@ -621,6 +623,13 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 	assert.Equal(t, billingChannelID, persisted.BillingChannelId)
 
 	seedChargedAccounting(t, userID, billingChannelID, tokenID, chargedQuota, 1)
+	// 渠道按折前收费；重载并模拟上游属性更新后仍须退回同一额度。
+	model.UpdateChannelUsedQuota(billingChannelID, beforeDiscount-chargedQuota)
+	task = &persisted
+	require.NoError(t, task.SetUpstreamProperties(map[string]any{"seed": 42, "new_api_discount_amounts": map[string]any{"quota_before_discount": 9999}}))
+	amounts, err := task.DiscountAmounts()
+	require.NoError(t, err)
+	assert.Equal(t, types.NewDiscountAmounts(beforeDiscount, chargedQuota), amounts)
 
 	assert.True(t, RefundMidjourneyQuota(ctx, task, "构图失败"))
 	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))

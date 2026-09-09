@@ -15,10 +15,32 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// 修饰符和基础名共享计费身份，渠道测试必须保持原价，不允许伪造请求倍率覆盖用户折扣。
+func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {
+	saved := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(saved)) })
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"discount-model":2}`))
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("group", "default")
+	for _, channelTest := range []bool{false, true} {
+		info := &relaycommon.RelayInfo{OriginModelName: "discount-model@temperature:0.2", UserGroup: "default", UsingGroup: "default", IsChannelTest: channelTest,
+			UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{"discount-model": 8000})}
+		price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+		require.NoError(t, err)
+		assert.Equal(t, "discount-model", info.GetBillingModelName())
+		want := 0.8
+		if channelTest {
+			want = 1
+		}
+		assert.Equal(t, want, price.UserModelDiscountMultiplier())
+	}
+}
 
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)

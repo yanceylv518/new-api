@@ -138,6 +138,14 @@ function applyRechargeRate(
   return (price * priceRate) / usdExchangeRate
 }
 
+/** 应用目录价格前限制异常的折扣倍率。 */
+function applyUserDiscount(price: number, discountMultiplier: number): number {
+  if (!Number.isFinite(discountMultiplier) || discountMultiplier <= 0) {
+    return price
+  }
+  return price * Math.min(discountMultiplier, 1)
+}
+
 /**
  * Format token-based price for display
  */
@@ -149,15 +157,25 @@ export function formatPrice(
   priceRate = 1,
   usdExchangeRate = 1,
   selectedGroup?: string,
+  discountMultiplierOrShowCurrencySymbol: number | boolean = 1,
   showCurrencySymbol = true
 ): string {
   if (model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
     return '-'
   }
 
+  const discountMultiplier =
+    typeof discountMultiplierOrShowCurrencySymbol === 'number'
+      ? discountMultiplierOrShowCurrencySymbol
+      : 1
+  const resolvedShowCurrencySymbol =
+    typeof discountMultiplierOrShowCurrencySymbol === 'boolean'
+      ? discountMultiplierOrShowCurrencySymbol
+      : showCurrencySymbol
   const displayGroupRatio = getDisplayGroupRatio(model, selectedGroup)
 
   let priceInUSD = calculateTokenPrice(model, type, displayGroupRatio)
+  priceInUSD = applyUserDiscount(priceInUSD, discountMultiplier)
   priceInUSD = applyRechargeRate(
     priceInUSD,
     showWithRecharge,
@@ -167,7 +185,7 @@ export function formatPrice(
 
   const price = priceInUSD / TOKEN_UNIT_DIVISORS[tokenUnit]
   return formatBillingCurrencyFromUSD(price, {
-    showSymbol: showCurrencySymbol,
+    showSymbol: resolvedShowCurrencySymbol,
     digitsLarge: 4,
     digitsSmall: 6,
     abbreviate: false,
@@ -185,7 +203,8 @@ export function formatGroupPrice(
   showWithRecharge = false,
   priceRate = 1,
   usdExchangeRate = 1,
-  groupRatio: Record<string, number>
+  groupRatio: Record<string, number>,
+  discountMultiplier = 1
 ): string {
   if (model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
     return '-'
@@ -193,6 +212,7 @@ export function formatGroupPrice(
 
   const ratio = getConfiguredGroupRatio(groupRatio, group)
   let priceInUSD = calculateTokenPrice(model, type, ratio)
+  priceInUSD = applyUserDiscount(priceInUSD, discountMultiplier)
 
   priceInUSD = applyRechargeRate(
     priceInUSD,
@@ -218,7 +238,8 @@ export function formatFixedPrice(
   showWithRecharge = false,
   priceRate = 1,
   usdExchangeRate = 1,
-  groupRatio: Record<string, number>
+  groupRatio: Record<string, number>,
+  discountMultiplier = 1
 ): string {
   if (model.quota_type !== QUOTA_TYPE_VALUES.REQUEST) {
     return '-'
@@ -226,6 +247,7 @@ export function formatFixedPrice(
 
   const ratio = getConfiguredGroupRatio(groupRatio, group)
   let priceInUSD = (model.model_price || 0) * ratio
+  priceInUSD = applyUserDiscount(priceInUSD, discountMultiplier)
 
   priceInUSD = applyRechargeRate(
     priceInUSD,
@@ -250,15 +272,25 @@ export function formatRequestPrice(
   priceRate = 1,
   usdExchangeRate = 1,
   selectedGroup?: string,
+  discountMultiplierOrShowCurrencySymbol: number | boolean = 1,
   showCurrencySymbol = true
 ): string {
   if (model.quota_type !== QUOTA_TYPE_VALUES.REQUEST) {
     return '-'
   }
 
+  const discountMultiplier =
+    typeof discountMultiplierOrShowCurrencySymbol === 'number'
+      ? discountMultiplierOrShowCurrencySymbol
+      : 1
+  const resolvedShowCurrencySymbol =
+    typeof discountMultiplierOrShowCurrencySymbol === 'boolean'
+      ? discountMultiplierOrShowCurrencySymbol
+      : showCurrencySymbol
   const displayGroupRatio = getDisplayGroupRatio(model, selectedGroup)
 
   let priceInUSD = (model.model_price || 0) * displayGroupRatio
+  priceInUSD = applyUserDiscount(priceInUSD, discountMultiplier)
 
   priceInUSD = applyRechargeRate(
     priceInUSD,
@@ -268,7 +300,7 @@ export function formatRequestPrice(
   )
 
   return formatBillingCurrencyFromUSD(priceInUSD, {
-    showSymbol: showCurrencySymbol,
+    showSymbol: resolvedShowCurrencySymbol,
     digitsLarge: 4,
     digitsSmall: 4,
     abbreviate: false,

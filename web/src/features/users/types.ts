@@ -145,6 +145,24 @@ export interface ManageUserQuotaPayload {
   value: number
 }
 
+// 用户模型折扣以基点保存：8500 表示按原价的 85% 计费。
+export interface UserModelPricingItem {
+  model_name: string
+  discount_bps: number
+}
+
+export interface UserModelPricingCollection {
+  user_id: number
+  items: UserModelPricingItem[]
+  revision: number
+  model_names: string[]
+}
+
+export interface UserModelPricingReplacePayload {
+  revision: number
+  items: UserModelPricingItem[]
+}
+
 // ============================================================================
 // Dialog Types
 // ============================================================================

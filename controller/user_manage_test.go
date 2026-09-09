@@ -93,6 +93,51 @@ func performManageUserRequest(t *testing.T, body string) *httptest.ResponseRecor
 	return recorder
 }
 
+// 管理接口必须跨组列出启用模型，拒绝非法草稿和旧版本覆盖，并沿用目标用户权限边界。
+func TestUserModelPricingManagementContract(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.Ability{}))
+	user := model.User{Username: "pricing-contract", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "default", Model: "pricing-public", ChannelId: 1, Enabled: true},
+		{Group: "private", Model: "pricing-private", ChannelId: 2, Enabled: true},
+		{Group: "private", Model: "pricing-disabled", ChannelId: 3, Enabled: false},
+	}).Error)
+	role := common.RoleRootUser
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("id", 9999); c.Set("role", role); c.Set("username", "root-operator") })
+	router.GET("/pricing/:id", GetUserModelPricing)
+	router.PUT("/pricing/:id", UpdateUserModelPricing)
+	request := func(method, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, fmt.Sprintf("/pricing/%d", user.Id), strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+	response := request(http.MethodGet, "")
+	assert.Contains(t, response.Body.String(), `"pricing-public"`)
+	assert.Contains(t, response.Body.String(), `"pricing-private"`)
+	assert.NotContains(t, response.Body.String(), `"pricing-disabled"`)
+	for _, invalid := range []string{
+		`{"items":[]}`, `{"revision":1,"items":[{"model_name":"pricing-public","discount_bps":0}]}`,
+		`{"revision":1,"items":[{"model_name":"pricing-public","discount_bps":8000},{"model_name":"pricing-public","discount_bps":7000}]}`,
+	} {
+		assert.Contains(t, request(http.MethodPut, invalid).Body.String(), `"success":false`)
+	}
+	valid := `{"revision":1,"items":[{"model_name":"pricing-private","discount_bps":8000}]}`
+	assert.Contains(t, request(http.MethodPut, valid).Body.String(), `"success":true`)
+	assert.Equal(t, http.StatusConflict, request(http.MethodPut, valid).Code)
+	rules, revision, err := model.GetUserModelPricing(user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, revision)
+	assert.Equal(t, map[string]int{"pricing-private": 8000}, rules)
+	role = common.RoleCommonUser
+	assert.Contains(t, request(http.MethodGet, "").Body.String(), `"success":false`)
+	assert.Contains(t, request(http.MethodPut, `{"revision":2,"items":[]}`).Body.String(), `"success":false`)
+}
+
 func TestManageUserDisableAdvancesAuthVersionOnceAndRevokesSession(t *testing.T) {
 	db := setupManageUserTestDB(t)
 	now := time.Now().Unix()

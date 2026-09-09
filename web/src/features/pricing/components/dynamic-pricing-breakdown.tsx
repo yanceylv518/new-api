@@ -62,8 +62,11 @@ import {
 } from '../lib/task-price-display'
 import type { BillingUsageSchema, BillingUsageUnit } from '../types'
 import { TaskFreeAllowanceNote } from './task-free-allowance-note'
+import { DiscountedPrice } from './discounted-price'
 
 type DynamicPricingBreakdownProps = {
+  /** 用户折扣只影响单价展示，不改变表达式条件。 */
+  priceMultiplier?: number
   billingExpr: string | null | undefined
   /**
    * Label of the tier that fired for the current request. When provided,
@@ -291,6 +294,7 @@ export function DynamicPricingBreakdown({
   usageSchema,
   taskPriceOptions,
   usageFacts,
+  priceMultiplier = 1,
 }: DynamicPricingBreakdownProps) {
   const { t, i18n } = useTranslation()
   const expr = billingExpr || ''
@@ -336,6 +340,34 @@ export function DynamicPricingBreakdown({
     }
   }, [expr, usageSchema, requestRules])
 
+  const discount =
+    Number.isFinite(priceMultiplier) && priceMultiplier > 0
+      ? Math.min(priceMultiplier, 1)
+      : 1
+  // 复用目标单价格式化器，保留任务单位和原始表达式展示。
+  const renderPrice = (value: number, field: BreakdownPriceField) => (
+    <DiscountedPrice
+      discounted={discount < 1}
+      original={formatBreakdownPrice(
+        value,
+        field,
+        symbol,
+        rate,
+        t,
+        taskPriceOptions,
+        i18n.language
+      )}
+      effective={formatBreakdownPrice(
+        value * discount,
+        field,
+        symbol,
+        rate,
+        t,
+        taskPriceOptions,
+        i18n.language
+      )}
+    />
+  )
   const hasTiers = tiers.length > 0
   const hasRules = ruleGroups.length > 0
 
@@ -562,15 +594,7 @@ export function DynamicPricingBreakdown({
                             ((field.unit === 'request' ||
                               field.unit === 'image') &&
                               Number.isFinite(value))
-                              ? formatBreakdownPrice(
-                                  value,
-                                  field,
-                                  symbol,
-                                  rate,
-                                  t,
-                                  taskPriceOptions,
-                                  i18n.language
-                                )
+                              ? renderPrice(value, field)
                               : '-'}
                             <TaskFreeAllowanceNote
                               allowance={
@@ -686,15 +710,7 @@ export function DynamicPricingBreakdown({
                     ((field.unit === 'request' || field.unit === 'image') &&
                       Number.isFinite(value)) ? (
                     <span className={cn(!compact && 'font-semibold')}>
-                      {formatBreakdownPrice(
-                        value,
-                        field,
-                        symbol,
-                        rate,
-                        t,
-                        taskPriceOptions,
-                        i18n.language
-                      )}
+                      {renderPrice(value, field)}
                       <TaskFreeAllowanceNote
                         allowance={
                           isTaskBreakdownTier(tier)

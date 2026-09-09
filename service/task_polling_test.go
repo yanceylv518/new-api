@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -259,11 +260,14 @@ func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
 		status      model.TaskStatus
 		units       float64
 		actualQuota int
+		discount    float64
 	}{
 		{name: "success with usage", status: model.TaskStatusSuccess, units: 3, actualQuota: 3_000},
 		{name: "failure with usage", status: model.TaskStatusFailure, units: 3, actualQuota: 0},
 		{name: "success with zero usage", status: model.TaskStatusSuccess, units: 0, actualQuota: 0},
 		{name: "failure with zero usage", status: model.TaskStatusFailure, units: 0, actualQuota: 0},
+		{name: "discounted success", status: model.TaskStatusSuccess, units: 3, actualQuota: 2400, discount: 0.8},
+		{name: "discounted failure", status: model.TaskStatusFailure, units: 3, actualQuota: 0, discount: 0.8},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -282,6 +286,13 @@ func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
 			task.Platform = "batch-plugin"
 			task.PrivateData.UpstreamTaskID = "upstream_batch_tiered_" + string(testCase.status)
 			task.SetData(map[string]any{"provider_payload": "must-be-preserved"})
+			// 模拟已扣费任务的重启恢复；表达式终态只采用持久化折扣。
+			if testCase.discount > 0 {
+				task.PrivateData.BillingContext.OtherRatios = map[string]float64{"user_model_discount": testCase.discount}
+				task.PrivateData.DiscountAmounts = hosttypes.NewDiscountAmounts(6250, preConsumedQuota)
+				seedChargedAccounting(t, userID, channelID, tokenID, preConsumedQuota, 1)
+				model.UpdateChannelUsedQuota(channelID, 1250)
+			}
 			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
 				ExprString:       expression,
 				ExprHash:         billingexpr.ExprHashString(expression),
@@ -313,6 +324,14 @@ func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 			assert.Equal(t, testCase.status, persisted.Status)
 			assert.Equal(t, testCase.actualQuota, persisted.Quota)
+			if testCase.discount > 0 {
+				before := 0
+				if testCase.status == model.TaskStatusSuccess {
+					before = 3000
+				}
+				assert.Equal(t, hosttypes.NewDiscountAmounts(before, testCase.actualQuota), persisted.PrivateData.DiscountAmounts)
+				assert.EqualValues(t, before, getChannelUsedQuota(t, channelID))
+			}
 			var persistedData map[string]any
 			require.NoError(t, common.Unmarshal(persisted.Data, &persistedData))
 			assert.Equal(t, "must-be-preserved", persistedData["provider_payload"])

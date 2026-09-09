@@ -26,7 +26,9 @@ type PricingPluginVariant struct {
 }
 
 type Pricing struct {
-	BillingPluginVariants  []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
+	BillingPluginVariants []PricingPluginVariant `json:"billing_plugin_variants,omitempty"`
+	// 用户专属字段只写入响应副本，不修改全局模型缓存。
+	UserModelDiscountBPS   int                                  `json:"user_model_discount_bps,omitempty"`
 	ModelName              string                               `json:"model_name"`
 	Description            string                               `json:"description,omitempty"`
 	Icon                   string                               `json:"icon,omitempty"`

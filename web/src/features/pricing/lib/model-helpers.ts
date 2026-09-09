@@ -94,6 +94,27 @@ export function getDisplayGroupRatio(
   return minRatio === Number.POSITIVE_INFINITY ? 1 : minRatio
 }
 
+/** 将后端的基点值转换为价格视图使用的倍率。 */
+export function getUserModelDiscountMultiplier(model: PricingModel): number {
+  const discountBPS = Number(model.user_model_discount_bps)
+  if (Number.isFinite(discountBPS) && discountBPS > 0 && discountBPS < 10000) {
+    return discountBPS / 10000
+  }
+  return 1
+}
+
+/** 判断当前已认证用户是否拥有该模型的折扣价格。 */
+export function hasUserModelDiscount(model: PricingModel): boolean {
+  return getUserModelDiscountMultiplier(model) < 1
+}
+
+/** 根据配置的折扣倍率计算实际收费比例，供价格展示使用。 */
+export function getUserModelDiscountPercent(model: PricingModel): number {
+  const multiplier = getUserModelDiscountMultiplier(model)
+  // 后端以基点存储，按基点精度归一化，避免浮点误差泄露到展示层。
+  return Math.round(multiplier * 10000) / 100
+}
+
 /**
  * Replace model placeholder in endpoint path
  */
