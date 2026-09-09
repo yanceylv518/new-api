@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	hosttypes "github.com/QuantumNous/new-api/types"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -109,9 +111,11 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	// 当前任务总费用，不是本次补扣或退款流水。
+	DiscountAmounts *hosttypes.DiscountAmounts `json:"discount_amounts,omitempty"`
+	Key             string                     `json:"key,omitempty"`
+	UpstreamTaskID  string                     `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL       string                     `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -199,7 +203,7 @@ func (p *TaskPrivateData) Scan(val interface{}) error {
 }
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
-	if p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
+	if p.DiscountAmounts == nil && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 {
@@ -632,4 +636,24 @@ func (t *Task) ToOpenAIVideo() *dto.OpenAIVideo {
 		}
 	}
 	return openAIVideo
+}
+
+// UpdateQuotaAndDiscountAmounts 重新读取私有数据后只替换金额，避免覆盖并发轮询的插件状态。
+func (t *Task) UpdateQuotaAndDiscountAmounts() error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		// SQLite 没有行锁，先取得写锁再读 JSON，避免并发更新后的读写锁升级失败。
+		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			if err := tx.Model(&Task{}).Where("id = ?", t.ID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+				return err
+			}
+		}
+		var stored Task
+		if err := lockForUpdate(tx).First(&stored, t.ID).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.DiscountAmounts = t.PrivateData.DiscountAmounts
+		return tx.Model(&Task{}).Where("id = ?", t.ID).Updates(map[string]any{
+			"quota": t.Quota, "private_data": stored.PrivateData,
+		}).Error
+	})
 }

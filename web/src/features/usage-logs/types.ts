@@ -185,6 +185,13 @@ export interface LogOtherData {
   model_ratio?: number
   completion_ratio?: number
   model_price?: number
+  // 消费日志中冻结的实际计费倍率（例如 0.8）。
+  user_model_discount?: number
+  // 使用服务器落库的整数额度快照，历史记录缺失时不通过比例反推。
+  quota_before_discount?: number
+  quota_after_discount?: number
+  discount_quota?: number
+  discount_cost_scope?: 'task_total'
   group_ratio?: number
   user_group_ratio?: number
   cache_ratio?: number

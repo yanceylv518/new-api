@@ -3,10 +3,12 @@ package service
 import (
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -108,13 +110,20 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 		return snap, nil
 	}
 
-	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio
+	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio * relayInfo.PriceData.UserModelDiscountMultiplier()
 	estimatedQuota, err := billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
 	if err != nil {
 		return nil, err
 	}
 	snap.GroupRatio = groupRatio
 	snap.EstimatedQuotaAfterGroup = estimatedQuota
+	original, originalClamp := common.QuotaRoundChecked(snap.EstimatedQuotaBeforeGroup * groupRatio)
+	noteQuotaClamp(relayInfo, originalClamp)
+	if original > 0 && estimatedQuota == 0 && relayInfo.PriceData.UserModelDiscountMultiplier() < 1 {
+		estimatedQuota = 1
+		snap.EstimatedQuotaAfterGroup = estimatedQuota
+	}
+	relayInfo.PriceData.DiscountAmounts = hosttypes.NewDiscountAmounts(original, estimatedQuota)
 	return snap, nil
 }
 
@@ -153,6 +162,9 @@ func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon
 		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 	}
 	relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+	if amounts := relayInfo.PriceData.DiscountAmounts; amounts != nil && amounts.After == relayInfo.FinalPreConsumedQuota {
+		relayInfo.ReservedDiscountAmounts = amounts
+	}
 	return nil
 }
 
@@ -177,8 +189,32 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 		if quota <= 0 {
 			quota = snap.EstimatedQuotaAfterGroup
 		}
+		// 正常请求保留真正预扣时的快照；旧上下文缺失时不伪造折前金额。
+		amounts := relayInfo.ReservedDiscountAmounts
+		if amounts == nil || amounts.After != quota {
+			amounts = relayInfo.PriceData.DiscountAmounts
+		}
+		if amounts != nil && amounts.After != quota {
+			amounts = nil
+		}
+		relayInfo.PriceData.DiscountAmounts = amounts
 		return true, quota, nil
 	}
+	originalQuota := tr.ActualQuotaAfterGroup
+	discountRatio := relayInfo.PriceData.UserModelDiscountMultiplier()
+	if discountRatio != 1 {
+		discountedQuota := tr.ActualQuotaBeforeGroup * snap.GroupRatio * discountRatio
+		var discountClamp *common.QuotaClamp
+		tr.ActualQuotaAfterGroup, discountClamp = common.QuotaRoundChecked(discountedQuota)
+		// 折后未饱和也必须保留折前异常，供渠道统计和管理员审计。
+		if tr.Clamp == nil {
+			tr.Clamp = discountClamp
+		}
+		if originalQuota > 0 && tr.ActualQuotaAfterGroup == 0 {
+			tr.ActualQuotaAfterGroup = 1
+		}
+	}
+	relayInfo.PriceData.DiscountAmounts = hosttypes.NewDiscountAmounts(originalQuota, tr.ActualQuotaAfterGroup)
 
 	// Surface any single-request saturation from settlement onto RelayInfo so the
 	// consume log records it under admin_info, regardless of which caller

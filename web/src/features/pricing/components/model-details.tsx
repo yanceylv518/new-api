@@ -72,7 +72,11 @@ import {
   type DynamicPriceEntry,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { getAvailableGroups, isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getAvailableGroups,
+  getUserModelDiscountMultiplier,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
 import { formatFixedPrice, formatGroupPrice } from '../lib/price'
 import {
   evaluateTaskUsageExamples,
@@ -86,10 +90,12 @@ import type {
   PricingModel,
   TokenUnit,
 } from '../types'
+import { DiscountedPrice } from './discounted-price'
 import { DynamicPricingBreakdown } from './dynamic-pricing-breakdown'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
 import { ModelDetailsApi } from './model-details-api'
 import { ModelDetailsPerformance } from './model-details-performance'
+import { UserPricingBadge } from './user-pricing-badge'
 
 // ----------------------------------------------------------------------------
 // Local UI helpers
@@ -617,6 +623,7 @@ function ModelHeader(props: { model: PricingModel }) {
         )}
         <span className='text-muted-foreground/30'>·</span>
         <ModelBillingModeBadge model={model} />
+        <UserPricingBadge model={model} />
       </div>
       {description && (
         <p className='text-muted-foreground mt-2 text-sm leading-relaxed'>
@@ -643,13 +650,25 @@ function PriceSection(props: {
   const tokenUnitLabel = props.tokenUnit === 'K' ? '1K' : '1M'
   const baseGroupKey = '_base'
   const baseGroupRatioMap = { [baseGroupKey]: 1 }
+  const discountMultiplier = getUserModelDiscountMultiplier(props.model)
   const dynamicSummary = getDynamicPricingSummary(props.model, {
     tokenUnit: props.tokenUnit,
     showRechargePrice: props.showRechargePrice,
     priceRate: props.priceRate,
     usdExchangeRate: props.usdExchangeRate,
     groupRatioMultiplier: 1,
+    discountMultiplier,
   })
+  const baseDynamicSummary =
+    discountMultiplier < 1
+      ? getDynamicPricingSummary(props.model, {
+          tokenUnit: props.tokenUnit,
+          showRechargePrice: props.showRechargePrice,
+          priceRate: props.priceRate,
+          usdExchangeRate: props.usdExchangeRate,
+          groupRatioMultiplier: 1,
+        })
+      : null
 
   const primaryPriceTypes: { label: string; type: PriceType }[] = [
     { label: t('Input'), type: 'input' },
@@ -730,7 +749,15 @@ function PriceSection(props: {
                     <DynamicPriceEntryLabel entry={entry} />
                   </div>
                   <div className='text-foreground mt-1 font-mono text-base font-semibold tabular-nums'>
-                    {entry.formatted}
+                    <DiscountedPrice
+                      discounted={discountMultiplier < 1}
+                      original={
+                        baseDynamicSummary?.entries.find(
+                          (item) => item.key === entry.key
+                        )?.formatted
+                      }
+                      effective={entry.formatted}
+                    />
                     <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
                       / {unitLabelKey ? t(unitLabelKey) : tokenUnitLabel}
                     </span>
@@ -783,6 +810,23 @@ function PriceSection(props: {
   }
 
   if (!isTokenBased) {
+    const originalPrice = formatFixedPrice(
+      props.model,
+      baseGroupKey,
+      props.showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      baseGroupRatioMap
+    )
+    const effectivePrice = formatFixedPrice(
+      props.model,
+      baseGroupKey,
+      props.showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      baseGroupRatioMap,
+      discountMultiplier
+    )
     return (
       <section>
         <SectionTitle>{t('Base Price')}</SectionTitle>
@@ -791,14 +835,11 @@ function PriceSection(props: {
             {t('Per request')}
           </span>
           <span className='text-foreground font-mono text-sm font-semibold tabular-nums'>
-            {formatFixedPrice(
-              props.model,
-              baseGroupKey,
-              props.showRechargePrice,
-              props.priceRate,
-              props.usdExchangeRate,
-              baseGroupRatioMap
-            )}
+            <DiscountedPrice
+              discounted={discountMultiplier < 1}
+              original={originalPrice}
+              effective={effectivePrice}
+            />
           </span>
         </div>
       </section>
@@ -806,23 +847,41 @@ function PriceSection(props: {
   }
 
   const secondaryItems = secondaryPriceTypes.filter((p) => p.available)
-  const renderPrice = (type: PriceType) => (
-    <>
-      {formatGroupPrice(
-        props.model,
-        baseGroupKey,
-        type,
-        props.tokenUnit,
-        props.showRechargePrice,
-        props.priceRate,
-        props.usdExchangeRate,
-        baseGroupRatioMap
-      )}
-      <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
-        / {tokenUnitLabel}
-      </span>
-    </>
-  )
+  const renderPrice = (type: PriceType) => {
+    const originalPrice = formatGroupPrice(
+      props.model,
+      baseGroupKey,
+      type,
+      props.tokenUnit,
+      props.showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      baseGroupRatioMap
+    )
+    const effectivePrice = formatGroupPrice(
+      props.model,
+      baseGroupKey,
+      type,
+      props.tokenUnit,
+      props.showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      baseGroupRatioMap,
+      discountMultiplier
+    )
+    return (
+      <>
+        <DiscountedPrice
+          discounted={discountMultiplier < 1}
+          original={originalPrice}
+          effective={effectivePrice}
+        />
+        <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
+          / {tokenUnitLabel}
+        </span>
+      </>
+    )
+  }
 
   return (
     <section>
@@ -941,6 +1000,7 @@ function GroupPricingSection(props: {
 }) {
   const { t } = useTranslation()
   const showRechargePrice = props.showRechargePrice ?? false
+  const discountMultiplier = getUserModelDiscountMultiplier(props.model)
 
   const availableGroups = useMemo(
     () => getAvailableGroups(props.model, props.usableGroup || {}),
@@ -1037,7 +1097,7 @@ function GroupPricingSection(props: {
       groupRatioMultiplier: 1,
       usageSchema: props.model.billing_usage_schema,
     })
-    const formattedPricesByGroup = new Map(
+    const baseFormattedPricesByGroup = new Map(
       availableGroups.map((group) => {
         const ratio = props.groupRatio[group] || 1
         return [
@@ -1048,6 +1108,22 @@ function GroupPricingSection(props: {
             priceRate: props.priceRate,
             usdExchangeRate: props.usdExchangeRate,
             groupRatioMultiplier: ratio,
+            usageSchema: props.model.billing_usage_schema,
+          }),
+        ] as const
+      })
+    )
+    const formattedPricesByGroup = new Map(
+      availableGroups.map((group) => {
+        const ratio = props.groupRatio[group] || 1
+        return [
+          group,
+          getDynamicFormattedPricesByTier(dynamicTiers, {
+            tokenUnit: props.tokenUnit,
+            showRechargePrice,
+            priceRate: props.priceRate,
+            usdExchangeRate: props.usdExchangeRate,
+            groupRatioMultiplier: ratio * discountMultiplier,
             usageSchema: props.model.billing_usage_schema,
           }),
         ] as const
@@ -1064,6 +1140,9 @@ function GroupPricingSection(props: {
             const formattedPricesByTier =
               formattedPricesByGroup.get(group) ??
               new Map<DynamicPricingTier, Map<string, string>>()
+            const baseFormattedPricesByTier =
+              baseFormattedPricesByGroup.get(group) ??
+              new Map<DynamicPricingTier, Map<string, string>>()
 
             return (
               <div key={group} className='overflow-hidden rounded-lg border'>
@@ -1078,9 +1157,7 @@ function GroupPricingSection(props: {
                   tableClassName='text-sm'
                   headerRowClassName='hover:bg-transparent'
                   data={dynamicTiers}
-                  getRowKey={(tier, tierIndex) =>
-                    `${group}-${tier.label || tierIndex}`
-                  }
+                  getRowKey={(_tier, tierIndex) => `${group}-tier-${tierIndex}`}
                   columns={[
                     {
                       id: 'tier',
@@ -1112,10 +1189,19 @@ function GroupPricingSection(props: {
                         ),
                         className: `${thClass} text-right`,
                         cellClassName: 'py-2.5 text-right font-mono',
-                        cell: (tier: (typeof dynamicTiers)[number]) =>
-                          formattedPricesByTier
-                            .get(tier)
-                            ?.get(fieldEntry.field) ?? '-',
+                        cell: (tier: (typeof dynamicTiers)[number]) => (
+                          <DiscountedPrice
+                            discounted={discountMultiplier < 1}
+                            original={baseFormattedPricesByTier
+                              .get(tier)
+                              ?.get(fieldEntry.field)}
+                            effective={
+                              formattedPricesByTier
+                                .get(tier)
+                                ?.get(fieldEntry.field) ?? '-'
+                            }
+                          />
+                        ),
                       }
                     }),
                   ]}
@@ -1151,6 +1237,7 @@ function GroupPricingSection(props: {
                               priceRate: props.priceRate,
                               usdExchangeRate: props.usdExchangeRate,
                               groupRatioMultiplier: ratio,
+                              discountMultiplier,
                             })}`,
                         },
                       ]}
@@ -1183,8 +1270,8 @@ function GroupPricingSection(props: {
     )
   }
 
-  const renderGroupPrice = (group: string, type: PriceType) =>
-    formatGroupPrice(
+  const renderGroupPrice = (group: string, type: PriceType) => {
+    const originalPrice = formatGroupPrice(
       props.model,
       group,
       type,
@@ -1194,8 +1281,27 @@ function GroupPricingSection(props: {
       props.usdExchangeRate,
       props.groupRatio
     )
-  const renderFixedGroupPrice = (group: string) =>
-    formatFixedPrice(
+    const effectivePrice = formatGroupPrice(
+      props.model,
+      group,
+      type,
+      props.tokenUnit,
+      showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      props.groupRatio,
+      discountMultiplier
+    )
+    return (
+      <DiscountedPrice
+        discounted={discountMultiplier < 1}
+        original={originalPrice}
+        effective={effectivePrice}
+      />
+    )
+  }
+  const renderFixedGroupPrice = (group: string) => {
+    const originalPrice = formatFixedPrice(
       props.model,
       group,
       showRechargePrice,
@@ -1203,6 +1309,23 @@ function GroupPricingSection(props: {
       props.usdExchangeRate,
       props.groupRatio
     )
+    const effectivePrice = formatFixedPrice(
+      props.model,
+      group,
+      showRechargePrice,
+      props.priceRate,
+      props.usdExchangeRate,
+      props.groupRatio,
+      discountMultiplier
+    )
+    return (
+      <DiscountedPrice
+        discounted={discountMultiplier < 1}
+        original={originalPrice}
+        effective={effectivePrice}
+      />
+    )
+  }
 
   return (
     <section>
@@ -1342,6 +1465,7 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
             />
             {isDynamic && (
               <DynamicPricingBreakdown
+                priceMultiplier={getUserModelDiscountMultiplier(props.model)}
                 billingExpr={props.model.billing_expr}
                 usageSchema={props.model.billing_usage_schema}
               />

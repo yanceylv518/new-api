@@ -50,8 +50,11 @@ import { isBreakdownTierMatched } from '../lib/breakdown-tier-match'
 import type { DynamicPriceLabelKind } from '../lib/dynamic-price'
 import { getTaskMatrixDisplayTiers } from '../lib/task-matrix-display'
 import type { BillingUsageSchema, BillingUsageUnit } from '../types'
+import { DiscountedPrice } from './discounted-price'
 
 type DynamicPricingBreakdownProps = {
+  /** 用户折扣只影响单价展示，不改变表达式条件。 */
+  priceMultiplier?: number
   billingExpr: string | null | undefined
   /**
    * Label of the tier that fired for the current request. When provided,
@@ -244,6 +247,7 @@ export function DynamicPricingBreakdown({
   compact = false,
   usageSchema,
   usageFacts,
+  priceMultiplier = 1,
 }: DynamicPricingBreakdownProps) {
   const { t } = useTranslation()
   const expr = billingExpr || ''
@@ -286,6 +290,18 @@ export function DynamicPricingBreakdown({
     }
   }, [expr, usageSchema, requestRules])
 
+  const discount =
+    Number.isFinite(priceMultiplier) && priceMultiplier > 0
+      ? Math.min(priceMultiplier, 1)
+      : 1
+  // 复用目标单价格式化器，保留任务单位和原始表达式展示。
+  const renderPrice = (value: number, field: BreakdownPriceField) => (
+    <DiscountedPrice
+      discounted={discount < 1}
+      original={formatBreakdownPrice(value, field, symbol, rate, t)}
+      effective={formatBreakdownPrice(value * discount, field, symbol, rate, t)}
+    />
+  )
   const hasTiers = tiers.length > 0
   const hasRules = ruleGroups.length > 0
 
@@ -462,15 +478,7 @@ export function DynamicPricingBreakdown({
                               compact ? 'text-xs' : 'text-sm font-semibold'
                             )}
                           >
-                            {value > 0
-                              ? formatBreakdownPrice(
-                                  value,
-                                  field,
-                                  symbol,
-                                  rate,
-                                  t
-                                )
-                              : '-'}
+                            {value > 0 ? renderPrice(value, field) : '-'}
                           </div>
                         </div>
                       )
@@ -561,7 +569,7 @@ export function DynamicPricingBreakdown({
                   const value = field.value(tier)
                   return value > 0 ? (
                     <span className={cn(!compact && 'font-semibold')}>
-                      {formatBreakdownPrice(value, field, symbol, rate, t)}
+                      {renderPrice(value, field)}
                     </span>
                   ) : (
                     '-'

@@ -19,6 +19,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -50,6 +51,10 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	}
 	if relayInfo.BillingSource == BillingSourceSubscription {
 		return false, errors.New("legacy Midjourney billing does not support subscriptions")
+	}
+	// 在插入任务前保存原始金额，失败退款不依赖进程内信息或当前折扣。
+	if err := task.SetDiscountAmounts(relayInfo.PriceData.DiscountAmounts); err != nil {
+		return false, fmt.Errorf("prepare Midjourney discount snapshot: %w", err)
 	}
 
 	task.Quota = quota
@@ -99,6 +104,23 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	if quota == 0 {
 		return true
 	}
+	amounts, err := task.DiscountAmounts()
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("读取 Midjourney 退款快照失败 task %s: %s", task.MjId, err))
+		return false
+	}
+	if amounts != nil && amounts.After != quota {
+		logger.LogError(ctx, fmt.Sprintf("Midjourney 退款快照与已扣额度不一致 task %s", task.MjId))
+		return false
+	}
+	// 先验证可写入的退款后快照，避免资金变更后才发现属性无法序列化。
+	refundedTask := *task
+	if amounts != nil {
+		if err := refundedTask.SetDiscountAmounts(types.NewDiscountAmounts(0, 0)); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("准备 Midjourney 退款快照失败 task %s: %s", task.MjId, err))
+			return false
+		}
+	}
 
 	if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 用户额度失败 task %s: %s", task.MjId, err.Error()))
@@ -116,8 +138,12 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 
 	billingChannelId := task.GetBillingChannelId()
 	model.UpdateUserUsedQuota(task.UserId, -quota)
-	model.UpdateChannelUsedQuota(billingChannelId, -quota)
+	model.UpdateChannelUsedQuota(billingChannelId, -amounts.ChannelQuota(quota))
 	other := model.NewLogOther()
+	if amounts != nil {
+		types.NewDiscountAmounts(0, 0).AddToLog(other)
+		other.SetPublic("discount_cost_scope", "task_total")
+	}
 	other.SetPublic("task_id", task.MjId)
 	other.SetPublic("reason", reason)
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
@@ -132,6 +158,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	})
 
 	task.Quota = 0
+	task.Properties = refundedTask.Properties
 	if err := task.UpdateBillingState(); err != nil {
 		logger.LogError(ctx, fmt.Sprintf("Midjourney 退款成功但清除 quota 失败 task %s: %s", task.MjId, err.Error()))
 	}

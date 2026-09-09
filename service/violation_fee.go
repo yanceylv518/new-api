@@ -147,6 +147,10 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		"violation_fee_marker": CSAMViolationMarker,
 	})
 
+	// 违规附加费不参与用户模型折扣。
+	other.SetPublic("quota_before_discount", feeQuota)
+	other.SetPublic("quota_after_discount", feeQuota)
+	other.SetPublic("discount_quota", 0)
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:      relayInfo.ChannelId,
 		ModelName:      relayInfo.OriginModelName,

@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -206,6 +207,8 @@ func TestRelayTaskSubmitAliasBillingIdentityAndExprFallback(t *testing.T) {
 			info.UsingGroup = "default"
 			pinMappingOrderPlugin(t, c, billingFallbackPlugin)
 			info.OriginModelName = "alias-model"
+			// 上游映射不能把用户公开模型的 80% 折扣换成上游名的 30%。
+			info.UserModelDiscountBPS = hosttypes.NewUserModelDiscountSnapshot(map[string]int{"alias-model": 8000, "declared-model": 3000})
 
 			_, taskErr := RelayTaskSubmit(c, info)
 			require.NotNil(t, taskErr)
@@ -222,6 +225,11 @@ func TestRelayTaskSubmitAliasBillingIdentityAndExprFallback(t *testing.T) {
 				assert.Equal(t, "alias-model", info.TieredBillingSnapshot.ModelName)
 				assert.Equal(t, testCase.wantExpr, info.TieredBillingSnapshot.ExprString)
 				assert.Equal(t, billingexpr.ExprHashString(testCase.wantExpr), info.TieredBillingSnapshot.ExprHash)
+				before, after := 1000000, 800000
+				if testCase.wantExpr == tailExpr {
+					before, after = 1500000, 1200000
+				}
+				assert.Equal(t, hosttypes.NewDiscountAmounts(before, after), info.PriceData.DiscountAmounts)
 				assert.NotEqual(t, "model_price_error", taskErr.Code)
 			} else {
 				assert.Nil(t, info.TieredBillingSnapshot)

@@ -29,6 +29,8 @@ import type {
   ManageUserAction,
   ManageUserQuotaPayload,
   ApiResponse,
+  UserModelPricingCollection,
+  UserModelPricingReplacePayload,
 } from './types'
 
 // ============================================================================
@@ -152,6 +154,23 @@ export async function resetUserPasskey(id: number): Promise<ApiResponse> {
  */
 export async function resetUserTwoFA(id: number): Promise<ApiResponse> {
   const res = await api.delete(`/api/user/${id}/2fa`)
+  return res.data
+}
+
+/** 读取指定用户配置的全部模型专属折扣比例。 */
+export async function getUserModelPricing(
+  userId: number
+): Promise<ApiResponse<UserModelPricingCollection>> {
+  const res = await api.get(`/api/user/${userId}/model-pricing`)
+  return res.data
+}
+
+/** 按读取时的 revision 原子替换指定用户的完整模型折扣规则集。 */
+export async function replaceUserModelPricing(
+  userId: number,
+  payload: UserModelPricingReplacePayload
+): Promise<ApiResponse> {
+  const res = await api.put(`/api/user/${userId}/model-pricing`, payload)
   return res.data
 }
 

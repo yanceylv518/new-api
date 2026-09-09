@@ -7,6 +7,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// UserModelDiscountRatioKey 标识计费快照和日志中的不可变用户模型折扣。
+const UserModelDiscountRatioKey = "user_model_discount"
+
 type GroupRatioInfo struct {
 	GroupRatio        float64
 	GroupSpecialRatio float64
@@ -28,11 +31,19 @@ type PriceData struct {
 	otherRatios          map[string]float64
 	UsePrice             bool
 	Quota                int // 按次计费的最终额度（MJ / Task）
-	QuotaToPreConsume    int // 按量计费的预消耗额度
-	GroupRatioInfo       GroupRatioInfo
+	// 任务提交调整必须沿用未乘倍率的原始额度，避免从折后取整金额反推。
+	BaseQuota         int
+	HasBaseQuota      bool
+	DiscountAmounts   *DiscountAmounts
+	QuotaToPreConsume int // 按量计费的预消耗额度
+	GroupRatioInfo    GroupRatioInfo
 }
 
 func (p *PriceData) AddOtherRatio(key string, ratio float64) {
+	// 用户模型折扣是保留倍率，只能表示不高于原价的折扣，避免被通用倍率乘积误当成加价。
+	if key == UserModelDiscountRatioKey && ratio > 1 {
+		return
+	}
 	if !isValidOtherRatio(ratio) {
 		return
 	}
@@ -79,6 +90,35 @@ func (p *PriceData) OtherRatioMultiplier() float64 {
 		}
 	}
 	return multiplier
+}
+
+// OtherRatioMultiplierBeforeDiscount 保留时长、质量等倍率，仅排除用户模型折扣。
+func (p *PriceData) OtherRatioMultiplierBeforeDiscount() float64 {
+	multiplier := 1.0
+	for key, ratio := range p.otherRatios {
+		if key != UserModelDiscountRatioKey && isValidOtherRatio(ratio) && ratio != 1 {
+			multiplier *= ratio
+		}
+	}
+	return multiplier
+}
+
+// ApplyOtherRatiosBeforeDiscount 用原始计费量计算折前金额，不读取或反推折后额度。
+func (p *PriceData) ApplyOtherRatiosBeforeDiscount(value decimal.Decimal) decimal.Decimal {
+	for key, ratio := range p.otherRatios {
+		if key != UserModelDiscountRatioKey && isValidOtherRatio(ratio) && ratio != 1 {
+			value = value.Mul(decimal.NewFromFloat(ratio))
+		}
+	}
+	return value
+}
+
+// UserModelDiscountMultiplier 返回经过校验的用户模型倍率，缺省时使用公开价格。
+func (p *PriceData) UserModelDiscountMultiplier() float64 {
+	if ratio, ok := p.otherRatios[UserModelDiscountRatioKey]; ok && isValidOtherRatio(ratio) && ratio <= 1 {
+		return ratio
+	}
+	return 1
 }
 
 func (p *PriceData) ApplyOtherRatiosToFloat(value float64) float64 {

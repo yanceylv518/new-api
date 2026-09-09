@@ -101,6 +101,11 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 		UserId: user.Id, ExpiresAt: time.Now().Add(time.Minute),
 	}).Error)
 	require.NoError(t, populateUserCache(user))
+	// 硬删除应同时移除独立折扣和共享版本，删除后不能从旧快照继续取价。
+	_, err := ReplaceUserModelPricing(user.Id, map[string]int{"deleted-model": 8000}, 1)
+	require.NoError(t, err)
+	_, err = GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	require.NoError(t, err)
 	// Administrative hard deletion commonly targets an already soft-deleted
 	// user; the shared version increment must therefore query unscoped.
 	require.NoError(t, DB.Delete(&user).Error)
@@ -128,6 +133,11 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, "2", committed)
 	assert.False(t, server.Exists(getUserCacheKey(user.Id)))
+	for _, key := range userModelPricingVersionKeys(user.Id) {
+		assert.False(t, server.Exists(key))
+	}
+	_, err = GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	assert.Error(t, err)
 }
 
 func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {

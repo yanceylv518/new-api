@@ -29,3 +29,5 @@ export {
   ModelDetailsDrawer,
 } from './model-details'
 export { PricingTable } from './pricing-table'
+export { DiscountedPrice } from './discounted-price'
+export { UserPricingBadge } from './user-pricing-badge'

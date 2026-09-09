@@ -50,12 +50,14 @@ import {
   Info,
   LogIn,
 } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import { DiscountedPrice } from '@/features/pricing/components/discounted-price'
 import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-pricing-breakdown'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
@@ -71,6 +73,7 @@ import {
   parseAuditLine,
   decodeBillingExprB64,
   getTieredBillingSummary,
+  getUserModelDiscountFactor,
   hasAnyCacheTokens,
   isViolationFeeLog,
   getFirstResponseTimeColor,
@@ -78,6 +81,7 @@ import {
   getReasoningEffortVariant,
   renderAuditContent,
 } from '../../lib/format'
+import { getRecordedDiscountAmounts } from '../../lib/model-pricing-detail'
 import { buildQuotaAuditOperation } from '../../lib/quota-audit-operation'
 import {
   getLogTypeConfig,
@@ -169,10 +173,25 @@ function BillingBreakdown(props: {
   const isClaude = other.claude === true
   const isTieredExpr = other.billing_mode === 'tiered_expr'
   const tieredSummary = getTieredBillingSummary(other)
+  const discountFactor = getUserModelDiscountFactor(other)
 
-  const rows: Array<{ label: string; value: string }> = []
+  const rows: Array<{ label: string; value: ReactNode }> = []
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
   const fmtPrice = (usd: number) => formatBillingCurrencyFromUSD(usd, priceOpts)
+  // 工具调用附加费不经过此格式化函数，因为用户折扣只覆盖模型用量。
+  const fmtModelPrice = (usd: number, suffix = ''): ReactNode => {
+    const original = `${fmtPrice(usd)}${suffix}`
+    if (discountFactor >= 1) return original
+
+    return (
+      <DiscountedPrice
+        discounted
+        original={original}
+        effective={`${fmtPrice(usd * discountFactor)}${suffix}`}
+        effectiveClassName='text-foreground font-semibold'
+      />
+    )
+  }
   const baseInputUSD = other.model_ratio != null ? other.model_ratio * 2.0 : 0
 
   if (isTieredExpr) {
@@ -190,7 +209,7 @@ function BillingBreakdown(props: {
       for (const entry of tieredSummary.priceEntries) {
         rows.push({
           label: t(entry.shortLabel),
-          value: `${fmtPrice(entry.price)}/M`,
+          value: fmtModelPrice(entry.price, '/M'),
         })
       }
     } else {
@@ -204,7 +223,7 @@ function BillingBreakdown(props: {
     if (other.model_price != null) {
       rows.push({
         label: t('Model Price'),
-        value: fmtPrice(other.model_price),
+        value: fmtModelPrice(other.model_price),
       })
     }
   } else {
@@ -212,15 +231,25 @@ function BillingBreakdown(props: {
     if (other.model_ratio != null) {
       rows.push({
         label: t('Input'),
-        value: `${fmtPrice(baseInputUSD)}/M`,
+        value: fmtModelPrice(baseInputUSD, '/M'),
       })
     }
     if (other.completion_ratio != null && other.model_ratio != null) {
       rows.push({
         label: t('Output'),
-        value: `${fmtPrice(baseInputUSD * other.completion_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.completion_ratio, '/M'),
       })
     }
+  }
+
+  if (discountFactor < 1) {
+    const configuredDiscount = (discountFactor * 100)
+      .toFixed(2)
+      .replace(/\.?0+$/, '')
+    rows.push({
+      label: t('Model discount'),
+      value: t('Discount {{percent}}%', { percent: configuredDiscount }),
+    })
   }
 
   const userGR = other.user_group_ratio
@@ -237,7 +266,7 @@ function BillingBreakdown(props: {
     if (other.cache_ratio != null && other.cache_ratio !== 1) {
       rows.push({
         label: t('Cache Read'),
-        value: `${fmtPrice(baseInputUSD * other.cache_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.cache_ratio, '/M'),
       })
     }
     if (
@@ -246,7 +275,7 @@ function BillingBreakdown(props: {
     ) {
       rows.push({
         label: t('Cache Creation'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.cache_creation_ratio, '/M'),
       })
     }
     if (
@@ -255,7 +284,10 @@ function BillingBreakdown(props: {
     ) {
       rows.push({
         label: t('Cache Creation (5m)'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio_5m)}/M`,
+        value: fmtModelPrice(
+          baseInputUSD * other.cache_creation_ratio_5m,
+          '/M'
+        ),
       })
     }
     if (
@@ -264,7 +296,10 @@ function BillingBreakdown(props: {
     ) {
       rows.push({
         label: t('Cache Creation (1h)'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio_1h)}/M`,
+        value: fmtModelPrice(
+          baseInputUSD * other.cache_creation_ratio_1h,
+          '/M'
+        ),
       })
     }
   }
@@ -273,7 +308,7 @@ function BillingBreakdown(props: {
     if (other.audio_ratio != null && other.audio_ratio !== 1) {
       rows.push({
         label: t('Audio input'),
-        value: `${fmtPrice(baseInputUSD * other.audio_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.audio_ratio, '/M'),
       })
     }
 
@@ -283,14 +318,14 @@ function BillingBreakdown(props: {
     ) {
       rows.push({
         label: t('Audio output'),
-        value: `${fmtPrice(baseInputUSD * other.audio_completion_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.audio_completion_ratio, '/M'),
       })
     }
 
     if (other.image_ratio != null && other.image_ratio !== 1) {
       rows.push({
         label: t('Image input'),
-        value: `${fmtPrice(baseInputUSD * other.image_ratio)}/M`,
+        value: fmtModelPrice(baseInputUSD * other.image_ratio, '/M'),
       })
     }
   }
@@ -319,7 +354,7 @@ function BillingBreakdown(props: {
   if (other.audio_input_seperate_price && other.audio_input_price) {
     rows.push({
       label: t('Audio Input Price'),
-      value: fmtPrice(other.audio_input_price),
+      value: fmtModelPrice(other.audio_input_price),
     })
   }
 
@@ -444,6 +479,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
+  const discountAmounts = getRecordedDiscountAmounts(other)
   const typeConfig = getLogTypeConfig(props.log.type)
 
   const isViolation = isViolationFeeLog(other)
@@ -711,6 +747,33 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
         </div>
+
+        {/* 金额来自本次日志快照；任务差额流水明确展示任务总费用。 */}
+        {(isConsume || isRefund) && discountAmounts && (
+          <DetailSection
+            label={
+              other?.discount_cost_scope === 'task_total'
+                ? t('Task total')
+                : t('Cost breakdown')
+            }
+          >
+            <DetailRow
+              label={t('Before discount')}
+              value={formatLogQuota(discountAmounts.before)}
+              mono
+            />
+            <DetailRow
+              label={t('After discount')}
+              value={formatLogQuota(discountAmounts.after)}
+              mono
+            />
+            <DetailRow
+              label={t('Discount savings')}
+              value={formatLogQuota(discountAmounts.savings)}
+              mono
+            />
+          </DetailSection>
+        )}
 
         {/* Request conversion (admin only, not for refund) */}
         {showConversion && (
@@ -1117,6 +1180,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
         {isTieredBilling && other?.expr_b64 && (
           <DetailSection label={t('Dynamic Pricing')}>
             <DynamicPricingBreakdown
+              priceMultiplier={getUserModelDiscountFactor(other)}
               compact
               billingExpr={decodeBillingExprB64(other.expr_b64)}
               matchedTierLabel={other.matched_tier}

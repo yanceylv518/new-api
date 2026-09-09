@@ -1,5 +1,86 @@
 package model
 
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+)
+
+// 本地账务字段与上游属性共用现有 JSON，不对历史大表增加列。
+const midjourneyDiscountAmountsKey = "new_api_discount_amounts"
+
+// DiscountAmounts 读取站内持久化快照；损坏数据必须在退款前报错，不能静默反推。
+func (midjourney *Midjourney) DiscountAmounts() (*types.DiscountAmounts, error) {
+	if midjourney.Properties == "" {
+		return nil, nil
+	}
+	var properties map[string]json.RawMessage
+	if err := common.UnmarshalJsonStr(midjourney.Properties, &properties); err != nil {
+		return nil, err
+	}
+	raw, ok := properties[midjourneyDiscountAmountsKey]
+	if !ok {
+		return nil, nil
+	}
+	var amounts types.DiscountAmounts
+	if err := common.Unmarshal(raw, &amounts); err != nil {
+		return nil, err
+	}
+	validated := types.NewDiscountAmounts(amounts.Before, amounts.After)
+	if validated == nil || *validated != amounts {
+		return nil, fmt.Errorf("invalid Midjourney discount amounts")
+	}
+	return validated, nil
+}
+
+// SetDiscountAmounts 保留所有上游属性，只修改由站内计费拥有的金额快照。
+func (midjourney *Midjourney) SetDiscountAmounts(amounts *types.DiscountAmounts) error {
+	properties := make(map[string]json.RawMessage)
+	if midjourney.Properties != "" {
+		if err := common.UnmarshalJsonStr(midjourney.Properties, &properties); err != nil {
+			return err
+		}
+	}
+	if properties == nil {
+		properties = make(map[string]json.RawMessage)
+	}
+	delete(properties, midjourneyDiscountAmountsKey)
+	if amounts != nil {
+		encoded, err := common.Marshal(amounts)
+		if err != nil {
+			return err
+		}
+		properties[midjourneyDiscountAmountsKey] = encoded
+	}
+	encoded, err := common.Marshal(properties)
+	if err != nil {
+		return err
+	}
+	midjourney.Properties = string(encoded)
+	return nil
+}
+
+// SetUpstreamProperties 不允许上游覆盖或伪造站内金额；轮询保留原有可信快照。
+func (midjourney *Midjourney) SetUpstreamProperties(properties any) error {
+	amounts, err := midjourney.DiscountAmounts()
+	if err != nil {
+		return err
+	}
+	encoded, err := common.Marshal(properties)
+	if err != nil {
+		return err
+	}
+	updated := *midjourney
+	updated.Properties = string(encoded)
+	if err := updated.SetDiscountAmounts(amounts); err != nil {
+		return err
+	}
+	midjourney.Properties = updated.Properties
+	return nil
+}
+
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
@@ -175,7 +256,7 @@ func (midjourney *Midjourney) Update() error {
 
 func (midjourney *Midjourney) UpdateBillingState() error {
 	return DB.Model(midjourney).
-		Select("quota", "token_id", "billing_channel_id").
+		Select("quota", "token_id", "billing_channel_id", "properties").
 		Updates(midjourney).Error
 }
 

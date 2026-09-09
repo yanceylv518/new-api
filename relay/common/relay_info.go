@@ -82,16 +82,20 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
-	TokenId           int
-	TokenKey          string
-	TokenGroup        string
-	UserId            int
-	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
-	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
-	StartTime         time.Time
-	FirstResponseTime time.Time
-	isFirstResponse   bool
+	// 预留时的金额用于表达式失败回退，不能由已取整额度反推。
+	ReservedDiscountAmounts *hosttypes.DiscountAmounts
+	// 只读规则在请求开始时冻结，重试不重新读取管理员配置。
+	UserModelDiscountBPS hosttypes.UserModelDiscountSnapshot
+	TokenId              int
+	TokenKey             string
+	TokenGroup           string
+	UserId               int
+	UsingGroup           string // 使用的分组，当auto跨分组重试时，会变动
+	UserGroup            string // 用户所在分组
+	TokenUnlimited       bool
+	StartTime            time.Time
+	FirstResponseTime    time.Time
+	isFirstResponse      bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -587,6 +591,9 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	userSetting, ok := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
 	if ok {
 		info.UserSetting = userSetting
+	}
+	if discounts, ok := common.GetContextKeyType[hosttypes.UserModelDiscountSnapshot](c, constant.ContextKeyUserModelDiscounts); ok {
+		info.UserModelDiscountBPS = discounts
 	}
 
 	return info

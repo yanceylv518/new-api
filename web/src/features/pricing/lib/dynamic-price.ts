@@ -47,6 +47,7 @@ type DynamicPriceOptions = {
   showRechargePrice?: boolean
   priceRate?: number
   usdExchangeRate?: number
+  discountMultiplier?: number
   groupRatioMultiplier?: number
   usageSchema?: BillingUsageSchema
 }
@@ -175,7 +176,10 @@ export function formatDynamicUnitPrice(
   valuePerMillionTokens: number,
   options: DynamicPriceOptions
 ): string {
-  const groupRatio = options.groupRatioMultiplier ?? 1
+  const discount = options.discountMultiplier ?? 1
+  const groupRatio =
+    (options.groupRatioMultiplier ?? 1) *
+    (Number.isFinite(discount) && discount > 0 ? Math.min(discount, 1) : 1)
   const priceRate = options.priceRate ?? 1
   const usdExchangeRate = options.usdExchangeRate ?? 1
   const priceUSD =
@@ -199,7 +203,10 @@ export function formatTaskUsageUnitPrice(
   valuePerUnit: number,
   options: DynamicPriceOptions
 ): string {
-  const groupRatio = options.groupRatioMultiplier ?? 1
+  const discount = options.discountMultiplier ?? 1
+  const groupRatio =
+    (options.groupRatioMultiplier ?? 1) *
+    (Number.isFinite(discount) && discount > 0 ? Math.min(discount, 1) : 1)
   const priceRate = options.priceRate ?? 1
   const usdExchangeRate = options.usdExchangeRate ?? 1
   const priceUSD = valuePerUnit * groupRatio

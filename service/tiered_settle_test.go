@@ -30,6 +30,18 @@ const probeExpr = `param("service_tier") == "fast" ? tier("fast", p * 4 + c * 20
 
 const testQuotaPerUnit = 500_000.0
 
+// 折前发生额度饱和、折后恢复正常范围时，管理员审计仍需保留原异常。
+func TestDiscountRetainsOriginalTieredSaturation(t *testing.T) {
+	info := makeRelayInfo(`tier("large", 6000000000)`, 1, 0, 0)
+	info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.5)
+	ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{})
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.Equal(t, 1500000000, quota)
+	require.NotNil(t, info.QuotaClamp)
+	assert.Equal(t, types.NewDiscountAmounts(math.MaxInt32, quota), info.PriceData.DiscountAmounts)
+}
+
 func makeSnapshot(expr string, groupRatio float64, estPrompt, estCompletion int) *billingexpr.BillingSnapshot {
 	return &billingexpr.BillingSnapshot{
 		BillingMode:               "tiered_expr",

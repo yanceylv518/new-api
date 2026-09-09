@@ -9,12 +9,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -42,6 +40,19 @@ const claudeCacheCreation1hMultiplier = 6 / 3.75
 // used for tiered expression pre-consume when the client omits max_tokens, so
 // the pre-consumed quota still reflects a plausible output cost in paid groups.
 const defaultTieredPreConsumeMaxTokens = 8192
+
+// addUserModelDiscount 将匹配到的用户规则冻结到 PriceData，供后续所有计费阶段复用。
+func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.PriceData) {
+	if info == nil || priceData == nil || info.IsChannelTest {
+		return
+	}
+	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
+	discountBPS := info.UserModelDiscountBPS.DiscountBPS(modelName)
+	if discountBPS < 1 || discountBPS >= 10000 {
+		return
+	}
+	priceData.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, float64(discountBPS)/10000)
+}
 
 // HandleGroupRatio checks for "auto_group" in the context and updates the group ratio and relayInfo.UsingGroup if present
 func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hosttypes.GroupRatioInfo {
@@ -74,7 +85,7 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hostty
 
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (hosttypes.PriceData, error) {
 	if info != nil {
-		if matched := resolveBillingModelName(info.GetOriginModelName()); matched != "" && matched != info.OriginModelName {
+		if matched := model.ResolveUserModelPricingName(info.GetOriginModelName()); matched != "" && matched != info.OriginModelName {
 			info.BillingModelName = matched
 		}
 	}
@@ -125,10 +136,19 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		imageRatio, _ = ratio_setting.GetImageRatio(billingModelName)
 		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
-		ratio := modelRatio * groupRatioInfo.GroupRatio
-		quota, err := common.QuotaFromFloatStrict(float64(preConsumedTokens) * ratio)
+		discountRatio := 1.0
+		if discountBPS := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(billingModelName)); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
+			discountRatio = float64(discountBPS) / 10000
+		}
+		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio
+		preConsumeValue := float64(preConsumedTokens) * ratio
+		quota, err := common.QuotaFromFloatStrict(preConsumeValue)
 		if err != nil {
 			return hosttypes.PriceData{}, err
+		}
+		// 折后仍为正的请求至少预留数据库的最小额度单位。
+		if discountRatio < 1 && preConsumeValue >= discountRatio && quota == 0 {
+			quota = 1
 		}
 		preConsumedQuota = quota
 	} else {
@@ -174,12 +194,23 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	}
 	if usePrice {
 		for name, ratio := range meta.BillingRatios {
+			// 用户折扣是独立表快照，不能由请求倍率或适配器输入伪造。
+			if name == hosttypes.UserModelDiscountRatioKey {
+				continue
+			}
 			priceData.AddOtherRatio(name, ratio)
 		}
+	}
+	// 管理员折扣是保留倍率，必须在适配器附加倍率写入后重新冻结，防止同名参数覆盖。
+	addUserModelDiscount(info, &priceData)
+	if usePrice {
 		quotaToPreConsume := priceData.ApplyOtherRatiosToFloat(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		quota, err := common.QuotaFromFloatStrict(quotaToPreConsume)
 		if err != nil {
 			return hosttypes.PriceData{}, err
+		}
+		if priceData.UserModelDiscountMultiplier() < 1 && quotaToPreConsume >= priceData.UserModelDiscountMultiplier() && quota == 0 {
+			quota = 1
 		}
 		priceData.QuotaToPreConsume = quota
 	}
@@ -255,8 +286,11 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 		ModelRatio:     modelRatio,
 		UsePrice:       usePrice,
 		Quota:          quota,
+		BaseQuota:      quota,
+		HasBaseQuota:   true,
 		GroupRatioInfo: groupRatioInfo,
 	}
+	addUserModelDiscount(info, &priceData)
 	return priceData, nil
 }
 
@@ -274,48 +308,9 @@ func HasModelBillingConfig(modelName string) bool {
 	return ok && strings.TrimSpace(expr) != ""
 }
 
-// HasPriceOrRatioEntry reports whether name has a configured price, ratio, or
-// tiered billing-mode entry after a single wildcard normalization. Self-use
-// fallback does not count as a configured ratio.
+// HasPriceOrRatioEntry 保留原导出接口，管理目录和计费共用模型层的唯一解析逻辑。
 func HasPriceOrRatioEntry(name string) bool {
-	formatted := ratio_setting.FormatMatchingModelName(name)
-	if _, ok := ratio_setting.GetModelPrice(formatted, false); ok {
-		return true
-	}
-	if ratio_setting.HasConfiguredModelRatio(formatted) {
-		return true
-	}
-	return billing_setting.GetBillingMode(formatted) == billing_setting.BillingModeTieredExpr
-}
-
-func resolveBillingModelName(origin string) string {
-	var candidates []string
-	if !reasoning.ParseModelModifiers(origin).HasModifiers() {
-		candidates = append(candidates, origin)
-	}
-	candidates = append(candidates, hostreasoning.CanonicalBillingModelNames(origin)...)
-	base := hostreasoning.BaseModelName(origin)
-	candidates = append(candidates, base)
-
-	seen := make(map[string]struct{}, len(candidates))
-	matched := ""
-	for _, name := range candidates {
-		if name == "" {
-			continue
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		if HasPriceOrRatioEntry(name) {
-			matched = name
-			break
-		}
-	}
-	if matched == "" {
-		matched = base
-	}
-	return matched
+	return model.HasPriceOrRatioEntry(name)
 }
 
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, meta *types.TokenCountMeta, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
@@ -345,10 +340,22 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 
 	// Expression coefficients are $/1M tokens prices; convert to quota the same way per-call billing does.
 	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
-	preConsumedQuota, err := billingexpr.QuotaRoundStrict(quotaBeforeGroup * groupRatioInfo.GroupRatio)
+	priceData := hosttypes.PriceData{GroupRatioInfo: groupRatioInfo}
+	addUserModelDiscount(info, &priceData)
+	preConsumeValue := quotaBeforeGroup * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
+	preConsumedQuota, err := billingexpr.QuotaRoundStrict(preConsumeValue)
 	if err != nil {
 		return hosttypes.PriceData{}, err
 	}
+	// 阶梯回退预扣时使用同一表达式的原始估算，保留取整前的原价来源。
+	originalEstimate, originalClamp := common.QuotaRoundChecked(quotaBeforeGroup * groupRatioInfo.GroupRatio)
+	if info.QuotaClamp == nil {
+		info.QuotaClamp = originalClamp
+	}
+	if originalEstimate > 0 && preConsumedQuota == 0 && priceData.UserModelDiscountMultiplier() < 1 {
+		preConsumedQuota = 1
+	}
+	priceData.DiscountAmounts = hosttypes.NewDiscountAmounts(originalEstimate, preConsumedQuota)
 
 	freeModel := false
 	if !operation_setting.GetQuotaSetting().EnableFreeModelPreConsume {
@@ -376,11 +383,8 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	info.TieredBillingSnapshot = snapshot
 	info.BillingRequestInput = &requestInput
 
-	priceData := hosttypes.PriceData{
-		FreeModel:         freeModel,
-		GroupRatioInfo:    groupRatioInfo,
-		QuotaToPreConsume: preConsumedQuota,
-	}
+	priceData.FreeModel = freeModel
+	priceData.QuotaToPreConsume = preConsumedQuota
 
 	logger.LogDebug(c, "model_price_helper_tiered result: model=%s preConsume=%d quotaBeforeGroup=%.2f groupRatio=%.2f tier=%s", billingModelName, preConsumedQuota, quotaBeforeGroup, groupRatioInfo.GroupRatio, trace.MatchedTier)
 

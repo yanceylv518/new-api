@@ -1026,6 +1026,9 @@ func (user *User) HardDelete() error {
 	if err := publishCommittedUserAuthVersion(user.Id, deletedAuthVersion); err != nil {
 		common.SysError(fmt.Sprintf("failed to publish auth tombstone after hard deleting user %d: %v", user.Id, err))
 	}
+	if err := invalidateUserModelPricing(user.Id); err != nil {
+		common.SysError(fmt.Sprintf("failed to invalidate pricing after hard deleting user %d: %v", user.Id, err))
+	}
 	if err := invalidateTokensCache(tokens); err != nil {
 		common.SysError(fmt.Sprintf("failed to invalidate token cache after hard deleting user %d: %v", user.Id, err))
 	}
@@ -1036,6 +1039,12 @@ func (user *User) HardDelete() error {
 }
 
 func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
+	// 硬删除在用户锁内清理独立规则及版本，避免并发改价留下孤儿数据。
+	for _, row := range []any{&UserModelPricing{}, &UserModelPricingRevision{}} {
+		if err := tx.Where("user_id = ?", userId).Delete(row).Error; err != nil {
+			return err
+		}
+	}
 	if err := releaseAllExternalIdentitiesWithTx(tx, userId); err != nil {
 		return err
 	}

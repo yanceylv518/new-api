@@ -1,12 +1,16 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,16 +18,79 @@ import (
 const userCacheSchemaVersion = 2
 
 type UserBase struct {
-	Id          int    `json:"id"`
-	Group       string `json:"group"`
-	Email       string `json:"email"`
-	Quota       int    `json:"quota"`
-	Status      int    `json:"status"`
-	Role        int    `json:"role"`
-	Username    string `json:"username"`
-	Setting     string `json:"setting"`
-	AuthVersion int64  `json:"-"`
-	CacheSchema int    `json:"-"`
+	Id          int    `json:"id" redis:"Id"`
+	Group       string `json:"group" redis:"Group"`
+	Email       string `json:"email" redis:"Email"`
+	Quota       int    `json:"quota" redis:"Quota"`
+	Status      int    `json:"status" redis:"Status"`
+	Role        int    `json:"role" redis:"Role"`
+	Username    string `json:"username" redis:"Username"`
+	Setting     string `json:"setting" redis:"Setting"`
+	AuthVersion int64  `json:"-" redis:"AuthVersion"`
+	CacheSchema int    `json:"-" redis:"CacheSchema"`
+}
+
+// GetUserCacheWithModelDiscounts 合并鉴权与折扣的只读 Redis 往返。
+// Hash 之后读取鉴权屏障，不能放行旧权限；折扣保持独立版本，异常仍走原回源协议。
+func GetUserCacheWithModelDiscounts(ctx context.Context, userID int) (*UserBase, hosttypes.UserModelDiscountSnapshot, error) {
+	if userID <= 0 {
+		return nil, hosttypes.UserModelDiscountSnapshot{}, fmt.Errorf("invalid pricing user")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, hosttypes.UserModelDiscountSnapshot{}, err
+	}
+	if common.RedisEnabled && common.RDB == nil {
+		return nil, hosttypes.UserModelDiscountSnapshot{}, fmt.Errorf("Redis client is unavailable")
+	}
+	var user *UserBase
+	var pricingCheck *pricingVersionCheck
+	if common.RedisEnabled && common.RDB != nil {
+		redisCtx, cancel := context.WithTimeout(ctx, time.Second)
+		pipe := common.RDB.Pipeline()
+		hash := pipe.HGetAll(redisCtx, getUserCacheKey(userID))
+		keys := append([]string{getUserAuthFenceKey(userID), getUserAuthVersionKey(userID)}, userModelPricingVersionKeys(userID)...)
+		versions := pipe.MGet(redisCtx, keys...)
+		_, err := pipe.Exec(redisCtx)
+		_ = pipe.Close()
+		cancel()
+		var cached UserBase
+		if err == nil && hash.Scan(&cached) == nil && cached.Id == userID && cached.CacheSchema == userCacheSchemaVersion && cached.AuthVersion > 0 {
+			values := versions.Val()
+			valid := len(values) == 4
+			for _, raw := range values[:min(2, len(values))] {
+				if raw == nil {
+					continue
+				}
+				value, ok := raw.(string)
+				version, parseErr := strconv.ParseInt(value, 10, 64)
+				if !ok || parseErr != nil || version <= 0 || version > cached.AuthVersion {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				user = &cached
+				check := parsePricingVersions(values[2:4])
+				pricingCheck = &check
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, hosttypes.UserModelDiscountSnapshot{}, err
+	}
+	if user == nil {
+		var err error
+		user, err = GetUserCache(userID)
+		if err != nil {
+			return nil, hosttypes.UserModelDiscountSnapshot{}, err
+		}
+	}
+	// 禁用用户仍交给鉴权层返回原有状态，不为其加载折扣规则。
+	if user.Status != common.UserStatusEnabled {
+		return user, hosttypes.UserModelDiscountSnapshot{}, nil
+	}
+	discounts, err := getUserModelDiscountSnapshot(ctx, userID, pricingCheck)
+	return user, discounts, err
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -33,6 +100,12 @@ func (user *UserBase) WriteContext(c *gin.Context) {
 	common.SetContextKey(c, constant.ContextKeyUserEmail, user.Email)
 	common.SetContextKey(c, constant.ContextKeyUserName, user.Username)
 	common.SetContextKey(c, constant.ContextKeyUserSetting, user.GetSetting())
+}
+
+// WriteContextWithModelDiscounts 将独立表中的折扣快照写入专用上下文键，避免伪装成用户偏好。
+func (user *UserBase) WriteContextWithModelDiscounts(c *gin.Context, discounts hosttypes.UserModelDiscountSnapshot) {
+	user.WriteContext(c)
+	common.SetContextKey(c, constant.ContextKeyUserModelDiscounts, discounts)
 }
 
 func (user *UserBase) GetSetting() dto.UserSetting {

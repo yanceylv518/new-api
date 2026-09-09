@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
@@ -244,6 +245,12 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
+	// remix 只继承请求参数，折扣使用新请求快照。
+	var inherited map[string]float64
+	if info.Action == constant.TaskActionRemix {
+		inherited = info.PriceData.OtherRatios()
+	}
+	info.TieredBillingSnapshot = nil
 	// 4. 价格计算：基础模型价格
 	info.OriginModelName = modelName
 	var priceData types.PriceData
@@ -286,7 +293,22 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		groupRatioInfo := helper.HandleGroupRatio(c, info)
 		quota, clamp := common.QuotaRoundChecked(cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		noteTaskQuotaClamp(info, clamp)
-		priceData = types.PriceData{Quota: quota, QuotaToPreConsume: quota, GroupRatioInfo: groupRatioInfo}
+		original := quota
+		priceData = types.PriceData{GroupRatioInfo: groupRatioInfo}
+		// 任务表达式已返回美元费用；不采用文本的每百万换算。
+		// 渠道映射仅选择上游计价配置；折扣始终匹配用户请求的公开计费身份。
+		discount := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(modelName)))
+		if discount >= 1 && discount < 10000 && !info.IsChannelTest {
+			priceData.AddOtherRatio(types.UserModelDiscountRatioKey, float64(discount)/10000)
+			value := cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
+			quota, clamp = common.QuotaRoundChecked(value)
+			if original > 0 && quota == 0 {
+				quota = 1
+			}
+			noteTaskQuotaClamp(info, clamp)
+		}
+		priceData.Quota, priceData.QuotaToPreConsume = quota, quota
+		priceData.DiscountAmounts = types.NewDiscountAmounts(original, quota)
 		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
 	} else {
 		priceData, err = helper.ModelPriceHelperPerCall(c, info)
@@ -295,6 +317,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 	info.PriceData = priceData
+	if info.TieredBillingSnapshot == nil {
+		mergeInheritedTaskBillingRatios(&info.PriceData, inherited)
+	}
 
 	// 5. 计费估算：让适配器根据用户请求提供 OtherRatios（时长、分辨率等）
 	//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
@@ -311,16 +336,30 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 		if len(estimatedRatios) > 0 {
 			for k, v := range estimatedRatios {
-				info.PriceData.AddOtherRatio(k, v)
+				if k != types.UserModelDiscountRatioKey {
+					info.PriceData.AddOtherRatio(k, v)
+				}
 			}
 		}
 	}
 
-	// 6. 将 OtherRatios 应用到基础额度（饱和转换，防止溢出成负数）
-	if info.TieredBillingSnapshot == nil && !common.StringsContains(constant.TaskPricePatches, modelName) {
-		quotaWithRatios := info.PriceData.ApplyOtherRatiosToFloat(float64(info.PriceData.Quota))
-		quota, clamp := common.QuotaFromFloatChecked(quotaWithRatios)
+	// 用户折扣仅在主机层应用；原始基础额度与提交后调整共用，避免整数反推。
+	if info.TieredBillingSnapshot == nil {
+		base := float64(info.PriceData.Quota)
+		info.PriceData.BaseQuota, info.PriceData.HasBaseQuota = info.PriceData.Quota, true
+		before := base
+		if !common.StringsContains(constant.TaskPricePatches, modelName) {
+			before *= info.PriceData.OtherRatioMultiplierBeforeDiscount()
+		}
+		original, originalClamp := common.QuotaFromFloatChecked(before)
+		discounted := before * info.PriceData.UserModelDiscountMultiplier()
+		quota, clamp := common.QuotaFromFloatChecked(discounted)
+		if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() != 1 {
+			quota = 1
+		}
 		info.PriceData.Quota = quota
+		info.PriceData.DiscountAmounts = types.NewDiscountAmounts(original, quota)
+		noteTaskQuotaClamp(info, originalClamp)
 		noteTaskQuotaClamp(info, clamp)
 	}
 
@@ -369,7 +408,6 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			if adjustedQuota, ok := recalcQuotaFromRatios(info, adjustedRatios); ok {
 				// 基于调整后的 ratios 重新计算 quota
 				finalQuota = adjustedQuota
-				info.PriceData.ReplaceOtherRatios(adjustedRatios)
 				info.PriceData.Quota = finalQuota
 			}
 		}
@@ -386,19 +424,60 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}, nil
 }
 
+// mergeInheritedTaskBillingRatios 合并原任务的请求倍率，并拒绝旧任务快照覆盖当前用户折扣。
+func mergeInheritedTaskBillingRatios(priceData *types.PriceData, ratios map[string]float64) {
+	if priceData == nil {
+		return
+	}
+	for key, ratio := range ratios {
+		if key == types.UserModelDiscountRatioKey {
+			continue
+		}
+		priceData.AddOtherRatio(key, ratio)
+	}
+}
+
 // recalcQuotaFromRatios 根据 adjustedRatios 重新计算 quota。
 // 公式: baseQuota × ∏(ratio) — 其中 baseQuota 是不含 OtherRatios 的基础额度。
 func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float64) (int, bool) {
 	// 从 PriceData 获取不含 OtherRatios 的基础价格
 	baseQuota := info.PriceData.RemoveOtherRatiosFromFloat(float64(info.PriceData.Quota))
-	priceData := info.PriceData
-	if !priceData.ReplaceOtherRatios(ratios) {
+	if info.PriceData.HasBaseQuota {
+		baseQuota = float64(info.PriceData.BaseQuota)
+	}
+	// 适配器只能替换请求倍率，所有输入都必须经过统一校验后再组成快照。
+	adjustedPriceData := types.PriceData{}
+	for key, ratio := range ratios {
+		if key == types.UserModelDiscountRatioKey {
+			continue
+		}
+		adjustedPriceData.AddOtherRatio(key, ratio)
+	}
+	if len(adjustedPriceData.OtherRatios()) == 0 {
+		return 0, false
+	}
+	// 适配器调整会替换请求倍率，但必须保留提交时冻结的用户折扣。
+	adjustedPriceData.AddOtherRatio(
+		types.UserModelDiscountRatioKey,
+		info.PriceData.UserModelDiscountMultiplier(),
+	)
+	mergedRatios := adjustedPriceData.OtherRatios()
+	if !info.PriceData.ReplaceOtherRatios(mergedRatios) {
 		return 0, false
 	}
 	// 应用新的 ratios
-	result := priceData.ApplyOtherRatiosToFloat(baseQuota)
+	result := info.PriceData.ApplyOtherRatiosToFloat(baseQuota)
 	quota, clamp := common.QuotaFromFloatChecked(result)
 	noteTaskQuotaClamp(info, clamp)
+	original, originalClamp := common.QuotaFromFloatChecked(baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount())
+	noteTaskQuotaClamp(info, originalClamp)
+	if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() < 1 {
+		quota = 1
+	}
+	if info.PriceData.UserModelDiscountMultiplier() == 1 {
+		original = quota
+	}
+	info.PriceData.DiscountAmounts = types.NewDiscountAmounts(original, quota)
 	return quota, true
 }
 

@@ -36,14 +36,19 @@ import {
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getUserModelDiscountMultiplier,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
 import {
   formatPrice,
   formatRequestPrice,
   stripTrailingZeros,
 } from '../lib/price'
 import type { PricingModel, TokenUnit } from '../types'
+import { DiscountedPrice } from './discounted-price'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
+import { UserPricingBadge } from './user-pricing-badge'
 
 // ----------------------------------------------------------------------------
 // Pricing Table Columns
@@ -90,6 +95,7 @@ export function usePricingColumns(
             <span className='truncate font-mono text-sm font-medium'>
               {model.model_name}
             </span>
+            <UserPricingBadge model={model} />
           </div>
         )
       },
@@ -116,6 +122,7 @@ export function usePricingColumns(
       ),
       cell: ({ row }) => {
         const model = row.original
+        const discountMultiplier = getUserModelDiscountMultiplier(model)
         const dynamicSummary = getDynamicPricingSummary(model, {
           tokenUnit,
           showRechargePrice,
@@ -125,7 +132,21 @@ export function usePricingColumns(
             model,
             selectedGroup
           ),
+          discountMultiplier,
         })
+        const baseDynamicSummary =
+          discountMultiplier < 1
+            ? getDynamicPricingSummary(model, {
+                tokenUnit,
+                showRechargePrice,
+                priceRate,
+                usdExchangeRate,
+                groupRatioMultiplier: getDynamicDisplayGroupRatio(
+                  model,
+                  selectedGroup
+                ),
+              })
+            : null
 
         if (dynamicSummary) {
           if (dynamicSummary.isSpecialExpression) {
@@ -163,9 +184,20 @@ export function usePricingColumns(
                       {index > 0 && (
                         <span className='text-muted-foreground/40 mx-1'>/</span>
                       )}
-                      {stripTrailingZeros(
-                        entry.formattedRange ?? entry.formatted
-                      )}
+                      <DiscountedPrice
+                        discounted={discountMultiplier < 1}
+                        original={
+                          baseDynamicSummary?.entries.find(
+                            (item) => item.key === entry.key
+                          )?.formattedRange ??
+                          baseDynamicSummary?.entries.find(
+                            (item) => item.key === entry.key
+                          )?.formatted
+                        }
+                        effective={stripTrailingZeros(
+                          entry.formattedRange ?? entry.formatted
+                        )}
+                      />
                       {unitLabelKey && <>/{t(unitLabelKey)}</>}
                     </span>
                   )
@@ -205,10 +237,34 @@ export function usePricingColumns(
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              selectedGroup
+              selectedGroup,
+              discountMultiplier
             )
           )
           const outputPrice = stripTrailingZeros(
+            formatPrice(
+              model,
+              'output',
+              tokenUnit,
+              showRechargePrice,
+              priceRate,
+              usdExchangeRate,
+              selectedGroup,
+              discountMultiplier
+            )
+          )
+          const baseInputPrice = stripTrailingZeros(
+            formatPrice(
+              model,
+              'input',
+              tokenUnit,
+              showRechargePrice,
+              priceRate,
+              usdExchangeRate,
+              selectedGroup
+            )
+          )
+          const baseOutputPrice = stripTrailingZeros(
             formatPrice(
               model,
               'output',
@@ -223,9 +279,17 @@ export function usePricingColumns(
           return (
             <div className='max-w-full min-w-0'>
               <span className='font-mono text-sm tabular-nums'>
-                {inputPrice}
+                <DiscountedPrice
+                  discounted={discountMultiplier < 1}
+                  original={baseInputPrice}
+                  effective={inputPrice}
+                />
                 <span className='text-muted-foreground/40 mx-1'>/</span>
-                {outputPrice}
+                <DiscountedPrice
+                  discounted={discountMultiplier < 1}
+                  original={baseOutputPrice}
+                  effective={outputPrice}
+                />
               </span>
               <div className='text-muted-foreground/50 text-[10px]'>
                 / {tokenUnitLabel} tokens
@@ -240,13 +304,29 @@ export function usePricingColumns(
             showRechargePrice,
             priceRate,
             usdExchangeRate,
+            selectedGroup,
+            discountMultiplier
+          )
+        )
+        const basePrice = stripTrailingZeros(
+          formatRequestPrice(
+            model,
+            showRechargePrice,
+            priceRate,
+            usdExchangeRate,
             selectedGroup
           )
         )
 
         return (
           <div className='max-w-full min-w-0'>
-            <span className='font-mono text-sm tabular-nums'>{price}</span>
+            <span className='font-mono text-sm tabular-nums'>
+              <DiscountedPrice
+                discounted={discountMultiplier < 1}
+                original={basePrice}
+                effective={price}
+              />
+            </span>
             <div className='text-muted-foreground/50 text-[10px]'>
               / {t('request')}
             </div>
@@ -263,6 +343,7 @@ export function usePricingColumns(
       header: t('Cached'),
       cell: ({ row }) => {
         const model = row.original
+        const discountMultiplier = getUserModelDiscountMultiplier(model)
         const dynamicSummary = getDynamicPricingSummary(model, {
           tokenUnit,
           showRechargePrice,
@@ -272,7 +353,21 @@ export function usePricingColumns(
             model,
             selectedGroup
           ),
+          discountMultiplier,
         })
+        const baseDynamicSummary =
+          discountMultiplier < 1
+            ? getDynamicPricingSummary(model, {
+                tokenUnit,
+                showRechargePrice,
+                priceRate,
+                usdExchangeRate,
+                groupRatioMultiplier: getDynamicDisplayGroupRatio(
+                  model,
+                  selectedGroup
+                ),
+              })
+            : null
 
         if (dynamicSummary) {
           if (dynamicSummary.isSpecialExpression) {
@@ -289,11 +384,18 @@ export function usePricingColumns(
           if (!cacheEntry) {
             return <span className='text-muted-foreground/30 text-xs'>—</span>
           }
+          const baseCacheEntry = baseDynamicSummary?.entries.find(
+            (entry) => entry.field === 'cacheReadPrice'
+          )
 
           return (
             <div className='max-w-full min-w-0'>
               <span className='font-mono text-sm tabular-nums'>
-                {stripTrailingZeros(cacheEntry.formatted)}
+                <DiscountedPrice
+                  discounted={discountMultiplier < 1}
+                  original={baseCacheEntry?.formatted}
+                  effective={stripTrailingZeros(cacheEntry.formatted)}
+                />
               </span>
               <div className='text-muted-foreground/50 text-[10px]'>
                 / {tokenUnitLabel}
@@ -320,6 +422,18 @@ export function usePricingColumns(
             showRechargePrice,
             priceRate,
             usdExchangeRate,
+            selectedGroup,
+            discountMultiplier
+          )
+        )
+        const baseCachedPrice = stripTrailingZeros(
+          formatPrice(
+            model,
+            'cache',
+            tokenUnit,
+            showRechargePrice,
+            priceRate,
+            usdExchangeRate,
             selectedGroup
           )
         )
@@ -327,7 +441,11 @@ export function usePricingColumns(
         return (
           <div className='max-w-full min-w-0'>
             <span className='font-mono text-sm tabular-nums'>
-              {cachedPrice}
+              <DiscountedPrice
+                discounted={discountMultiplier < 1}
+                original={baseCachedPrice}
+                effective={cachedPrice}
+              />
             </span>
             <div className='text-muted-foreground/50 text-[10px]'>
               / {tokenUnitLabel}

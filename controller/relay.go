@@ -27,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -167,6 +168,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
 	} else {
 		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
+		relayInfo.ReservedDiscountAmounts = priceData.DiscountAmounts
 		if newAPIError != nil {
 			return
 		}
@@ -738,11 +740,12 @@ func executeTaskSubmissionWith(
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
 	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.DiscountAmounts = relayInfo.PriceData.DiscountAmounts
 	task.PrivateData.BillingContext = &model.TaskBillingContext{
 		ModelPrice:      relayInfo.PriceData.ModelPrice,
 		GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
 		ModelRatio:      relayInfo.PriceData.ModelRatio,
-		OtherRatios:     relayInfo.PriceData.OtherRatios(),
+		OtherRatios:     buildTaskBillingOtherRatios(&relayInfo.PriceData),
 		OriginModelName: relayInfo.OriginModelName,
 		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
 		TieredSnapshot:  relayInfo.TieredBillingSnapshot,
@@ -901,4 +904,21 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *taskdto.TaskEr
 		return false
 	}
 	return true
+}
+
+// buildTaskBillingOtherRatios 创建异步任务的计费快照。
+// PriceData.OtherRatios 在没有附加倍率时会返回 nil；这里必须先初始化可写 Map，
+// 以便即使按原价计费也能持久化用户折扣倍率，避免任务提交成功后在落库阶段 panic。
+func buildTaskBillingOtherRatios(priceData *hosttypes.PriceData) map[string]float64 {
+	// 通过 PriceData 重新接收倍率，确保任务快照不会绕过统一的有限值和正数校验。
+	snapshot := hosttypes.PriceData{}
+	if priceData != nil {
+		for key, ratio := range priceData.OtherRatios() {
+			snapshot.AddOtherRatio(key, ratio)
+		}
+		snapshot.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, priceData.UserModelDiscountMultiplier())
+	} else {
+		snapshot.AddOtherRatio(hosttypes.UserModelDiscountRatioKey, 1)
+	}
+	return snapshot.OtherRatios()
 }

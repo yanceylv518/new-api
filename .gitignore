@@ -44,3 +44,6 @@ relaykit/relayconvert/chat_responses_live_local_test.go
 service/openaicompat/chat_responses_live_local_test.go
 go.work
 go.work.sum
+
+# 本地折扣验证工具与压测报告，不进入产品提交。
+/tools/
