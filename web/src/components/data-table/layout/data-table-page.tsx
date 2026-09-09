@@ -175,6 +175,8 @@ export type DataTablePageProps<TData> = {
     row: Row<TData>,
     helpers: DataTableRenderRowHelpers
   ) => React.ReactNode
+  /** 与 renderRow 配合返回独立 tbody；加载和空状态仍使用默认表体。 */
+  renderRowGroups?: boolean
 
   /**
    * Desktop column className resolver. Use for semantic alignment/spacing only;
@@ -432,6 +434,7 @@ function renderMobile<TData>(
           emptyAction={props.emptyAction}
           skeletonKeyPrefix={props.skeletonKeyPrefix}
           renderRow={props.renderRow}
+          renderRowGroups={props.renderRowGroups}
           applyHeaderSize={props.applyHeaderSize}
           tableHeaderClassName={cn(
             '[background-color:var(--table-header)]',
@@ -531,6 +534,7 @@ function renderDesktop<TData>(
       emptyAction={props.emptyAction}
       skeletonKeyPrefix={props.skeletonKeyPrefix}
       renderRow={props.renderRow}
+      renderRowGroups={props.renderRowGroups}
       applyHeaderSize={props.applyHeaderSize}
       splitHeader={fixedHeight}
       tableContainerClassName={fixedHeight ? 'h-full min-h-0' : undefined}

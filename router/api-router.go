@@ -153,6 +153,8 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.DELETE("/:id/bindings/:binding_type", controller.AdminClearUserBinding)
 				adminRoute.GET("/:id", controller.GetUser)
 				adminRoute.GET("/:id/model-pricing", middleware.DisableCache(), controller.GetUserModelPricing)
+				adminRoute.GET("/model-pricing", middleware.DisableCache(), controller.GetUserModelPricingOverview)
+				adminRoute.GET("/:id/model-pricing/rules", middleware.DisableCache(), controller.GetUserModelPricingRulePage)
 				adminRoute.PUT("/:id/model-pricing", middleware.DisableCache(), controller.UpdateUserModelPricing)
 				adminRoute.POST("/", controller.CreateUser)
 				adminRoute.POST("/manage", controller.ManageUser)

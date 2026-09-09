@@ -31,6 +31,8 @@ import type {
   ApiResponse,
   UserModelPricingCollection,
   UserModelPricingReplacePayload,
+  UserModelPricingOverviewData,
+  UserModelPricingOverviewParams,
 } from './types'
 
 // ============================================================================
@@ -171,6 +173,48 @@ export async function replaceUserModelPricing(
   payload: UserModelPricingReplacePayload
 ): Promise<ApiResponse> {
   const res = await api.put(`/api/user/${userId}/model-pricing`, payload)
+  return res.data
+}
+
+/** 总览只请求摘要，规则通过展开区分页接口按需加载。 */
+export async function getUserModelPricingOverview(
+  params: UserModelPricingOverviewParams = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<UserModelPricingOverviewData>> {
+  const res = await api.get('/api/user/model-pricing', {
+    // React Query 管理去重和取消，避免共享已取消的 Axios 请求。
+    disableDuplicate: true,
+    skipErrorHandler: true,
+    signal,
+    params: {
+      keyword: params.keyword,
+      p: params.p,
+      page_size: params.page_size,
+      summary: true,
+    },
+  })
+  return res.data
+}
+
+/** 读取单个用户的一页匹配规则；取消展开后可取消未完成请求。 */
+export async function getUserModelPricingRulePage(
+  userId: number,
+  keyword: string,
+  page: number,
+  signal: AbortSignal
+) {
+  const res = await api.get<
+    ApiResponse<{
+      items: import('./types').UserModelPricingItem[]
+      total: number
+      page_size: number
+    }>
+  >(`/api/user/${userId}/model-pricing/rules`, {
+    disableDuplicate: true,
+    skipErrorHandler: true,
+    params: { keyword, p: page },
+    signal,
+  })
   return res.data
 }
 

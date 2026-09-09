@@ -48,6 +48,8 @@ export type DataTableViewProps<TData> = {
   emptyCellClassName?: string
   skeletonKeyPrefix?: string
   skeletonRowHeight?: string
+  /** 自定义行返回独立 tbody 分组，使组内 sticky 行受当前分组边界约束。 */
+  renderRowGroups?: boolean
   renderRow?: (
     row: Row<TData>,
     helpers: DataTableRenderRowHelpers

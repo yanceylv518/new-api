@@ -251,6 +251,15 @@ function renderTableBody<TData>(
   colSpan: number,
   getColumnClassName: DataTableColumnClassName
 ) {
+  // 分组直接挂在 table 下，避免 tbody 嵌套，并让浏览器原生处理吸顶行的交接。
+  if (
+    props.renderRowGroups &&
+    props.renderRow &&
+    !props.isLoading &&
+    rows.length > 0
+  ) {
+    return renderTableBodyContent(props, rows, colSpan, getColumnClassName)
+  }
   return (
     <TableBody className={props.tableBodyClassName}>
       {renderTableBodyContent(props, rows, colSpan, getColumnClassName)}

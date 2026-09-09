@@ -376,3 +376,17 @@ bun run build
 - `3d1eaf61fa6524a5d5d3ecf263067774c232ec11`：rc35 没有源提交引用的 `idx_logs_user_created_type`，改用现有 `idx_user_id_id` 的 MySQL 优化器注释提示，匹配用户条件和 ID 排序，不增加日志大表索引。MySQL 5.7 等不支持该提示的版本会忽略注释；兼容测试不等于这些版本已获得强制索引效果。
 
 验证：`PRICING_EXTERNAL_TESTS=1 go test ./model -run '^TestUserLogFinalOutcomeDatabaseMatrix$' -v -count=1 -timeout=3m` 在 SQLite 3.50.4、MySQL 5.7.44、PostgreSQL 17.11 通过；覆盖分页、类型/模型筛选不复活中间错误、跨用户同 request_id、空/NULL 请求 ID、管理员完整链。`go test ./model -count=1 -timeout=3m` 和 `go build ./...` 通过。前端 `bun run typecheck` 通过；`bun run test src/features/usage-logs --maxWorkers=2` 为 13 个文件、114 项全部通过。
+
+## 13. 用户折扣总览增量移植（2026-09-09）
+
+本轮目标为 `custom/rc35-user-model-discount`，在 `540ba8f34` 上增加 `/users/model-pricing`，保留 rc35 现有独立版本表、计费和批量编辑实现。新增总览和明细查询各自放在独立文件，未覆盖 rc35 的折扣核心。用户管理页和侧边栏均有入口。
+
+总览请求 `/api/user/model-pricing?summary=true`，仅返回每个用户的匹配模型数量、折扣区间；展开后通过 `/api/user/:id/model-pricing/rules` 加载每页 20 条明细。搜索模型时排除其他规则，同模型的多个用户独立显示。桌面用户行紧贴表头吸顶、下一用户接替；卡片按宽度自动排列，只保留模型名和折扣比例。组件复用 rc35 的 DataTablePage、ErrorState、EmptyState、LoadingState 和原编辑弹窗，公共表格只增加可选 tbody 分组渲染能力。
+
+请求由 React Query 管理去重及取消，切换搜索重置明细分页，保存和刷新使摘要及明细失效；收起释放明细缓存。未增加数据库迁移或全局统计缓存。精确统计及包含搜索仍有扫描成本，深分页仍有 OFFSET 成本，均有 5 秒查询预算。
+
+rc35 本机 SQLite 10 万条规则基准（100 用户 × 1000 规则、20 用户/页、3 次采样）：完整响应 963612 字节，摘要 3752 字节；分配内存约 13.3 MB 降到 74.5 KB；查询加序列化约 219 ms 降到 112 ms，20 条明细约 1.22 ms。这是本机基准，未推断生产并发容量。
+
+数据库验证命令：`PRICING_EXTERNAL_TESTS=1 go test ./model -run 'Test(GetUserModelPricingOverview|UserModelPricingSummaryAndRulePages|UserModelPricingExternalDatabases)' -count=1 -v`。真实 SQLite 3.50.4、MySQL 5.7.44、PostgreSQL 17.11 通过；覆盖摘要、分页、模型搜索、跨用户同模型、角色边界及模型大小写统计。`go build ./...` 和完整 model 测试通过。前端 `bun run typecheck`、`bun run build`、改动文件 lint/格式检查通过；总览与原编辑弹窗 Vitest 测试共 12 项通过。初始化状态缓存已由 rc35 基线修复，本轮未重复移植。
+
+验证限制：完整 controller 测试未通过，多项未改动的认证测试在 Windows 清理 `audit.db` 时因文件占用失败，60 秒限时重跑也超时；未将它们计为通过。本轮接口通过独立 `go test ./controller -run '^TestUserModelPricingManagementContract$' -count=1 -timeout=60s` 验证。数据库验证创建的专用 Compose 容器及网络已清理。
