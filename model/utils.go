@@ -62,67 +62,9 @@ func addNewRecord(type_ int, id int, value int) {
 	batchUpdateStores[type_][id] = sum
 }
 
+// batchUpdate 保留原有周期刷盘入口，失败批次由事务提交标识保护重试。
 func batchUpdate() {
-	// check if there's any data to update
-	hasData := false
-	for i := 0; i < BatchUpdateTypeCount; i++ {
-		batchUpdateLocks[i].Lock()
-		if len(batchUpdateStores[i]) > 0 {
-			hasData = true
-			batchUpdateLocks[i].Unlock()
-			break
-		}
-		batchUpdateLocks[i].Unlock()
-	}
-
-	if !hasData {
-		return
-	}
-
-	common.SysLog("batch update started")
-	stores := make([]map[int]int, BatchUpdateTypeCount)
-	for i := 0; i < BatchUpdateTypeCount; i++ {
-		batchUpdateLocks[i].Lock()
-		stores[i] = batchUpdateStores[i]
-		batchUpdateStores[i] = make(map[int]int)
-		batchUpdateLocks[i].Unlock()
-	}
-
-	for i, store := range stores {
-		if i == BatchUpdateTypeUserQuota || i == BatchUpdateTypeUsedQuota || i == BatchUpdateTypeRequestCount {
-			continue
-		}
-		for key, value := range store {
-			switch i {
-			case BatchUpdateTypeTokenQuota:
-				err := increaseTokenQuota(key, value)
-				if err != nil {
-					common.SysLog("failed to batch update token quota: " + err.Error())
-				}
-			case BatchUpdateTypeChannelUsedQuota:
-				updateChannelUsedQuota(key, value)
-			}
-		}
-	}
-
-	userQuotaStore := stores[BatchUpdateTypeUserQuota]
-	usedQuotaStore := stores[BatchUpdateTypeUsedQuota]
-	requestCountStore := stores[BatchUpdateTypeRequestCount]
-
-	userIDs := make(map[int]struct{}, len(userQuotaStore)+len(usedQuotaStore)+len(requestCountStore))
-	for key := range userQuotaStore {
-		userIDs[key] = struct{}{}
-	}
-	for key := range usedQuotaStore {
-		userIDs[key] = struct{}{}
-	}
-	for key := range requestCountStore {
-		userIDs[key] = struct{}{}
-	}
-	for key := range userIDs {
-		updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
-	}
-	common.SysLog("batch update finished")
+	flushAccountingBatch()
 }
 
 func RecordExist(err error) (bool, error) {

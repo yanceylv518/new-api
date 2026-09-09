@@ -685,14 +685,15 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		if result.Clamp != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算额度发生饱和: %+v", task.TaskID, result.Clamp))
 		}
-		bc.TieredSnapshot.UsageFacts = usageFacts
-		bc.TieredSnapshot.EstimatedTier = result.MatchedTier
+		// 事务提交前保留原快照作为版本依据，失败时不能提前覆盖调用方内存。
+		settledSnapshot := *bc.TieredSnapshot
+		settledSnapshot.UsageFacts = usageFacts
+		settledSnapshot.EstimatedTier = result.MatchedTier
 		// 终态表达式使用提交时折扣，折前和折后都从本次表达式结果计算。
 		before, after := result.ActualQuotaAfterGroup, result.ActualQuotaAfterGroup
 		if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
-			value := result.ActualQuotaBeforeGroup * bc.TieredSnapshot.GroupRatio * price.UserModelDiscountMultiplier()
 			var clamp *common.QuotaClamp
-			after, clamp = common.QuotaRoundChecked(value)
+			after, clamp = common.QuotaDiscountChecked(result.ActualQuotaBeforeGroup*bc.TieredSnapshot.GroupRatio, price.UserModelDiscountMultiplier(), false)
 			if result.Clamp == nil {
 				result.Clamp = clamp
 			}
@@ -700,7 +701,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 				after = 1
 			}
 		}
-		RecalculateTaskQuotaWithAmounts(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), "任务用量表达式结算", result.Clamp)
+		settleTaskQuotaWithSnapshot(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), &settledSnapshot, "任务用量表达式结算", result.Clamp)
 		return true
 	}
 	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
@@ -714,7 +715,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		var clamp *common.QuotaClamp
 		if price := taskBillingContextPriceData(task.PrivateData.BillingContext); price != nil {
 			value := float64(before) * price.UserModelDiscountMultiplier()
-			actualQuota, clamp = common.QuotaFromFloatChecked(value)
+			actualQuota, clamp = common.QuotaDiscountChecked(float64(before), price.UserModelDiscountMultiplier(), true)
 			if value > 0 && actualQuota == 0 {
 				actualQuota = 1
 			}

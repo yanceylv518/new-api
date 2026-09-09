@@ -41,6 +41,7 @@ func TestMain(m *testing.M) {
 		&User{},
 		&UserModelPricing{},
 		&UserModelPricingRevision{},
+		&AccountingBatchReceipt{},
 		&UserSession{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},

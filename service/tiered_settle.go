@@ -203,9 +203,10 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 	originalQuota := tr.ActualQuotaAfterGroup
 	discountRatio := relayInfo.PriceData.UserModelDiscountMultiplier()
 	if discountRatio != 1 {
-		discountedQuota := tr.ActualQuotaBeforeGroup * snap.GroupRatio * discountRatio
+		beforeDiscount := tr.ActualQuotaBeforeGroup * snap.GroupRatio
 		var discountClamp *common.QuotaClamp
-		tr.ActualQuotaAfterGroup, discountClamp = common.QuotaRoundChecked(discountedQuota)
+		// 与任务终态共享同一十进制折扣契约，统一处理半额度和非有限输入。
+		tr.ActualQuotaAfterGroup, discountClamp = common.QuotaDiscountChecked(beforeDiscount, discountRatio, false)
 		// 折后未饱和也必须保留折前异常，供渠道统计和管理员审计。
 		if tr.Clamp == nil {
 			tr.Clamp = discountClamp

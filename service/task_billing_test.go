@@ -136,6 +136,14 @@ func seedChargedAccounting(t *testing.T, userID, channelID, tokenID, quota, requ
 	}
 }
 
+// 结算必须针对已提交任务，夹具在调用生产结算前保存完整配置，不模拟不存在的任务 ID。
+func persistTaskForBillingTest(t *testing.T, task *model.Task) {
+	t.Helper()
+	if task.ID == 0 {
+		require.NoError(t, model.DB.Create(task).Error)
+	}
+}
+
 func makeTask(userId, channelId, quota, tokenId int, billingSource string, subscriptionId int) *model.Task {
 	return &model.Task{
 		TaskID:    "task_" + time.Now().Format("150405.000"),
@@ -989,6 +997,7 @@ func TestRecalculate_PositiveDelta(t *testing.T) {
 
 	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, actualQuota, "adaptor adjustment")
 
 	// User quota should decrease by the delta (1000 additional charge)
@@ -1028,6 +1037,7 @@ func TestRecalculate_NegativeDelta(t *testing.T) {
 
 	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, actualQuota, "adaptor adjustment")
 
 	// User quota should increase by abs(delta) = 2000 (refund overpayment)
@@ -1061,13 +1071,16 @@ func TestRecalculate_ZeroDelta(t *testing.T) {
 	seedUser(t, userID, initQuota)
 
 	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
+	// 金额快照也已一致时才是真正的无变更结算，应保持不新增日志。
+	task.PrivateData.DiscountAmounts = types.NewDiscountAmounts(preConsumed, preConsumed)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, preConsumed, "exact match")
 
 	// No change to user quota
 	assert.Equal(t, initQuota, getUserQuota(t, userID))
 
-	// No log created (delta is zero)
+	// 金额和元数据都未变化，不产生第二条日志。
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
@@ -1083,6 +1096,7 @@ func TestRecalculate_ActualQuotaZero(t *testing.T) {
 	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
 	require.NoError(t, model.DB.Create(task).Error)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, 0, "zero actual")
 
 	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
@@ -1102,6 +1116,7 @@ func TestRecalculate_RejectsNegativeActualQuota(t *testing.T) {
 	seedUser(t, userID, initQuota)
 	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, -1, "invalid negative actual")
 
 	assert.Equal(t, initQuota, getUserQuota(t, userID))
@@ -1127,6 +1142,7 @@ func TestRecalculate_Subscription_NegativeDelta(t *testing.T) {
 
 	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceSubscription, subID)
 
+	persistTaskForBillingTest(t, task)
 	RecalculateTaskQuota(ctx, task, actualQuota, "subscription over-charge")
 
 	// Subscription used should decrease by delta (refund 3000)
@@ -1384,6 +1400,7 @@ func TestSettle_PerCallBilling_SkipsAdaptorAdjust(t *testing.T) {
 	adaptor := &mockAdaptor{adjustReturn: 2000}
 	taskResult := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 
 	// Per-call: no adjustment despite adaptor returning 2000
@@ -1412,6 +1429,7 @@ func TestSettle_PerCallBilling_SkipsTotalTokens(t *testing.T) {
 	adaptor := &mockAdaptor{adjustReturn: 0}
 	taskResult := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, TotalTokens: 9999}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 
 	// Per-call: no recalculation by tokens
@@ -1441,6 +1459,7 @@ func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
 	adaptor := &mockAdaptor{adjustReturn: adaptorQuota}
 	taskResult := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 
 	// Non-per-call: adaptor adjustment applies (refund 2000)
@@ -1472,6 +1491,7 @@ func TestSettle_TieredEvaluationFailureKeepsPreConsumedCharge(t *testing.T) {
 		TaskUsageBilling: true,
 	}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(ctx, &mockAdaptor{}, task, &relaycommon.TaskInfo{Status: model.TaskStatusFailure})
 
 	assert.True(t, settled)
@@ -1502,6 +1522,7 @@ func TestSettle_TieredFailureReturnsFalseForCallerRefund(t *testing.T) {
 		EstimatedTier:    "base",
 	}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(
 		ctx,
 		&mockAdaptor{adjustReturn: 1},
@@ -1539,6 +1560,7 @@ func TestSettle_TieredSuccessStillRecomputes(t *testing.T) {
 		EstimatedTier:    "base",
 	}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(
 		ctx,
 		&mockAdaptor{adjustReturn: 1},
@@ -1612,6 +1634,7 @@ func TestSettle_TieredUsageFactsMergeCompletionOverSubmission(t *testing.T) {
 				EstimatedTier:    "base",
 			}
 
+			persistTaskForBillingTest(t, task)
 			settled := settleTaskBillingOnComplete(
 				context.Background(),
 				&mockAdaptor{},
@@ -1661,6 +1684,7 @@ func TestSettle_TieredSnapshotWriteBackUsesSettledFactsAndMatchedTier(t *testing
 		EstimatedTier:    "720P",
 	}
 
+	persistTaskForBillingTest(t, task)
 	settled := settleTaskBillingOnComplete(
 		context.Background(),
 		&mockAdaptor{},
@@ -1677,6 +1701,12 @@ func TestSettle_TieredSnapshotWriteBackUsesSettledFactsAndMatchedTier(t *testing
 	assert.Equal(t, map[string]any{"resolution": "1080P", "seconds": float64(5)}, snap.UsageFacts)
 	assert.Equal(t, "1080P", snap.EstimatedTier)
 	assert.Equal(t, 50, task.Quota)
+	// 必须检查重新加载的任务，不能仅断言调用方内存已被改写。
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	require.NotNil(t, persisted.PrivateData.BillingContext.TieredSnapshot)
+	assert.Equal(t, snap.UsageFacts, persisted.PrivateData.BillingContext.TieredSnapshot.UsageFacts)
+	assert.Equal(t, "1080P", persisted.PrivateData.BillingContext.TieredSnapshot.EstimatedTier)
 
 	log := getLastLog(t)
 	require.NotNil(t, log)
@@ -1737,6 +1767,7 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 			seedChannel(t, channelID)
 
 			task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+			persistTaskForBillingTest(t, task)
 			settled := settleTaskBillingOnComplete(
 				context.Background(),
 				&mockAdaptor{},

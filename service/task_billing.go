@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -101,43 +102,6 @@ func resolveTokenKey(ctx context.Context, tokenId int, taskID string) string {
 	return token.Key
 }
 
-// taskIsSubscription 判断任务是否通过订阅计费。
-func taskIsSubscription(task *model.Task) bool {
-	return task.PrivateData.BillingSource == BillingSourceSubscription && task.PrivateData.SubscriptionId > 0
-}
-
-// taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
-func taskAdjustFunding(task *model.Task, delta int) error {
-	if taskIsSubscription(task) {
-		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
-	}
-	if delta > 0 {
-		return model.DecreaseUserQuota(task.UserId, delta, false)
-	}
-	return model.IncreaseUserQuota(task.UserId, -delta, false)
-}
-
-// taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
-// 需要通过 resolveTokenKey 运行时获取 key（不从 PrivateData 中读取）。
-func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
-	if task.PrivateData.TokenId <= 0 || delta == 0 {
-		return
-	}
-	tokenKey := resolveTokenKey(ctx, task.PrivateData.TokenId, task.TaskID)
-	if tokenKey == "" {
-		return
-	}
-	var err error
-	if delta > 0 {
-		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
-	} else {
-		err = model.IncreaseTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
-	}
-	if err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("调整令牌额度失败 (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
-	}
-}
-
 // taskBillingOther 从 task 的 BillingContext 构建日志 Other 字段。
 func taskBillingOther(task *model.Task) *model.LogOther {
 	other := model.NewLogOther()
@@ -221,18 +185,20 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		return true
 	}
 
-	// 1. 退还资金来源（钱包或订阅）
-	if err := taskAdjustFunding(task, -quota); err != nil {
+	// 资金、令牌、渠道及任务金额在同一主库事务内退款，重复请求由持久化任务金额去重。
+	var amounts *types.DiscountAmounts
+	if task.PrivateData.DiscountAmounts != nil {
+		amounts = types.NewDiscountAmounts(0, 0)
+	}
+	delta, err := model.CommitTaskSettlement(ctx, task, 0, amounts)
+	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还资金来源失败 task %s: %s", task.TaskID, err.Error()))
 		return false
 	}
-
-	// 2. 退还令牌额度
-	taskAdjustTokenQuota(ctx, task, -quota)
-
-	// 3. 回减预扣时累计的用户和渠道用量，请求次数保持不变
-	model.UpdateUserUsedQuota(task.UserId, -quota)
-	model.UpdateChannelUsedQuota(task.ChannelId, -task.PrivateData.DiscountAmounts.ChannelQuota(quota))
+	if delta == 0 {
+		return true
+	}
+	quota = -delta
 
 	// 4. 记录日志
 	other := taskBillingOther(task)
@@ -254,15 +220,6 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		Other:     other,
 	})
 
-	// 5. 资金退款完成后再清除持久化标记。
-	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
-	task.Quota = 0
-	if task.PrivateData.DiscountAmounts != nil {
-		task.PrivateData.DiscountAmounts = types.NewDiscountAmounts(0, 0)
-	}
-	if err := task.UpdateQuotaAndDiscountAmounts(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("退款成功但清除 task quota 失败 task %s: %s", task.TaskID, err.Error()))
-	}
 	return true
 }
 
@@ -283,30 +240,29 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // RecalculateTaskQuotaWithAmounts 在资金调整成功后保存本次实际费用快照。
 // 日志中的三项金额是任务总额，原 quota 字段仍表示本次补扣或退款差额。
 func RecalculateTaskQuotaWithAmounts(ctx context.Context, task *model.Task, actualQuota int, amounts *types.DiscountAmounts, reason string, clamps ...*common.QuotaClamp) {
+	settleTaskQuotaWithSnapshot(ctx, task, actualQuota, amounts, nil, reason, clamps...)
+}
+
+// settleTaskQuotaWithSnapshot 在同一结算中保存可选的最终用量；只有事务确实更新时才记日志。
+func settleTaskQuotaWithSnapshot(ctx context.Context, task *model.Task, actualQuota int, amounts *types.DiscountAmounts, snapshot *billingexpr.BillingSnapshot, reason string, clamps ...*common.QuotaClamp) {
 	if actualQuota < 0 {
 		return
 	}
-	preConsumedQuota := task.Quota
-	quotaDelta := actualQuota - preConsumedQuota
-
-	if quotaDelta == 0 {
-		previousAmounts := task.PrivateData.DiscountAmounts
-		if amounts != nil {
-			task.PrivateData.DiscountAmounts = amounts
-			if err := task.UpdateQuotaAndDiscountAmounts(); err != nil {
-				logger.LogError(ctx, fmt.Sprintf("保存任务金额快照失败 task %s: %s", task.TaskID, err.Error()))
-				task.PrivateData.DiscountAmounts = previousAmounts
-				return
-			}
-			// 折后整数相同也可能对应不同折前金额，渠道统计必须补记原价差额。
-			if previousAmounts != nil && previousAmounts.After == actualQuota && amounts.After == actualQuota {
-				model.UpdateChannelUsedQuota(task.ChannelId, amounts.Before-previousAmounts.Before)
-			}
-		}
-		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 预扣费准确（%s，%s）",
-			task.TaskID, logger.LogQuota(actualQuota), reason))
+	// 不允许不匹配的 JSON 金额快照进入资金调整，避免实扣、渠道与日志各记不同金额。
+	if amounts != nil && !amounts.ValidFor(actualQuota) {
+		logger.LogError(ctx, fmt.Sprintf("任务金额快照与实际扣款不一致 task %s", task.TaskID))
 		return
 	}
+	result, err := model.CommitTaskSettlementWithSnapshot(ctx, task, actualQuota, amounts, snapshot)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("任务原子结算失败 task %s: %s", task.TaskID, err.Error()))
+		return
+	}
+	if !result.Updated {
+		return
+	}
+	quotaDelta := result.QuotaDelta
+	preConsumedQuota := actualQuota - quotaDelta
 
 	logger.LogInfo(ctx, fmt.Sprintf("任务 %s 差额结算：delta=%s（实际：%s，预扣：%s，%s）",
 		task.TaskID,
@@ -316,42 +272,15 @@ func RecalculateTaskQuotaWithAmounts(ctx context.Context, task *model.Task, actu
 		reason,
 	))
 
-	previousAmounts := task.PrivateData.DiscountAmounts
-	// 调整资金来源
-	if err := taskAdjustFunding(task, quotaDelta); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("差额结算资金调整失败 task %s: %s", task.TaskID, err.Error()))
-		return
-	}
-
-	// 调整令牌额度
-	taskAdjustTokenQuota(ctx, task, quotaDelta)
-
-	task.Quota = actualQuota
-	if amounts != nil {
-		task.PrivateData.DiscountAmounts = amounts
-		if err := task.UpdateQuotaAndDiscountAmounts(); err != nil {
-			logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
-		}
-	} else if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
-	}
-
-	// 目标版本结算只调整用量，不再次累计请求次数。
-	model.UpdateUserUsedQuota(task.UserId, quotaDelta)
 	var logType int
 	var logQuota int
-	if quotaDelta > 0 {
+	if quotaDelta >= 0 {
 		logType = model.LogTypeConsume
 		logQuota = quotaDelta
 	} else {
 		logType = model.LogTypeRefund
 		logQuota = -quotaDelta
 	}
-	channelDelta := quotaDelta
-	if previousAmounts != nil && amounts != nil && previousAmounts.After == preConsumedQuota && amounts.After == actualQuota {
-		channelDelta = amounts.Before - previousAmounts.Before
-	}
-	model.UpdateChannelUsedQuota(task.ChannelId, channelDelta)
 	other := taskBillingOther(task)
 	other.SetPublic("task_id", task.TaskID)
 	other.SetPublic("pre_consumed_quota", preConsumedQuota)
@@ -374,6 +303,8 @@ func RecalculateTaskQuotaWithAmounts(ctx context.Context, task *model.Task, actu
 		Group:     task.Group,
 		Other:     other,
 		NodeName:  task.PrivateData.NodeName,
+		// 零差额只补齐最终费用或用量，不能再次计入导出的请求次数。
+		MetadataOnly: quotaDelta == 0,
 	})
 }
 
@@ -424,7 +355,8 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	// 计算 OtherRatios 乘积（视频折扣、时长等）
 	otherMultiplier := 1.0
 	beforeMultiplier := 1.0
-	if priceData := taskBillingContextPriceData(task.PrivateData.BillingContext); priceData != nil {
+	priceData := taskBillingContextPriceData(task.PrivateData.BillingContext)
+	if priceData != nil {
 		otherMultiplier = priceData.OtherRatioMultiplier()
 		beforeMultiplier = priceData.OtherRatioMultiplierBeforeDiscount()
 	}
@@ -435,6 +367,11 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
 	originalValue := float64(totalTokens) * modelRatio * finalGroupRatio * beforeMultiplier
+	// 折前沿用任务既有计价；只将用户折扣改为十进制乘法，避免 200*0.29 截断成 57。
+	// 先截断再走统一饱和转换器，保留任务的截断契约及非有限输入的审计行为。
+	if priceData != nil && priceData.UserModelDiscountMultiplier() != 1 {
+		actualQuota, clamp = common.QuotaDiscountChecked(originalValue, priceData.UserModelDiscountMultiplier(), true)
+	}
 	originalQuota, originalClamp := common.QuotaFromFloatChecked(originalValue)
 	if originalQuota > 0 && actualQuota == 0 && otherMultiplier != beforeMultiplier {
 		actualQuota = 1
