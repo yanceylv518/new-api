@@ -108,6 +108,11 @@ export function SidebarModulesCard() {
           title: t('Task Logs'),
           description: t('System task records'),
         },
+        {
+          key: 'assets',
+          title: t('Assets'),
+          description: t('Seedance asset library'),
+        },
       ],
     },
     {

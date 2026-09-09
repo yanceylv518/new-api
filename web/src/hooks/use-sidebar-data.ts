@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   Activity,
+  Archive,
   Box,
   ClipboardList,
   CreditCard,
@@ -104,6 +105,11 @@ export function useSidebarData(): SidebarData {
             activeUrls: ['/usage-logs/drawing'],
             configUrls: ['/usage-logs/drawing', '/usage-logs/task'],
             icon: ListTodo,
+          },
+          {
+            title: t('Assets'),
+            url: '/seedance-assets',
+            icon: Archive,
           },
         ],
       },

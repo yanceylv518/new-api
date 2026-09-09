@@ -12,7 +12,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const redisRateLimitNamespace = "rateLimit:v2"
+const (
+	redisRateLimitNamespace         = "rateLimit:v2"
+	seedanceAssetRateLimitRequests  = 60
+	seedanceAssetRateLimitWindowSec = 60
+)
 
 // Redis rate limiting intentionally uses a fixed window. The single Lua script
 // makes increment, expiry, and the limit decision atomic, while retaining the
@@ -195,6 +199,11 @@ func DownloadRateLimit() func(c *gin.Context) {
 
 func UploadRateLimit() func(c *gin.Context) {
 	return rateLimitFactory(common.UploadRateLimitNum, common.UploadRateLimitDuration, "UP")
+}
+
+// SeedanceAssetRateLimit 为素材库所有读写接口提供统一的用户维度限流。
+func SeedanceAssetRateLimit() func(c *gin.Context) {
+	return userRateLimitFactory(seedanceAssetRateLimitRequests, seedanceAssetRateLimitWindowSec, "SA")
 }
 
 // userRateLimitFactory creates a rate limiter keyed by authenticated user ID

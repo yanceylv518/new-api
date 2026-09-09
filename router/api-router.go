@@ -124,6 +124,16 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.POST("/waffo-pancake/pay", middleware.CriticalRateLimit(), controller.RequestWaffoPancakePay)
 				selfRoute.POST("/aff_transfer", middleware.UserCriticalRateLimit("aff-transfer"), controller.TransferAffQuota)
 				selfRoute.PUT("/setting", controller.UpdateUserSetting)
+				// 素材接口继承用户鉴权与禁用缓存，并按用户限制操作速率。
+				selfRoute.GET("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssetGroups)
+				selfRoute.POST("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAssetGroup)
+				selfRoute.PUT("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.UpdateSeedanceAssetGroup)
+				selfRoute.DELETE("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAssetGroup)
+				selfRoute.GET("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssets)
+				selfRoute.POST("/seedance/assets/upload", middleware.SeedanceAssetRateLimit(), middleware.UploadRateLimit(), middleware.DisableCache(), controller.UploadSeedanceAsset)
+				selfRoute.POST("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAsset)
+				selfRoute.POST("/seedance/assets/:id/refresh", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.RefreshSeedanceAsset)
+				selfRoute.DELETE("/seedance/assets/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAsset)
 
 				// 2FA routes
 				selfRoute.GET("/2fa/status", controller.Get2FAStatus)
@@ -205,6 +215,8 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			optionRoute.GET("/", controller.GetOptions)
 			optionRoute.PUT("/", controller.UpdateOption)
+			// OSS 配置仅允许现有 RootAuth 路由访问。
+			optionRoute.PUT("/private-asset-oss", controller.UpdatePrivateAssetOSSSettings)
 			optionRoute.GET("/model_pricing", controller.GetModelPricingConfig)
 			optionRoute.PATCH("/model_pricing", controller.UpdateModelPricingConfig)
 			optionRoute.POST("/payment_compliance", controller.ConfirmPaymentCompliance)

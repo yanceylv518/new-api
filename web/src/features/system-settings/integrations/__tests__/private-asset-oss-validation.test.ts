@@ -1,0 +1,73 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+
+import { describe, test } from 'vitest'
+
+import { createPrivateAssetOSSSchema } from '../private-asset-oss-validation'
+
+const schema = createPrivateAssetOSSSchema((key) => key)
+
+const validSettings = {
+  region: 'cn-hangzhou',
+  endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+  bucket: 'private-assets',
+  prefix: 'private-assets/',
+  accessKeyId: 'test-id',
+  accessKeySecret: '',
+}
+
+describe('Private asset OSS settings validation', () => {
+  // 首次配置必须提供密钥；已配置时留空代表保留，不能误发空字符串覆盖。
+  test('requires a secret only for the initial OSS configuration', () => {
+    const initialSchema = createPrivateAssetOSSSchema((key) => key, false)
+    assert.equal(initialSchema.safeParse(validSettings).success, false)
+    assert.equal(
+      initialSchema.safeParse({
+        ...validSettings,
+        accessKeySecret: 'test-secret',
+      }).success,
+      true
+    )
+    assert.equal(schema.safeParse(validSettings).success, true)
+  })
+  test('accepts an HTTPS Alibaba Cloud OSS configuration', () => {
+    assert.equal(schema.safeParse(validSettings).success, true)
+  })
+
+  test('rejects HTTP endpoints', () => {
+    assert.equal(
+      schema.safeParse({
+        ...validSettings,
+        endpoint: 'http://oss-cn-hangzhou.aliyuncs.com',
+      }).success,
+      false
+    )
+  })
+
+  test('rejects invalid prefix path segments', () => {
+    assert.equal(
+      schema.safeParse({
+        ...validSettings,
+        prefix: 'private-assets/../other',
+      }).success,
+      false
+    )
+  })
+})

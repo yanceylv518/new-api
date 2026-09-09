@@ -22,6 +22,7 @@ import type {
   ConfirmPaymentComplianceResponse,
   FetchUpstreamRatiosRequest,
   LogCleanupTask,
+  PrivateAssetOSSSettingsRequest,
   SystemOptionsResponse,
   SystemTaskListResponse,
   SystemTaskResponse,
@@ -38,6 +39,17 @@ export async function getSystemOptions() {
 
 export async function updateSystemOption(request: UpdateOptionRequest) {
   const res = await api.put<UpdateOptionResponse>('/api/option/', request)
+  return res.data
+}
+
+// OSS 配置通过专用接口原子保存，空密钥由服务端保留现有值。
+export async function updatePrivateAssetOSSSettings(
+  request: PrivateAssetOSSSettingsRequest
+) {
+  const res = await api.put<UpdateOptionResponse>(
+    '/api/option/private-asset-oss',
+    request
+  )
   return res.data
 }
 

@@ -79,6 +79,7 @@ import {
   renderAuditContent,
 } from '../../lib/format'
 import { buildQuotaAuditOperation } from '../../lib/quota-audit-operation'
+import { getTaskSettlementRefund } from '../../lib/task-refund'
 import {
   getLogTypeConfig,
   isPerCallBilling,
@@ -448,6 +449,8 @@ export function DetailsDialog(props: DetailsDialogProps) {
 
   const isViolation = isViolationFeeLog(other)
   const isRefund = props.log.type === 6
+  // 直接读取历史日志的额度快照，随所选日志更新，不依赖原因文案或新增状态。
+  const taskSettlementRefund = getTaskSettlementRefund(props.log.type, other)
   const isConsume = props.log.type === 2
   const isTopup = props.log.type === 1
   const isManage = props.log.type === 3
@@ -826,11 +829,36 @@ export function DetailsDialog(props: DetailsDialogProps) {
           </DetailSection>
         )}
 
-        {/* Refund details (type=6) */}
+        {/* 退差额展示实际结算金额；其他任务退款继续展示原有原因。 */}
         {isRefund && other && (other.task_id || other.reason) && (
-          <DetailSection label={t('Refund Details')}>
+          <DetailSection
+            label={
+              taskSettlementRefund
+                ? t('Task settlement refund')
+                : t('Refund Details')
+            }
+          >
             {other.task_id && (
               <DetailRow label={t('Task ID')} value={other.task_id} mono />
+            )}
+            {taskSettlementRefund && (
+              <>
+                <DetailRow
+                  label={t('Pre-consumed')}
+                  value={formatLogQuota(taskSettlementRefund.preConsumedQuota)}
+                  mono
+                />
+                <DetailRow
+                  label={t('Actual cost')}
+                  value={formatLogQuota(taskSettlementRefund.actualQuota)}
+                  mono
+                />
+                <DetailRow
+                  label={t('Refund amount')}
+                  value={formatLogQuota(props.log.quota)}
+                  mono
+                />
+              </>
             )}
             {other.reason && (
               <DetailRow label={t('Reason')} value={other.reason} />

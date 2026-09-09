@@ -122,6 +122,10 @@ export function SidebarModulesSection({
         title: t('Task logs'),
         description: t('Background job tracker for queued work.'),
       },
+      assets: {
+        title: t('Assets'),
+        description: t('Seedance asset library'),
+      },
     },
     personal: {
       topup: {

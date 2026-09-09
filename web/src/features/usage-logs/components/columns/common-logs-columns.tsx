@@ -50,6 +50,7 @@ import {
   isViolationFeeLog,
   renderAuditContent,
 } from '../../lib/format'
+import { getTaskSettlementRefund } from '../../lib/task-refund'
 import {
   isDisplayableLogType,
   isTimingLogType,
@@ -131,7 +132,13 @@ function buildTypeDetailSegments(
   }
 
   if (log.type === 6) {
-    return [{ text: t('Async task refund') }]
+    // 列表与详情使用同一份结算快照区分退差额和普通任务退款。
+    const settlement = getTaskSettlementRefund(log.type, other)
+    return [
+      {
+        text: settlement ? t('Task settlement refund') : t('Async task refund'),
+      },
+    ]
   }
 
   if (log.type !== 2) return []

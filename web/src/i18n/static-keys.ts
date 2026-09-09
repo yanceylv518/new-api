@@ -554,6 +554,22 @@ export const STATIC_I18N_KEYS = [
   'OpenAI Models upstream path must not contain {model}',
   'OpenAI Models route is required to enable upstream model checks',
 
+  // Seedance asset library status and dynamic type labels
+  'Processing',
+  'Uploaded',
+  'File',
+  'Unsupported file type',
+  'File is empty',
+  'File exceeds {{limit}}',
+  '{{count}} assets',
+  'Drop your first asset',
+  'Use the upload area above to add an image, video, or audio file.',
+  'No matching assets',
+  'Try a different search or filter.',
+  'No assets in this group',
+  'Delete "{{name}}" from this group? This action cannot be undone.',
+  'Delete "{{name}}" and all of its stored assets? This action cannot be undone.',
+
   // Dashboard flow stages (labels/descriptions passed to t at runtime)
   'User',
   'Node',

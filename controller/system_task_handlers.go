@@ -12,8 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
 
-// RegisterScheduledSystemTasks wires the periodic channel test, upstream model
-// update, and async task polling (Midjourney / Suno / video) jobs into the
+// RegisterScheduledSystemTasks wires periodic channel test, upstream model
+// update, async task polling, and Seedance asset polling jobs into the
 // system task framework so a DB lease dedups execution across multiple master
 // instances and each run is recorded as one task row. Call this before
 // service.StartSystemTaskRunner.
@@ -22,6 +22,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(seedanceAssetPollHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -149,6 +150,28 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+// seedanceAssetPollHandler 按固定间隔同步到期的 Seedance 素材审核状态。
+type seedanceAssetPollHandler struct{}
+
+func (seedanceAssetPollHandler) Type() string { return model.SystemTaskTypeSeedanceAssetPoll }
+
+func (seedanceAssetPollHandler) Enabled() bool {
+	return model.HasDueSeedanceAssets(common.GetTimestamp())
+}
+
+func (seedanceAssetPollHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (seedanceAssetPollHandler) NewPayload() any { return nil }
+
+func (seedanceAssetPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunSeedanceAssetPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 

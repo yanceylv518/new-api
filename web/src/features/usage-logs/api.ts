@@ -118,10 +118,16 @@ const taskArtifactRequestConfig = {
   skipErrorHandler: true,
 } satisfies ApiRequestConfig
 
-export async function getTaskArtifacts(taskId: string) {
+// 预览与复制共用鉴权投影，支持调用方取消并避免复用已经取消的 GET。
+export async function getTaskArtifacts(taskId: string, signal?: AbortSignal) {
   const response = await api.get<TaskArtifactsResponse>(
     `/api/task/${encodeURIComponent(taskId)}/artifacts`,
-    taskArtifactRequestConfig
+    {
+      ...taskArtifactRequestConfig,
+      signal,
+      disableDuplicate: true,
+      timeout: 30000,
+    }
   )
   return parseTaskArtifactsResponse(response.data)
 }

@@ -27,9 +27,11 @@ import {
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
+import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import {
   Alert,
@@ -55,6 +57,7 @@ import {
 } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { cn } from '@/lib/utils'
 
 import { getTaskArtifacts } from '../api'
@@ -275,7 +278,16 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
         </CardDescription>
       </CardHeader>
       <CardContent>{cardContent}</CardContent>
-      <CardFooter>
+      <CardFooter className='flex flex-wrap gap-2'>
+        {/* 复制服务端投影地址，保留插件鉴权与统一 artifacts 路径。 */}
+        <CopyButton
+          value={props.artifact.content_url}
+          variant='outline'
+          size='sm'
+          tooltip={t('Copy link')}
+        >
+          {t('Copy link')}
+        </CopyButton>
         <Button
           variant='outline'
           size='sm'
@@ -311,7 +323,7 @@ function TaskArtifacts(props: TaskArtifactsProps) {
   const { t } = useTranslation()
   const artifactsQuery = useQuery({
     queryKey: ['usage-logs', 'task-artifacts', props.taskId],
-    queryFn: () => getTaskArtifacts(props.taskId),
+    queryFn: ({ signal }) => getTaskArtifacts(props.taskId, signal),
     enabled: props.enabled,
     retry: false,
     staleTime: 30_000,
@@ -405,6 +417,47 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const previewMode = resolveTaskPreviewMode(props.log)
+  const { copyToClipboard } = useCopyToClipboard()
+  const mountedRef = useRef(true)
+  const copyingRef = useRef(false)
+  const copyQuery = useQuery({
+    queryKey: ['usage-logs', 'task-artifacts', props.log.task_id],
+    queryFn: ({ signal }) => getTaskArtifacts(props.log.task_id, signal),
+    enabled: false,
+    retry: false,
+    staleTime: 30_000,
+  })
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // 列表只在点击复制时获取授权链接；多视频不任意选取，交由现有 artifacts 弹窗选择。
+  const copyVideoLink = async () => {
+    if (copyingRef.current) return
+    copyingRef.current = true
+    try {
+      const result = await copyQuery.refetch({ throwOnError: true })
+      if (!mountedRef.current || !result.data) return
+      const videos = result.data.artifacts.filter(
+        (artifact) => artifact.type === 'video'
+      )
+      let url: string | undefined
+      if (videos.length === 1) url = videos[0].content_url
+      else if (result.data.artifacts.length === 0) {
+        url = result.data.legacyContentUrl
+      }
+      if (url) await copyToClipboard(url)
+      else setOpen(true)
+    } catch {
+      if (mountedRef.current) toast.error(t('Failed to load artifacts'))
+    } finally {
+      copyingRef.current = false
+    }
+  }
 
   if (!shouldLoadTaskArtifacts(props.log, true)) {
     return <span className='text-muted-foreground/60 text-xs'>-</span>
@@ -415,29 +468,43 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
 
   return (
     <>
-      {previewMode === 'legacy-video' ? (
-        <button
-          type='button'
-          className='text-foreground text-xs hover:underline'
-          onClick={() => setOpen(true)}
-        >
-          {t('Click to preview video')}
-        </button>
-      ) : (
+      <div className='flex flex-wrap items-center gap-2'>
+        {previewMode === 'legacy-video' ? (
+          <Button
+            type='button'
+            variant='ghost'
+            size='xs'
+            className='text-foreground text-xs hover:underline'
+            onClick={() => setOpen(true)}
+          >
+            {t('Preview video')}
+          </Button>
+        ) : (
+          <Button
+            type='button'
+            variant='outline'
+            size='xs'
+            onClick={() => setOpen(true)}
+          >
+            <HugeiconsIcon
+              icon={File01Icon}
+              strokeWidth={2}
+              data-icon='inline-start'
+            />
+            {t('Artifacts')}
+          </Button>
+        )}
         <Button
           type='button'
-          variant='outline'
+          variant='ghost'
           size='xs'
-          onClick={() => setOpen(true)}
+          disabled={copyQuery.isFetching}
+          onClick={copyVideoLink}
         >
-          <HugeiconsIcon
-            icon={File01Icon}
-            strokeWidth={2}
-            data-icon='inline-start'
-          />
-          {t('Artifacts')}
+          {copyQuery.isFetching ? <Spinner /> : null}
+          {t('Copy link')}
         </Button>
-      )}
+      </div>
       <Dialog
         open={open}
         onOpenChange={setOpen}
@@ -479,24 +546,38 @@ interface LegacyVideoMediaProps {
 }
 
 function LegacyVideoMedia(props: LegacyVideoMediaProps) {
+  const { t } = useTranslation()
   const [mediaFailed, setMediaFailed] = useState(false)
   const [mediaRevision, setMediaRevision] = useState(0)
 
-  return mediaFailed ? (
-    <MediaFailure
-      onRetry={() => {
-        setMediaFailed(false)
-        setMediaRevision((revision) => revision + 1)
-      }}
-    />
-  ) : (
-    <video
-      key={mediaRevision}
-      src={props.contentUrl}
-      controls
-      preload='metadata'
-      className='max-h-[60vh] w-full rounded-md bg-black'
-      onError={() => setMediaFailed(true)}
-    />
+  // 旧视频也只复制服务端提供的投影链接，不从任务 ID 拼接旧接口。
+  return (
+    <div className='space-y-3'>
+      <CopyButton
+        value={props.contentUrl}
+        variant='outline'
+        size='sm'
+        tooltip={t('Copy link')}
+      >
+        {t('Copy link')}
+      </CopyButton>
+      {mediaFailed ? (
+        <MediaFailure
+          onRetry={() => {
+            setMediaFailed(false)
+            setMediaRevision((revision) => revision + 1)
+          }}
+        />
+      ) : (
+        <video
+          key={mediaRevision}
+          src={props.contentUrl}
+          controls
+          preload='metadata'
+          className='max-h-[60vh] w-full rounded-md bg-black'
+          onError={() => setMediaFailed(true)}
+        />
+      )}
+    </div>
   )
 }
