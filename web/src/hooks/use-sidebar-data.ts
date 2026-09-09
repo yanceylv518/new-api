@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import {
   Activity,
   Archive,
+  BadgePercent,
   Box,
   ClipboardList,
   CreditCard,
@@ -152,6 +153,11 @@ export function useSidebarData(): SidebarData {
             title: t('Users'),
             url: '/users',
             icon: Users,
+          },
+          {
+            title: t('User Discounts'),
+            url: '/users/model-pricing',
+            icon: BadgePercent,
           },
           {
             title: t('Redemption Codes'),

@@ -109,6 +109,8 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	router.Use(func(c *gin.Context) { c.Set("id", 9999); c.Set("role", role); c.Set("username", "root-operator") })
 	router.GET("/pricing/:id", GetUserModelPricing)
 	router.PUT("/pricing/:id", UpdateUserModelPricing)
+	router.GET("/overview", GetUserModelPricingOverview)
+	router.GET("/rules/:id", GetUserModelPricingRulePage)
 	request := func(method, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, fmt.Sprintf("/pricing/%d", user.Id), strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -133,7 +135,23 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, revision)
 	assert.Equal(t, map[string]int{"pricing-private": 8000}, rules)
+	// 同一管理入口验证摘要与按需明细的真实响应，并保护角色降级后的拒绝行为。
+	for _, url := range []string{"/overview?summary=true&keyword=private", fmt.Sprintf("/rules/%d?keyword=private", user.Id)} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, url, nil))
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"success":true`)
+		if strings.HasPrefix(url, "/overview") {
+			assert.Contains(t, recorder.Body.String(), `"rule_count":1`)
+			assert.Contains(t, recorder.Body.String(), `"rules":[]`)
+		} else {
+			assert.Contains(t, recorder.Body.String(), `"model_name":"pricing-private"`)
+		}
+	}
 	role = common.RoleCommonUser
+	denied := httptest.NewRecorder()
+	router.ServeHTTP(denied, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/rules/%d", user.Id), nil))
+	assert.Contains(t, denied.Body.String(), `"success":false`)
 	assert.Contains(t, request(http.MethodGet, "").Body.String(), `"success":false`)
 	assert.Contains(t, request(http.MethodPut, `{"revision":2,"items":[]}`).Body.String(), `"success":false`)
 }

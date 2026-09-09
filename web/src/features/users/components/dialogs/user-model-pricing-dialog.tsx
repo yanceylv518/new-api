@@ -68,6 +68,7 @@ interface UserModelPricingDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   user: Pick<User, 'id' | 'username'>
+  onSaved?: () => void | Promise<void>
 }
 
 type DiscountFilter = 'all' | 'configured' | 'unconfigured'
@@ -204,6 +205,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         queryKey: ['user-model-pricing', props.user.id],
       })
       toast.success(t('Model pricing saved'))
+      // 保存后刷新总览摘要和展开明细，避免继续展示旧折扣。
+      await props.onSaved?.()
       handleOpenChange(false)
     },
     onError: async (error) => {

@@ -99,6 +99,21 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			revision, err := ReplaceUserModelPricingContext(t.Context(), user.Id, discounts, 1)
 			require.NoError(t, err)
 			assert.EqualValues(t, 2, revision)
+			// 总览及分页在真实引擎验证，统计不能因排序规则合并大小写不同的模型。
+			overview, err := GetUserModelPricingOverview(t.Context(), "", common.RoleRootUser, 0, 20, true)
+			require.NoError(t, err)
+			assert.EqualValues(t, 4, overview.TotalModels)
+			require.Len(t, overview.Items, 1)
+			assert.Empty(t, overview.Items[0].Rules)
+			assert.Equal(t, 4, overview.Items[0].RuleCount)
+			assert.Equal(t, 6000, overview.Items[0].MinDiscountBPS)
+			page, total, err := GetUserModelPricingRulePage(t.Context(), user.Id, common.RoleRootUser, "Model-A", 1)
+			require.NoError(t, err)
+			require.NotEmpty(t, page)
+			assert.EqualValues(t, len(page), total)
+			for _, rule := range page {
+				assert.Contains(t, []string{"Model-A", "model-a"}, rule.ModelName)
+			}
 			got, err = GetUserModelDiscountBPSContext(t.Context(), user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, discounts, got)

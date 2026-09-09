@@ -163,6 +163,40 @@ export interface UserModelPricingReplacePayload {
   items: UserModelPricingItem[]
 }
 
+// 管理端折扣总览按用户聚合，避免页面为每个用户重复请求规则接口。
+export interface UserModelPricingOverviewUser {
+  id: number
+  username: string
+  display_name: string
+  email: string
+  group: string
+  role: number
+  status: number
+}
+
+export interface UserModelPricingOverviewItem {
+  user: UserModelPricingOverviewUser
+  rules: UserModelPricingItem[]
+  rule_count: number
+  min_discount_bps?: number
+  max_discount_bps?: number
+}
+
+export interface UserModelPricingOverviewData {
+  items: UserModelPricingOverviewItem[]
+  total: number
+  page: number
+  page_size: number
+  total_rules: number
+  total_models: number
+}
+
+export interface UserModelPricingOverviewParams {
+  keyword?: string
+  p?: number
+  page_size?: number
+}
+
 // ============================================================================
 // Dialog Types
 // ============================================================================
