@@ -15,8 +15,24 @@ func TestDiscountAmountsAudit(t *testing.T) {
 		assert.Equal(t, values[0], amounts.Before)
 		assert.Equal(t, values[1], amounts.After)
 		assert.Equal(t, values[0]-values[1], amounts.Savings)
+		assert.True(t, amounts.ValidFor(values[1]))
+		assert.Equal(t, values[0], amounts.ChannelQuota(values[1]))
 	}
 	for _, values := range [][2]int{{-1, 0}, {1, -1}, {1, 2}} {
 		assert.Nil(t, NewDiscountAmounts(values[0], values[1]))
+	}
+}
+
+// 从 JSON 读出的字段不会经过构造函数；损坏或不属于本次扣款的快照不能用于渠道原价。
+func TestDiscountAmountsRejectCorruptPersistedValues(t *testing.T) {
+	for _, amounts := range []*DiscountAmounts{
+		nil,
+		{Before: 100, After: 20, Savings: 999},
+		{Before: 100, After: 19, Savings: 81},
+		{Before: -1, After: 20, Savings: -21},
+		{Before: 2147483648, After: 20, Savings: 2147483628},
+	} {
+		assert.False(t, amounts.ValidFor(20))
+		assert.Equal(t, 20, amounts.ChannelQuota(20))
 	}
 }

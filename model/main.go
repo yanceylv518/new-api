@@ -340,6 +340,7 @@ func migrateDB() error {
 		&User{},
 		&UserModelPricing{},
 		&UserModelPricingRevision{},
+		&AccountingBatchReceipt{},
 		&UserSession{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},

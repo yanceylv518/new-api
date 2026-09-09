@@ -147,6 +147,22 @@ func QuotaRoundStrict(value float64) (int, error) {
 	return strictQuota(QuotaRoundChecked(value))
 }
 
+// QuotaDiscountChecked 在用户折扣边界使用十进制乘法；truncate 保留任务路径的截断规则。
+// 非有限数继续通过统一转换器产生审计标记，不允许 decimal.NewFromFloat panic。
+func QuotaDiscountChecked(value, discount float64, truncate bool) (int, *QuotaClamp) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.IsNaN(discount) || math.IsInf(discount, 0) {
+		if truncate {
+			return QuotaFromFloatChecked(value * discount)
+		}
+		return QuotaRoundChecked(value * discount)
+	}
+	amount := decimal.NewFromFloat(value).Mul(decimal.NewFromFloat(discount))
+	if truncate {
+		amount = amount.Truncate(0)
+	}
+	return QuotaFromDecimalChecked(amount)
+}
+
 // QuotaFromDecimal converts a computed quota decimal to int with saturation.
 // The decimal is rounded (half away from zero) before conversion.
 func QuotaFromDecimal(d decimal.Decimal) int {

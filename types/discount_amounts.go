@@ -18,9 +18,16 @@ func NewDiscountAmounts(before, after int) *DiscountAmounts {
 	return &DiscountAmounts{Before: before, After: after, Savings: before - after}
 }
 
+// ValidFor 校验持久化快照的完整算术约束和所属扣款；JSON 重载不经过构造函数，必须再次验证。
+func (amounts *DiscountAmounts) ValidFor(charged int) bool {
+	return amounts != nil && charged >= 0 && amounts.After == charged &&
+		amounts.Before >= charged && amounts.Before <= math.MaxInt32 &&
+		amounts.Savings == amounts.Before-charged
+}
+
 // AddToLog 仅通过公开字段写入契约输出金额，保持 types 不依赖 model。
 func (amounts *DiscountAmounts) AddToLog(other interface{ SetPublic(string, any) bool }) {
-	if amounts == nil || other == nil {
+	if amounts == nil || !amounts.ValidFor(amounts.After) || other == nil {
 		return
 	}
 	other.SetPublic("quota_before_discount", amounts.Before)
@@ -30,7 +37,7 @@ func (amounts *DiscountAmounts) AddToLog(other interface{ SetPublic(string, any)
 
 // ChannelQuota 返回与本次扣费匹配的折前额度；历史快照缺失时保留已知扣费口径，不反推。
 func (amounts *DiscountAmounts) ChannelQuota(charged int) int {
-	if amounts != nil && amounts.After == charged && amounts.Before >= charged {
+	if amounts.ValidFor(charged) {
 		return amounts.Before
 	}
 	return charged

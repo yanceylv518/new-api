@@ -400,16 +400,17 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 }
 
 type RecordTaskBillingLogParams struct {
-	UserId    int
-	LogType   int
-	Content   string
-	ChannelId int
-	ModelName string
-	Quota     int
-	TokenId   int
-	Group     string
-	Other     *LogOther
-	NodeName  string // 任务发起节点；为空时回退当前节点
+	UserId       int
+	LogType      int
+	Content      string
+	ChannelId    int
+	ModelName    string
+	Quota        int
+	TokenId      int
+	Group        string
+	Other        *LogOther
+	NodeName     string // 任务发起节点；为空时回退当前节点
+	MetadataOnly bool   // 仅补齐零差额结算元数据，不增加导出的用量和请求次数
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
@@ -442,7 +443,7 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	if err != nil {
 		common.SysLog("failed to record task billing log: " + err.Error())
 	}
-	if params.LogType == LogTypeConsume && common.DataExportEnabled {
+	if params.LogType == LogTypeConsume && common.DataExportEnabled && !params.MetadataOnly {
 		nodeName := params.NodeName
 		if nodeName == "" {
 			nodeName = common.NodeName

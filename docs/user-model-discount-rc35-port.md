@@ -390,3 +390,69 @@ rc35 本机 SQLite 10 万条规则基准（100 用户 × 1000 规则、20 用户
 数据库验证命令：`PRICING_EXTERNAL_TESTS=1 go test ./model -run 'Test(GetUserModelPricingOverview|UserModelPricingSummaryAndRulePages|UserModelPricingExternalDatabases)' -count=1 -v`。真实 SQLite 3.50.4、MySQL 5.7.44、PostgreSQL 17.11 通过；覆盖摘要、分页、模型搜索、跨用户同模型、角色边界及模型大小写统计。`go build ./...` 和完整 model 测试通过。前端 `bun run typecheck`、`bun run build`、改动文件 lint/格式检查通过；总览与原编辑弹窗 Vitest 测试共 12 项通过。初始化状态缓存已由 rc35 基线修复，本轮未重复移植。
 
 验证限制：完整 controller 测试未通过，多项未改动的认证测试在 Windows 清理 `audit.db` 时因文件占用失败，60 秒限时重跑也超时；未将它们计为通过。本轮接口通过独立 `go test ./controller -run '^TestUserModelPricingManagementContract$' -count=1 -timeout=60s` 验证。数据库验证创建的专用 Compose 容器及网络已清理。
+
+## 14. 故障修复范围与批量恢复（2026-09-10）
+
+故障注入发现了缓存失效恢复旧余额、批量刷盘失败丢增量、任务资金与金额快照分步提交及折扣舍入遗漏。后续 A/B 压测发现同步资金方案的明显性能代价。当前按用户要求仅恢复第 2 项批量刷盘修复，第 1 项同步资金写库继续撤回；任务事务、精度与金额校验保留。
+
+### 14.1 保留缓存预扣，恢复批量失败保护
+
+普通请求保留原有 Redis 原子预扣、缓存余额读取及资金增量批量落库。不在每次余额缓存命中时额外读取数据库，不强制所有预扣/退款同步写库。`quota_reserve.go`、`user.go`、`token.go`、`user_cache.go` 与 HEAD 一致。
+
+批量刷盘恢复独立小表 `accounting_batch_receipts`（批次 ID 与 attempt），用户/令牌资金增量和统计在同一批次事务内提交。任一步写入失败保留原批次；提交应答丢失时用同一标识重试，不重复扣费。失败期间的新记录保留在下一批，不覆盖旧批次。MySQL `clientFoundRows` 模式下以 attempt 判定首次提交，不依赖 RowsAffected。
+
+确认提交后删除标识，清理应答丢失时只重试删除。令牌全退导致净资金增量为零时，仍保留最近访问时间更新。新表不修改用户/令牌/任务大表列；升级时需先运行主库迁移，再运行新版刷盘逻辑。
+
+边界仍明确保留：缓存失效/断连时可能重新使用尚未扣除的旧数据库余额，第 1 项风险未修复。尚未提交的批次内容仍在进程内存中，强杀进程可能丢失待写资金；提交标识不等于持久化队列。不能删除仍可能重试的批次标识。此次恢复尚未提交或部署。
+
+### 14.2 保留任务结算事务
+
+`model.CommitTaskSettlement` 仍以持久化任务为去重依据，将资金、令牌、用量和任务 quota/折扣金额 JSON 放在同一主库事务中。失败回滚、目标重试去重、旧快照冲突校验、资金归属检查及 SQLite/MySQL/PostgreSQL 锁定策略保留。
+
+为兼容恢复的缓存/批量机制，只有成功提交的非零差额才同步应用守卫式缓存增量，不能直接删除缓存后从尚未刷盘的数据库重建余额。订阅结算不调整钱包缓存；重复目标不重复调整缓存。回归覆盖任务补扣、部分退款、全退与其他待刷盘请求共存，以及失败回滚后重试。
+
+任务事务仍不保证独立日志库跨库原子提交，缓存更新失败或未知提交结果也不承诺 Redis 与数据库原子一致；这些边界沿用缓存/批量架构限制。任务轮询终态 CAS 保留，不引入任务日志 outbox。
+
+### 14.3 保留精度与金额校验
+
+任务 token 重算、adaptor 终态和表达式入口的折扣计算继续使用 `common.QuotaDiscountChecked`，保留原有截断/半入规则与饱和审计。折前、折后、优惠金额的关系校验以及渠道折前用量口径不回退。没有给大表新增列。
+
+### 14.4 历史 A/B 结论
+
+回退前的 132 轮正式测量包含 812,633 次资金/HTTP 计时操作及 322,175 条含预热 HTTP 账单，正式样本对账通过。完整 HTTP 吞吐下降 40.4%～87.9%；统计大批次合并事务反而更快。该结论说明当时完整修复方案的成本，不等于两项改动分别都有同等代价，亦不代表 VPS 容量。
+
+原始数据、测试环境问题及排除规则见已忽略的 `tools/pricing-load/results/ab-review-20260909.md`。当前回退未提交、推送或部署。
+
+### 14.5 撤回两项时的历史验证（不代表当前组合）
+
+- `git diff --exit-code HEAD -- model/quota_reserve.go model/user.go model/token.go model/user_cache.go model/utils.go model/main.go model/task_cas_test.go`：通过，七个文件完整恢复原提交。
+- `go test -race ./model ./service ./common ./types -run 'Test(TaskSettlement|Discount|RedisBatchReserve|BatchUpdateAccumulates|SynchronousReserve|TaskDiscount|QuotaDiscount)' -count=1 -timeout=3m`：model/service/types 相关测试通过，common 无匹配用例。首次撤回遗漏了批次引用而编译失败，完成恢复后重跑通过。
+- `go test -race ./model -run '^TestTaskSettlementPreservesPendingBatchQuota$' -count=1 -timeout=60s`：通过（7.056s），SQLite 上在资金变更后的最终任务快照写入处注入失败，验证回滚、重试和待刷盘增量共存。
+- 设置 `PRICING_EXTERNAL_TESTS=1`、`PRICING_SEPARATE_LOG_DB=1` 后，执行 `go test '-overlay=E:/WorkSpace/开发/GS/new-api-bee45b5/tools/pricing-load/ab-after.json' ./tools/pricing-load -run '^(TestTaskDiscountAmountExternal|TestDiscountBalanceExhaustionHTTP|TestFinalBillingHTTP)$' -race -count=1 -timeout=4m`：通过（23.810s），覆盖真实 MySQL 5.7.44、PostgreSQL 17.11 及独立日志库的任务金额、余额竞争和 HTTP 计费。overlay 仅为已忽略的测试工具暴露刷盘入口，不进入产品构建。
+- `go build ./...`、`go vet ./model ./service`、`git diff --check`：通过。隔离 Compose 容器和网络已清理。
+
+### 14.6 单独恢复第 2 项后的验证
+
+- `go test -race ./model -run '^(TestAccountingBatchRollbackAndUnknownCommit|TestTaskSettlementPreservesPendingBatchQuota|TestDiscountConcurrentBatchAccounting|TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance)$' -count=1 -timeout=2m`：通过（7.001s），覆盖 SQLite 批次回滚、两类应答丢失、失败期间新增记录、任务与待刷盘资金共存。
+- 设置 `PRICING_EXTERNAL_TESTS=1`，执行 `go test -race ./model -run '^TestAccountingExternalDatabases$' -count=1 -timeout=3m`：通过（2.608s）。真实 MySQL 5.7.44、PostgreSQL 17.11 及 MySQL clientFoundRows 模式验证旧表升级、重复迁移与资金批次失败重试。
+- 设置 `PRICING_AB=1`、`AB_VARIANT=batch-only`、`AB_MODE=http`、`AB_USERS=200`、`AB_WORKERS=128`、`AB_SECONDS=3`、`GOMAXPROCS=8`，分别设置 `AB_ENGINE=mysql/postgres`，执行 `go test '-overlay=E:/WorkSpace/开发/GS/new-api-bee45b5/tools/pricing-load/ab-after.json' ./tools/pricing-load -run '^TestAccountingAB$' -race -count=1 -timeout=3m`：两库通过（18.389s / 12.914s）。实际启用缓存预扣和新批次机制，服务端完成屏障后刷盘，核对用户/令牌余额、用量、请求数、渠道折前统计及折扣日志。本轮为正确性验证，不把 race 和内存盘环境下的耗时当作性能基准。
+- `go test -race ./model -run 'Test.*(Batch|Reserve)' -count=1 -timeout=2m`：通过（1.777s）。`go build ./...`、`go vet ./model ./service`、`git diff --check` 通过。
+- 四个资金热路径文件仍与 HEAD 一致，未恢复第 1 项。测试容器和网络已清理；尚未提交或部署。
+
+### 14.7 修正任务最终金额日志与用量持久化（P2-3、P2-4）
+
+折后额度未变而折前金额或优惠金额发生变化时，原先只更新任务和渠道统计，没有最终结算日志。现在由任务事务返回是否实际更新：首次更新写入 `Quota=0` 的消费日志，三项费用仍为 `task_total`；专用 `MetadataOnly` 参数使该日志不增加导出用量及请求次数。完整目标已经持久化时不重复记录。
+
+表达式结算原先只在调用方内存更新实际 `UsageFacts` 和命中档位，重新加载后仍是估算值。现在通过同一主库结算事务保存到现有 `private_data.billing_context.tiered_snapshot`。只采纳最终用量和档位，保留提交时冻结的表达式、倍率等参数，以及数据库中更新后的插件状态。金额和计费快照共同校验版本：同目标重试幂等，旧对象的不同目标必须重载后处理；仅用量变化而金额相同也会落库并记一条零差额日志。事务失败不提前改写调用方快照。
+
+范围：没有新增数据库列或迁移，没有引入任务日志 outbox，没有恢复普通请求同步资金方案；新增快照序列化仅用于任务表达式最终结算。沿用主库与独立日志库不能原子提交的边界，日志写入失败或进程在提交后退出仍可能缺日志，本轮不声称跨库恰好一次交付。终态 CAS 后结算失败仍需显式重试或人工对账，不新增自动恢复机制。
+
+验证环境为 Go 1.26.0 / Windows、SQLite 3.50.4（现有项目驱动）、MySQL 5.7.44、PostgreSQL 17.11；外部数据库与 Redis 使用已有隔离 Compose。未重跑历史性能 A/B，也不将 race 耗时作为吞吐性能结论。
+
+- 修复前两项定向回归实际失败：零差额日志不存在，数据库仍为 `720P` 而内存为 `1080P`；修复后通过。增强用例曾误用 token 计价夹具的换算比例，显式配置任务用量计价与单位后通过，未为此修改生产计价规则。
+- `go test -race ./service -run '^(TestDiscountTaskZeroDeltaPreservesPluginState|TestSettle_TieredSnapshotWriteBackUsesSettledFactsAndMatchedTier|TestTaskSettlement.*)$' -count=1 -timeout=2m`：通过（6.914s）。覆盖金额变化但实扣为零差额、仅用量变化、并发独立旧副本、同目标重载重试、旧版本冲突、冻结价格及插件保留、最终写入失败后的资金与快照回滚。
+- 设置 `PRICING_EXTERNAL_TESTS=1`、`PRICING_SEPARATE_LOG_DB=1`，执行 `go test '-overlay=E:/WorkSpace/开发/GS/new-api-bee45b5/tools/pricing-load/ab-after.json' ./tools/pricing-load -run '^(TestTaskDiscountAmountExternal|TestTaskSettlementSnapshotExternal)$' -race -count=1 -timeout=3m`：通过（8.438s）。真实 MySQL/PostgreSQL 验证资金、渠道、令牌、最终快照、16 个并发旧副本和事务回滚；独立日志库验证零差额最终费用及重试不重复日志。overlay 只用于已忽略的测试工具。
+- `go test -race ./service -run 'Test.*(Discount|Task|Recalculate|Settle|Billing)' -count=1 -timeout=2m`：通过（8.217s），包含钱包/订阅、退差额、终态轮询和原有计费回归。
+- `go test -race ./service ./model ./common ./types -count=1 -timeout=3m`：model/common/types 全量通过（27.820s / 13.191s / 12.440s）；service 全量失败。更新“金额与元数据均无变化”的夹具后，`go test -json -race ./service -count=1 -timeout=2m` 仍在未改动的 `TestObserveChannelAffinityUsageCacheByRelayFormat_UnsupportedModeKeepsEmpty` 失败（计数期望 1、实际 3）。在保存的原提交 `d1e502277` 源码目录执行 `go test -race ./service -run '^TestObserveChannelAffinityUsageCacheByRelayFormat_' -count=3 -timeout=1m`，同类计数失败也复现。本轮不修改渠道亲和缓存；全量测试不计为通过。
+- `go build ./...`、`go vet ./model ./service`、`git diff --check`：通过。`git diff --exit-code HEAD -- model/quota_reserve.go model/user.go model/token.go model/user_cache.go` 通过，四个资金热路径文件未变化。
+- 本轮隔离 Compose 容器和网络已移除；本节记录提交前的验证结果，目标分支为 `custom/rc35-user-model-discount`，未部署。
