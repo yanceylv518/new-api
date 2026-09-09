@@ -557,6 +557,17 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 
 const logSearchCountLimit = 10000
 
+const mysqlUserLogIndexHint = "/*+ INDEX(logs idx_user_id_id) */ logs.*"
+
+// selectUserLogColumns 为 MySQL 用户日志列表提示现有的用户加 ID 复合索引，
+// 避免在大日志表中因排序和分页退化为全表扫描；其他数据库保持默认列选择。
+func selectUserLogColumns(tx *gorm.DB) *gorm.DB {
+	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+		return tx.Select(mysqlUserLogIndexHint)
+	}
+	return tx
+}
+
 func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
@@ -586,6 +597,18 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if group != "" {
 		tx = tx.Where("logs."+logGroupCol+" = ?", group)
 	}
+	// 仅合并同一用户、同一请求的错误和消费回退结果，退款及其他账务事件必须独立保留。
+	// 用递增主键判定最终尝试，且不受外层筛选影响，避免筛选重新暴露早期失败。
+	// ClickHouse 的展示 ID 不代表写入顺序，因此沿用其现有查询行为。
+	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		tx = tx.Where(`logs.request_id IS NULL OR logs.request_id = '' OR logs.type NOT IN ? OR NOT EXISTS (
+			SELECT 1 FROM logs AS newer_logs
+			WHERE newer_logs.request_id = logs.request_id
+			  AND newer_logs.user_id = logs.user_id
+			  AND newer_logs.type IN ?
+			  AND newer_logs.id > logs.id
+		)`, []int{LogTypeError, LogTypeConsume}, []int{LogTypeError, LogTypeConsume})
+	}
 	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
 	if err != nil {
 		common.SysError("failed to count user logs: " + err.Error())
@@ -595,7 +618,8 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("logs.")
 	}
-	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
+	// 提示只用于列表，保持计数查询及管理员查询不变。
+	err = selectUserLogColumns(tx).Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
