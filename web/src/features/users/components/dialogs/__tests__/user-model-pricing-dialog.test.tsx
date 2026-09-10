@@ -64,13 +64,24 @@ const models = Array.from({ length: 30 }, (_, index) => ({
   enable_groups: ['default'],
 }))
 
+// 生成多页测试所需的完整已配置规则集，保持弹窗只展示有专属折扣的模型。
+function configuredItemsFor(pricingModels: readonly { model_name: string }[]) {
+  return pricingModels.map(({ model_name }) => ({
+    model_name,
+    discount_bps: 8000,
+  }))
+}
+
 const apiClient = api as unknown as MockableApi
 const originalGet = apiClient.get
 const originalPut = apiClient.put
 let renderedDialog: RenderedDialog | null = null
 
 // 为组件测试提供稳定的定价、状态和已有折扣数据，避免依赖真实后端。
-function installApiFixtures(pricingModels = models) {
+function installApiFixtures(
+  pricingModels = models,
+  pricingItems = [{ model_name: 'model-03', discount_bps: 8000 }]
+) {
   apiClient.get = async (url) => {
     switch (url) {
       case '/api/status':
@@ -81,7 +92,7 @@ function installApiFixtures(pricingModels = models) {
             success: true,
             data: {
               user_id: 42,
-              items: [{ model_name: 'model-03', discount_bps: 8000 }],
+              items: pricingItems,
               revision: 1,
               model_names: pricingModels.map((model) => model.model_name),
             },
@@ -120,7 +131,7 @@ async function waitForCondition(
   })
 }
 
-async function renderDialog(expectedInputCount = 25) {
+async function renderDialog(expectedInputCount = 25, configuredOnly = false) {
   const host = document.createElement('div')
   document.body.append(host)
   const root = createRoot(host)
@@ -142,6 +153,7 @@ async function renderDialog(expectedInputCount = 25) {
               open={open}
               onOpenChange={() => undefined}
               user={{ id: 42, username: 'pricing-user' }}
+              configuredOnly={configuredOnly}
             />
           </I18nextProvider>
         </QueryClientProvider>
@@ -195,33 +207,6 @@ async function changeInput(input: HTMLInputElement, value: string) {
   })
 }
 
-// 通过用户可见的下拉选项切换折扣配置状态，覆盖筛选控件的真实交互路径。
-async function selectDiscountFilter(label: string) {
-  const trigger = document.querySelector<HTMLButtonElement>(
-    '[data-slot="select-trigger"]'
-  )
-  assert.ok(trigger)
-
-  await act(async () => trigger.click())
-  await act(async () =>
-    waitForCondition(
-      () =>
-        [
-          ...document.querySelectorAll<HTMLElement>(
-            '[data-slot="select-item"]'
-          ),
-        ].some((item) => item.textContent?.trim() === label),
-      `discount filter option was not rendered: ${label}`
-    )
-  )
-
-  const item = [
-    ...document.querySelectorAll<HTMLElement>('[data-slot="select-item"]'),
-  ].find((option) => option.textContent?.trim() === label)
-  assert.ok(item)
-  await act(async () => item.click())
-}
-
 afterEach(async () => {
   apiClient.get = originalGet
   apiClient.put = originalPut
@@ -237,20 +222,25 @@ afterEach(async () => {
 describe('user model pricing dialog', () => {
   // 全选覆盖分页外的模型，超出规则上限时整批拒绝，原价重置仍然可用。
   test('selects across all pages and rejects batches exceeding the rule limit', async () => {
-    installApiFixtures(
-      Array.from({ length: 1001 }, (_, index) => ({
-        ...models[0],
-        id: index + 1,
-        model_name: `bulk-${index}`,
-      }))
-    )
-    await renderDialog()
+    const bulkModels = Array.from({ length: 1001 }, (_, index) => ({
+      ...models[0],
+      id: index + 1,
+      model_name: `bulk-${index}`,
+    }))
+    installApiFixtures(bulkModels, configuredItemsFor(bulkModels))
+    await renderDialog(25)
     const selectAll = document.querySelector<HTMLElement>(
       '[aria-label="Select all (filtered)"]'
     )
     assert.ok(selectAll)
     await act(async () => selectAll.click())
     assert.ok(document.body.textContent?.includes('1001 model(s) selected'))
+    const batchToolbar = document.querySelector<HTMLElement>(
+      '[data-slot="model-pricing-batch"]'
+    )
+    assert.ok(batchToolbar)
+    assert.equal(batchToolbar.getAttribute('role'), 'toolbar')
+    assert.equal(batchToolbar.dataset.placement, 'floating')
     const batch = document.querySelector<HTMLInputElement>(
       '[aria-label="Batch discount percentage"]'
     )
@@ -266,16 +256,39 @@ describe('user model pricing dialog', () => {
         'At most 1000 model pricing rules are allowed'
       )
     )
-    assert.equal(getModelInput('bulk-0').value, '100')
+    assert.equal(getModelInput('bulk-0').value, '80')
     await changeInput(batch, '100')
     await act(async () => apply.click())
     assert.equal(batch.getAttribute('aria-invalid'), 'false')
   })
 
+  // 表头和模型行必须共用三列模板，保证全选框、模型名和输入框在同一竖线上。
+  test('keeps the model header and rows on the same column template', async () => {
+    installApiFixtures(models, configuredItemsFor(models))
+    await renderDialog(25)
+
+    const header = document.querySelector<HTMLElement>(
+      '[data-slot="model-pricing-header"]'
+    )
+    const row = document.querySelector<HTMLElement>(
+      '[data-slot="model-pricing-row"]'
+    )
+    assert.ok(header)
+    assert.ok(row)
+
+    for (const columnClass of [
+      'grid-cols-[2rem_minmax(0,1fr)_7rem]',
+      'sm:grid-cols-[2rem_minmax(0,1fr)_9rem]',
+    ]) {
+      assert.equal(header.classList.contains(columnClass), true)
+      assert.equal(row.classList.contains(columnClass), true)
+    }
+  })
+
   // 跨页与筛选保留选择，批量操作只写草稿，提交仍携带原 revision。
   test('applies a batch discount across pages without changing unselected models', async () => {
-    installApiFixtures()
-    await renderDialog()
+    installApiFixtures(models, configuredItemsFor(models))
+    await renderDialog(25)
     const selectFirst = document.querySelector<HTMLElement>(
       '[aria-label="Select model model-01"]'
     )
@@ -308,7 +321,7 @@ describe('user model pricing dialog', () => {
     await act(async () => apply.click())
     assert.equal(submitted, undefined)
     assert.equal(getModelInput('model-30').value, '65.25')
-    assert.equal(getModelInput('model-29').value, '100')
+    assert.equal(getModelInput('model-29').value, '80')
     const form = document.querySelector<HTMLFormElement>(
       '#user-model-pricing-form'
     )
@@ -321,21 +334,31 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     )
-    assert.deepEqual(submitted, {
-      revision: 1,
-      items: [
-        { model_name: 'model-03', discount_bps: 8000 },
-        { model_name: 'model-01', discount_bps: 6525 },
-        { model_name: 'model-30', discount_bps: 6525 },
-      ],
-    })
+    assert.ok(submitted)
+    const submittedPayload = submitted as {
+      revision: number
+      items: { model_name: string; discount_bps: number }[]
+    }
+    assert.equal(submittedPayload.revision, 1)
+    assert.equal(submittedPayload.items.length, models.length)
+    assert.deepEqual(
+      submittedPayload.items.find((item) => item.model_name === 'model-01'),
+      { model_name: 'model-01', discount_bps: 6525 }
+    )
+    assert.deepEqual(
+      submittedPayload.items.find((item) => item.model_name === 'model-30'),
+      { model_name: 'model-30', discount_bps: 6525 }
+    )
+    assert.deepEqual(
+      submittedPayload.items.find((item) => item.model_name === 'model-29'),
+      { model_name: 'model-29', discount_bps: 8000 }
+    )
   })
 
-  // 全选只覆盖当前筛选结果；原价批量设置清除专属折扣，关闭后不能残留选择。
-  test('selects only filtered models and resets selection when reopened', async () => {
+  // 全选只覆盖当前已配置模型；原价批量设置清除专属折扣，关闭后不能残留选择。
+  test('selects configured models and resets selection when reopened', async () => {
     installApiFixtures()
-    await renderDialog()
-    await selectDiscountFilter('Configured discounts')
+    await renderDialog(1, true)
     const selectAll = document.querySelector<HTMLElement>(
       '[aria-label="Select all (filtered)"]'
     )
@@ -348,25 +371,12 @@ describe('user model pricing dialog', () => {
     assert.ok(apply)
     await act(async () => apply.click())
     assert.equal(getModelInput('model-03').value, '100')
-    await selectDiscountFilter('All')
-    assert.equal(
-      document
-        .querySelector('[aria-label="Select model model-01"]')
-        ?.getAttribute('aria-checked'),
-      'false'
-    )
-    assert.equal(
-      document
-        .querySelector('[aria-label="Select all (filtered)"]')
-        ?.getAttribute('aria-checked'),
-      'mixed'
-    )
     assert.ok(renderedDialog)
     await renderedDialog.renderOpen(false)
     await renderedDialog.renderOpen(true)
     await act(async () =>
       waitForCondition(
-        () => visibleModelNames().length === 25,
+        () => visibleModelNames().length === 1,
         'reopened models missing'
       )
     )
@@ -379,7 +389,10 @@ describe('user model pricing dialog', () => {
 
   // 空值及越界值不能写入所选模型，也不能让未应用的批量输入阻止保存草稿。
   test('rejects invalid batch values and clears the selection explicitly', async () => {
-    installApiFixtures(models.slice(0, 3))
+    installApiFixtures(
+      models.slice(0, 3),
+      configuredItemsFor(models.slice(0, 3))
+    )
     await renderDialog(3)
     const selectAll = document.querySelector<HTMLElement>(
       '[aria-label="Select all (filtered)"]'
@@ -399,7 +412,7 @@ describe('user model pricing dialog', () => {
       await act(async () => apply.click())
       assert.equal(batch.getAttribute('aria-invalid'), 'true')
       assert.equal(getModelInput('model-03').value, '80')
-      assert.equal(getModelInput('model-01').value, '100')
+      assert.equal(getModelInput('model-01').value, '80')
     }
     const clear = document.querySelector<HTMLButtonElement>(
       '[aria-label="Clear selection"]'
@@ -436,7 +449,7 @@ describe('user model pricing dialog', () => {
       }
       return fixtureGet(url)
     }
-    await renderDialog(3)
+    await renderDialog(1, true)
     assert.equal(visibleModelNames().includes('disabled-model'), false)
     await changeInput(getModelInput('model-03'), '100')
     let submitted: unknown
@@ -465,7 +478,7 @@ describe('user model pricing dialog', () => {
   // 重新打开失败时不能把旧缓存当成最新会话，重试成功后再恢复编辑。
   test('blocks editing cached rules when reopening fails and recovers on retry', async () => {
     installApiFixtures(models.slice(0, 3))
-    await renderDialog(3)
+    await renderDialog(1, true)
     assert.ok(renderedDialog)
     await renderedDialog.renderOpen(false)
     const fixtureGet = apiClient.get
@@ -496,7 +509,7 @@ describe('user model pricing dialog', () => {
     await act(async () => retry.click())
     await act(async () =>
       waitForCondition(
-        () => visibleModelNames().length === 3,
+        () => visibleModelNames().length === 1,
         'retry did not restore editing'
       )
     )
@@ -507,7 +520,7 @@ describe('user model pricing dialog', () => {
   // 后台规则和模型目录变化不能覆盖草稿，也不能让旧草稿携带新 revision 绕过冲突检查。
   test('keeps draft and original revision through refetch and a save conflict', async () => {
     installApiFixtures()
-    await renderDialog()
+    await renderDialog(1, true)
     assert.ok(renderedDialog)
     await changeInput(getModelInput('model-03'), '55')
     const initialNames = visibleModelNames()
@@ -572,24 +585,24 @@ describe('user model pricing dialog', () => {
       )
     )
     assert.equal(getModelInput('model-01').value, '70')
-    assert.equal(getModelInput('model-03').value, '100')
+    assert.deepEqual(visibleModelNames(), ['model-01'])
   })
 
-  test('lists enabled models, preserves configured values, searches, and paginates', async () => {
-    installApiFixtures()
-    await renderDialog()
+  test('lists configured models, preserves values, searches, and paginates', async () => {
+    installApiFixtures(models, configuredItemsFor(models))
+    await renderDialog(25, true)
 
     assert.equal(visibleModelNames().length, 25)
-    // 已保存折扣的模型优先显示，其余模型继续保持原始顺序。
+    // 列表只包含已配置模型，并保持接口返回的稳定顺序。
     assert.deepEqual(visibleModelNames().slice(0, 4), [
-      'model-03',
       'model-01',
       'model-02',
+      'model-03',
       'model-04',
     ])
     assert.equal(visibleModelNames().includes('model-25'), true)
     assert.equal(visibleModelNames().includes('model-26'), false)
-    assert.equal(getModelInput('model-01').value, '100')
+    assert.equal(getModelInput('model-01').value, '80')
     assert.equal(getModelInput('model-03').value, '80')
 
     await changeInput(getModelInput('model-03'), '')
@@ -667,7 +680,8 @@ describe('user model pricing dialog', () => {
   })
 
   test('sizes a sparse model list to its content without pagination', async () => {
-    installApiFixtures(models.slice(0, 3))
+    const sparseModels = models.slice(0, 3)
+    installApiFixtures(sparseModels, configuredItemsFor(sparseModels))
     await renderDialog(3)
 
     assert.equal(visibleModelNames().length, 3)
@@ -695,39 +709,35 @@ describe('user model pricing dialog', () => {
     assert.equal(dialogBody.classList.contains('overflow-y-hidden'), true)
   })
 
-  test('filters models by configured discount status', async () => {
+  // 编辑入口只展示当前用户已配置且仍启用的模型，不再把未改模型混入列表。
+  test('shows only configured enabled models in the edit dialog', async () => {
+    installApiFixtures()
+    await renderDialog(1, true)
+
+    assert.deepEqual(visibleModelNames(), ['model-03'])
+    assert.equal(
+      document.querySelector<HTMLElement>('[data-slot="select-trigger"]'),
+      null
+    )
+  })
+
+  // 用户管理入口展示接口返回的全部启用模型，未配置项按原价回填。
+  test('shows all enabled models in the user model pricing dialog', async () => {
     installApiFixtures()
     await renderDialog()
 
-    const discountFilterTrigger = document.querySelector<HTMLElement>(
-      '[data-slot="select-trigger"]'
-    )
-    assert.ok(discountFilterTrigger)
-    assert.equal(discountFilterTrigger.textContent?.includes('All'), true)
-
-    await selectDiscountFilter('Configured discounts')
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().length === 1,
-        'configured discount filter did not narrow the list'
-      )
-    )
-    assert.deepEqual(visibleModelNames(), ['model-03'])
-
-    await selectDiscountFilter('Unconfigured discounts')
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().length === 25,
-        'unconfigured discount filter did not render the first page'
-      )
-    )
-    assert.equal(visibleModelNames().includes('model-03'), false)
+    assert.equal(visibleModelNames().length, 25)
+    assert.equal(visibleModelNames().includes('model-01'), true)
+    assert.equal(visibleModelNames().includes('model-25'), true)
+    assert.equal(visibleModelNames().includes('model-26'), false)
+    assert.equal(getModelInput('model-01').value, '100')
+    assert.equal(getModelInput('model-03').value, '80')
   })
 
   // 提交分页外的空折扣时，页面必须回到错误行并显示字段错误。
   test('reveals an invalid discount after submitting from another page', async () => {
-    installApiFixtures()
-    await renderDialog()
+    installApiFixtures(models, configuredItemsFor(models))
+    await renderDialog(25)
 
     const nextPageButton = document.querySelector<HTMLButtonElement>(
       'button[aria-label="Next page"]'

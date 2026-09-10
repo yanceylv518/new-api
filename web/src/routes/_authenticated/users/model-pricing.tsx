@@ -27,6 +27,11 @@ const userModelPricingSearchSchema = z.object({
   page: z.number().optional().catch(1),
   pageSize: z.number().optional().catch(undefined),
   filter: z.string().optional().catch(''),
+  group: z.array(z.string()).optional().catch([]),
+  role: z
+    .array(z.enum(['1', '10', '100']))
+    .optional()
+    .catch([]),
 })
 
 export const Route = createFileRoute('/_authenticated/users/model-pricing')({

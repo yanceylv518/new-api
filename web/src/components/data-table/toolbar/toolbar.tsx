@@ -254,24 +254,21 @@ export function DataTableToolbar<TData>(props: DataTableToolbarProps<TData>) {
     />
   )
 
-  const filterChips = React.useMemo(
-    () =>
-      filters.map((filter) => {
-        const column = props.table.getColumn(filter.columnId)
-        if (!column) return null
-        return (
-          <DataTableFacetedFilter
-            key={filter.columnId}
-            column={column}
-            title={filter.title}
-            options={filter.options}
-            singleSelect={filter.singleSelect}
-          />
-        )
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [props.filters, props.table]
-  )
+  // 表格筛选状态是可变的，节点必须随工具栏渲染重新读取当前值，才能及时同步按钮徽标与勾选状态。
+  const filterChips = filters.map((filter) => {
+    const column = props.table.getColumn(filter.columnId)
+    if (!column) return null
+    return (
+      <DataTableFacetedFilter
+        key={filter.columnId}
+        column={column}
+        value={column.getFilterValue() as string[] | undefined}
+        title={filter.title}
+        options={filter.options}
+        singleSelect={filter.singleSelect}
+      />
+    )
+  })
 
   const handleReset = () => {
     setIsSearchComposing(false)

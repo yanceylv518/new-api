@@ -177,6 +177,7 @@ export interface UserModelPricingOverviewUser {
 export interface UserModelPricingOverviewItem {
   user: UserModelPricingOverviewUser
   rules: UserModelPricingItem[]
+  preview_rules?: UserModelPricingItem[]
   rule_count: number
   min_discount_bps?: number
   max_discount_bps?: number
@@ -193,6 +194,8 @@ export interface UserModelPricingOverviewData {
 
 export interface UserModelPricingOverviewParams {
   keyword?: string
+  group?: string
+  role?: string
   p?: number
   page_size?: number
 }
