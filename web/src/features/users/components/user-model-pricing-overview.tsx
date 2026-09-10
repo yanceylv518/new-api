@@ -1,3 +1,9 @@
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { getRouteApi, Link } from '@tanstack/react-router'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -16,13 +22,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getRouteApi, Link } from '@tanstack/react-router'
-import type { ColumnDef, Row } from '@tanstack/react-table'
+import type {
+  ColumnDef,
+  ColumnFiltersState,
+  OnChangeFn,
+  PaginationState,
+  Row,
+} from '@tanstack/react-table'
 import {
   BadgePercent,
-  ChevronDown,
   Layers3,
+  List,
   ListChecks,
   Loader2,
   Pencil,
@@ -30,22 +40,17 @@ import {
   TriangleAlert,
   Users,
 } from 'lucide-react'
-import {
-  createContext,
-  useContext,
-  useCallback,
-  useMemo,
-  useState,
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { DataTablePage, useDataTable } from '@/components/data-table'
-import { EmptyState } from '@/components/empty-state'
-import { ErrorState } from '@/components/error-state'
+import {
+  sideDrawerContentClassName,
+  sideDrawerFormClassName,
+  sideDrawerHeaderClassName,
+} from '@/components/drawer-layout'
 import { GroupBadge } from '@/components/group-badge'
 import { SectionPageLayout } from '@/components/layout'
-import { LoadingState } from '@/components/loading-state'
-import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -57,6 +62,21 @@ import {
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from '@/components/ui/empty'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { TableCell, TableRow } from '@/components/ui/table'
 import {
   Tooltip,
@@ -68,10 +88,11 @@ import { useTableUrlState } from '@/hooks/use-table-url-state'
 import { cn } from '@/lib/utils'
 
 import {
+  getGroups,
   getUserModelPricingOverview,
   getUserModelPricingRulePage,
 } from '../api'
-import { USER_ROLES, USER_STATUSES } from '../constants'
+import { getUserRoleOptions, USER_ROLES } from '../constants'
 import type {
   UserModelPricingItem,
   UserModelPricingOverviewData,
@@ -81,8 +102,6 @@ import type {
 import { UserModelPricingDialog } from './dialogs/user-model-pricing-dialog'
 
 const route = getRouteApi('/_authenticated/users/model-pricing')
-// 搜索作用域随总览更新，展开区按作用域独立缓存，避免混入其他模型。
-const PricingSearchContext = createContext('')
 
 const EMPTY_OVERVIEW: UserModelPricingOverviewData = {
   items: [],
@@ -109,7 +128,7 @@ function getUserInitials(user: UserModelPricingOverviewUser): string {
   return source.slice(0, 2).toUpperCase()
 }
 
-// 摘要只展示折扣区间，收起状态不下载完整规则。
+// 抽屉头部展示当前用户的折扣区间，主表使用模型预览避免信息过于抽象。
 function DiscountSummary({ item }: { item: UserModelPricingOverviewItem }) {
   return (
     <span className='text-info font-mono font-semibold tabular-nums'>
@@ -120,28 +139,62 @@ function DiscountSummary({ item }: { item: UserModelPricingOverviewItem }) {
   )
 }
 
-/** 展开才挂载查询，每页最多 20 个模型；切页替换而不累积 DOM 和结果。 */
-function DiscountRulePage({ userId }: { userId: number }) {
-  const keyword = useContext(PricingSearchContext)
+// 主表只展示前三个模型，剩余数量通过计数提示；具体规则在抽屉中完整查看。
+function DiscountModelPreview({
+  item,
+}: {
+  item: UserModelPricingOverviewItem
+}) {
+  const previewRules = (item.preview_rules ?? item.rules).slice(0, 3)
+
+  if (previewRules.length === 0) {
+    return <span className='text-muted-foreground'>—</span>
+  }
+
   return (
-    <DiscountRulePageContent
-      key={`${userId}:${keyword}`}
-      userId={userId}
-      keyword={keyword}
-    />
+    <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
+      {previewRules.map((rule) => (
+        <span
+          key={rule.model_name}
+          className='border-border/70 bg-muted/40 inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs'
+          title={`${rule.model_name} - ${formatDiscountRate(rule.discount_bps)}`}
+        >
+          <span className='min-w-0 truncate font-mono' translate='no'>
+            {rule.model_name}
+          </span>
+          <span className='text-info shrink-0 font-mono font-semibold tabular-nums'>
+            {formatDiscountRate(rule.discount_bps)}
+          </span>
+        </span>
+      ))}
+      {item.rule_count > previewRules.length ? (
+        <span className='text-muted-foreground shrink-0 font-mono text-xs tabular-nums'>
+          +{item.rule_count - previewRules.length}
+        </span>
+      ) : null}
+    </div>
   )
 }
 
-function DiscountRulePageContent(props: { userId: number; keyword: string }) {
+type UserModelPricingRulePage = {
+  items: UserModelPricingItem[]
+  total: number
+  page_size: number
+}
+
+/** 抽屉内按滚动位置加载模型，页面本身只保留用户分页。 */
+function DiscountRuleList(props: { userId: number; keyword: string }) {
   const { t } = useTranslation()
-  const [page, setPage] = useState(1)
-  const query = useQuery({
-    queryKey: ['user-model-pricing-rules', props.userId, props.keyword, page],
-    queryFn: async ({ signal }) => {
+  const scrollAreaRef = useRef<HTMLDivElement>(null)
+  const loadMoreRef = useRef<HTMLDivElement>(null)
+  const query = useInfiniteQuery<UserModelPricingRulePage>({
+    queryKey: ['user-model-pricing-rules', props.userId, props.keyword],
+    initialPageParam: 1,
+    queryFn: async ({ pageParam, signal }) => {
       const response = await getUserModelPricingRulePage(
         props.userId,
         props.keyword,
-        page,
+        Number(pageParam),
         signal
       )
       if (!response.success || !response.data) {
@@ -149,62 +202,191 @@ function DiscountRulePageContent(props: { userId: number; keyword: string }) {
       }
       return response.data
     },
-    staleTime: 0,
-    gcTime: 0,
-    placeholderData: (previous) => previous,
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce(
+        (count, page) => count + page.items.length,
+        0
+      )
+      if (lastPage.items.length === 0 || loaded >= lastPage.total) {
+        return undefined
+      }
+      return allPages.length + 1
+    },
+    staleTime: 15_000,
+    gcTime: 5 * 60_000,
     retry: 1,
     refetchOnWindowFocus: false,
   })
-  const totalPages = Math.max(1, Math.ceil((query.data?.total ?? 0) / 20))
+  const { fetchNextPage, hasNextPage, isFetchingNextPage } = query
+  const fetchNextPageInFlightRef = useRef(false)
+
+  // 统一保护自动加载请求，避免滚动事件和观察器在同一帧重复请求同一页。
+  const loadNextPage = useCallback(() => {
+    if (
+      !hasNextPage ||
+      isFetchingNextPage ||
+      fetchNextPageInFlightRef.current
+    ) {
+      return
+    }
+
+    fetchNextPageInFlightRef.current = true
+    void fetchNextPage().then(
+      () => {
+        fetchNextPageInFlightRef.current = false
+      },
+      () => {
+        fetchNextPageInFlightRef.current = false
+      }
+    )
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage])
+
+  // 同时监听真实滚动距离和底部哨兵，兼容不同浏览器对自定义滚动根节点的处理。
+  useEffect(() => {
+    const viewport = scrollAreaRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]'
+    )
+    const target = loadMoreRef.current
+    if (!viewport || !target) {
+      return
+    }
+
+    const loadWhenNearBottom = () => {
+      // 抽屉动画或测试环境尚未完成布局时，零尺寸不能代表已经到达底部。
+      if (viewport.clientHeight <= 0 || viewport.scrollHeight <= 0) {
+        return
+      }
+      const distanceToBottom =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
+      if (distanceToBottom <= 240) {
+        loadNextPage()
+      }
+    }
+
+    const observer =
+      typeof IntersectionObserver === 'undefined'
+        ? null
+        : new IntersectionObserver(
+            (entries) => {
+              if (entries[0]?.isIntersecting) {
+                loadNextPage()
+              }
+            },
+            { root: viewport, rootMargin: '240px 0px' }
+          )
+    const resizeObserver =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(loadWhenNearBottom)
+    observer?.observe(target)
+    resizeObserver?.observe(viewport)
+    resizeObserver?.observe(target)
+    viewport.addEventListener('scroll', loadWhenNearBottom, { passive: true })
+
+    // 页面首批数据不足以撑满抽屉时，立即继续加载，避免必须手动滚动才能触发。
+    const frameId = requestAnimationFrame(loadWhenNearBottom)
+    return () => {
+      cancelAnimationFrame(frameId)
+      observer?.disconnect()
+      resizeObserver?.disconnect()
+      viewport.removeEventListener('scroll', loadWhenNearBottom)
+    }
+  }, [loadNextPage])
+
+  const rules = query.data?.pages.flatMap((page) => page.items) ?? []
   return (
-    <div className='space-y-3 whitespace-normal' aria-busy={query.isFetching}>
-      <div className='flex items-center justify-between gap-2'>
-        <span className='text-muted-foreground text-xs'>
-          {t('Page {{current}} of {{total}}', {
-            current: page,
-            total: totalPages,
-          })}
-        </span>
-        <div className='flex gap-2'>
-          <Button
-            variant='outline'
-            size='sm'
-            disabled={page === 1 || query.isFetching}
-            onClick={() => setPage((value) => value - 1)}
-          >
-            {t('Previous page')}
-          </Button>
-          <Button
-            variant='outline'
-            size='sm'
-            disabled={!query.data || page >= totalPages || query.isFetching}
-            onClick={() => setPage((value) => value + 1)}
-          >
-            {t('Next page')}
-          </Button>
-        </div>
-      </div>
+    <div
+      ref={scrollAreaRef}
+      className='flex min-h-0 flex-1 flex-col'
+      aria-busy={query.isFetching}
+      aria-live='polite'
+    >
       {query.isPending ? (
-        <LoadingState className='min-h-24' message={t('Loading')} />
+        <div className='flex min-h-24 items-center justify-center'>
+          <Loader2 className='animate-spin' aria-label={t('Loading')} />
+        </div>
       ) : null}
-      {query.isError ? (
+      {query.isError && !query.data ? (
         <OverviewError
           onRetry={() => {
             void query.refetch()
           }}
         />
       ) : null}
-      {query.data ? (
-        <div className={query.isPlaceholderData ? 'opacity-60' : undefined}>
-          <DiscountRuleGrid rules={query.data.items} />
-        </div>
+      {query.data && rules.length > 0 ? (
+        <ScrollArea className='min-h-0 flex-1 pr-2'>
+          <DiscountRuleGrid rules={rules} />
+          <div
+            ref={loadMoreRef}
+            data-slot='load-more-sentinel'
+            className='flex min-h-8 items-center justify-center'
+            aria-hidden='true'
+          >
+            {isFetchingNextPage ? (
+              <Loader2
+                className='text-muted-foreground size-4 animate-spin'
+                aria-label={t('Loading')}
+              />
+            ) : null}
+          </div>
+        </ScrollArea>
       ) : null}
-      {query.data?.items.length === 0 ? (
+      {query.data && rules.length === 0 ? (
         <p className='text-muted-foreground py-4 text-sm'>
           {t('No models matched your search.')}
         </p>
       ) : null}
     </div>
+  )
+}
+
+/** 在抽屉中展示单个用户的规则，避免主表出现嵌套明细和第二套分页。 */
+export function UserModelPricingDetailsSheet(props: {
+  item: UserModelPricingOverviewItem
+  keyword: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const { t } = useTranslation()
+
+  return (
+    <Sheet open={props.open} onOpenChange={props.onOpenChange}>
+      <SheetContent className={sideDrawerContentClassName('sm:max-w-2xl')}>
+        <SheetHeader className={sideDrawerHeaderClassName()}>
+          <div className='min-w-0 pr-8'>
+            <SheetTitle className='flex min-w-0 items-center gap-2'>
+              <span
+                className='min-w-0 truncate'
+                title={props.item.user.username}
+              >
+                {props.item.user.username}
+              </span>
+              <TableId
+                value={`#${props.item.user.id}`}
+                className='shrink-0 text-xs'
+              />
+            </SheetTitle>
+            <SheetDescription className='mt-1'>
+              {t('Model discounts')}
+            </SheetDescription>
+          </div>
+          <div className='flex flex-wrap items-center gap-2'>
+            <GroupBadge group={props.item.user.group} />
+            <UserRole user={props.item.user} />
+            <RuleCount count={props.item.rule_count} />
+            <DiscountSummary item={props.item} />
+          </div>
+        </SheetHeader>
+        <div
+          className={sideDrawerFormClassName('min-h-0 gap-3 overflow-hidden')}
+        >
+          <DiscountRuleList
+            userId={props.item.user.id}
+            keyword={props.keyword}
+          />
+        </div>
+      </SheetContent>
+    </Sheet>
   )
 }
 
@@ -226,6 +408,7 @@ function DiscountRuleGrid({ rules }: { rules: UserModelPricingItem[] }) {
             <p
               className='font-mono text-sm leading-relaxed [overflow-wrap:anywhere]'
               title={rule.model_name}
+              translate='no'
             >
               {rule.model_name}
             </p>
@@ -270,41 +453,32 @@ function UserIdentity({ user }: { user: UserModelPricingOverviewUser }) {
   )
 }
 
-function UserStatus({ user }: { user: UserModelPricingOverviewUser }) {
+// 用户折扣总览仅展示角色，账号启用状态不属于该页面的筛选和比较维度。
+function UserRole({ user }: { user: UserModelPricingOverviewUser }) {
   const { t } = useTranslation()
-  const status = USER_STATUSES[user.status as keyof typeof USER_STATUSES]
   const role = USER_ROLES[user.role as keyof typeof USER_ROLES]
 
+  if (!role) return null
+
   return (
-    <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
-      {status ? (
-        <StatusBadge
-          label={t(status.labelKey)}
-          variant={status.variant}
-          copyable={false}
-        />
-      ) : null}
-      {role ? (
-        <span className='text-muted-foreground inline-flex items-center gap-1 text-xs'>
-          <role.icon aria-hidden='true' className='size-3.5' />
-          {t(role.labelKey)}
-        </span>
-      ) : null}
-    </div>
+    <span className='text-muted-foreground inline-flex items-center gap-1 text-xs'>
+      <role.icon aria-hidden='true' className='size-3.5' />
+      {t(role.labelKey)}
+    </span>
   )
 }
 
-function ExpandDiscountsButton({
-  expanded,
+function ViewDiscountsButton({
+  open,
   username,
   onClick,
 }: {
-  expanded: boolean
+  open: boolean
   username: string
   onClick: () => void
 }) {
   const { t } = useTranslation()
-  const label = expanded
+  const label = open
     ? t('Hide discounts for {{username}}', { username })
     : t('Show discounts for {{username}}', { username })
 
@@ -317,17 +491,11 @@ function ExpandDiscountsButton({
             size='icon-sm'
             onClick={onClick}
             aria-label={label}
-            aria-expanded={expanded}
+            aria-expanded={open}
           />
         }
       >
-        <ChevronDown
-          aria-hidden='true'
-          className={cn(
-            'transition-transform duration-200 motion-reduce:transition-none',
-            expanded && 'rotate-180'
-          )}
-        />
+        <List aria-hidden='true' />
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
     </Tooltip>
@@ -377,111 +545,86 @@ function RuleCount({ count }: { count: number }) {
 
 function UserModelPricingDesktopRow({
   item,
-  expanded,
-  onToggle,
+  selected,
+  onOpen,
   onEdit,
 }: {
   item: UserModelPricingOverviewItem
-  expanded: boolean
-  onToggle: () => void
+  selected: boolean
+  onOpen: () => void
   onEdit: () => void
 }) {
   return (
-    // 每个用户独立成组，吸顶行在当前模型列表结束时被下一用户自然顶走。
-    <tbody className='[clip-path:inset(0)] [&>tr]:animate-none'>
-      <TableRow
-        aria-expanded={expanded ? true : undefined}
-        className={cn(
-          'sticky top-10 z-[5] bg-background shadow-[0_1px_0_var(--border)] [&>td]:py-3',
-          expanded && '[&>td]:bg-muted/40'
-        )}
-      >
-        <TableCell className='w-12 px-2'>
-          <ExpandDiscountsButton
-            expanded={expanded}
+    <TableRow
+      aria-selected={selected}
+      className={cn('[&>td]:py-3', selected && 'bg-muted/40 hover:bg-muted/40')}
+    >
+      <TableCell className='min-w-[240px]'>
+        <UserIdentity user={item.user} />
+      </TableCell>
+      <TableCell className='min-w-[130px]'>
+        <GroupBadge group={item.user.group} />
+      </TableCell>
+      <TableCell className='min-w-[170px]'>
+        <UserRole user={item.user} />
+      </TableCell>
+      <TableCell className='min-w-[110px]'>
+        <RuleCount count={item.rule_count} />
+      </TableCell>
+      <TableCell className='max-w-[520px] min-w-[300px]'>
+        <DiscountModelPreview item={item} />
+      </TableCell>
+      <TableCell className='w-24 px-2 text-right'>
+        <div className='flex items-center justify-end gap-1'>
+          <ViewDiscountsButton
+            open={selected}
             username={item.user.username}
-            onClick={onToggle}
+            onClick={onOpen}
           />
-        </TableCell>
-        <TableCell className='min-w-[240px]'>
-          <UserIdentity user={item.user} />
-        </TableCell>
-        <TableCell className='min-w-[130px]'>
-          <GroupBadge group={item.user.group} />
-        </TableCell>
-        <TableCell className='min-w-[170px]'>
-          <UserStatus user={item.user} />
-        </TableCell>
-        <TableCell className='min-w-[110px]'>
-          <RuleCount count={item.rule_count} />
-        </TableCell>
-        <TableCell className='max-w-[520px] min-w-[300px]'>
-          <DiscountSummary item={item} />
-        </TableCell>
-        <TableCell className='w-14 px-2 text-right'>
           <EditDiscountsButton username={item.user.username} onClick={onEdit} />
-        </TableCell>
-      </TableRow>
-      {expanded && (
-        <TableRow className='bg-muted/20 hover:bg-muted/20 !h-auto'>
-          <TableCell colSpan={7} className='px-4 py-5'>
-            {/* 用户行已展示规则数量，展开区直接列出模型，避免重复标题和嵌套卡片。 */}
-            <DiscountRulePage userId={item.user.id} />
-          </TableCell>
-        </TableRow>
-      )}
-    </tbody>
+        </div>
+      </TableCell>
+    </TableRow>
   )
 }
 
 export function UserModelPricingMobileRow({
   item,
-  expanded,
-  onToggle,
+  selected,
+  onOpen,
   onEdit,
 }: {
   item: UserModelPricingOverviewItem
-  expanded: boolean
-  onToggle: () => void
+  selected: boolean
+  onOpen: () => void
   onEdit: () => void
 }) {
   return (
     <div
       className={cn(
         '[background-color:var(--data-table-card-bg,var(--table-row))] p-3',
-        expanded && 'bg-muted/20'
+        selected && 'bg-muted/20'
       )}
     >
-      {/* 手机端将用户信息作为组内吸顶区，外层组保留边界以实现自然交接。 */}
-      <div className='bg-background sticky top-0 z-[5] -mx-3 -mt-3 px-3 py-3 shadow-[0_1px_0_var(--border)]'>
-        <div className='flex min-w-0 items-start gap-2'>
-          <ExpandDiscountsButton
-            expanded={expanded}
+      <div className='flex min-w-0 items-start gap-2'>
+        <div className='min-w-0 flex-1'>
+          <UserIdentity user={item.user} />
+        </div>
+        <div className='flex shrink-0 items-center gap-1'>
+          <ViewDiscountsButton
+            open={selected}
             username={item.user.username}
-            onClick={onToggle}
+            onClick={onOpen}
           />
-          <div className='min-w-0 flex-1'>
-            <UserIdentity user={item.user} />
-          </div>
           <EditDiscountsButton username={item.user.username} onClick={onEdit} />
         </div>
-        <div className='mt-3 flex flex-wrap items-center gap-2'>
-          <GroupBadge group={item.user.group} />
-          <UserStatus user={item.user} />
-          <RuleCount count={item.rule_count} />
-        </div>
       </div>
-      {!expanded && (
-        <div className='mt-3'>
-          <DiscountSummary item={item} />
-        </div>
-      )}
-      {expanded && (
-        <div className='mt-4 border-t pt-4 pb-2'>
-          {/* 移动端与桌面端保持一致，分隔线下直接展示模型列表。 */}
-          <DiscountRulePage userId={item.user.id} />
-        </div>
-      )}
+      <div className='mt-3 flex flex-wrap items-center gap-2'>
+        <GroupBadge group={item.user.group} />
+        <UserRole user={item.user} />
+        <RuleCount count={item.rule_count} />
+        <DiscountModelPreview item={item} />
+      </div>
     </div>
   )
 }
@@ -490,16 +633,21 @@ function OverviewEmpty({ hasSearch }: { hasSearch: boolean }) {
   const { t } = useTranslation()
 
   return (
-    <EmptyState
-      bordered
-      icon={BadgePercent}
-      title={t('No user discounts configured')}
-      description={
-        hasSearch
-          ? t('No users or models matched your search.')
-          : t('No model discounts have been configured yet.')
-      }
-    />
+    <div className='rounded-lg border p-6'>
+      <Empty className='border-none p-0'>
+        <EmptyHeader>
+          <EmptyMedia variant='icon'>
+            <BadgePercent aria-hidden='true' className='size-5' />
+          </EmptyMedia>
+          <EmptyTitle>{t('No user discounts configured')}</EmptyTitle>
+          <EmptyDescription>
+            {hasSearch
+              ? t('No users or models matched your search.')
+              : t('No model discounts have been configured yet.')}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    </div>
   )
 }
 
@@ -508,16 +656,16 @@ function OverviewMobileList({
   isLoading,
   isFetching,
   hasSearch,
-  expandedUserIds,
-  onToggle,
+  selectedUserId,
+  onOpen,
   onEdit,
 }: {
   items: UserModelPricingOverviewItem[]
   isLoading: boolean
   isFetching: boolean
   hasSearch: boolean
-  expandedUserIds: Set<number>
-  onToggle: (userId: number) => void
+  selectedUserId: number | null
+  onOpen: (item: UserModelPricingOverviewItem) => void
   onEdit: (user: UserModelPricingOverviewUser) => void
 }) {
   if (isLoading) {
@@ -546,8 +694,8 @@ function OverviewMobileList({
         <UserModelPricingMobileRow
           key={item.user.id}
           item={item}
-          expanded={expandedUserIds.has(item.user.id)}
-          onToggle={() => onToggle(item.user.id)}
+          selected={selectedUserId === item.user.id}
+          onOpen={() => onOpen(item)}
           onEdit={() => onEdit(item.user)}
         />
       ))}
@@ -571,7 +719,7 @@ function OverviewStats({
       iconClassName: 'text-info bg-info/10',
     },
     {
-      label: t('Discount rules'),
+      label: t('Configured models'),
       value: data.total_rules,
       icon: ListChecks,
       iconClassName: 'text-warning bg-warning/10',
@@ -621,11 +769,16 @@ function OverviewError({ onRetry }: { onRetry: () => void }) {
   const { t } = useTranslation()
 
   return (
-    <ErrorState
-      title={t('Failed to load user discounts')}
-      onRetry={onRetry}
-      className='border-destructive/30 bg-destructive/5 min-h-56 rounded-lg border'
-    />
+    <div className='border-destructive/30 bg-destructive/5 flex min-h-56 flex-col items-center justify-center gap-3 rounded-lg border px-4 text-center'>
+      <TriangleAlert aria-hidden='true' className='text-destructive size-5' />
+      <p className='text-sm font-medium'>
+        {t('Failed to load user discounts')}
+      </p>
+      <Button variant='outline' onClick={onRetry}>
+        <RefreshCw aria-hidden='true' />
+        {t('Retry')}
+      </Button>
+    </div>
   )
 }
 
@@ -648,14 +801,12 @@ function OverviewRefreshError({ onRetry }: { onRetry: () => void }) {
   )
 }
 
-/** 管理端用户折扣总览，负责分页查询、展开状态和已有编辑弹窗的联动。 */
+/** 管理端用户折扣总览，负责用户分页、详情抽屉和已有编辑弹窗的联动。 */
 export function UserModelPricingOverview() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const isMobile = useMediaQuery('(max-width: 640px)')
-  const [expandedUserIds, setExpandedUserIds] = useState<Set<number>>(
-    () => new Set()
-  )
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
   const [editingUser, setEditingUser] =
     useState<UserModelPricingOverviewUser | null>(null)
 
@@ -675,7 +826,33 @@ export function UserModelPricingOverview() {
       defaultPageSize: isMobile ? 10 : 20,
     },
     globalFilter: { enabled: true, key: 'filter' },
+    columnFilters: [
+      { columnId: 'group', searchKey: 'group', type: 'array' },
+      { columnId: 'role', searchKey: 'role', type: 'array' },
+    ],
   })
+
+  const groupFilter =
+    (columnFilters.find((filter) => filter.id === 'group')?.value as
+      | string[]
+      | undefined) ?? []
+  const roleFilter =
+    (columnFilters.find((filter) => filter.id === 'role')?.value as
+      | string[]
+      | undefined) ?? []
+
+  const { data: groupsData } = useQuery({
+    queryKey: ['groups'],
+    queryFn: getGroups,
+  })
+  const groupOptions = useMemo(
+    () =>
+      (groupsData?.data || []).map((group) => ({
+        label: group,
+        value: group,
+      })),
+    [groupsData]
+  )
 
   const query = useQuery({
     queryKey: [
@@ -683,11 +860,15 @@ export function UserModelPricingOverview() {
       pagination.pageIndex + 1,
       pagination.pageSize,
       globalFilter,
+      groupFilter,
+      roleFilter,
     ],
     queryFn: async ({ signal }) => {
       const response = await getUserModelPricingOverview(
         {
           keyword: globalFilter,
+          group: groupFilter.length > 0 ? groupFilter[0] : undefined,
+          role: roleFilter.length > 0 ? roleFilter[0] : undefined,
           p: pagination.pageIndex + 1,
           page_size: pagination.pageSize,
         },
@@ -704,33 +885,22 @@ export function UserModelPricingOverview() {
 
   const overview = query.data ?? EMPTY_OVERVIEW
   const items = overview.items
-  const hasSearch = Boolean(globalFilter?.trim())
+  const hasSearch = Boolean(
+    globalFilter?.trim() || groupFilter.length > 0 || roleFilter.length > 0
+  )
+  const selectedUser =
+    items.find((item) => item.user.id === selectedUserId) ?? null
 
-  const toggleUser = useCallback((userId: number) => {
-    setExpandedUserIds((previous) => {
-      const next = new Set(previous)
-      if (next.has(userId)) next.delete(userId)
-      else next.add(userId)
-      return next
-    })
+  const openUser = useCallback((item: UserModelPricingOverviewItem) => {
+    setSelectedUserId((previous) =>
+      previous === item.user.id ? null : item.user.id
+    )
   }, [])
 
   const editUser = useCallback((user: UserModelPricingOverviewUser) => {
+    setSelectedUserId(null)
     setEditingUser(user)
   }, [])
-
-  const toggleAll = useCallback(() => {
-    setExpandedUserIds((previous) => {
-      const allExpanded =
-        items.length > 0 && items.every((item) => previous.has(item.user.id))
-      return allExpanded
-        ? new Set()
-        : new Set(items.map((item) => item.user.id))
-    })
-  }, [items])
-
-  const allExpanded =
-    items.length > 0 && items.every((item) => expandedUserIds.has(item.user.id))
 
   const refreshOverview = useCallback(() => {
     void query.refetch()
@@ -748,9 +918,31 @@ export function UserModelPricingOverview() {
     })
   }, [queryClient])
 
+  // 用户筛选或翻页会改变主列表上下文，先关闭详情抽屉再提交 URL 状态。
+  const handleGlobalFilterChange: OnChangeFn<string> = useCallback(
+    (updater) => {
+      setSelectedUserId(null)
+      onGlobalFilterChange?.(updater)
+    },
+    [onGlobalFilterChange]
+  )
+  const handlePaginationChange: OnChangeFn<PaginationState> = useCallback(
+    (updater) => {
+      setSelectedUserId(null)
+      onPaginationChange(updater)
+    },
+    [onPaginationChange]
+  )
+  const handleColumnFiltersChange: OnChangeFn<ColumnFiltersState> = useCallback(
+    (updater) => {
+      setSelectedUserId(null)
+      onColumnFiltersChange(updater)
+    },
+    [onColumnFiltersChange]
+  )
+
   const columns = useMemo<ColumnDef<UserModelPricingOverviewItem>[]>(
     () => [
-      { id: 'expand', header: '', size: 48, enableHiding: false },
       {
         id: 'user',
         accessorFn: (item) => item.user.username,
@@ -765,9 +957,9 @@ export function UserModelPricingOverview() {
         size: 150,
       },
       {
-        id: 'status',
-        accessorFn: (item) => item.user.status,
-        header: t('Status'),
+        id: 'role',
+        accessorFn: (item) => item.user.role,
+        header: t('Role'),
         size: 170,
       },
       {
@@ -779,11 +971,13 @@ export function UserModelPricingOverview() {
       {
         id: 'discounts',
         accessorFn: (item) =>
-          item.rules.map((rule) => rule.model_name).join(' '),
+          (item.preview_rules ?? item.rules)
+            .map((rule) => rule.model_name)
+            .join(' '),
         header: t('Model discounts'),
         size: 380,
       },
-      { id: 'actions', header: t('Actions'), size: 64, enableHiding: false },
+      { id: 'actions', header: t('Actions'), size: 96, enableHiding: false },
     ],
     [t]
   )
@@ -795,13 +989,13 @@ export function UserModelPricingOverview() {
         <UserModelPricingDesktopRow
           key={row.id}
           item={item}
-          expanded={expandedUserIds.has(item.user.id)}
-          onToggle={() => toggleUser(item.user.id)}
+          selected={selectedUserId === item.user.id}
+          onOpen={() => openUser(item)}
           onEdit={() => editUser(item.user)}
         />
       )
     },
-    [editUser, expandedUserIds, toggleUser]
+    [editUser, openUser, selectedUserId]
   )
 
   const { table } = useDataTable({
@@ -809,13 +1003,13 @@ export function UserModelPricingOverview() {
     columns,
     getRowId: (item) => String(item.user.id),
     pagination,
-    onPaginationChange,
+    onPaginationChange: handlePaginationChange,
     manualPagination: true,
     manualFiltering: true,
     columnFilters,
-    onColumnFiltersChange,
+    onColumnFiltersChange: handleColumnFiltersChange,
     globalFilter,
-    onGlobalFilterChange,
+    onGlobalFilterChange: handleGlobalFilterChange,
     totalCount: overview.total,
     ensurePageInRange,
   })
@@ -850,7 +1044,7 @@ export function UserModelPricingOverview() {
   }
 
   return (
-    <PricingSearchContext.Provider value={globalFilter ?? ''}>
+    <>
       <SectionPageLayout fixedContent>
         <SectionPageLayout.Breadcrumb>
           <OverviewBreadcrumb />
@@ -894,17 +1088,14 @@ export function UserModelPricingOverview() {
                 skeletonKeyPrefix='user-model-pricing-overview-skeleton'
                 applyHeaderSize
                 renderRow={renderDesktopRow}
-                renderRowGroups
-                // 分离边框且清零间距，避免折叠边框在吸顶合成时露出下方文字。
-                tableClassName='[&_table]:border-separate [&_table]:border-spacing-0'
                 mobile={
                   <OverviewMobileList
                     items={items}
                     isLoading={query.isLoading}
                     isFetching={query.isFetching}
                     hasSearch={hasSearch}
-                    expandedUserIds={expandedUserIds}
-                    onToggle={toggleUser}
+                    selectedUserId={selectedUserId}
+                    onOpen={openUser}
                     onEdit={editUser}
                   />
                 }
@@ -912,29 +1103,20 @@ export function UserModelPricingOverview() {
                   searchPlaceholder: t('Search users or models...'),
                   searchDebounceMs: 400,
                   hideViewOptions: true,
-                  preActions:
-                    items.length > 0 ? (
-                      <Button
-                        variant='ghost'
-                        size='sm'
-                        onClick={toggleAll}
-                        aria-label={
-                          allExpanded ? t('Collapse all') : t('Expand all')
-                        }
-                      >
-                        {allExpanded ? (
-                          <ChevronDown
-                            aria-hidden='true'
-                            className='rotate-180'
-                          />
-                        ) : (
-                          <ChevronDown aria-hidden='true' />
-                        )}
-                        <span>
-                          {allExpanded ? t('Collapse all') : t('Expand all')}
-                        </span>
-                      </Button>
-                    ) : undefined,
+                  filters: [
+                    {
+                      columnId: 'group',
+                      title: t('Group'),
+                      options: groupOptions,
+                      singleSelect: true,
+                    },
+                    {
+                      columnId: 'role',
+                      title: t('Role'),
+                      options: getUserRoleOptions(t),
+                      singleSelect: true,
+                    },
+                  ],
                 }}
               />
             </div>
@@ -942,9 +1124,21 @@ export function UserModelPricingOverview() {
         </SectionPageLayout.Content>
       </SectionPageLayout>
 
+      {selectedUser ? (
+        <UserModelPricingDetailsSheet
+          open
+          item={selectedUser}
+          keyword={globalFilter ?? ''}
+          onOpenChange={(open) => {
+            if (!open) setSelectedUserId(null)
+          }}
+        />
+      ) : null}
+
       {editingUser ? (
         <UserModelPricingDialog
           open
+          configuredOnly
           onOpenChange={(open) => {
             if (!open) setEditingUser(null)
           }}
@@ -952,7 +1146,7 @@ export function UserModelPricingOverview() {
           onSaved={handleSaved}
         />
       ) : null}
-    </PricingSearchContext.Provider>
+    </>
   )
 }
 

@@ -1,20 +1,32 @@
 package controller
 
 import (
+	"strconv"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 )
 
-// GetUserModelPricingOverview 返回管理员可见的用户折扣汇总，页面可一次展示每个用户的全部规则。
+// GetUserModelPricingOverview 返回管理员可见的用户折扣汇总及少量模型预览。
 func GetUserModelPricingOverview(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
+	var roleFilter *int
+	if roleValue := c.Query("role"); roleValue != "" {
+		if parsedRole, err := strconv.Atoi(roleValue); err == nil {
+			roleFilter = &parsedRole
+		}
+	}
 	result, err := model.GetUserModelPricingOverview(
 		c.Request.Context(),
 		c.Query("keyword"),
 		c.GetInt("role"),
 		pageInfo.GetStartIdx(),
 		pageInfo.GetPageSize(),
+		model.UserModelPricingOverviewFilters{
+			Group: c.Query("group"),
+			Role:  roleFilter,
+		},
 		c.Query("summary") == "true",
 	)
 	if err != nil {

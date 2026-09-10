@@ -1137,6 +1137,7 @@
     "Configured": "已配置",
     "Configured as PayMethods JSON. The type value decides which payment flow is used: stripe for Stripe, waffo_pancake for Waffo Pancake, and other values are sent to Epay as the type parameter.": "保存为 PayMethods JSON。type 值决定点击后使用哪个支付流程：stripe 走 Stripe，waffo_pancake 走 Waffo Pancake，其他值作为 Epay 的 type 参数提交。",
     "Configured discounts": "已配置折扣",
+    "Configured models": "已配置模型",
     "Configured routes and latency checks": "已配置路由和延迟检测",
     "Confirm": "确认",
     "Confirm Action": "确认操作",

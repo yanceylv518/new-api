@@ -176,7 +176,7 @@ export async function replaceUserModelPricing(
   return res.data
 }
 
-/** 总览只请求摘要，规则通过展开区分页接口按需加载。 */
+/** 总览请求用户摘要和少量模型预览，完整规则通过抽屉分页接口按需加载。 */
 export async function getUserModelPricingOverview(
   params: UserModelPricingOverviewParams = {},
   signal?: AbortSignal
@@ -188,6 +188,8 @@ export async function getUserModelPricingOverview(
     signal,
     params: {
       keyword: params.keyword,
+      group: params.group,
+      role: params.role,
       p: params.p,
       page_size: params.page_size,
       summary: true,

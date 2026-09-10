@@ -1137,6 +1137,7 @@
     "Configured": "Đã cấu hình",
     "Configured as PayMethods JSON. The type value decides which payment flow is used: stripe for Stripe, waffo_pancake for Waffo Pancake, and other values are sent to Epay as the type parameter.": "Được lưu dưới dạng JSON PayMethods. Giá trị type quyết định luồng thanh toán sẽ dùng: stripe cho Stripe, waffo_pancake cho Waffo Pancake, các giá trị khác được gửi tới Epay dưới dạng tham số type.",
     "Configured discounts": "Giảm giá đã cấu hình",
+    "Configured models": "Mô hình đã cấu hình",
     "Configured routes and latency checks": "Tuyến đã cấu hình và kiểm tra độ trễ",
     "Confirm": "Xác nhận",
     "Confirm Action": "Xác nhận hành động",

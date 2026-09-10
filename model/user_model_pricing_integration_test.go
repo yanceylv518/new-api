@@ -100,7 +100,7 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			require.NoError(t, err)
 			assert.EqualValues(t, 2, revision)
 			// 总览及分页在真实引擎验证，统计不能因排序规则合并大小写不同的模型。
-			overview, err := GetUserModelPricingOverview(t.Context(), "", common.RoleRootUser, 0, 20, true)
+			overview, err := GetUserModelPricingOverview(t.Context(), "", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, true)
 			require.NoError(t, err)
 			assert.EqualValues(t, 4, overview.TotalModels)
 			require.Len(t, overview.Items, 1)

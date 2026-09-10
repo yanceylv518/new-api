@@ -44,15 +44,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { handleServerError } from '@/lib/handle-server-error'
+import { cn } from '@/lib/utils'
 
 import { getUserModelPricing, replaceUserModelPricing } from '../../api'
 import {
@@ -68,22 +61,123 @@ interface UserModelPricingDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   user: Pick<User, 'id' | 'username'>
+  // 总览页编辑时只展示已经保存专属折扣的模型，用户管理页默认展示全部启用模型。
+  configuredOnly?: boolean
   onSaved?: () => void | Promise<void>
 }
 
-type DiscountFilter = 'all' | 'configured' | 'unconfigured'
-
 // 固定每页模型数量，配合列表滚动避免大量模型撑开弹窗。
 const MODEL_PAGE_SIZE = 25
+
+// 表头与数据行共用同一套列模板和水平内边距，确保复选框、模型名和折扣输入严格对齐。
+const MODEL_PRICING_GRID_CLASS =
+  'grid grid-cols-[2rem_minmax(0,1fr)_7rem] gap-2 sm:grid-cols-[2rem_minmax(0,1fr)_9rem]'
+
+type ModelPricingBatchActionsProps = {
+  selectedCount: number
+  value: string
+  error: string | null
+  disabled: boolean
+  onValueChange: (value: string) => void
+  onApply: () => void
+  onClear: () => void
+}
+
+/**
+ * 在模型列表底部提供批量编辑工具条。
+ *
+ * 工具条悬浮在列表阶段内，不参与列表的普通排版；列表底部会预留安全区，
+ * 让最后一个模型仍可滚动到工具条上方，避免批量操作遮挡输入框。
+ */
+function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
+  const { t } = useTranslation()
+
+  return (
+    <div
+      data-slot='model-pricing-batch'
+      data-placement='floating'
+      role='toolbar'
+      aria-label={t('{{n}} model(s) selected', {
+        n: props.selectedCount,
+      })}
+      className='pointer-events-none absolute inset-x-2 bottom-2 z-20 flex justify-center sm:inset-x-4 sm:bottom-3'
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape') return
+        event.preventDefault()
+        props.onClear()
+      }}
+    >
+      <div className='bg-background/95 supports-[backdrop-filter]:bg-background/70 pointer-events-auto flex w-full max-w-2xl flex-wrap items-center gap-2 rounded-xl border p-2 shadow-xl backdrop-blur-lg'>
+        <span className='min-w-0 flex-1 text-sm'>
+          {t('{{n}} model(s) selected', { n: props.selectedCount })}
+        </span>
+        <div className='relative w-24 shrink-0'>
+          <Input
+            type='number'
+            min='0.01'
+            max='100'
+            step='0.01'
+            value={props.value}
+            disabled={props.disabled}
+            aria-label={t('Batch discount percentage')}
+            aria-invalid={Boolean(props.error)}
+            aria-describedby={
+              props.error ? 'model-pricing-batch-error' : undefined
+            }
+            className='pr-7 font-mono'
+            onChange={(event) => props.onValueChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              props.onApply()
+            }}
+          />
+          <span className='text-muted-foreground pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-xs'>
+            %
+          </span>
+        </div>
+        <Button
+          type='button'
+          variant='outline'
+          disabled={props.disabled}
+          onClick={props.onApply}
+        >
+          <BadgePercent aria-hidden='true' />
+          {t('Apply discount')}
+        </Button>
+        <Button
+          type='button'
+          variant='ghost'
+          size='icon-sm'
+          aria-label={t('Clear selection')}
+          title={t('Clear selection')}
+          disabled={props.disabled}
+          onClick={props.onClear}
+        >
+          <X aria-hidden='true' />
+        </Button>
+        {props.error && (
+          <p
+            id='model-pricing-batch-error'
+            role='alert'
+            className='text-destructive basis-full px-1 text-xs'
+          >
+            {props.error}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /** 管理员编辑单个用户的完整模型折扣比例规则。 */
 export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const configuredOnly = props.configuredOnly === true
   const [searchTerm, setSearchTerm] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
-  const [discountFilter, setDiscountFilter] = useState<DiscountFilter>('all')
-  // 以规范化模型名保存选择，翻页和筛选不改变批量操作的目标。
+  // 以规范化模型名保存选择，翻页和搜索不改变批量操作的目标。
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set())
   const [batchDiscount, setBatchDiscount] = useState('100')
   const [batchError, setBatchError] = useState<string | null>(null)
@@ -107,6 +201,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   // 编辑会话冻结规则、目录与 revision，后台查询更新不得重建行索引或覆盖未保存草稿。
   const [editorSnapshot, setEditorSnapshot] = useState<{
     userId: number
+    configuredOnly: boolean
     collection: NonNullable<typeof collection>
     rows: ReturnType<typeof buildUserModelPricingRows>
   } | null>(null)
@@ -118,7 +213,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     setBatchError(null)
   } else if (
     props.open &&
-    editorSnapshot?.userId !== props.user.id &&
+    (editorSnapshot?.userId !== props.user.id ||
+      editorSnapshot?.configuredOnly !== configuredOnly) &&
     collection &&
     query.isSuccess &&
     query.data.success &&
@@ -129,28 +225,33 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     setSelectedModels(new Set())
     setBatchDiscount('100')
     setBatchError(null)
+    const normalizedEnabledNames = new Set(
+      collection.model_names.map(normalizeUserModelPricingModelName)
+    )
+    const configuredModels = collection.items
+      .filter((item) =>
+        normalizedEnabledNames.has(
+          normalizeUserModelPricingModelName(item.model_name)
+        )
+      )
+      .map(({ model_name }) => ({ model_name }))
     setEditorSnapshot({
       userId: props.user.id,
+      configuredOnly,
       collection,
-      // 目录与规则由同一管理接口返回，加载失败时一次重试即可恢复整个编辑会话。
+      // 用户管理入口展示全部启用模型；总览编辑入口只展示已配置且仍启用的模型。
       rows: buildUserModelPricingRows(
-        collection.model_names.map((model_name) => ({ model_name }))
+        configuredOnly
+          ? configuredModels
+          : collection.model_names.map((model_name) => ({ model_name }))
       ),
     })
   }
   const activeSnapshot =
-    editorSnapshot?.userId === props.user.id ? editorSnapshot : null
-  // 复用归一化后的折扣规则判断模型是否已经配置过专属折扣。
-  const configuredDiscounts = useMemo(() => {
-    const discounts = new Map<string, number>()
-    for (const item of activeSnapshot?.collection.items ?? []) {
-      discounts.set(
-        normalizeUserModelPricingModelName(item.model_name),
-        item.discount_bps / 100
-      )
-    }
-    return discounts
-  }, [activeSnapshot])
+    editorSnapshot?.userId === props.user.id &&
+    editorSnapshot.configuredOnly === configuredOnly
+      ? editorSnapshot
+      : null
 
   const pricingRows = useMemo(
     () => activeSnapshot?.rows ?? [],
@@ -166,7 +267,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       ])
     )
     form.reset({
-      // 所有启用模型都展示，未配置专属折扣时默认按原价计费。
+      // 未配置模型在完整目录模式下按原价回填，已配置模式的行都有专属折扣值。
       items: activeSnapshot.rows.map((model) => ({
         model_name: model.model_name,
         discount_percent:
@@ -178,10 +279,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
 
   const handleOpenChange = (open: boolean) => {
     if (!open) {
-      // 关闭时清空筛选状态，下一次打开默认从第一页展示全部模型。
+      // 关闭时清空搜索状态，下一次打开从当前入口对应的模型集第一页开始。
       setSearchTerm('')
       setCurrentPage(1)
-      setDiscountFilter('all')
     }
     props.onOpenChange(open)
   }
@@ -232,31 +332,17 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       (query.data !== undefined &&
         (!query.data.success || !Array.isArray(collection?.model_names))))
 
-  // 预先缓存小写模型名，搜索时只扫描稳定的行索引，减少重复字符串处理和对象创建。
+  // 预先缓存小写模型名，搜索时只扫描稳定的模型行索引。
   const modelRows = useMemo(
     () =>
       pricingRows.map((model, index) => ({
         model,
         index,
         searchName: model.model_name.toLowerCase(),
-        isConfigured: configuredDiscounts.has(
-          normalizeUserModelPricingModelName(model.model_name)
-        ),
       })),
-    [configuredDiscounts, pricingRows]
+    [pricingRows]
   )
-  // 只排序显示索引副本，保留表单字段的原始索引，避免输入时焦点和值发生错位。
-  // 排序依据是已保存的折扣规则，编辑中的空值不会触发行位置跳动。
-  const orderedRows = useMemo(
-    () =>
-      [...modelRows].sort(
-        (left, right) =>
-          Number(right.isConfigured) - Number(left.isConfigured) ||
-          left.index - right.index
-      ),
-    [modelRows]
-  )
-  // 校验失败时按表单原始索引恢复筛选和分页，让被卸载的错误行重新挂载。
+  // 校验失败时按表单原始索引恢复搜索和分页，让被卸载的错误行重新挂载。
   const handleInvalid = (errors: FieldErrors<UserModelPricingFormValues>) => {
     const invalidItemKey = Object.keys(errors.items ?? {}).find((key) =>
       /^\d+$/.test(key)
@@ -264,26 +350,20 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     if (invalidItemKey === undefined) return
 
     const invalidItemIndex = Number(invalidItemKey)
-    const orderedIndex = orderedRows.findIndex(
+    const modelIndex = modelRows.findIndex(
       (row) => row.index === invalidItemIndex
     )
-    if (orderedIndex < 0) return
+    if (modelIndex < 0) return
 
     setSearchTerm('')
-    setDiscountFilter('all')
-    setCurrentPage(Math.floor(orderedIndex / MODEL_PAGE_SIZE) + 1)
+    setCurrentPage(Math.floor(modelIndex / MODEL_PAGE_SIZE) + 1)
   }
   const filteredRows = useMemo(() => {
     const keyword = deferredSearchTerm.trim().toLowerCase()
-    return orderedRows.filter(({ searchName, isConfigured }) => {
-      const matchesSearch = !keyword || searchName.includes(keyword)
-      const matchesDiscountFilter =
-        discountFilter === 'all' ||
-        (discountFilter === 'configured' && isConfigured) ||
-        (discountFilter === 'unconfigured' && !isConfigured)
-      return matchesSearch && matchesDiscountFilter
-    })
-  }, [deferredSearchTerm, discountFilter, orderedRows])
+    return modelRows.filter(
+      ({ searchName }) => !keyword || searchName.includes(keyword)
+    )
+  }, [deferredSearchTerm, modelRows])
   const totalModels = pricingRows.length
   const totalFilteredModels = filteredRows.length
   const totalPages = Math.max(
@@ -350,14 +430,6 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     // 批量写完再统一更新字段错误，避免每写一行就对完整表单重复校验。
     void form.trigger(changedFields)
   }
-  // 显式渲染筛选标签，避免下拉框回退显示内部枚举值（如 all）。
-  let discountFilterLabel = t('Unconfigured discounts')
-  if (discountFilter === 'all') {
-    discountFilterLabel = t('All')
-  } else if (discountFilter === 'configured') {
-    discountFilterLabel = t('Configured discounts')
-  }
-
   // 连续的 flex 高度约束将可用空间传给模型滚动区，同时保留少量模型时的内容自适应高度。
   return (
     <Dialog
@@ -450,38 +522,6 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     aria-label={t('Search models')}
                   />
                 </div>
-                <Select
-                  value={discountFilter}
-                  onValueChange={(value) => {
-                    if (
-                      value !== 'all' &&
-                      value !== 'configured' &&
-                      value !== 'unconfigured'
-                    ) {
-                      return
-                    }
-                    setDiscountFilter(value)
-                    setCurrentPage(1)
-                  }}
-                >
-                  <SelectTrigger
-                    className='w-full sm:w-44'
-                    aria-label={t('Discount filter')}
-                  >
-                    <SelectValue>{discountFilterLabel}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent alignItemWithTrigger={false}>
-                    <SelectGroup>
-                      <SelectItem value='all'>{t('All')}</SelectItem>
-                      <SelectItem value='configured'>
-                        {t('Configured discounts')}
-                      </SelectItem>
-                      <SelectItem value='unconfigured'>
-                        {t('Unconfigured discounts')}
-                      </SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
               </div>
               {totalModels > 0 && (
                 <span className='text-muted-foreground shrink-0 text-xs'>
@@ -491,80 +531,13 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               )}
             </div>
 
-            {activeSnapshot && selectedModels.size > 0 && (
-              <div
-                className='flex shrink-0 flex-col gap-2'
-                data-slot='model-pricing-batch'
-              >
-                <div className='flex flex-wrap items-center gap-2'>
-                  <span className='text-muted-foreground text-xs'>
-                    {t('{{n}} model(s) selected', { n: selectedModels.size })}
-                  </span>
-                  <div className='relative w-24 shrink-0'>
-                    <Input
-                      type='number'
-                      min='0.01'
-                      max='100'
-                      step='0.01'
-                      value={batchDiscount}
-                      disabled={mutation.isPending}
-                      aria-label={t('Batch discount percentage')}
-                      aria-invalid={Boolean(batchError)}
-                      aria-describedby={
-                        batchError ? 'model-pricing-batch-error' : undefined
-                      }
-                      className='pr-7 font-mono'
-                      onChange={(event) => {
-                        setBatchDiscount(event.target.value)
-                        setBatchError(null)
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key !== 'Enter') return
-                        event.preventDefault()
-                        applyBatchDiscount()
-                      }}
-                    />
-                    <span className='text-muted-foreground pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-xs'>
-                      %
-                    </span>
-                  </div>
-                  <Button
-                    type='button'
-                    variant='outline'
-                    disabled={mutation.isPending}
-                    onClick={applyBatchDiscount}
-                  >
-                    <BadgePercent aria-hidden='true' />
-                    {t('Apply discount')}
-                  </Button>
-                  <Button
-                    type='button'
-                    variant='ghost'
-                    size='icon-sm'
-                    aria-label={t('Clear selection')}
-                    title={t('Clear selection')}
-                    disabled={mutation.isPending}
-                    onClick={() => {
-                      setSelectedModels(new Set())
-                      setBatchError(null)
-                    }}
-                  >
-                    <X aria-hidden='true' />
-                  </Button>
-                </div>
-                {batchError && (
-                  <p
-                    id='model-pricing-batch-error'
-                    role='alert'
-                    className='text-destructive text-xs'
-                  >
-                    {batchError}
-                  </p>
-                )}
-              </div>
-            )}
-
-            <div className='grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_7rem] items-center gap-2 px-1 text-xs font-medium sm:grid-cols-[2rem_minmax(0,1fr)_9rem]'>
+            <div
+              data-slot='model-pricing-header'
+              className={cn(
+                MODEL_PRICING_GRID_CLASS,
+                'shrink-0 items-center px-2 text-xs font-medium'
+              )}
+            >
               <Checkbox
                 className='justify-self-center'
                 aria-label={t('Select all (filtered)')}
@@ -586,20 +559,22 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                 }}
               />
               <span>{t('Model')}</span>
-              <span>{t('Discount percentage')}</span>
+              <span className='min-w-0 truncate'>
+                {t('Discount percentage')}
+              </span>
             </div>
 
-            {totalFilteredModels === 0 ? (
-              <div
-                data-slot='model-pricing-list'
-                className='text-muted-foreground flex min-h-0 items-center justify-center rounded-md border px-4 py-10 text-center text-sm'
-              >
-                {totalModels === 0
-                  ? t('No models available')
-                  : t('No models matched your search.')}
-              </div>
-            ) : (
-              <>
+            <div data-slot='model-pricing-stage' className='relative min-h-0'>
+              {totalFilteredModels === 0 ? (
+                <div
+                  data-slot='model-pricing-list'
+                  className='text-muted-foreground flex min-h-0 items-center justify-center rounded-md border px-4 py-10 text-center text-sm'
+                >
+                  {totalModels === 0
+                    ? t('No model discounts have been configured yet.')
+                    : t('No models matched your search.')}
+                </div>
+              ) : (
                 <div
                   data-slot='model-pricing-list'
                   className='flex min-h-0 flex-col overflow-hidden rounded-md border'
@@ -608,11 +583,20 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     data-slot='model-pricing-scroll'
                     className='max-h-[min(55vh,32rem)] min-h-0 flex-1 overflow-y-auto overscroll-contain'
                   >
-                    <div className='divide-y'>
+                    <div
+                      className={cn(
+                        'divide-y',
+                        selectedModels.size > 0 && 'pb-28 sm:pb-20'
+                      )}
+                    >
                       {paginatedRows.map(({ model, index }) => (
                         <div
                           key={model.model_name}
-                          className='grid grid-cols-[2rem_minmax(0,1fr)_7rem] items-start gap-2 sm:grid-cols-[2rem_minmax(0,1fr)_9rem]'
+                          data-slot='model-pricing-row'
+                          className={cn(
+                            MODEL_PRICING_GRID_CLASS,
+                            'items-start px-2'
+                          )}
                         >
                           <Checkbox
                             className='mt-3 justify-self-center'
@@ -652,7 +636,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                             control={form.control}
                             name={`items.${index}.discount_percent`}
                             render={({ field }) => (
-                              <FormItem className='p-2'>
+                              <FormItem className='py-2.5'>
                                 <FormLabel className='sr-only'>
                                   {t('Discount percentage')}
                                 </FormLabel>
@@ -691,49 +675,68 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     </div>
                   </div>
                 </div>
-                {/* 分页栏独立于模型列表，模型滚动时不会与模型行处于同一层级。 */}
-                <div
-                  data-slot='model-pricing-pagination'
-                  className='flex shrink-0 items-center justify-between gap-2 px-1 text-xs'
-                >
-                  <span className='text-muted-foreground'>
-                    {t('Page {{current}} of {{total}}', {
-                      current: safeCurrentPage,
-                      total: totalPages,
-                    })}
-                  </span>
-                  {showPagination && (
-                    <div className='flex items-center gap-1'>
-                      <Button
-                        type='button'
-                        variant='outline'
-                        size='icon-sm'
-                        onClick={() =>
-                          setCurrentPage((page) => Math.max(1, page - 1))
-                        }
-                        disabled={safeCurrentPage === 1}
-                        aria-label={t('Previous page')}
-                      >
-                        <ChevronLeft aria-hidden='true' />
-                      </Button>
-                      <Button
-                        type='button'
-                        variant='outline'
-                        size='icon-sm'
-                        onClick={() =>
-                          setCurrentPage((page) =>
-                            Math.min(totalPages, page + 1)
-                          )
-                        }
-                        disabled={safeCurrentPage === totalPages}
-                        aria-label={t('Next page')}
-                      >
-                        <ChevronRight aria-hidden='true' />
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              </>
+              )}
+
+              {activeSnapshot && selectedModels.size > 0 && (
+                <ModelPricingBatchActions
+                  selectedCount={selectedModels.size}
+                  value={batchDiscount}
+                  error={batchError}
+                  disabled={mutation.isPending}
+                  onValueChange={(value) => {
+                    setBatchDiscount(value)
+                    setBatchError(null)
+                  }}
+                  onApply={applyBatchDiscount}
+                  onClear={() => {
+                    setSelectedModels(new Set())
+                    setBatchError(null)
+                  }}
+                />
+              )}
+            </div>
+
+            {totalFilteredModels > 0 && (
+              /* 分页栏独立于模型列表和悬浮工具条，始终保留可点击空间。 */
+              <div
+                data-slot='model-pricing-pagination'
+                className='flex shrink-0 items-center justify-between gap-2 px-1 text-xs'
+              >
+                <span className='text-muted-foreground'>
+                  {t('Page {{current}} of {{total}}', {
+                    current: safeCurrentPage,
+                    total: totalPages,
+                  })}
+                </span>
+                {showPagination && (
+                  <div className='flex items-center gap-1'>
+                    <Button
+                      type='button'
+                      variant='outline'
+                      size='icon-sm'
+                      onClick={() =>
+                        setCurrentPage((page) => Math.max(1, page - 1))
+                      }
+                      disabled={safeCurrentPage === 1}
+                      aria-label={t('Previous page')}
+                    >
+                      <ChevronLeft aria-hidden='true' />
+                    </Button>
+                    <Button
+                      type='button'
+                      variant='outline'
+                      size='icon-sm'
+                      onClick={() =>
+                        setCurrentPage((page) => Math.min(totalPages, page + 1))
+                      }
+                      disabled={safeCurrentPage === totalPages}
+                      aria-label={t('Next page')}
+                    >
+                      <ChevronRight aria-hidden='true' />
+                    </Button>
+                  </div>
+                )}
+              </div>
             )}
           </form>
         </Form>

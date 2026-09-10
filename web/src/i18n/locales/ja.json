@@ -1137,6 +1137,7 @@
     "Configured": "設定済み",
     "Configured as PayMethods JSON. The type value decides which payment flow is used: stripe for Stripe, waffo_pancake for Waffo Pancake, and other values are sent to Epay as the type parameter.": "PayMethods JSON として保存されます。type 値で使用する決済フローを決定します。stripe は Stripe、waffo_pancake は Waffo Pancake、それ以外の値は Epay の type パラメーターとして送信されます。",
     "Configured discounts": "設定済みの割引",
+    "Configured models": "設定済みモデル",
     "Configured routes and latency checks": "設定済みルートとレイテンシ確認",
     "Confirm": "確認",
     "Confirm Action": "アクションの確認",

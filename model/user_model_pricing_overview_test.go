@@ -18,10 +18,15 @@ func TestUserModelPricingSummaryAndRulePages(t *testing.T) {
 		require.NoError(t, DB.Create(&UserModelPricing{UserId: user.Id, ModelName: fmt.Sprintf("match-%02d", i), DiscountBPS: 5000 + i}).Error)
 	}
 	require.NoError(t, DB.Create(&UserModelPricing{UserId: user.Id, ModelName: "excluded", DiscountBPS: 8000}).Error)
-	result, err := GetUserModelPricingOverview(t.Context(), "match-", common.RoleRootUser, 0, 20, true)
+	result, err := GetUserModelPricingOverview(t.Context(), "match-", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, true)
 	require.NoError(t, err)
 	require.Len(t, result.Items, 1)
 	assert.Empty(t, result.Items[0].Rules)
+	assert.Equal(t, []UserModelPricingOverviewRule{
+		{ModelName: "match-00", DiscountBPS: 5000},
+		{ModelName: "match-01", DiscountBPS: 5001},
+		{ModelName: "match-02", DiscountBPS: 5002},
+	}, result.Items[0].PreviewRules)
 	assert.Equal(t, 25, result.Items[0].RuleCount)
 	assert.Equal(t, 5000, result.Items[0].MinDiscountBPS)
 	assert.Equal(t, 5024, result.Items[0].MaxDiscountBPS)
@@ -67,7 +72,7 @@ func BenchmarkUserModelPricingOverview(b *testing.B) {
 		b.Run(fmt.Sprintf("summary=%v", summary), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				result, err := GetUserModelPricingOverview(b.Context(), "", common.RoleRootUser, 0, 20, summary)
+				result, err := GetUserModelPricingOverview(b.Context(), "", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, summary)
 				require.NoError(b, err)
 				require.Equal(b, int64(100000), result.TotalRules)
 				encoded, err := common.Marshal(result)
@@ -118,7 +123,7 @@ func TestGetUserModelPricingOverviewGroupsRulesAndAppliesRoleBoundary(t *testing
 	}
 	require.NoError(t, DB.Delete(&deletedUser).Error)
 
-	result, err := GetUserModelPricingOverview(t.Context(), "", common.RoleAdminUser, 0, 20)
+	result, err := GetUserModelPricingOverview(t.Context(), "", common.RoleAdminUser, 0, 20, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), result.TotalUsers)
 	assert.Equal(t, int64(2), result.TotalRules)
@@ -152,7 +157,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 		require.NoError(t, DB.Create(&rule).Error)
 	}
 
-	result, err := GetUserModelPricingOverview(t.Context(), "claude", common.RoleRootUser, 0, 1)
+	result, err := GetUserModelPricingOverview(t.Context(), "claude", common.RoleRootUser, 0, 1, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), result.TotalUsers)
 	assert.Equal(t, int64(1), result.TotalRules)
@@ -164,7 +169,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	}, result.Items[0].Rules)
 
 	// 同名模型属于不同用户时不能跨用户去重，且分页统计只计算匹配规则。
-	result, err = GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 0, 20)
+	result, err = GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), result.TotalUsers)
 	assert.Equal(t, int64(2), result.TotalRules)
@@ -175,21 +180,73 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 		assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "gpt-4o", DiscountBPS: discount}}, result.Items[i].Rules)
 		assert.Equal(t, 1, result.Items[i].RuleCount)
 	}
-	page, err := GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 1, 1)
+	page, err := GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 1, 1, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
 	assert.Equal(t, result.Items[1], page.Items[0])
 	assert.Equal(t, int64(2), page.TotalUsers)
 
 	// 用户搜索仍可查看该用户的所有规则；无匹配时返回空集合。
-	result, err = GetUserModelPricingOverview(t.Context(), "alpha-user", common.RoleRootUser, 0, 20)
+	result, err = GetUserModelPricingOverview(t.Context(), "alpha-user", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	require.Len(t, result.Items, 1)
 	assert.Len(t, result.Items[0].Rules, 2)
-	result, err = GetUserModelPricingOverview(t.Context(), "missing-model", common.RoleRootUser, 0, 20)
+	result, err = GetUserModelPricingOverview(t.Context(), "missing-model", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
 	assert.Empty(t, result.Items)
 	assert.Zero(t, result.TotalUsers)
 	assert.Zero(t, result.TotalRules)
 	assert.Zero(t, result.TotalModels)
+}
+
+// 分组和角色筛选必须同时约束用户集合及统计结果，不能只过滤当前页内容。
+func TestGetUserModelPricingOverviewFiltersByGroupAndRole(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	users := []*User{
+		{Id: 31, Username: "team-a-user", Group: "team-a", AffCode: "overview-team-a-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled},
+		{Id: 32, Username: "team-a-admin", Group: "team-a", AffCode: "overview-team-a-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 33, Username: "team-b-user", Group: "team-b", AffCode: "overview-team-b-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled},
+	}
+	for _, user := range users {
+		require.NoError(t, DB.Create(user).Error)
+	}
+	for _, rule := range []UserModelPricing{
+		{UserId: users[0].Id, ModelName: "team-a-model", DiscountBPS: 8000},
+		{UserId: users[1].Id, ModelName: "team-a-admin-model", DiscountBPS: 7500},
+		{UserId: users[2].Id, ModelName: "team-b-model", DiscountBPS: 7000},
+	} {
+		require.NoError(t, DB.Create(&rule).Error)
+	}
+
+	commonRole := common.RoleCommonUser
+	result, err := GetUserModelPricingOverview(
+		t.Context(),
+		"",
+		common.RoleRootUser,
+		0,
+		20,
+		UserModelPricingOverviewFilters{Group: "team-a", Role: &commonRole},
+		true,
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, users[0].Id, result.Items[0].User.Id)
+	assert.Equal(t, int64(1), result.TotalUsers)
+	assert.Equal(t, int64(1), result.TotalRules)
+	assert.Equal(t, int64(1), result.TotalModels)
+
+	result, err = GetUserModelPricingOverview(
+		t.Context(),
+		"",
+		common.RoleRootUser,
+		0,
+		20,
+		UserModelPricingOverviewFilters{Group: "team-a"},
+		true,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), result.TotalUsers)
+	assert.Equal(t, int64(2), result.TotalRules)
+	assert.Equal(t, []int{users[0].Id, users[1].Id}, []int{result.Items[0].User.Id, result.Items[1].User.Id})
 }
