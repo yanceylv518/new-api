@@ -55,7 +55,7 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			common.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:16389", DB: engine.redisDB})
 			common.RedisEnabled = true
 			t.Cleanup(func() {
-				assert.NoError(t, db.Migrator().DropTable(&UserModelPricing{}, &UserModelPricingRevision{}, &Task{}, &Midjourney{}, &User{}))
+				assert.NoError(t, db.Migrator().DropTable(&UserModelPricing{}, &UserModelPricingRevision{}, &Task{}, &Midjourney{}, &Ability{}, &User{}))
 				assert.NoError(t, common.RDB.FlushDB(context.Background()).Err())
 				_ = common.RDB.Close()
 				DB, common.RDB, common.RedisEnabled = oldDB, oldRedis, oldEnabled
@@ -66,13 +66,20 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			var version string
 			require.NoError(t, db.Raw("SELECT VERSION()").Scan(&version).Error)
 			t.Logf("engine=%s version=%s", engine.name, version)
-			// 先创建不带折扣列的目标用户表，再重复安装两张新表。
-			require.NoError(t, db.AutoMigrate(&User{}, &Task{}, &Midjourney{}))
+			// 先创建目标用户、能力和独立折扣表，重复安装折扣表必须保持幂等。
+			require.NoError(t, db.AutoMigrate(&User{}, &Task{}, &Midjourney{}, &Ability{}))
 			user := User{Username: "pricing-integration", Password: "unused"}
 			require.NoError(t, db.Create(&user).Error)
 			for range 2 {
 				require.NoError(t, db.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}))
 			}
+			// 启用能力是总览判断模型是否仍存在的权威目录。
+			require.NoError(t, db.Create(&[]Ability{
+				{Group: "default", Model: "Model-A", ChannelId: 1, Enabled: true},
+				{Group: "default", Model: "model-a", ChannelId: 2, Enabled: true},
+				{Group: "default", Model: "café", ChannelId: 3, Enabled: true},
+				{Group: "default", Model: "cafe", ChannelId: 4, Enabled: true},
+			}).Error)
 			require.False(t, db.Migrator().HasColumn(&User{}, "model_pricing_version"))
 			// 两种任务都复用原有 JSON 列；更新金额时必须保留运行状态，重载后可用于退款。
 			task := Task{UserId: user.Id, TaskID: "pricing-json-task", Quota: 8}

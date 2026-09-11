@@ -57,6 +57,11 @@ type UserModelPricing struct {
 	DiscountBPS int    `json:"discount_bps" gorm:"type:int;not null"`
 }
 
+// userModelPricingModelKey 使用规范化模型名生成稳定键，查询时绕开数据库大小写和重音排序规则。
+func userModelPricingModelKey(modelName string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(modelName)))
+}
+
 // BeforeCreate 用规范化模型名的固定长度哈希隔离数据库排序规则，保留大小写语义。
 func (rule *UserModelPricing) BeforeCreate(_ *gorm.DB) error {
 	rule.ModelName = ratio_setting.FormatMatchingModelName(ResolveUserModelPricingName(strings.TrimSpace(rule.ModelName)))
@@ -64,7 +69,7 @@ func (rule *UserModelPricing) BeforeCreate(_ *gorm.DB) error {
 	if err != nil {
 		return err
 	}
-	rule.ModelKey = fmt.Sprintf("%x", sha256.Sum256([]byte(rule.ModelName)))
+	rule.ModelKey = userModelPricingModelKey(rule.ModelName)
 	return nil
 }
 

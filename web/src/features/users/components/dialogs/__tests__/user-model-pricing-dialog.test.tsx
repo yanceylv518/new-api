@@ -441,6 +441,7 @@ describe('user model pricing dialog', () => {
               model_names: models.slice(0, 3).map((model) => model.model_name),
               items: [
                 { model_name: 'disabled-model', discount_bps: 6000 },
+                { model_name: 'model-02', discount_bps: 10000 },
                 { model_name: 'model-03', discount_bps: 8000 },
               ],
             },
@@ -451,6 +452,7 @@ describe('user model pricing dialog', () => {
     }
     await renderDialog(1, true)
     assert.equal(visibleModelNames().includes('disabled-model'), false)
+    assert.equal(visibleModelNames().includes('model-02'), false)
     await changeInput(getModelInput('model-03'), '100')
     let submitted: unknown
     apiClient.put = async (_url, payload) => {

@@ -20,8 +20,6 @@ package model
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -70,13 +68,41 @@ type UserModelPricingOverviewResult struct {
 type UserModelPricingOverviewFilters struct {
 	Group string
 	Role  *int
+	// modelKeys 由服务端当前启用模型目录生成，避免历史规则污染总览。
+	modelKeys []string
+}
+
+// getEnabledUserModelPricingModelKeys 将编辑目录转换成查询键，确保总览和编辑使用同一模型可见性边界。
+func getEnabledUserModelPricingModelKeys(ctx context.Context) ([]string, error) {
+	modelNames, err := GetUserModelPricingModelNames(ctx)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(modelNames))
+	seen := make(map[string]struct{}, len(modelNames))
+	for _, modelName := range modelNames {
+		key := userModelPricingModelKey(modelName)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // userModelPricingOverviewQuery 统一构造权限和搜索条件，保证统计、分页和明细使用同一数据范围。
 func userModelPricingOverviewQuery(tx *gorm.DB, keyword string, requesterRole int, filters UserModelPricingOverviewFilters) *gorm.DB {
 	query := tx.Model(&UserModelPricing{}).
 		Joins("JOIN users ON users.id = user_model_pricings.user_id").
-		Where("users.deleted_at IS NULL")
+		Where("users.deleted_at IS NULL").
+		Where("user_model_pricings.discount_bps > 0 AND user_model_pricings.discount_bps < ?", fullPriceDiscountBPS)
+	if filters.modelKeys != nil {
+		if len(filters.modelKeys) == 0 {
+			return query.Where("1 = 0")
+		}
+		query = query.Where("user_model_pricings.model_key IN ?", filters.modelKeys)
+	}
 	if requesterRole != common.RoleRootUser {
 		query = query.Where("users.role < ?", requesterRole)
 	}
@@ -102,68 +128,31 @@ func userModelPricingOverviewQuery(tx *gorm.DB, keyword string, requesterRole in
 	)
 }
 
-type userModelPricingOverviewPreviewRow struct {
-	UserID      int            `gorm:"column:user_id"`
-	ModelName   sql.NullString `gorm:"column:preview_model_name"`
-	DiscountBPS sql.NullInt64  `gorm:"column:preview_discount_bps"`
-}
-
 // getUserModelPricingOverviewPreview 按模型排序取每个用户的前三条预览规则。
-// 通过三个带 OFFSET 的标量子查询避免把用户的完整规则集载入摘要响应，并保持三种数据库的 SQL 兼容性。
-func getUserModelPricingOverviewPreview(tx *gorm.DB, userIDs []int, keyword string, requesterRole int) (map[int][]UserModelPricingOverviewRule, error) {
+// 只读取当前页用户的已过滤规则，再在 Go 中截断；每用户规则上限为 1000，避免相关子查询重复扫描整张表。
+func getUserModelPricingOverviewPreview(tx *gorm.DB, userIDs []int, keyword string, requesterRole int, filters UserModelPricingOverviewFilters) (map[int][]UserModelPricingOverviewRule, error) {
 	previewRules := make(map[int][]UserModelPricingOverviewRule, len(userIDs))
-	keyword = strings.TrimSpace(keyword)
-	previewFilter := ""
-	var previewArgs []any
-	if keyword != "" {
-		like := "%" + keyword + "%"
-		// 用户信息命中时展示该用户的前三条规则，只有模型命中时才限制为匹配模型。
-		previewFilter = " AND (preview_user.username LIKE ? OR preview_user.display_name LIKE ? OR preview_user.email LIKE ? OR preview.model_name LIKE ?)"
-		previewArgs = []any{like, like, like, like}
+	type previewRuleRow struct {
+		UserID      int    `gorm:"column:user_id"`
+		ModelName   string `gorm:"column:model_name"`
+		DiscountBPS int    `gorm:"column:discount_bps"`
 	}
-
-	for offset := 0; offset < userModelPricingOverviewPreviewRuleLimit; offset++ {
-		modelNameQuery := fmt.Sprintf(`(
-			SELECT preview.model_name
-			FROM user_model_pricings AS preview
-			JOIN users AS preview_user ON preview_user.id = preview.user_id
-			WHERE preview.user_id = user_model_pricings.user_id%s
-			ORDER BY preview.model_name ASC, preview.model_key ASC
-			LIMIT 1 OFFSET %d
-		)`, previewFilter, offset)
-		discountQuery := fmt.Sprintf(`(
-			SELECT preview.discount_bps
-			FROM user_model_pricings AS preview
-			JOIN users AS preview_user ON preview_user.id = preview.user_id
-			WHERE preview.user_id = user_model_pricings.user_id%s
-			ORDER BY preview.model_name ASC, preview.model_key ASC
-			LIMIT 1 OFFSET %d
-		)`, previewFilter, offset)
-
-		// 摘要外层只校验权限和当前页用户，模型关键词过滤在两个标量子查询内各绑定一次。
-		query := userModelPricingOverviewQuery(tx, "", requesterRole, UserModelPricingOverviewFilters{}).
-			Where("user_model_pricings.user_id IN ?", userIDs)
-		selectArgs := make([]any, 0, len(previewArgs)*2)
-		selectArgs = append(selectArgs, previewArgs...)
-		selectArgs = append(selectArgs, previewArgs...)
-		var rows []userModelPricingOverviewPreviewRow
-		selectSQL := fmt.Sprintf(
-			"DISTINCT user_model_pricings.user_id, %s AS preview_model_name, %s AS preview_discount_bps",
-			modelNameQuery,
-			discountQuery,
-		)
-		if err := query.Select(selectSQL, selectArgs...).Find(&rows).Error; err != nil {
-			return nil, err
+	var rows []previewRuleRow
+	query := userModelPricingOverviewQuery(tx, keyword, requesterRole, filters).
+		Where("user_model_pricings.user_id IN ?", userIDs)
+	if err := query.Select("user_model_pricings.user_id, user_model_pricings.model_name, user_model_pricings.discount_bps").
+		Order("user_model_pricings.user_id ASC, user_model_pricings.model_name ASC, user_model_pricings.model_key ASC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if len(previewRules[row.UserID]) >= userModelPricingOverviewPreviewRuleLimit {
+			continue
 		}
-		for _, row := range rows {
-			if !row.ModelName.Valid || !row.DiscountBPS.Valid {
-				continue
-			}
-			previewRules[row.UserID] = append(previewRules[row.UserID], UserModelPricingOverviewRule{
-				ModelName:   row.ModelName.String,
-				DiscountBPS: int(row.DiscountBPS.Int64),
-			})
-		}
+		previewRules[row.UserID] = append(previewRules[row.UserID], UserModelPricingOverviewRule{
+			ModelName:   row.ModelName,
+			DiscountBPS: row.DiscountBPS,
+		})
 	}
 	return previewRules, nil
 }
@@ -190,8 +179,13 @@ func GetUserModelPricingOverview(ctx context.Context, keyword string, requesterR
 
 	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
 	defer cancel()
+	activeModelKeys, err := getEnabledUserModelPricingModelKeys(ctx)
+	if err != nil {
+		return result, err
+	}
+	filters.modelKeys = activeModelKeys
 	result.Items = make([]UserModelPricingOverviewItem, 0)
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		matchedUserIds := userModelPricingOverviewMatchedUserIds(tx, keyword, requesterRole, filters)
 		// 三项统计合并为一次扫描；按模型哈希去重，保留大小写不同的模型语义。
 		var totals struct {
@@ -254,7 +248,7 @@ func GetUserModelPricingOverview(ctx context.Context, keyword string, requesterR
 		var previewRules map[int][]UserModelPricingOverviewRule
 		if summary {
 			var err error
-			previewRules, err = getUserModelPricingOverviewPreview(tx, userIds, keyword, requesterRole)
+			previewRules, err = getUserModelPricingOverviewPreview(tx, userIds, keyword, requesterRole, filters)
 			if err != nil {
 				return err
 			}
@@ -314,10 +308,15 @@ func GetUserModelPricingRulePage(ctx context.Context, userId, requesterRole int,
 	if page < 1 || page > maxUserModelPricingRules/20+1 {
 		return nil, 0, ErrUserModelPricingInvalid
 	}
+	activeModelKeys, err := getEnabledUserModelPricingModelKeys(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	filters := UserModelPricingOverviewFilters{modelKeys: activeModelKeys}
 	items := make([]UserModelPricingOverviewRule, 0)
 	var total int64
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := userModelPricingOverviewQuery(tx, keyword, requesterRole, UserModelPricingOverviewFilters{}).Where("user_model_pricings.user_id = ?", userId)
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := userModelPricingOverviewQuery(tx, keyword, requesterRole, filters).Where("user_model_pricings.user_id = ?", userId)
 		if err := query.Count(&total).Error; err != nil {
 			return err
 		}

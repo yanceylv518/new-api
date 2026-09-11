@@ -52,6 +52,7 @@ import {
   buildUserModelPricingPayload,
   buildUserModelPricingRows,
   createUserModelPricingFormSchema,
+  FULL_PRICE_DISCOUNT_BPS,
   normalizeUserModelPricingModelName,
   type UserModelPricingFormValues,
 } from '../../lib/user-model-pricing-form'
@@ -229,10 +230,13 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       collection.model_names.map(normalizeUserModelPricingModelName)
     )
     const configuredModels = collection.items
-      .filter((item) =>
-        normalizedEnabledNames.has(
-          normalizeUserModelPricingModelName(item.model_name)
-        )
+      .filter(
+        (item) =>
+          item.discount_bps > 0 &&
+          item.discount_bps < FULL_PRICE_DISCOUNT_BPS &&
+          normalizedEnabledNames.has(
+            normalizeUserModelPricingModelName(item.model_name)
+          )
       )
       .map(({ model_name }) => ({ model_name }))
     setEditorSnapshot({
