@@ -35,8 +35,8 @@ export interface UserModelPricingDisplayRow {
 }
 
 // 未配置专属折扣时按原价展示；提交时原价不会写入独立表。
-const fullPriceDiscountPercent = 100
-const fullPriceDiscountBPS = fullPriceDiscountPercent * 100
+export const FULL_PRICE_DISCOUNT_BPS = 10000
+const fullPriceDiscountPercent = FULL_PRICE_DISCOUNT_BPS / 100
 
 /** 与后端计费匹配规则保持一致，避免别名模型被重复定价。 */
 export function normalizeUserModelPricingModelName(modelName: string): string {
@@ -170,6 +170,9 @@ export function buildUserModelPricingPayload(
 
   // 弹窗仅展示启用模型，完整替换时必须保留不可见模型已有的折扣。
   for (const item of persistedItems) {
+    if (item.discount_bps <= 0 || item.discount_bps >= FULL_PRICE_DISCOUNT_BPS) {
+      continue
+    }
     const modelName = normalizeUserModelPricingModelName(item.model_name)
     itemsByModel.set(modelName, { ...item, model_name: modelName })
   }
@@ -177,7 +180,7 @@ export function buildUserModelPricingPayload(
   for (const item of values.items) {
     const modelName = normalizeUserModelPricingModelName(item.model_name)
     const discountBPS = Math.round(item.discount_percent * 100)
-    if (discountBPS === fullPriceDiscountBPS) {
+    if (discountBPS === FULL_PRICE_DISCOUNT_BPS) {
       itemsByModel.delete(modelName)
       continue
     }

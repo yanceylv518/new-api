@@ -9,13 +9,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// 为总览测试建立与编辑目录一致的启用模型集合，避免把规则表中的历史模型误当成当前模型。
+func createEnabledPricingAbilities(t testing.TB, names ...string) {
+	t.Helper()
+	abilities := make([]Ability, len(names))
+	for index, name := range names {
+		abilities[index] = Ability{
+			Group:     "default",
+			Model:     name,
+			ChannelId: index + 1,
+			Enabled:   true,
+		}
+	}
+	require.NoError(t, DB.CreateInBatches(&abilities, 100).Error)
+}
+
 // 摘要与分页明细必须使用相同搜索权限，且大于一页时不漏项、不混入其他用户。
 func TestUserModelPricingSummaryAndRulePages(t *testing.T) {
 	setupUserUpdateTestState(t)
 	user := User{Id: 71, Username: "paged-user", AffCode: "paged", Role: common.RoleCommonUser}
 	require.NoError(t, DB.Create(&user).Error)
+	activeModelNames := make([]string, 25)
+	for i := range activeModelNames {
+		activeModelNames[i] = fmt.Sprintf("match-%02d", i)
+	}
+	createEnabledPricingAbilities(t, activeModelNames...)
 	for i := 0; i < 25; i++ {
-		require.NoError(t, DB.Create(&UserModelPricing{UserId: user.Id, ModelName: fmt.Sprintf("match-%02d", i), DiscountBPS: 5000 + i}).Error)
+		require.NoError(t, DB.Create(&UserModelPricing{UserId: user.Id, ModelName: activeModelNames[i], DiscountBPS: 5000 + i}).Error)
 	}
 	require.NoError(t, DB.Create(&UserModelPricing{UserId: user.Id, ModelName: "excluded", DiscountBPS: 8000}).Error)
 	result, err := GetUserModelPricingOverview(t.Context(), "match-", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, true)
@@ -55,16 +75,23 @@ func TestUserModelPricingSummaryAndRulePages(t *testing.T) {
 func BenchmarkUserModelPricingOverview(b *testing.B) {
 	require.NoError(b, DB.Exec("DELETE FROM user_model_pricings").Error)
 	require.NoError(b, DB.Exec("DELETE FROM users").Error)
+	require.NoError(b, DB.Exec("DELETE FROM abilities").Error)
 	b.Cleanup(func() {
 		DB.Exec("DELETE FROM user_model_pricings")
 		DB.Exec("DELETE FROM users")
+		DB.Exec("DELETE FROM abilities")
 	})
+	activeModelNames := make([]string, 1000)
+	for i := range activeModelNames {
+		activeModelNames[i] = fmt.Sprintf("model-%04d", i)
+	}
+	createEnabledPricingAbilities(b, activeModelNames...)
 	for u := 1; u <= 100; u++ {
 		user := User{Id: u, Username: fmt.Sprintf("bench-%d", u), AffCode: fmt.Sprintf("bench-%d", u), Role: common.RoleCommonUser}
 		require.NoError(b, DB.Create(&user).Error)
 		rules := make([]UserModelPricing, 1000)
 		for i := range rules {
-			rules[i] = UserModelPricing{UserId: u, ModelName: fmt.Sprintf("model-%04d", i), DiscountBPS: 7500}
+			rules[i] = UserModelPricing{UserId: u, ModelName: activeModelNames[i], DiscountBPS: 7500}
 		}
 		require.NoError(b, DB.CreateInBatches(&rules, 100).Error)
 	}
@@ -121,6 +148,7 @@ func TestGetUserModelPricingOverviewGroupsRulesAndAppliesRoleBoundary(t *testing
 	} {
 		require.NoError(t, DB.Create(&rule).Error)
 	}
+	createEnabledPricingAbilities(t, "gpt-4o", "doubao-video", "admin-only-model", "deleted-only-model")
 	require.NoError(t, DB.Delete(&deletedUser).Error)
 
 	result, err := GetUserModelPricingOverview(t.Context(), "", common.RoleAdminUser, 0, 20, UserModelPricingOverviewFilters{})
@@ -156,6 +184,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	for _, rule := range rules {
 		require.NoError(t, DB.Create(&rule).Error)
 	}
+	createEnabledPricingAbilities(t, "gpt-4o", "claude-3-7")
 
 	result, err := GetUserModelPricingOverview(t.Context(), "claude", common.RoleRootUser, 0, 1, UserModelPricingOverviewFilters{})
 	require.NoError(t, err)
@@ -218,6 +247,7 @@ func TestGetUserModelPricingOverviewFiltersByGroupAndRole(t *testing.T) {
 	} {
 		require.NoError(t, DB.Create(&rule).Error)
 	}
+	createEnabledPricingAbilities(t, "team-a-model", "team-a-admin-model", "team-b-model")
 
 	commonRole := common.RoleCommonUser
 	result, err := GetUserModelPricingOverview(
@@ -249,4 +279,41 @@ func TestGetUserModelPricingOverviewFiltersByGroupAndRole(t *testing.T) {
 	assert.Equal(t, int64(2), result.TotalUsers)
 	assert.Equal(t, int64(2), result.TotalRules)
 	assert.Equal(t, []int{users[0].Id, users[1].Id}, []int{result.Items[0].User.Id, result.Items[1].User.Id})
+}
+
+// 总览只统计当前启用且确实低于原价的规则，并且摘要预览不能串到其他用户。
+func TestUserModelPricingOverviewHidesStaleAndFullPriceRules(t *testing.T) {
+	setupUserUpdateTestState(t)
+	users := []*User{
+		{Id: 81, Username: "active-discount-user", AffCode: "overview-active", Role: common.RoleCommonUser},
+		{Id: 82, Username: "other-discount-user", AffCode: "overview-other", Role: common.RoleCommonUser},
+	}
+	for _, user := range users {
+		require.NoError(t, DB.Create(user).Error)
+	}
+	createEnabledPricingAbilities(t, "active-model", "full-price-model", "other-model")
+	for _, rule := range []UserModelPricing{
+		{UserId: users[0].Id, ModelName: "active-model", DiscountBPS: 8000},
+		{UserId: users[0].Id, ModelName: "full-price-model", DiscountBPS: fullPriceDiscountBPS},
+		{UserId: users[0].Id, ModelName: "kimi-k3", DiscountBPS: 7000},
+		{UserId: users[1].Id, ModelName: "other-model", DiscountBPS: 6000},
+	} {
+		require.NoError(t, DB.Create(&rule).Error)
+	}
+
+	result, err := GetUserModelPricingOverview(t.Context(), "", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, true)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), result.TotalUsers)
+	assert.Equal(t, int64(2), result.TotalRules)
+	assert.Equal(t, int64(2), result.TotalModels)
+	require.Len(t, result.Items, 2)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, result.Items[0].PreviewRules)
+	assert.Equal(t, 1, result.Items[0].RuleCount)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "other-model", DiscountBPS: 6000}}, result.Items[1].PreviewRules)
+	assert.Equal(t, 1, result.Items[1].RuleCount)
+
+	items, total, err := GetUserModelPricingRulePage(t.Context(), users[0].Id, common.RoleRootUser, "", 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, items)
 }
