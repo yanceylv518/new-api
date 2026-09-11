@@ -284,9 +284,9 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
           value={props.artifact.content_url}
           variant='outline'
           size='sm'
-          tooltip={t('Copy link')}
+          tooltip={t('Copy Link')}
         >
-          {t('Copy link')}
+          {t('Copy Link')}
         </CopyButton>
         <Button
           variant='outline'
@@ -468,7 +468,7 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
 
   return (
     <>
-      <div className='flex flex-wrap items-center gap-2'>
+      <div className='flex min-w-max flex-nowrap items-center gap-1'>
         {previewMode === 'legacy-video' ? (
           <Button
             type='button'
@@ -502,7 +502,7 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
           onClick={copyVideoLink}
         >
           {copyQuery.isFetching ? <Spinner /> : null}
-          {t('Copy link')}
+          {t('Copy Link')}
         </Button>
       </div>
       <Dialog
@@ -557,9 +557,9 @@ function LegacyVideoMedia(props: LegacyVideoMediaProps) {
         value={props.contentUrl}
         variant='outline'
         size='sm'
-        tooltip={t('Copy link')}
+        tooltip={t('Copy Link')}
       >
-        {t('Copy link')}
+        {t('Copy Link')}
       </CopyButton>
       {mediaFailed ? (
         <MediaFailure

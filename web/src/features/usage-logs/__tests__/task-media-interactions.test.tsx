@@ -65,6 +65,16 @@ function renderTask(log = task) {
   )
 }
 
+test('keeps task media actions beside each other', () => {
+  renderTask()
+
+  const preview = screen.getByRole('button', { name: 'Preview video' })
+  const copy = screen.getByRole('button', { name: 'Copy Link' })
+
+  expect(preview.parentElement).toHaveClass('flex-nowrap')
+  expect(preview.parentElement).toContainElement(copy)
+})
+
 test('copies a single video beside the list preview using the authorized projection only on click', async () => {
   const user = userEvent.setup()
   const write = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
@@ -84,7 +94,7 @@ test('copies a single video beside the list preview using the authorized project
   renderTask()
   expect(screen.getByRole('button', { name: 'Preview video' })).toBeVisible()
   expect(adapter).not.toHaveBeenCalled()
-  await user.click(screen.getByRole('button', { name: 'Copy link' }))
+  await user.click(screen.getByRole('button', { name: 'Copy Link' }))
   await waitFor(() => expect(write).toHaveBeenCalledWith(videoUrl))
   expect(adapter.mock.calls.map(([config]) => config.url)).toEqual([
     '/api/task/task-video/artifacts',
@@ -121,7 +131,7 @@ test('multiple videos open the artifact chooser without copying an arbitrary URL
     ...task,
     admin_info: { task_plugin: { key: 'seedance', name: 'Seedance' } },
   })
-  await user.click(screen.getByRole('button', { name: 'Copy link' }))
+  await user.click(screen.getByRole('button', { name: 'Copy Link' }))
   await screen.findByRole('dialog', { name: 'Artifacts' })
   expect(write).not.toHaveBeenCalled()
   expect(screen.getAllByRole('button', { name: 'Download' })).toHaveLength(2)
@@ -141,7 +151,7 @@ test('legacy projection previews and copies its authorized URL and offers retry 
     config,
   })
   renderTask()
-  await user.click(screen.getByRole('button', { name: 'Copy link' }))
+  await user.click(screen.getByRole('button', { name: 'Copy Link' }))
   await waitFor(() => expect(write).toHaveBeenCalledWith(videoUrl))
   await user.click(screen.getByRole('button', { name: 'Preview video' }))
   const dialog = await screen.findByRole('dialog')
@@ -173,7 +183,7 @@ test('a failed artifact request copies nothing and can be retried from the list'
     config,
   })
   renderTask()
-  const copy = screen.getByRole('button', { name: 'Copy link' })
+  const copy = screen.getByRole('button', { name: 'Copy Link' })
   await user.click(copy)
   await waitFor(() => expect(copy).toBeEnabled())
   expect(write).not.toHaveBeenCalled()

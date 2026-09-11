@@ -248,8 +248,9 @@ export function useTaskLogsColumns(
       cell: ({ row }) => (
         <TaskArtifactsCell key={row.original.task_id} log={row.original} />
       ),
-      size: 120,
-      maxSize: 140,
+      // 为预览和复制操作保留同一行的最小可用宽度，避免 flex-wrap 将按钮拆成两行。
+      size: 190,
+      maxSize: 240,
     },
     {
       accessorKey: 'fail_reason',
