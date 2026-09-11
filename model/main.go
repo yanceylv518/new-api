@@ -368,6 +368,7 @@ func migrateDB() error {
 		// 素材与授权映射随主库迁移，复用现有顺序迁移入口。
 		&SeedanceAssetGroup{},
 		&SeedanceAsset{},
+		&SeedanceAssetCleanupJob{},
 		&CasbinRule{},
 		&AuthzRole{},
 	)

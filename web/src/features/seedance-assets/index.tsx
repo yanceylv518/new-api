@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Archive } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -34,6 +34,7 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import {
   createSeedanceAssetGroup,
+  batchDeleteSeedanceAssets,
   deleteSeedanceAsset,
   deleteSeedanceAssetGroup,
   listSeedanceAssetGroups,
@@ -79,6 +80,10 @@ export function SeedanceAssets() {
     null
   )
   const [deleteAsset, setDeleteAsset] = useState<SeedanceAsset | null>(null)
+  const [deleteSelectedAssets, setDeleteSelectedAssets] = useState(false)
+  const [selectedAssetIds, setSelectedAssetIds] = useState<Set<number>>(
+    () => new Set()
+  )
   const [storedViewMode, setStoredViewMode] = useDataTableViewMode({
     storageKey: SEEDANCE_ASSETS_VIEW_MODE_KEY,
     defaultMode: DATA_TABLE_VIEW_MODES.CARD,
@@ -111,6 +116,13 @@ export function SeedanceAssets() {
     // React Query 管理计时器与卸载取消；全部进入终态后停止轮询。
     refetchInterval: (query) => (query.state.data?.has_pending ? 5000 : false),
   })
+
+  // 分组和筛选改变后清空选择；分页切换保留已选 ID，支持跨页批量操作。
+  useEffect(() => {
+    setSelectedAssetIds(new Set())
+  }, [selectedId, debouncedSearch, typeFilter, statusFilter])
+
+  const clearAssetSelection = () => setSelectedAssetIds(new Set())
 
   // 先把变更接口返回的完整素材写入缓存，再重新请求列表，避免刷新结果被下一次渲染吞掉。
   const updateAssetCache = (updatedAsset: SeedanceAsset) => {
@@ -194,12 +206,51 @@ export function SeedanceAssets() {
   })
   const deleteAssetMutation = useMutation({
     mutationFn: deleteSeedanceAsset,
-    onSuccess: () => {
+    onSuccess: (_response, assetId) => {
+      setSelectedAssetIds((current) => {
+        if (!current.has(assetId)) return current
+        const next = new Set(current)
+        next.delete(assetId)
+        return next
+      })
       setDeleteAsset(null)
       void invalidate()
       toast.success(t('Deleted successfully'))
     },
     onError: (error) => {
+      void invalidate()
+      handleServerError(error)
+    },
+  })
+  const batchDeleteAssetMutation = useMutation({
+    mutationFn: batchDeleteSeedanceAssets,
+    onSuccess: async (response) => {
+      setDeleteSelectedAssets(false)
+      setSelectedAssetIds(new Set(response.data.failed_ids))
+      await invalidate()
+      if (response.data.failed_ids.length > 0) {
+        toast.warning(
+          t('Deleted {{deleted}} assets; {{failed}} failed', {
+            deleted: response.data.deleted_ids.length,
+            failed: response.data.failed_ids.length,
+          })
+        )
+      } else if (response.data.pending_ids.length > 0) {
+        toast.success(
+          t('Queued {{count}} assets for deletion', {
+            count: response.data.pending_ids.length,
+          })
+        )
+      } else {
+        toast.success(
+          t('Deleted {{count}} assets', {
+            count: response.data.deleted_ids.length,
+          })
+        )
+      }
+    },
+    onError: (error) => {
+      setDeleteSelectedAssets(false)
       void invalidate()
       handleServerError(error)
     },
@@ -244,6 +295,7 @@ export function SeedanceAssets() {
             isCreating={createGroupMutation.isPending}
             onRetry={() => void groups.refetch()}
             onSelect={(group) => {
+              clearAssetSelection()
               setSelectedGroupId(group.group_id)
               setSearch('')
               setTypeFilter('all')
@@ -264,9 +316,10 @@ export function SeedanceAssets() {
 
           <div className={seedanceAssetLayoutClasses.workspace}>
             <AssetUploadPanel
-              key={selectedId}
               groupId={canUpload ? selectedId : ''}
+              groupName={selectedGroup?.name}
               onUploaded={(asset) => {
+                clearAssetSelection()
                 setPage(1)
                 void queryClient
                   .cancelQueries({
@@ -290,7 +343,9 @@ export function SeedanceAssets() {
                   page={assets.data?.page ?? page}
                   total={assets.data?.total ?? 0}
                   pageSize={24}
-                  onPageChange={setPage}
+                  onPageChange={(nextPage) => {
+                    setPage(nextPage)
+                  }}
                   isLoading={Boolean(selectedId) && assets.isPending}
                   isError={Boolean(selectedId) && assets.isError}
                   isFetching={assets.isFetching}
@@ -299,14 +354,17 @@ export function SeedanceAssets() {
                   statusFilter={statusFilter}
                   viewMode={viewMode}
                   onSearchChange={(value) => {
+                    clearAssetSelection()
                     setSearch(value)
                     setPage(1)
                   }}
                   onTypeFilterChange={(value) => {
+                    clearAssetSelection()
                     setTypeFilter(value)
                     setPage(1)
                   }}
                   onStatusFilterChange={(value) => {
+                    clearAssetSelection()
                     setStatusFilter(value)
                     setPage(1)
                   }}
@@ -314,6 +372,28 @@ export function SeedanceAssets() {
                   onRetry={() => void assets.refetch()}
                   onRefresh={(asset) => refreshAssetMutation.mutate(asset)}
                   onDelete={setDeleteAsset}
+                  selectedIds={selectedAssetIds}
+                  onSelectionChange={(asset, selected) => {
+                    setSelectedAssetIds((current) => {
+                      const next = new Set(current)
+                      if (selected) next.add(asset.id)
+                      else next.delete(asset.id)
+                      return next
+                    })
+                  }}
+                  onSelectAll={(selected) => {
+                    setSelectedAssetIds((current) => {
+                      const next = new Set(current)
+                      for (const asset of rows) {
+                        if (selected) next.add(asset.id)
+                        else next.delete(asset.id)
+                      }
+                      return next
+                    })
+                  }}
+                  onClearSelection={clearAssetSelection}
+                  onBatchDelete={() => setDeleteSelectedAssets(true)}
+                  isBatchDeleting={batchDeleteAssetMutation.isPending}
                   refreshingId={
                     refreshAssetMutation.isPending &&
                     refreshAssetMutation.variables
@@ -374,6 +454,25 @@ export function SeedanceAssets() {
         confirmText={t('Delete')}
         handleConfirm={() => {
           if (deleteAsset) deleteAssetMutation.mutate(deleteAsset.id)
+        }}
+      />
+      <ConfirmDialog
+        open={deleteSelectedAssets}
+        onOpenChange={(open) => {
+          if (!batchDeleteAssetMutation.isPending) setDeleteSelectedAssets(open)
+        }}
+        title={t('Delete selected assets')}
+        desc={t(
+          'Delete {{count}} selected assets from this group? This action cannot be undone.',
+          { count: selectedAssetIds.size }
+        )}
+        destructive
+        isLoading={batchDeleteAssetMutation.isPending}
+        confirmText={t('Delete')}
+        handleConfirm={() => {
+          if (selectedAssetIds.size > 0) {
+            batchDeleteAssetMutation.mutate([...selectedAssetIds])
+          }
         }}
       />
     </Main>

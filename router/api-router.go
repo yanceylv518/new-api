@@ -132,6 +132,7 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.GET("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssets)
 				selfRoute.POST("/seedance/assets/upload", middleware.SeedanceAssetRateLimit(), middleware.UploadRateLimit(), middleware.DisableCache(), controller.UploadSeedanceAsset)
 				selfRoute.POST("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAsset)
+				selfRoute.POST("/seedance/assets/batch-delete", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAssetBatch)
 				selfRoute.POST("/seedance/assets/:id/refresh", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.RefreshSeedanceAsset)
 				selfRoute.DELETE("/seedance/assets/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAsset)
 

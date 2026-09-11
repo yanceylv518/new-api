@@ -69,10 +69,10 @@ func IsSeedanceAssetGroupNameDuplicated(id uint, userID int, name string) (bool,
 
 // SeedanceAsset 保存上游素材状态及其所属用户，所有读取必须带 UserID 条件。
 type SeedanceAsset struct {
-	ID                uint                 `gorm:"primaryKey" json:"id"`
-	UserID            int                  `gorm:"index;not null" json:"user_id"`
+	ID                uint                 `gorm:"primaryKey;index:idx_seedance_asset_user_group_id,priority:3;index:idx_seedance_asset_poll_due,priority:4" json:"id"`
+	UserID            int                  `gorm:"index;not null;index:idx_seedance_asset_user_group_id,priority:1" json:"user_id"`
 	ChannelID         int                  `gorm:"index;not null" json:"channel_id"`
-	GroupID           string               `gorm:"index;size:128;not null" json:"group_id"`
+	GroupID           string               `gorm:"index;size:128;not null;index:idx_seedance_asset_user_group_id,priority:2" json:"group_id"`
 	AssetID           string               `gorm:"uniqueIndex;size:128;not null" json:"asset_id"`
 	Name              string               `gorm:"size:64;not null" json:"name"`
 	AssetType         string               `gorm:"size:16;not null" json:"asset_type"`
@@ -82,11 +82,11 @@ type SeedanceAsset struct {
 	KeyFingerprint    string               `gorm:"size:64" json:"-"`
 	UpstreamDeletedAt int64                `gorm:"not null;default:0" json:"-"`
 	PreviewURL        string               `gorm:"size:4096" json:"preview_url,omitempty"`
-	Status            string               `gorm:"index;size:32;not null" json:"status"`
+	Status            string               `gorm:"index;index:idx_seedance_asset_poll_due,priority:1;size:32;not null" json:"status"`
 	FailureCode       string               `gorm:"size:128" json:"failure_code,omitempty"`
 	PollAttempts      int                  `gorm:"not null;default:0" json:"-"`
-	NextPollAt        int64                `gorm:"index;not null;default:0" json:"-"`
-	PollLeaseUntil    int64                `gorm:"index;not null;default:0" json:"-"`
+	NextPollAt        int64                `gorm:"index;index:idx_seedance_asset_poll_due,priority:2;not null;default:0" json:"-"`
+	PollLeaseUntil    int64                `gorm:"index;index:idx_seedance_asset_poll_due,priority:3;not null;default:0" json:"-"`
 	CreatedAt         time.Time            `json:"created_at"`
 	UpdatedAt         time.Time            `json:"updated_at"`
 }
@@ -134,13 +134,15 @@ func HasDueSeedanceAssets(now int64) bool {
 	if DB == nil {
 		return false
 	}
-	var count int64
-	err := DB.Model(&SeedanceAsset{}).
+	var marker struct {
+		ID uint
+	}
+	result := DB.Model(&SeedanceAsset{}).
 		Where("LOWER(status) IN ?", []string{"processing", "pending"}).
 		Where("(next_poll_at = 0 OR next_poll_at <= ?)", now).
 		Where("(poll_lease_until = 0 OR poll_lease_until <= ?)", now).
-		Count(&count).Error
-	return err == nil && count > 0
+		Select("id").Limit(1).Find(&marker)
+	return result.Error == nil && result.RowsAffected > 0
 }
 
 // ClaimSeedanceAssetForPolling 使用读取时的更新时间抢占素材，避免过期列表结果重复发起上游请求。

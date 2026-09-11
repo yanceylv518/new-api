@@ -23,6 +23,8 @@ import { CopyButton } from '@/components/copy-button'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardFooter } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { cn } from '@/lib/utils'
 
 import type { SeedanceAsset } from '../api'
 import { getSeedanceAssetTypeLabel } from '../lib/upload'
@@ -34,6 +36,10 @@ type AssetItemProps = {
   mode: 'grid' | 'list'
   onRefresh: (asset: SeedanceAsset) => void
   onDelete: (asset: SeedanceAsset) => void
+  onSelectionChange: (asset: SeedanceAsset, selected: boolean) => void
+  selected: boolean
+  selectionDisabled?: boolean
+  isBatchDeleting?: boolean
   isRefreshing?: boolean
   isDeleting?: boolean
 }
@@ -57,6 +63,7 @@ function AssetActions(props: AssetItemProps) {
         disabled={
           props.isRefreshing ||
           props.isDeleting ||
+          props.isBatchDeleting ||
           props.asset.status === 'Deleting'
         }
         onClick={() => props.onRefresh(props.asset)}
@@ -68,7 +75,11 @@ function AssetActions(props: AssetItemProps) {
         variant='ghost'
         title={t('Delete')}
         aria-label={t('Delete')}
-        disabled={props.isDeleting || props.isRefreshing}
+        disabled={
+          props.isDeleting ||
+          props.isRefreshing ||
+          props.isBatchDeleting
+        }
         onClick={() => props.onDelete(props.asset)}
       >
         <Trash2 />
@@ -84,7 +95,23 @@ export function AssetItem(props: AssetItemProps) {
 
   if (props.mode === 'list') {
     return (
-      <article className='group flex min-w-0 items-center gap-3 border-b py-3 last:border-b-0 sm:gap-4'>
+      <article
+        className={cn(
+          'group flex min-w-0 items-center gap-3 border-b py-3 last:border-b-0 sm:gap-4',
+          props.selected && 'bg-primary/5'
+        )}
+      >
+        <Checkbox
+          className='ml-1'
+          checked={props.selected}
+          disabled={props.selectionDisabled}
+          onCheckedChange={(value) =>
+            props.onSelectionChange(props.asset, Boolean(value))
+          }
+          aria-label={t('Select {{name}}', {
+            name: props.asset.name || props.asset.asset_id,
+          })}
+        />
         <div className='bg-muted flex aspect-video size-16 shrink-0 items-center justify-center overflow-hidden rounded-lg sm:size-20'>
           <AssetPreview
             asset={props.asset}
@@ -121,7 +148,23 @@ export function AssetItem(props: AssetItemProps) {
   }
 
   return (
-    <Card className='min-w-0 gap-0 py-0'>
+    <Card
+      className={cn(
+        'relative min-w-0 gap-0 py-0',
+        props.selected && 'ring-primary ring-2'
+      )}
+    >
+      <Checkbox
+        className='bg-background/90 absolute top-3 left-3 z-10 shadow-sm'
+        checked={props.selected}
+        disabled={props.selectionDisabled}
+        onCheckedChange={(value) =>
+          props.onSelectionChange(props.asset, Boolean(value))
+        }
+        aria-label={t('Select {{name}}', {
+          name: props.asset.name || props.asset.asset_id,
+        })}
+      />
       <div className='bg-muted aspect-video w-full overflow-hidden'>
         <AssetPreview
           asset={props.asset}

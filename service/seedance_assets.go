@@ -24,6 +24,7 @@ import (
 
 // SeedanceAssetClient 调用兼容火山方舟的 Seedance 素材 Action 接口。
 type SeedanceAssetClient struct {
+	ChannelID      int
 	baseURL        string
 	apiKey         string
 	path           string
@@ -242,6 +243,12 @@ func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 	if extension == "" {
 		extension = ".bin"
 	}
+	// 视频和音频不需要转码；multipart 文件可定位时直接流式上传，避免再次复制到临时文件。
+	if assetType != "Image" {
+		if seekable, ok := reader.(io.ReadSeeker); ok {
+			return storeSeedanceAssetUploadStream(ctx, seekable, filename, assetType, userID, storage, extension)
+		}
+	}
 	file, err := os.CreateTemp("", "new-api-seedance-asset-*"+extension)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create seedance asset temporary file: %w", err)
@@ -283,6 +290,9 @@ func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 		cleanupCtx, cancel := seedanceAssetCleanupContext(ctx)
 		defer cancel()
 		if cleanupErr := storage.DeletePrivateAsset(cleanupCtx, objectKey); cleanupErr != nil {
+			if queueErr := queueSeedanceAssetObjectCleanup(objectKey, storage.location); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue OSS cleanup: %w", queueErr))
+			}
 			return nil, errors.Join(err, fmt.Errorf("failed to clean up interrupted OSS upload: %w", cleanupErr))
 		}
 		return nil, err
@@ -292,6 +302,9 @@ func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 		cleanupCtx, cancel := seedanceAssetCleanupContext(ctx)
 		defer cancel()
 		if cleanupErr := storage.DeletePrivateAsset(cleanupCtx, objectKey); cleanupErr != nil {
+			if queueErr := queueSeedanceAssetObjectCleanup(objectKey, storage.location); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue OSS cleanup: %w", queueErr))
+			}
 			return nil, errors.Join(err, fmt.Errorf("failed to clean up OSS object after signing failure: %w", cleanupErr))
 		}
 		return nil, err
@@ -312,23 +325,87 @@ func openSeedanceAssetUploadPath(path string) (*os.File, string, error) {
 		return nil, "", err
 	}
 
-	header := make([]byte, 512)
-	read, readErr := file.Read(header)
-	if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+	contentType, err := detectSeedanceAssetContentType(file, path)
+	if err != nil {
 		_ = file.Close()
-		return nil, "", seekErr
+		return nil, "", err
+	}
+	return file, contentType, nil
+}
+
+// storeSeedanceAssetUploadStream 复用可定位的上传流，只用真实文件大小构造 OSS Content-Length。
+func storeSeedanceAssetUploadStream(ctx context.Context, reader io.ReadSeeker, filename, assetType string, userID int, storage *PrivateAssetOSSStorage, extension string) (*SeedanceAssetUpload, error) {
+	actualSize, err := reader.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine seedance asset size: %w", err)
+	}
+	if actualSize <= 0 {
+		return nil, fmt.Errorf("seedance asset file is empty")
+	}
+	if actualSize > SeedanceAssetMaxUploadSize(assetType) {
+		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to rewind seedance asset upload: %w", err)
+	}
+	contentType, err := detectSeedanceAssetContentType(reader, filename)
+	if err != nil {
+		return nil, err
+	}
+	objectKey, err := storage.NewPrivateAssetOSSObjectKey(userID, extension)
+	if err != nil {
+		return nil, err
+	}
+	if err := storage.UploadPrivateAsset(ctx, objectKey, contentType, actualSize, io.LimitReader(reader, actualSize)); err != nil {
+		cleanupCtx, cancel := seedanceAssetCleanupContext(ctx)
+		defer cancel()
+		if cleanupErr := storage.DeletePrivateAsset(cleanupCtx, objectKey); cleanupErr != nil {
+			if queueErr := queueSeedanceAssetObjectCleanup(objectKey, storage.location); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue OSS cleanup: %w", queueErr))
+			}
+			return nil, errors.Join(err, fmt.Errorf("failed to clean up interrupted OSS upload: %w", cleanupErr))
+		}
+		return nil, err
+	}
+	upstreamURL, err := storage.PrivateAssetUpstreamURL(ctx, objectKey)
+	if err != nil {
+		cleanupCtx, cancel := seedanceAssetCleanupContext(ctx)
+		defer cancel()
+		if cleanupErr := storage.DeletePrivateAsset(cleanupCtx, objectKey); cleanupErr != nil {
+			if queueErr := queueSeedanceAssetObjectCleanup(objectKey, storage.location); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue OSS cleanup: %w", queueErr))
+			}
+			return nil, errors.Join(err, fmt.Errorf("failed to clean up OSS object after signing failure: %w", cleanupErr))
+		}
+		return nil, err
+	}
+	return &SeedanceAssetUpload{
+		ObjectKey: objectKey,
+		URL:       upstreamURL,
+		AssetType: assetType,
+		Size:      actualSize,
+		Storage:   storage.location,
+		storage:   storage,
+	}, nil
+}
+
+// detectSeedanceAssetContentType 从流头部探测 MIME 并在容器格式无法识别时回退到扩展名。
+func detectSeedanceAssetContentType(reader io.ReadSeeker, filename string) (string, error) {
+	header := make([]byte, 512)
+	read, readErr := reader.Read(header)
+	if _, seekErr := reader.Seek(0, io.SeekStart); seekErr != nil {
+		return "", seekErr
 	}
 	if readErr != nil && readErr != io.EOF {
-		_ = file.Close()
-		return nil, "", readErr
+		return "", readErr
 	}
 	contentType := http.DetectContentType(header[:read])
 	if contentType == "application/octet-stream" {
-		if extensionType := mime.TypeByExtension(filepath.Ext(path)); extensionType != "" {
+		if extensionType := mime.TypeByExtension(filepath.Ext(filename)); extensionType != "" {
 			contentType = extensionType
 		}
 	}
-	return file, contentType, nil
+	return contentType, nil
 }
 
 // RemoveSeedanceAssetObject 删除 OSS 对象；非 OSS 素材无需执行存储清理。
@@ -355,14 +432,15 @@ func seedanceAssetCleanupContext(ctx context.Context) (context.Context, context.
 func RollbackSeedanceAsset(ctx context.Context, client *SeedanceAssetClient, assetID, objectKey string, upload ...*SeedanceAssetUpload) error {
 	cleanupCtx, cancel := seedanceAssetCleanupContext(ctx)
 	defer cancel()
-	if client == nil {
-		return errors.New("seedance asset client is nil")
-	}
-
 	var cleanupErr error
 	if strings.TrimSpace(assetID) != "" {
-		if err := client.DeleteSeedanceAsset(cleanupCtx, assetID); err != nil {
+		if client == nil {
+			cleanupErr = errors.Join(cleanupErr, errors.New("seedance asset client is nil"))
+		} else if err := client.DeleteSeedanceAsset(cleanupCtx, assetID); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("upstream asset cleanup failed: %w", err))
+			if queueErr := queueSeedanceAssetUpstreamCleanup(model.SeedanceAssetCleanupKindUpstreamAsset, client, assetID); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue upstream cleanup: %w", queueErr))
+			}
 		}
 	}
 	if strings.TrimSpace(objectKey) != "" {
@@ -374,6 +452,13 @@ func RollbackSeedanceAsset(ctx context.Context, client *SeedanceAssetClient, ass
 		}
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("OSS asset cleanup failed: %w", err))
+			storage := model.SeedanceAssetStorage{}
+			if len(upload) > 0 && upload[0] != nil {
+				storage = upload[0].Storage
+			}
+			if queueErr := queueSeedanceAssetObjectCleanup(objectKey, storage); queueErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to queue OSS cleanup: %w", queueErr))
+			}
 		}
 	}
 	return cleanupErr
@@ -389,7 +474,13 @@ func RollbackSeedanceAssetGroup(ctx context.Context, client *SeedanceAssetClient
 	if strings.TrimSpace(groupID) == "" {
 		return nil
 	}
-	return client.DeleteSeedanceAssetGroup(cleanupCtx, groupID)
+	if err := client.DeleteSeedanceAssetGroup(cleanupCtx, groupID); err != nil {
+		if queueErr := queueSeedanceAssetUpstreamCleanup(model.SeedanceAssetCleanupKindUpstreamGroup, client, groupID); queueErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to queue upstream group cleanup: %w", queueErr))
+		}
+		return err
+	}
+	return nil
 }
 
 // RollbackSeedanceAssetGroupName 恢复远端素材组名称，避免本地更新失败后两端不一致。
@@ -426,8 +517,17 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 			return nil, err
 		}
 		key = selected
-	} else if binding[0] == "" && !channel.ChannelInfo.IsMultiKey {
-		key = channel.Key
+	} else if strings.TrimSpace(binding[0]) == "" {
+		// 旧映射没有账号摘要时回退到当前可用账号，避免删除任务永久卡在无法绑定账号。
+		if !channel.ChannelInfo.IsMultiKey {
+			key = channel.Key
+		} else {
+			selected, _, err := channel.GetNextEnabledKey()
+			if err != nil {
+				return nil, err
+			}
+			key = selected
+		}
 	} else {
 		// 以密钥摘要绑定账号，不依赖可重新排序的密钥下标，也不把密钥写入素材表。
 		for index, candidate := range channel.GetKeys() {
@@ -454,6 +554,7 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 		baseURL = strings.TrimSuffix(baseURL, assetPath)
 	}
 	return &SeedanceAssetClient{
+		ChannelID:      channel.Id,
 		baseURL:        baseURL,
 		apiKey:         key,
 		path:           assetPath,

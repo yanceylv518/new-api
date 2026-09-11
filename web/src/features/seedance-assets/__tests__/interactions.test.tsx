@@ -197,6 +197,107 @@ test('refreshes only the selected asset and keeps sibling preview URLs stable', 
   expect(requests.some((url) => url.endsWith('/2/refresh'))).toBe(false)
 })
 
+test('selects the visible assets and deletes them with one batch request', async () => {
+  const batchRequests: number[][] = []
+  api.defaults.adapter = async (config) => {
+    let data: unknown
+    if (config.url?.endsWith('asset-groups')) {
+      data = {
+        success: true,
+        data: [{ id: 1, group_id: 'group-1', name: 'References' }],
+      }
+    } else if (config.url?.endsWith('/batch-delete')) {
+      batchRequests.push(JSON.parse(String(config.data)).ids)
+      data = {
+        success: true,
+        data: { deleted_ids: [], failed_ids: [], pending_ids: [1, 2] },
+      }
+    } else {
+      data = {
+        success: true,
+        data: [firstAsset, secondAsset],
+        total: 2,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      }
+    }
+    return { data, status: 200, statusText: 'OK', headers: {}, config }
+  }
+
+  renderLibrary()
+  await screen.findByRole('img', { name: 'cover.png' })
+  await userEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
+  expect(screen.getByText('2 selected')).toBeInTheDocument()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Delete selected assets' })
+  )
+  const confirmation = await screen.findByRole('alertdialog')
+  expect(confirmation).toHaveTextContent('Delete 2 selected assets')
+  await userEvent.click(
+    within(confirmation).getByRole('button', { name: 'Delete' })
+  )
+
+  await waitFor(() => expect(batchRequests).toEqual([[1, 2]]))
+  await waitFor(() =>
+    expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
+  )
+})
+
+test('keeps failed assets selected after a partial batch deletion', async () => {
+  api.defaults.adapter = async (config) => {
+    let data: unknown
+    if (config.url?.endsWith('asset-groups')) {
+      data = {
+        success: true,
+        data: [{ id: 1, group_id: 'group-1', name: 'References' }],
+      }
+    } else if (config.url?.endsWith('/batch-delete')) {
+      data = {
+        success: false,
+        message: '1 asset failed to delete',
+        data: { deleted_ids: [1], failed_ids: [2] },
+      }
+    } else {
+      data = {
+        success: true,
+        data: [firstAsset, secondAsset],
+        total: 2,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      }
+    }
+    return { data, status: 200, statusText: 'OK', headers: {}, config }
+  }
+
+  renderLibrary()
+  await screen.findByRole('img', { name: 'cover.png' })
+  await userEvent.click(
+    screen.getByRole('checkbox', { name: 'Select cover.png' })
+  )
+  await userEvent.click(
+    screen.getByRole('checkbox', { name: 'Select second.png' })
+  )
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Delete selected assets' })
+  )
+  const confirmation = await screen.findByRole('alertdialog')
+  await userEvent.click(
+    within(confirmation).getByRole('button', { name: 'Delete' })
+  )
+
+  await waitFor(() =>
+    expect(
+      screen.getByRole('checkbox', { name: 'Select second.png' })
+    ).toHaveAttribute('aria-checked', 'true')
+  )
+  expect(
+    screen.getByRole('checkbox', { name: 'Select cover.png' })
+  ).toHaveAttribute('aria-checked', 'false')
+  expect(screen.getByText('1 selected')).toBeInTheDocument()
+})
+
 test('reloads the list after uploading and supports switching view with keyboard', async () => {
   let uploaded = false
   const listRequests: string[] = []
@@ -238,6 +339,144 @@ test('reloads the list after uploading and supports switching view with keyboard
   await userEvent.keyboard('{Enter}')
   expect(tableButton).toHaveAttribute('aria-pressed', 'true')
   expect(screen.getByRole('article')).toHaveTextContent('cover.png')
+})
+
+test('opens the floating upload queue and shows each transfer status', async () => {
+  let resolveUpload: ((response: AxiosResponse) => void) | undefined
+  let activeResponse: AxiosResponse | undefined
+  const adapter = vi.fn<AxiosAdapter>(
+    (config) =>
+      new Promise((resolve) => {
+        resolveUpload = resolve
+        activeResponse = {
+          data: { success: true, data: firstAsset },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      })
+  )
+  api.defaults.adapter = adapter
+  const client = new QueryClient()
+  clients.push(client)
+  const view = render(
+    <QueryClientProvider client={client}>
+      <AssetUploadPanel groupId='group-1' onUploaded={() => undefined}>
+        {() => null}
+      </AssetUploadPanel>
+    </QueryClientProvider>
+  )
+
+  await userEvent.upload(
+    screen.getByLabelText('Upload assets', { selector: 'input' }),
+    new File(['image'], 'cover.png', { type: 'image/png' })
+  )
+  const queueButton = screen.getByRole('button', { name: 'Upload queue' })
+  await userEvent.click(queueButton)
+  const queue = screen.getByRole('region', { name: 'Upload queue' })
+  await waitFor(() => expect(queue).toHaveTextContent('Uploading'))
+
+  await act(async () => {
+    if (resolveUpload && activeResponse) resolveUpload(activeResponse)
+  })
+  await waitFor(() => expect(queue).toHaveTextContent('Uploaded'))
+  expect(queueButton).toHaveAttribute('aria-expanded', 'true')
+  await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+  expect(queueButton).toHaveAttribute('aria-expanded', 'false')
+  view.unmount()
+})
+
+test('shows failed transfers and retries them from the floating queue', async () => {
+  let attempts = 0
+  const adapter = vi.fn<AxiosAdapter>(async (config) => {
+    attempts++
+    if (attempts === 1) throw new Error('temporary upload failure')
+    return {
+      data: { success: true, data: firstAsset },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  })
+  api.defaults.adapter = adapter
+  const client = new QueryClient()
+  clients.push(client)
+  const view = render(
+    <QueryClientProvider client={client}>
+      <AssetUploadPanel groupId='group-1' onUploaded={() => undefined}>
+        {() => null}
+      </AssetUploadPanel>
+    </QueryClientProvider>
+  )
+
+  await userEvent.upload(
+    screen.getByLabelText('Upload assets', { selector: 'input' }),
+    new File(['image'], 'cover.png', { type: 'image/png' })
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Upload queue' }))
+  const queue = screen.getByRole('region', { name: 'Upload queue' })
+  await waitFor(() => expect(queue).toHaveTextContent('Upload failed'))
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Retry failed uploads' })
+  )
+  await waitFor(() => expect(queue).toHaveTextContent('Uploaded'))
+  expect(attempts).toBe(2)
+  view.unmount()
+})
+
+test('keeps an active upload visible when switching asset groups', async () => {
+  let resolveUpload: ((response: AxiosResponse) => void) | undefined
+  let activeResponse: AxiosResponse | undefined
+  const adapter = vi.fn<AxiosAdapter>(
+    (config) =>
+      new Promise((resolve) => {
+        resolveUpload = resolve
+        activeResponse = {
+          data: { success: true, data: firstAsset },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      })
+  )
+  api.defaults.adapter = adapter
+  const client = new QueryClient()
+  clients.push(client)
+  const renderPanel = (groupId: string, groupName: string) => (
+    <QueryClientProvider client={client}>
+      <AssetUploadPanel
+        groupId={groupId}
+        groupName={groupName}
+        onUploaded={() => undefined}
+      >
+        {() => null}
+      </AssetUploadPanel>
+    </QueryClientProvider>
+  )
+  const view = render(renderPanel('group-1', 'References'))
+
+  await userEvent.upload(
+    screen.getByLabelText('Upload assets', { selector: 'input' }),
+    new File(['image'], 'cover.png', { type: 'image/png' })
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Upload queue' }))
+  const queue = screen.getByRole('region', { name: 'Upload queue' })
+  await waitFor(() => expect(queue).toHaveTextContent('Uploading'))
+  expect(queue).toHaveTextContent('0%')
+
+  view.rerender(renderPanel('group-2', 'Generated'))
+  expect(screen.getByRole('region', { name: 'Upload queue' })).toHaveTextContent(
+    'References'
+  )
+
+  await act(async () => {
+    if (resolveUpload && activeResponse) resolveUpload(activeResponse)
+  })
+  await waitFor(() => expect(queue).toHaveTextContent('Uploaded'))
+  view.unmount()
 })
 
 test('renews only a failed preview and bounds automatic recovery', () => {

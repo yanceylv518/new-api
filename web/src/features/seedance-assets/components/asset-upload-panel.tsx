@@ -19,7 +19,9 @@ For commercial licensing, please contact support@quantumnous.com
 import { useMutation } from '@tanstack/react-query'
 import {
   AlertCircle,
+  CheckCheck,
   CheckCircle2,
+  CloudUpload,
   File,
   Loader2,
   RotateCcw,
@@ -30,6 +32,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
+import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
 
 import { uploadSeedanceAsset, type SeedanceAsset } from '../api'
@@ -44,9 +47,10 @@ import type { SeedanceUploadItem } from '../types'
 // 包含完成条目，限制文件引用和 DOM 的总占用；用户可清除后继续上传。
 const MAX_UPLOAD_QUEUE_ITEMS = 100
 
-// 上传队列逐个执行并有界保留；切换分组或离开页面时取消请求并丢弃未开始条目。
+// 上传队列逐个执行并有界保留；切换分组时继续处理原分组任务，避免用户误操作导致上传丢失。
 export function AssetUploadPanel(props: {
   groupId: string
+  groupName?: string
   onUploaded: (asset: SeedanceAsset) => void
   children: (browse: () => void) => ReactNode
 }) {
@@ -61,6 +65,7 @@ export function AssetUploadPanel(props: {
   const mountedRef = useRef(true)
   const [dragActive, setDragActive] = useState(false)
   const [queue, setQueue] = useState<SeedanceUploadItem[]>([])
+  const [queueOpen, setQueueOpen] = useState(false)
 
   const uploadMutation = useMutation({ mutationFn: uploadSeedanceAsset })
 
@@ -90,7 +95,11 @@ export function AssetUploadPanel(props: {
         const item = pendingRef.current.shift()
         if (!item) continue
         pendingIdsRef.current.delete(item.id)
-        updateQueueItem(item.id, { status: 'uploading', error: undefined })
+        updateQueueItem(item.id, {
+          status: 'uploading',
+          progress: 0,
+          error: undefined,
+        })
         try {
           const controller = new AbortController()
           controllerRef.current = controller
@@ -99,8 +108,11 @@ export function AssetUploadPanel(props: {
             file: item.file,
             name: item.name,
             signal: controller.signal,
+            onUploadProgress: (progress) => {
+              updateQueueItem(item.id, { progress })
+            },
           })
-          updateQueueItem(item.id, { status: 'success' })
+          updateQueueItem(item.id, { status: 'success', progress: 100 })
           if (mountedRef.current) props.onUploaded(response.data)
         } catch (error: unknown) {
           updateQueueItem(item.id, {
@@ -142,7 +154,9 @@ export function AssetUploadPanel(props: {
         groupId: props.groupId,
         file,
         name: [...file.name].slice(0, 64).join(''),
+        groupName: props.groupName,
         status: 'queued',
+        progress: 0,
       })
     }
     if (validItems.length === 0) return
@@ -157,7 +171,29 @@ export function AssetUploadPanel(props: {
     if (item.status !== 'error' || pendingIdsRef.current.has(item.id)) return
     pendingIdsRef.current.add(item.id)
     pendingRef.current.push(item)
-    updateQueueItem(item.id, { status: 'queued', error: undefined })
+    updateQueueItem(item.id, { status: 'queued', progress: 0, error: undefined })
+    void processQueue()
+  }
+
+  // 批量重试只重新入队失败项，保留正在上传和已完成的条目状态。
+  const retryFailedUploads = () => {
+    const failedItems = queue.filter(
+      (item) =>
+        item.status === 'error' && !pendingIdsRef.current.has(item.id)
+    )
+    if (failedItems.length === 0) return
+    const failedIds = new Set(failedItems.map((item) => item.id))
+    for (const item of failedItems) {
+      pendingIdsRef.current.add(item.id)
+      pendingRef.current.push(item)
+    }
+    setQueue((current) =>
+      current.map((item) =>
+        failedIds.has(item.id)
+          ? { ...item, status: 'queued', progress: 0, error: undefined }
+          : item
+      )
+    )
     void processQueue()
   }
 
@@ -217,91 +253,189 @@ export function AssetUploadPanel(props: {
         }}
       />
 
-      {queue.length > 0 ? (
-        <div className='border-border/70 mx-4 mb-4 shrink-0 rounded-lg border sm:mx-6'>
-          <div className='flex items-center justify-between gap-3 border-b px-3 py-2'>
-            <div className='text-sm font-medium'>
-              {t('Upload queue')}{' '}
-              <span className='text-muted-foreground'>({queue.length})</span>
-            </div>
-            <Button
-              type='button'
-              size='sm'
-              variant='ghost'
-              onClick={clearFinished}
-              disabled={
-                !queue.some(
-                  (item) => item.status === 'success' || item.status === 'error'
-                )
-              }
+      {props.groupId || queue.length > 0 ? (
+        <div className={seedanceAssetLayoutClasses.uploadQueue}>
+          {queueOpen ? (
+            <div
+              id='seedance-upload-queue'
+              role='region'
+              aria-label={t('Upload queue')}
+              className={seedanceAssetLayoutClasses.uploadQueuePanel}
             >
-              <X />
-              {t('Clear finished')}
-            </Button>
-          </div>
-          <ul className='max-h-40 divide-y overflow-y-auto overscroll-contain'>
-            {queue.map((item) => (
-              <li
-                key={item.id}
-                className='flex min-w-0 items-center gap-3 px-3 py-2.5'
-              >
-                <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-md'>
-                  <File className='size-4' aria-hidden='true' />
-                </span>
-                <div className='min-w-0 flex-1'>
-                  <p className='truncate text-sm' title={item.name}>
-                    {item.name}
+              <div className='flex items-center justify-between gap-2 border-b px-3 py-2.5'>
+                <div className='flex min-w-0 items-center gap-2'>
+                  <CloudUpload
+                    className='text-primary size-4 shrink-0'
+                    aria-hidden='true'
+                  />
+                  <p className='truncate text-sm font-medium'>
+                    {t('Upload queue')}{' '}
+                    <span className='text-muted-foreground'>
+                      ({queue.length})
+                    </span>
                   </p>
-                  <p className='text-muted-foreground text-xs'>
-                    {formatSeedanceFileSize(item.file.size)}
-                  </p>
-                  {item.error ? (
-                    <p
-                      className='text-destructive truncate text-xs'
-                      title={item.error}
-                    >
-                      {item.error}
-                    </p>
-                  ) : null}
                 </div>
-                {item.status === 'queued' ? (
-                  <span className='text-muted-foreground shrink-0 text-xs'>
-                    {t('Queued')}
-                  </span>
-                ) : null}
-                {item.status === 'uploading' ? (
-                  <Loader2
-                    className='text-muted-foreground size-4 shrink-0 animate-spin'
-                    aria-label={t('Uploading')}
-                  />
-                ) : null}
-                {item.status === 'success' ? (
-                  <CheckCircle2
-                    className='text-success size-4 shrink-0'
-                    aria-label={t('Uploaded')}
-                  />
-                ) : null}
-                {item.status === 'error' ? (
+                <div className='flex shrink-0 items-center gap-1'>
                   <Button
                     type='button'
                     size='icon-sm'
                     variant='ghost'
-                    title={t('Retry')}
-                    aria-label={t('Retry')}
-                    onClick={() => retryItem(item)}
+                    title={t('Retry failed uploads')}
+                    aria-label={t('Retry failed uploads')}
+                    onClick={retryFailedUploads}
+                    disabled={
+                      !queue.some(
+                        (item) =>
+                          item.status === 'error' &&
+                          !pendingIdsRef.current.has(item.id)
+                      )
+                    }
                   >
                     <RotateCcw />
                   </Button>
-                ) : null}
-                {item.status === 'error' ? (
-                  <AlertCircle
-                    className='text-destructive size-4 shrink-0'
-                    aria-hidden='true'
-                  />
-                ) : null}
-              </li>
-            ))}
-          </ul>
+                  <Button
+                    type='button'
+                    size='icon-sm'
+                    variant='ghost'
+                    title={t('Clear finished')}
+                    aria-label={t('Clear finished')}
+                    onClick={clearFinished}
+                    disabled={
+                      !queue.some(
+                        (item) =>
+                          item.status === 'success' || item.status === 'error'
+                      )
+                    }
+                  >
+                    <CheckCheck />
+                  </Button>
+                  <Button
+                    type='button'
+                    size='icon-sm'
+                    variant='ghost'
+                    title={t('Close')}
+                    aria-label={t('Close')}
+                    onClick={() => setQueueOpen(false)}
+                  >
+                    <X />
+                  </Button>
+                </div>
+              </div>
+              {queue.length > 0 ? (
+                <ul className='max-h-72 divide-y overflow-y-auto overscroll-contain'>
+                  {queue.map((item) => (
+                    <li
+                      key={item.id}
+                      className='flex min-w-0 items-center gap-3 px-3 py-2.5'
+                    >
+                      <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-md'>
+                        <File className='size-4' aria-hidden='true' />
+                      </span>
+                      <div className='min-w-0 flex-1'>
+                        <p className='truncate text-sm' title={item.name}>
+                          {item.name}
+                        </p>
+                        {item.groupName ? (
+                          <p
+                            className='text-muted-foreground truncate text-xs'
+                            title={item.groupName}
+                          >
+                            {item.groupName}
+                          </p>
+                        ) : null}
+                        <p className='text-muted-foreground text-xs'>
+                          {formatSeedanceFileSize(item.file.size)}
+                        </p>
+                        {item.status === 'uploading' ? (
+                          <div className='mt-1 flex min-w-0 items-center gap-2'>
+                            <Progress
+                              value={item.progress}
+                              aria-label={t('Progress')}
+                              className='min-w-0 flex-1 gap-0'
+                            />
+                            <span className='text-muted-foreground shrink-0 text-[0.65rem] tabular-nums'>
+                              {item.progress}%
+                            </span>
+                          </div>
+                        ) : null}
+                        {item.error ? (
+                          <p
+                            className='text-destructive truncate text-xs'
+                            title={item.error}
+                          >
+                            {item.error}
+                          </p>
+                        ) : null}
+                      </div>
+                      {item.status === 'queued' ? (
+                        <span className='text-muted-foreground shrink-0 text-xs'>
+                          {t('Queued')}
+                        </span>
+                      ) : null}
+                      {item.status === 'uploading' ? (
+                        <span className='text-muted-foreground flex shrink-0 items-center gap-1 text-xs'>
+                          <Loader2
+                            className='size-4 animate-spin'
+                            aria-hidden='true'
+                          />
+                          {t('Uploading')}
+                        </span>
+                      ) : null}
+                      {item.status === 'success' ? (
+                        <span className='text-success flex shrink-0 items-center gap-1 text-xs'>
+                          <CheckCircle2 className='size-4' aria-hidden='true' />
+                          {t('Uploaded')}
+                        </span>
+                      ) : null}
+                      {item.status === 'error' ? (
+                        <div className='text-destructive flex shrink-0 items-center gap-1'>
+                          <span className='text-xs'>{t('Upload failed')}</span>
+                          <AlertCircle className='size-4' aria-hidden='true' />
+                          <Button
+                            type='button'
+                            size='icon-sm'
+                            variant='ghost'
+                            title={t('Retry')}
+                            aria-label={t('Retry')}
+                            onClick={() => retryItem(item)}
+                          >
+                            <RotateCcw />
+                          </Button>
+                        </div>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className='text-muted-foreground flex min-h-28 flex-col items-center justify-center gap-2 px-4 text-center text-xs'>
+                  <CloudUpload className='size-5' aria-hidden='true' />
+                  {t('No uploads yet')}
+                </div>
+              )}
+            </div>
+          ) : null}
+          <Button
+            type='button'
+            size='icon-lg'
+            variant='default'
+            className='relative rounded-full border shadow-lg'
+            title={t('Upload queue')}
+            aria-label={t('Upload queue')}
+            aria-expanded={queueOpen}
+            aria-controls='seedance-upload-queue'
+            onClick={() => setQueueOpen((current) => !current)}
+          >
+            {queue.some((item) => item.status === 'uploading') ? (
+              <Loader2 className='animate-spin' />
+            ) : (
+              <CloudUpload />
+            )}
+            {queue.length > 0 ? (
+              <span className='bg-destructive text-destructive-foreground absolute -top-1 -right-1 flex min-w-5 items-center justify-center rounded-full px-1 text-[0.65rem] leading-5 font-semibold'>
+                {queue.length > 99 ? '99+' : queue.length}
+              </span>
+            ) : null}
+          </Button>
         </div>
       ) : null}
     </section>

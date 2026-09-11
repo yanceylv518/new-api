@@ -33,6 +33,7 @@ function getStatusVariant(status: string): StatusVariant {
       return 'danger'
     case 'processing':
     case 'pending':
+    case 'deleting':
       return 'warning'
     default:
       return 'neutral'
@@ -58,18 +59,18 @@ function getStatusLabel(status: string): string {
   }
 }
 
-// 状态颜色与审核生命周期保持一致，Processing 使用持续旋转图标避免脉冲闪烁。
+// 状态颜色与生命周期保持一致，处理中和删除中都使用持续旋转图标表示后台工作。
 export function AssetStatusBadge(props: { asset: SeedanceAsset }) {
   const { t } = useTranslation()
   const statusLabel = getStatusLabel(props.asset.status)
-  const isProcessing = statusLabel === 'Processing'
+  const isBusy = statusLabel === 'Processing' || statusLabel === 'Deleting...'
   return (
     <StatusBadge
       variant={getStatusVariant(props.asset.status)}
       copyable={false}
       aria-live='polite'
     >
-      {isProcessing ? (
+      {isBusy ? (
         <Loader2
           className='size-3.5 shrink-0 animate-spin'
           aria-hidden='true'

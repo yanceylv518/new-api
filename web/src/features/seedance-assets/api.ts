@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { t } from 'i18next'
+import type { AxiosProgressEvent } from 'axios'
 
 import { api } from '@/lib/api'
 
@@ -60,6 +61,18 @@ export type SeedanceAssetResponse<T> = {
   success: boolean
   message?: string
   data: T
+}
+
+export type SeedanceAssetBatchDeleteResult = {
+  deleted_ids: number[]
+  failed_ids: number[]
+  pending_ids: number[]
+}
+
+type SeedanceAssetBatchDeleteResponse = {
+  success: boolean
+  message?: string
+  data: SeedanceAssetBatchDeleteResult
 }
 
 // 分组与素材列表由 React Query 单独管理缓存；绕过 HTTP 去重，取消后不会重用旧请求。
@@ -154,6 +167,7 @@ export async function uploadSeedanceAsset(payload: {
   file: File
   name: string
   signal?: AbortSignal
+  onUploadProgress?: (progress: number) => void
 }) {
   const formData = new FormData()
   formData.append('group_id', payload.groupId)
@@ -171,6 +185,12 @@ export async function uploadSeedanceAsset(payload: {
           timeout: 120000,
           skipErrorHandler: true,
           skipBusinessError: true,
+          onUploadProgress: (event: AxiosProgressEvent) => {
+            if (!event.total || event.total <= 0) return
+            payload.onUploadProgress?.(
+              Math.min(100, Math.round((event.loaded / event.total) * 100))
+            )
+          },
         }
       )
     ).data
@@ -195,4 +215,36 @@ export async function deleteSeedanceAsset(id: number) {
       )
     ).data
   )
+}
+
+// 批量删除返回逐项结果；部分失败时保留失败 ID，让页面支持定向重试。
+export async function batchDeleteSeedanceAssets(
+  ids: number[]
+): Promise<SeedanceAssetBatchDeleteResponse> {
+  const response = (
+    await api.post<{
+      success: boolean
+      message?: string
+      data?: Omit<SeedanceAssetBatchDeleteResult, 'pending_ids'> & {
+        pending_ids?: number[]
+      }
+    }>(
+      '/api/user/seedance/assets/batch-delete',
+      { ids },
+      {
+        skipBusinessError: true,
+      }
+    )
+  ).data
+  if (!response.data) {
+    throw new Error(response.message || t('Request failed'))
+  }
+  return {
+    success: response.success,
+    message: response.message,
+    data: {
+      ...response.data,
+      pending_ids: response.data.pending_ids ?? [],
+    },
+  }
 }

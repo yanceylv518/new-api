@@ -61,4 +61,12 @@ describe('Seedance asset layout', () => {
       /overflow-y-auto/
     )
   })
+
+  test('anchors the upload queue control to the workspace corner', () => {
+    assert.match(seedanceAssetLayoutClasses.uploadPanel, /relative/)
+    assert.match(seedanceAssetLayoutClasses.uploadQueue, /absolute/)
+    assert.match(seedanceAssetLayoutClasses.uploadQueue, /right-4/)
+    assert.match(seedanceAssetLayoutClasses.uploadQueue, /bottom-4/)
+    assert.match(seedanceAssetLayoutClasses.uploadQueuePanel, /overflow-hidden/)
+  })
 })

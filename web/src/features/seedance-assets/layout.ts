@@ -23,6 +23,10 @@ export const seedanceAssetLayoutClasses = {
     'grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,11rem)_minmax(0,1fr)] overflow-hidden md:grid-cols-[250px_minmax(0,1fr)] md:grid-rows-1',
   workspace: 'flex min-h-0 min-w-0 flex-col overflow-hidden',
   uploadPanel: 'relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden',
+  uploadQueue:
+    'absolute right-4 bottom-4 z-30 flex max-w-[calc(100%-2rem)] flex-col items-end gap-2',
+  uploadQueuePanel:
+    'bg-background/95 w-80 max-w-full overflow-hidden rounded-lg border shadow-xl backdrop-blur-sm',
   library: 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden',
   groupSidebar:
     'bg-muted/20 flex min-h-0 min-w-0 flex-col gap-2 overflow-hidden border-b p-3 md:gap-4 md:border-r md:border-b-0 md:p-4',

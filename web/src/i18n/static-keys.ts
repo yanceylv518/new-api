@@ -569,6 +569,13 @@ export const STATIC_I18N_KEYS = [
   'No assets in this group',
   'Delete "{{name}}" from this group? This action cannot be undone.',
   'Delete "{{name}}" and all of its stored assets? This action cannot be undone.',
+  'Delete selected assets',
+  'Delete {{count}} selected assets from this group? This action cannot be undone.',
+  'Deleted {{count}} assets',
+  'Deleted {{deleted}} assets; {{failed}} failed',
+  'Queued {{count}} assets for deletion',
+  'Retry failed uploads',
+  'No uploads yet',
 
   // Dashboard flow stages (labels/descriptions passed to t at runtime)
   'User',

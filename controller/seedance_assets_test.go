@@ -35,6 +35,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -72,7 +73,7 @@ func setupSeedanceControllerRegression(t *testing.T, upstream http.HandlerFunc) 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetCleanupJob{}))
 	model.DB = db
 	t.Cleanup(func() { model.DB = previousDB; _ = sqlDB.Close() })
 	server := httptest.NewServer(upstream)
@@ -266,7 +267,54 @@ func TestSeedanceDeleteResumesAfterLocalFailure(t *testing.T) {
 	assert.Equal(t, "Deleting", asset.Status)
 	payload = invokeSeedanceRegression(t, DeleteSeedanceAsset, http.MethodDelete, "/", fmt.Sprint(asset.ID), "")
 	assert.True(t, payload.Success, payload.Message)
+	_, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
 	assert.EqualValues(t, 1, calls.Load())
+}
+
+// 批量删除先原子入队；后台单条上游失败不会阻断其他素材，失败项保留供重试。
+func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
+	var calls atomic.Int32
+	db, group, first := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 2 {
+			_, _ = w.Write([]byte(`{"code":"operation_failed","message":"rejected"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	second := &model.SeedanceAsset{
+		UserID: 9, ChannelID: 1, GroupID: group.GroupID, AssetID: "asset-second",
+		Name: "second", AssetType: "Image", Status: "Active",
+	}
+	require.NoError(t, db.Create(second).Error)
+
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d,999999]}`, first.ID, second.ID, first.ID)
+	payload := invokeSeedanceRegression(t, DeleteSeedanceAssetBatch, http.MethodPost, "/", "", body)
+	assert.True(t, payload.Success)
+	var result seedanceAssetBatchDeleteResult
+	require.NoError(t, common.Unmarshal(payload.Data, &result))
+	assert.Empty(t, result.DeletedIDs)
+	assert.Empty(t, result.FailedIDs)
+	assert.Equal(t, []uint{first.ID, second.ID}, result.PendingIDs)
+	assert.Zero(t, calls.Load())
+
+	var remaining []model.SeedanceAsset
+	require.NoError(t, db.Where("id IN ?", []uint{first.ID, second.ID}).Find(&remaining).Error)
+	require.Len(t, remaining, 2)
+	assert.Equal(t, "Deleting", remaining[0].Status)
+	assert.Equal(t, "Deleting", remaining[1].Status)
+
+	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, summary.Candidates)
+	assert.Equal(t, 1, summary.Completed)
+	assert.Equal(t, 1, summary.RetryScheduled)
+	assert.EqualValues(t, 2, calls.Load())
+
+	remaining = nil
+	require.NoError(t, db.Where("id IN ?", []uint{first.ID, second.ID}).Find(&remaining).Error)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "Deleting", remaining[0].Status)
 }
 
 // 覆盖第 201 条素材、跨页搜索、用户隔离和筛选下的后台轮询提示。

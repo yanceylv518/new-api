@@ -23,6 +23,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(seedanceAssetPollHandler{})
+	service.RegisterSystemTaskHandler(seedanceAssetCleanupHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -168,6 +169,28 @@ func (seedanceAssetPollHandler) NewPayload() any { return nil }
 
 func (seedanceAssetPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary, err := service.RunSeedanceAssetPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+// seedanceAssetCleanupHandler 按固定间隔重试上游和 OSS 的失败补偿任务。
+type seedanceAssetCleanupHandler struct{}
+
+func (seedanceAssetCleanupHandler) Type() string { return model.SystemTaskTypeSeedanceAssetCleanup }
+
+func (seedanceAssetCleanupHandler) Enabled() bool {
+	return model.HasDueSeedanceAssetCleanupJobs(common.GetTimestamp())
+}
+
+func (seedanceAssetCleanupHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (seedanceAssetCleanupHandler) NewPayload() any { return nil }
+
+func (seedanceAssetCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunSeedanceAssetCleanupOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	if err != nil {
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
 		return

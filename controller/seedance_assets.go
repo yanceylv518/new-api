@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -18,6 +19,45 @@ import (
 
 type seedanceAssetGroupRequest struct {
 	Name string `json:"name" binding:"required,max=64"`
+}
+
+const seedanceAssetGroupCleanupWorkerSize = 4
+
+// cleanupSeedanceAssetGroupAssets 用固定并发清理组内 OSS 对象，减少大素材组删除的总耗时。
+// 每条素材仍独立返回错误，已完成的条目不会因为同批其他条目失败而重复处理。
+func cleanupSeedanceAssetGroupAssets(ctx context.Context, assets []model.SeedanceAsset) error {
+	if len(assets) == 0 {
+		return nil
+	}
+	jobs := make(chan *model.SeedanceAsset, len(assets))
+	results := make(chan error, len(assets))
+	for index := range assets {
+		jobs <- &assets[index]
+	}
+	close(jobs)
+	workerSize := min(seedanceAssetGroupCleanupWorkerSize, len(assets))
+	var workers sync.WaitGroup
+	workers.Add(workerSize)
+	for worker := 0; worker < workerSize; worker++ {
+		go func() {
+			defer workers.Done()
+			for asset := range jobs {
+				if err := cleanupSeedanceAssetUpload(ctx, asset); err != nil {
+					results <- err
+					continue
+				}
+				results <- model.DB.WithContext(ctx).Delete(asset).Error
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateSeedanceAssetGroup 更新当前用户自己的素材组名称。
@@ -132,15 +172,9 @@ func DeleteSeedanceAssetGroup(c *gin.Context) {
 		if len(assets) == 0 {
 			break
 		}
-		for index := range assets {
-			if err := cleanupSeedanceAssetUpload(c.Request.Context(), &assets[index]); err != nil {
-				common.ApiError(c, err)
-				return
-			}
-			if err := model.DB.WithContext(c.Request.Context()).Delete(&assets[index]).Error; err != nil {
-				common.ApiError(c, err)
-				return
-			}
+		if err := cleanupSeedanceAssetGroupAssets(c.Request.Context(), assets); err != nil {
+			common.ApiError(c, err)
+			return
 		}
 	}
 	if err := model.DB.WithContext(c.Request.Context()).Delete(&group).Error; err != nil {
@@ -185,8 +219,16 @@ func enqueueSeedanceAssetPolling() {
 
 // seedanceAssetPreviewURL 为 OSS 对象按需签名，外部 URL 素材继续使用原始地址。
 func seedanceAssetPreviewURL(ctx context.Context, asset *model.SeedanceAsset) (string, error) {
+	return seedanceAssetPreviewURLWithStorage(ctx, asset, nil)
+}
+
+// seedanceAssetPreviewURLWithStorage 允许列表请求复用同一位置的 OSS 客户端。
+func seedanceAssetPreviewURLWithStorage(ctx context.Context, asset *model.SeedanceAsset, storage *service.PrivateAssetOSSStorage) (string, error) {
 	if strings.TrimSpace(asset.ObjectKey) != "" {
-		return service.SeedanceAssetOSSPreviewURL(ctx, asset.ObjectKey, asset.Storage)
+		if storage == nil {
+			return service.SeedanceAssetOSSPreviewURL(ctx, asset.ObjectKey, asset.Storage)
+		}
+		return storage.PrivateAssetPreviewURL(ctx, asset.ObjectKey)
 	}
 	if previewURL := strings.TrimSpace(asset.PreviewURL); previewURL != "" {
 		return previewURL, nil
@@ -271,8 +313,10 @@ func ListSeedanceAssets(c *gin.Context) {
 		query = query.Where("group_id = ?", groupID)
 	}
 	// 当前页即使只显示终态，也要在同组仍有审核任务时更新筛选结果。
-	var pending int64
-	if err := query.Session(&gorm.Session{}).Where("LOWER(status) IN ?", []string{"processing", "pending"}).Count(&pending).Error; err != nil {
+	var pendingMarker struct {
+		ID uint
+	}
+	if err := query.Session(&gorm.Session{}).Where("LOWER(status) IN ?", []string{"processing", "pending", "deleting"}).Select("id").Limit(1).Find(&pendingMarker).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -296,6 +340,8 @@ func ListSeedanceAssets(c *gin.Context) {
 	case "", "all":
 	case "processing":
 		query = query.Where("LOWER(status) IN ?", []string{"processing", "pending"})
+	case "deleting":
+		query = query.Where("LOWER(status) = ?", "deleting")
 	case "active":
 		query = query.Where("LOWER(status) IN ?", []string{"active", "success", "succeeded"})
 	case "failed":
@@ -317,11 +363,34 @@ func ListSeedanceAssets(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	// 同一页通常共用一个 OSS 位置，复用客户端避免每个素材重复加载和校验配置。
+	previewStorages := make(map[model.SeedanceAssetStorage]*service.PrivateAssetOSSStorage)
+	previewStorageErrors := make(map[model.SeedanceAssetStorage]error)
 	previewSignFailures := 0
 	var firstPreviewSignFailure error
 	var firstPreviewFailureAssetID uint
 	for index := range assets {
-		previewURL, err := seedanceAssetPreviewURL(c.Request.Context(), &assets[index])
+		var storage *service.PrivateAssetOSSStorage
+		var err error
+		if strings.TrimSpace(assets[index].ObjectKey) != "" {
+			location := assets[index].Storage
+			if cached, ok := previewStorages[location]; ok {
+				storage = cached
+			} else if cachedErr, ok := previewStorageErrors[location]; ok {
+				err = cachedErr
+			} else {
+				storage, err = service.NewPrivateAssetOSSStorage(location)
+				if err != nil {
+					previewStorageErrors[location] = err
+				} else {
+					previewStorages[location] = storage
+				}
+			}
+		}
+		var previewURL string
+		if err == nil {
+			previewURL, err = seedanceAssetPreviewURLWithStorage(c.Request.Context(), &assets[index], storage)
+		}
 		if err != nil {
 			assets[index].PreviewURL = ""
 			previewSignFailures++
@@ -336,7 +405,7 @@ func ListSeedanceAssets(c *gin.Context) {
 	if firstPreviewSignFailure != nil {
 		common.SysError(fmt.Sprintf("failed to sign %d Seedance asset previews; first_asset_id=%d: %v", previewSignFailures, firstPreviewFailureAssetID, firstPreviewSignFailure))
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": assets, "total": total, "page": page.Page, "page_size": page.PageSize, "has_pending": pending > 0})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": assets, "total": total, "page": page.Page, "page_size": page.PageSize, "has_pending": pendingMarker.ID > 0})
 }
 
 // RefreshSeedanceAsset 同步查询上游审核状态并更新本地记录。
@@ -394,6 +463,50 @@ func RefreshSeedanceAsset(c *gin.Context) {
 	common.ApiSuccess(c, asset)
 }
 
+const seedanceAssetBatchDeleteLimit = 100
+
+type seedanceAssetBatchDeleteRequest struct {
+	IDs []uint `json:"ids"`
+}
+
+type seedanceAssetBatchDeleteResult struct {
+	DeletedIDs []uint `json:"deleted_ids"`
+	FailedIDs  []uint `json:"failed_ids"`
+	PendingIDs []uint `json:"pending_ids"`
+}
+
+// deleteSeedanceAssetRecord 删除单条素材的本地映射、OSS 对象和上游引用。
+// 删除过程允许在上游或本地清理失败后重试，已确认的上游删除不会重复调用。
+func deleteSeedanceAssetRecord(ctx context.Context, asset *model.SeedanceAsset) error {
+	// 删除意图使后台轮询停止；上游确认之前保留 OSS 文件与授权映射。
+	if err := model.DB.WithContext(ctx).Model(asset).Updates(map[string]any{"status": "Deleting", "poll_lease_until": 0}).Error; err != nil {
+		return err
+	}
+	if asset.UpstreamDeletedAt == 0 {
+		channel, err := model.GetChannelById(asset.ChannelID, true)
+		if err != nil {
+			return err
+		}
+		client, err := service.NewSeedanceAssetClient(channel, asset.KeyFingerprint)
+		if err != nil {
+			return err
+		}
+		if err := client.DeleteSeedanceAsset(ctx, asset.AssetID); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Model(asset).Update("upstream_deleted_at", common.GetTimestamp()).Error; err != nil {
+			return err
+		}
+	}
+	if err := cleanupSeedanceAssetUpload(ctx, asset); err != nil {
+		return err
+	}
+	if err := model.DB.WithContext(ctx).Delete(asset).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
 // DeleteSeedanceAsset 删除用户自己的素材及上游引用。
 func DeleteSeedanceAsset(c *gin.Context) {
 	var asset model.SeedanceAsset
@@ -401,40 +514,89 @@ func DeleteSeedanceAsset(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	// 删除意图使后台轮询停止；上游确认之前保留 OSS 文件与授权映射。
-	if err := model.DB.WithContext(c.Request.Context()).Model(&asset).Updates(map[string]any{"status": "Deleting", "poll_lease_until": 0}).Error; err != nil {
-		common.ApiError(c, err)
+	if strings.EqualFold(asset.Status, "deleting") {
+		// 失败后的删除必须保留人工重试入口，并与批量删除共享同一幂等任务。
+		job := service.NewSeedanceAssetDeleteCleanupJob(&asset)
+		if err := model.QueueSeedanceAssetDeletion(c.Request.Context(), []model.SeedanceAssetCleanupJob{job}); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		service.EnqueueSeedanceAssetCleanup()
+		c.JSON(http.StatusAccepted, gin.H{"success": true, "data": nil})
 		return
 	}
-	if asset.UpstreamDeletedAt == 0 {
-		channel, err := model.GetChannelById(asset.ChannelID, true)
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		client, err := service.NewSeedanceAssetClient(channel, asset.KeyFingerprint)
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		if err := client.DeleteSeedanceAsset(c.Request.Context(), asset.AssetID); err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		if err := model.DB.WithContext(c.Request.Context()).Model(&asset).Update("upstream_deleted_at", common.GetTimestamp()).Error; err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	}
-	if err := cleanupSeedanceAssetUpload(c.Request.Context(), &asset); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	if err := model.DB.WithContext(c.Request.Context()).Delete(&asset).Error; err != nil {
+	if err := deleteSeedanceAssetRecord(c.Request.Context(), &asset); err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, nil)
+}
+
+// DeleteSeedanceAssetBatch 按当前用户归属创建后台删除任务，避免批量上游请求阻塞单次 HTTP 请求。
+// 本地状态与任务入队使用同一事务，后台任务完成外部清理后才删除素材映射。
+func DeleteSeedanceAssetBatch(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var req seedanceAssetBatchDeleteRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 || len(req.IDs) > seedanceAssetBatchDeleteLimit {
+		common.ApiErrorI18n(c, "invalid_params")
+		return
+	}
+
+	ids := make([]uint, 0, len(req.IDs))
+	seen := make(map[uint]struct{}, len(req.IDs))
+	for _, id := range req.IDs {
+		if id == 0 {
+			common.ApiErrorI18n(c, "invalid_params")
+			return
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	var assets []model.SeedanceAsset
+	if err := model.DB.WithContext(c.Request.Context()).
+		Where("user_id = ? AND id IN ?", c.GetInt("id"), ids).
+		Find(&assets).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	assetsByID := make(map[uint]*model.SeedanceAsset, len(assets))
+	for index := range assets {
+		assetsByID[assets[index].ID] = &assets[index]
+	}
+
+	jobs := make([]model.SeedanceAssetCleanupJob, 0, len(assets))
+	result := seedanceAssetBatchDeleteResult{
+		DeletedIDs: make([]uint, 0),
+		FailedIDs:  make([]uint, 0),
+		PendingIDs: make([]uint, 0, len(assets)),
+	}
+	for _, id := range ids {
+		asset, exists := assetsByID[id]
+		if !exists {
+			// 不返回不属于当前用户的 ID，避免批量接口泄露资源是否存在。
+			continue
+		}
+		jobs = append(jobs, service.NewSeedanceAssetDeleteCleanupJob(asset))
+		result.PendingIDs = append(result.PendingIDs, id)
+	}
+	if len(jobs) == 0 {
+		common.ApiErrorI18n(c, "invalid_params")
+		return
+	}
+	if err := model.QueueSeedanceAssetDeletion(c.Request.Context(), jobs); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	service.EnqueueSeedanceAssetCleanup()
+	c.JSON(http.StatusAccepted, gin.H{
+		"success": true,
+		"message": fmt.Sprintf("%d assets queued for deletion", len(result.PendingIDs)),
+		"data":    result,
+	})
 }
 
 // UploadSeedanceAsset 接收用户拖拽的本地文件，转为上游可访问的临时 URL 后提交审核。

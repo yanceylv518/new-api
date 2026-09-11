@@ -48,6 +48,7 @@ type fakePrivateAssetOSSClient struct {
 	putBody    []byte
 	deletedKey string
 	putErr     error
+	deleteErr  error
 }
 
 // 渠道选择必须越过满页的非 Doubao 插件，并跳过所有密钥禁用的账号。
@@ -241,6 +242,9 @@ func (client *fakePrivateAssetOSSClient) PutObject(_ context.Context, request *o
 
 func (client *fakePrivateAssetOSSClient) DeleteObject(_ context.Context, request *oss.DeleteObjectRequest, _ ...func(*oss.Options)) (*oss.DeleteObjectResult, error) {
 	client.deletedKey = *request.Key
+	if client.deleteErr != nil {
+		return nil, client.deleteErr
+	}
 	return &oss.DeleteObjectResult{}, nil
 }
 
@@ -256,9 +260,10 @@ func useFakePrivateAssetOSSStorage(t *testing.T) *fakePrivateAssetOSSClient {
 	previousFactory := privateAssetOSSStorageFactory
 	privateAssetOSSStorageFactory = func(...model.SeedanceAssetStorage) (*PrivateAssetOSSStorage, error) {
 		return &PrivateAssetOSSStorage{
-			client: client,
-			bucket: "test-private-assets",
-			prefix: "private-assets/",
+			client:   client,
+			bucket:   "test-private-assets",
+			prefix:   "private-assets/",
+			location: model.SeedanceAssetStorage{Region: "test-region", Endpoint: "https://oss.example.com", Bucket: "test-private-assets"},
 		}, nil
 	}
 	t.Cleanup(func() { privateAssetOSSStorageFactory = previousFactory })
@@ -492,6 +497,26 @@ func TestStoreSeedanceAssetUploadPersistsInOSSUntilDeleted(t *testing.T) {
 
 	require.NoError(t, RemoveSeedanceAssetObject(context.Background(), upload.ObjectKey))
 	require.Equal(t, upload.ObjectKey, client.deletedKey)
+}
+
+// 可定位的视频流应直接写入 OSS，避免先复制到第二份临时文件。
+func TestStoreSeedanceAssetUploadStreamsSeekableVideo(t *testing.T) {
+	client := useFakePrivateAssetOSSStorage(t)
+	content := []byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'm', 'p', '4', '2', 0, 0, 0, 0, 'm', 'p', '4', '2'}
+	upload, err := StoreSeedanceAssetUpload(
+		context.Background(),
+		bytes.NewReader(content),
+		"clip.mp4",
+		"video/mp4",
+		"",
+		int64(len(content)),
+		42,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "Video", upload.AssetType)
+	assert.Equal(t, int64(len(content)), upload.Size)
+	assert.Equal(t, content, client.putBody)
+	assert.Equal(t, "video/mp4", *client.putRequest.ContentType)
 }
 
 // 上传完成后即使全局工厂已切换，补偿也必须使用原客户端删除原 Bucket 中的对象。

@@ -22,6 +22,7 @@ export type SeedanceAssetStatusFilter =
   | 'all'
   | 'Active'
   | 'Processing'
+  | 'Deleting'
   | 'Failed'
 
 export type SeedanceUploadItem = {
@@ -29,6 +30,8 @@ export type SeedanceUploadItem = {
   groupId: string
   file: File
   name: string
+  groupName?: string
   status: 'queued' | 'uploading' | 'success' | 'error'
+  progress: number
   error?: string
 }

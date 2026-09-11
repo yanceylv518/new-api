@@ -115,3 +115,35 @@ func TestSeedanceAssetGroupNameIsUniquePerUser(t *testing.T) {
 	differentUser := &SeedanceAssetGroup{UserID: 8, ChannelID: 1, GroupID: "group-3", Name: first.Name}
 	require.NoError(t, db.Create(differentUser).Error)
 }
+
+// 同一补偿目标重复入队时只保留一条记录，避免故障恢复后重复调用外部删除接口。
+func TestSeedanceAssetCleanupJobIsDeduplicated(t *testing.T) {
+	previousDB := DB
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetCleanupJob{}))
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	first := &SeedanceAssetCleanupJob{
+		Kind: SeedanceAssetCleanupKindOSSObject, DedupKey: "same-cleanup-target",
+		Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: 100,
+	}
+	require.NoError(t, CreateSeedanceAssetCleanupJob(first))
+	second := &SeedanceAssetCleanupJob{
+		Kind: SeedanceAssetCleanupKindOSSObject, DedupKey: first.DedupKey,
+		Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: 100,
+	}
+	require.NoError(t, CreateSeedanceAssetCleanupJob(second))
+
+	var count int64
+	require.NoError(t, db.Model(&SeedanceAssetCleanupJob{}).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+}

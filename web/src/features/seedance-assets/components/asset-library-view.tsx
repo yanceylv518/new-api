@@ -25,6 +25,8 @@ import {
   Loader2,
   RefreshCw,
   Search,
+  Trash2,
+  X,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
@@ -33,6 +35,7 @@ import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -77,11 +80,24 @@ export function AssetLibraryView(props: {
   onBrowse: () => void
   onRefresh: (asset: SeedanceAsset) => void
   onDelete: (asset: SeedanceAsset) => void
+  selectedIds: Set<number>
+  onSelectionChange: (asset: SeedanceAsset, selected: boolean) => void
+  onSelectAll: (selected: boolean) => void
+  onClearSelection: () => void
+  onBatchDelete: () => void
+  isBatchDeleting?: boolean
   refreshingId?: number
   deletingId?: number
 }) {
   const { t } = useTranslation()
   const totalPages = Math.max(1, Math.ceil(props.total / props.pageSize))
+  const selectedCount = props.selectedIds.size
+  const allRowsSelected =
+    props.rows.length > 0 &&
+    props.rows.every((asset) => props.selectedIds.has(asset.id))
+  const someRowsSelected = props.rows.some((asset) =>
+    props.selectedIds.has(asset.id)
+  )
   const hasFilters = Boolean(
     props.search.trim() ||
     props.typeFilter !== 'all' ||
@@ -171,6 +187,7 @@ export function AssetLibraryView(props: {
               <SelectContent>
                 <SelectItem value='all'>{t('All statuses')}</SelectItem>
                 <SelectItem value='Processing'>{t('Processing')}</SelectItem>
+                <SelectItem value='Deleting'>{t('Deleting...')}</SelectItem>
                 <SelectItem value='Active'>{t('Active')}</SelectItem>
                 <SelectItem value='Failed'>{t('Failed')}</SelectItem>
               </SelectContent>
@@ -209,9 +226,55 @@ export function AssetLibraryView(props: {
 
       <div className={seedanceAssetLayoutClasses.assetScroll}>
         <div className='flex items-center justify-between gap-3 py-4'>
-          <span className='text-muted-foreground text-xs'>
-            {t('{{count}} assets', { count: props.total })}
-          </span>
+          <div className='flex min-w-0 flex-wrap items-center gap-3'>
+            {props.rows.length > 0 ? (
+              <label className='flex items-center gap-2 text-xs'>
+                <Checkbox
+                  checked={allRowsSelected}
+                  indeterminate={someRowsSelected && !allRowsSelected}
+                  disabled={props.isBatchDeleting || props.isFetching}
+                  onCheckedChange={(value) => props.onSelectAll(Boolean(value))}
+                />
+                <span>{t('Select all')}</span>
+              </label>
+            ) : null}
+            <span className='text-muted-foreground text-xs'>
+              {t('{{count}} assets', { count: props.total })}
+            </span>
+          </div>
+          {selectedCount > 0 ? (
+            <div className='flex shrink-0 items-center gap-1'>
+              <span className='text-muted-foreground text-xs'>
+                {t('{{count}} selected', { count: selectedCount })}
+              </span>
+              <Button
+                type='button'
+                variant='ghost'
+                size='icon-sm'
+                title={t('Clear selection')}
+                aria-label={t('Clear selection')}
+                disabled={props.isBatchDeleting}
+                onClick={props.onClearSelection}
+              >
+                <X />
+              </Button>
+              <Button
+                type='button'
+                variant='destructive'
+                size='icon-sm'
+                title={t('Delete selected assets')}
+                aria-label={t('Delete selected assets')}
+                disabled={props.isBatchDeleting || props.isFetching}
+                onClick={props.onBatchDelete}
+              >
+                {props.isBatchDeleting ? (
+                  <Loader2 className='animate-spin' />
+                ) : (
+                  <Trash2 />
+                )}
+              </Button>
+            </div>
+          ) : null}
           {props.isFetching && !props.isLoading ? (
             <span
               role='status'
@@ -268,6 +331,10 @@ export function AssetLibraryView(props: {
                 mode='grid'
                 onRefresh={props.onRefresh}
                 onDelete={props.onDelete}
+                onSelectionChange={props.onSelectionChange}
+                selected={props.selectedIds.has(asset.id)}
+                selectionDisabled={props.isBatchDeleting || props.isFetching}
+                isBatchDeleting={props.isBatchDeleting}
                 isRefreshing={props.refreshingId === asset.id}
                 isDeleting={props.deletingId === asset.id}
               />
@@ -286,6 +353,10 @@ export function AssetLibraryView(props: {
                 mode='list'
                 onRefresh={props.onRefresh}
                 onDelete={props.onDelete}
+                onSelectionChange={props.onSelectionChange}
+                selected={props.selectedIds.has(asset.id)}
+                selectionDisabled={props.isBatchDeleting || props.isFetching}
+                isBatchDeleting={props.isBatchDeleting}
                 isRefreshing={props.refreshingId === asset.id}
                 isDeleting={props.deletingId === asset.id}
               />
