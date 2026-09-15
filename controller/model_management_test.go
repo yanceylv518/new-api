@@ -33,6 +33,10 @@ import (
 func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 	t.Helper()
 	database, isolatedDSN := newAuditTestDatabase(t, kind, dsn)
+	// InitDB 会重新打开同一数据库，先关闭建库连接，防止 Windows 测试目录被未释放句柄占用。
+	initialConnection, initialErr := database.DB()
+	require.NoError(t, initialErr)
+	require.NoError(t, initialConnection.Close())
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousMaster, previousSQLite := common.IsMasterNode, common.SQLitePath

@@ -578,7 +578,10 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 
 func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.plugin.Meta.Models...) }
 func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
-func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
+
+// TaskPluginKey 提供稳定的插件身份，避免服务层依赖可修改的显示名称。
+func (a *TaskAdaptor) TaskPluginKey() string { return a.plugin.Meta.Key }
+func (a *TaskAdaptor) FetchMode() string     { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
 	taskContexts := make([]map[string]any, 0, len(tasks))

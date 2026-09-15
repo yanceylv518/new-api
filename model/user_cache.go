@@ -1,7 +1,7 @@
 package model
 
 import (
-	"errors"
+	"context"
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const userCacheSchemaVersion = 2
@@ -24,6 +25,8 @@ type UserBase struct {
 	Setting     string `json:"setting"`
 	AuthVersion int64  `json:"-"`
 	CacheSchema int    `json:"-"`
+	// 仅存在于缓存，用于阻止结算提交窗口内读取旧余额。
+	VideoQuotaPending int64 `json:"-"`
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -92,29 +95,53 @@ func GetUserCache(userId int) (*UserBase, error) {
 		return userCache, nil
 	}
 
-	// Redis misses and read failures both fall back to the shared database. A
-	// version fence newer than the database is the one exception: allowing that
-	// snapshot would re-authorize a user while a restrictive update is pending.
+	// Redis启用时，冷填充同时遵守鉴权栅栏和视频结算标记，故障不返回旧余额。
+	if common.RedisEnabled {
+		if err := recoverVideoQuotaCache(context.Background(), userId); err != nil {
+			return nil, err
+		}
+		// 锁住数据库快照到缓存发布的间隔，防止旧余额晚于结算回填。
+		var result *UserBase
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockSQLiteQuotaCache(tx.Model(&User{}).Where("id = ?", userId)); err != nil {
+				return err
+			}
+			var user User
+			if err := lockForUpdate(tx).Where("id = ?", userId).First(&user).Error; err != nil {
+				return err
+			}
+			if err := populateUserCache(user); err != nil {
+				return err
+			}
+			var err error
+			result, err = cacheReadUserBase(userId)
+			return err
+		})
+		return result, err
+	}
 	user, err := GetUserById(userId, false)
 	if err != nil {
 		return nil, err
-	}
-	if common.RedisEnabled {
-		floor, floorErr := getUserAuthVersionFloor(userId)
-		if floorErr == nil && floor > user.AuthVersion {
-			return nil, ErrUserAuthCachePending
-		}
-		if err := populateUserCache(*user); err != nil {
-			if errors.Is(err, ErrUserAuthCachePending) {
-				return nil, err
-			}
-			common.SysLog("failed to synchronously populate user cache: " + err.Error())
-		}
 	}
 	return user.ToBaseUser(), nil
 }
 
 func cacheGetUserBase(userId int) (*UserBase, error) {
+	user, err := cacheReadUserBase(userId)
+	if err == nil && user.VideoQuotaPending > 0 {
+		if err := recoverVideoQuotaCache(context.Background(), userId); err != nil {
+			return nil, err
+		}
+		user, err = cacheReadUserBase(userId)
+		if err == nil && user.VideoQuotaPending > 0 {
+			return nil, ErrQuotaCachePending
+		}
+	}
+	return user, err
+}
+
+// 恢复和冷填充使用不递归的读取，避免持有行锁时再次进入恢复事务。
+func cacheReadUserBase(userId int) (*UserBase, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}

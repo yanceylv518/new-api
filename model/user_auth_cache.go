@@ -57,6 +57,7 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	ttl := userCacheTTLSeconds()
 	const script = `
 local incoming = tonumber(ARGV[1])
+if ARGV[10] == '1' and tonumber(redis.call('HGET',KEYS[4],'TaskID') or '0') > 0 then return -2 end
 local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
 local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
 local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
@@ -77,12 +78,13 @@ redis.call('HSET', KEYS[1],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9])
 if ARGV[10] == '1' and redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
-  redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
+  redis.call('HSET', KEYS[1], 'Quota', redis.call('HGET',KEYS[4],'Quota') or ARGV[11])
+  redis.call('DEL',KEYS[4])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
+		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), videoUserQuotaKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
 		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
 	).Int()
@@ -91,6 +93,9 @@ return 1`
 	}
 	if result == 0 {
 		return ErrUserAuthCachePending
+	}
+	if result == -2 {
+		return ErrQuotaCachePending
 	}
 	return nil
 }

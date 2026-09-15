@@ -99,7 +99,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.3.4",
+  version: "1.3.5",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -717,12 +717,15 @@ function h3ContextIRUsage(ctx, req) {
 
 // 识别上游 task_type 和网关持久化 action，确保结算阶段仍保留再生成维度。
 function h3CompletionOperation(task, body) {
+  // 持久化动作是提交时的计费身份，上游回包不能把视频切换成另一种低价操作。
+  const action = trimmed(task && task.action).toLowerCase();
+  if (action === H3_REGENERATION_ACTION) return H3_REGENERATION_OPERATION;
+  if (action === H3_CONTEXT_IR_ACTION) return H3_CONTEXT_IR_OPERATION;
+  if (["text_to_video", "image_to_video", "first_tail_to_video", "reference_to_video"].includes(action)) return H3_GENERATION_OPERATION;
   const payload = h3QueryTask(body);
   const taskType = trimmed(payload && payload.task_type).toLowerCase();
   if (taskType === H3_REGENERATION_OPERATION) return H3_REGENERATION_OPERATION;
   if (taskType === H3_CONTEXT_IR_TASK_TYPE) return H3_CONTEXT_IR_OPERATION;
-  if (task && trimmed(task.action).toLowerCase() === H3_REGENERATION_ACTION) return H3_REGENERATION_OPERATION;
-  if (task && trimmed(task.action).toLowerCase() === H3_CONTEXT_IR_ACTION) return H3_CONTEXT_IR_OPERATION;
   return H3_GENERATION_OPERATION;
 }
 
@@ -1120,7 +1123,8 @@ export function extractUsageOnComplete(task, _taskResult, body) {
     // Omit malformed or out-of-contract upstream values so settlement keeps
     // the bounded submission estimate instead of accepting a new multiplier.
     for (const field of fields) {
-      if (field.value === undefined || field.value === null || field.value === "") continue;
+      // 只接受数值或非空数字字符串；Number(false)、Number([]) 不能覆盖预留用量。
+      if ((typeof field.value !== "number" && typeof field.value !== "string") || String(field.value).trim() === "") continue;
       const value = Number(field.value);
       if (!Number.isFinite(value) || value < field.minimum || value > field.maximum || (field.integer && !Number.isInteger(value))) continue;
       facts[field.key] = value;

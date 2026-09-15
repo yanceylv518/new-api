@@ -170,25 +170,30 @@ func TestBatchUpdateAccumulatorSaturatesOverflow(t *testing.T) {
 	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
 }
 
-func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {
+func TestReserveRejectsUnavailableRedisWithoutMutatingBalances(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	server := useUserCacheMiniRedis(t)
 
 	user := createReserveTestUser(t, 20)
+	token := createReserveTestToken(t, 20)
 	require.NoError(t, populateUserCache(user))
 	server.Close()
 
-	// Redis 故障时降级为数据库条件更新：服务保持可用且不会超扣。
+	// Redis启用时可能有尚未落库的预扣，故障必须显式失败而不能使用旧DB余额。
 	reserved, err := TryReserveUserQuota(user.Id, 5)
-	require.NoError(t, err)
-	assert.True(t, reserved)
-	assert.Equal(t, 15, getUserQuotaFromDB(t, user.Id))
+	require.ErrorIs(t, err, ErrQuotaCachePending)
+	assert.False(t, reserved)
+	assert.Equal(t, 20, getUserQuotaFromDB(t, user.Id))
 
 	reserved, err = TryReserveUserQuota(user.Id, 16)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrQuotaCachePending)
 	assert.False(t, reserved)
-	assert.Equal(t, 15, getUserQuotaFromDB(t, user.Id))
+	assert.Equal(t, 20, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 5, false)
+	require.ErrorIs(t, err, ErrQuotaCachePending)
+	assert.False(t, reserved)
+	assert.Equal(t, 20, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
 func TestSynchronousReserveCompensatesCacheWhenPersistenceFails(t *testing.T) {

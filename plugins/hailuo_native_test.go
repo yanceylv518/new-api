@@ -206,6 +206,30 @@ func TestHailuoNativeTaskRenderers(t *testing.T) {
 }
 
 // Context-IR 仅使用合法的实际 Token 数覆盖预扣，缺失或畸形用量必须保留估算。
+// 媒体用量中的布尔、数组和空白字符串不能转成零后错误退还已预留的费用。
+func TestHailuoVideoCompletionRejectsCoercedUsage(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	for _, invalid := range []any{false, true, " ", []any{}, []any{0}, map[string]any{}, -1, "Infinity"} {
+		facts := callHailuoHook(t, plugin, "extractUsageOnComplete", map[string]any{"action": "text_to_video"}, nil,
+			map[string]any{"task": map[string]any{"status": "succeeded", "usage": map[string]any{
+				"input_image_count": invalid, "input_seconds": invalid, "output_seconds": 5,
+			}}})
+		assert.NotContains(t, facts, "input_images", "invalid=%#v", invalid)
+		assert.NotContains(t, facts, "input_video_seconds", "invalid=%#v", invalid)
+		assert.EqualValues(t, 5, facts["seconds"])
+	}
+}
+
+// 完成响应不能把已提交任务切换到另一种价格；只有缺少任务身份时才采用厂商提示。
+func TestHailuoCompletionPreservesSubmittedOperation(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	for action, operation := range map[string]string{"text_to_video": "generation", "regeneration": "regeneration", "context_ir": "context_ir"} {
+		facts := callHailuoHook(t, plugin, "extractUsageOnComplete", map[string]any{"action": action}, nil,
+			map[string]any{"task": map[string]any{"task_type": "h3_context_ir", "usage": map[string]any{}}})
+		assert.Equal(t, operation, facts["operation"])
+	}
+}
+
 func TestHailuoNativeContextIRCompletionTokenBoundaries(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
 	for _, tc := range []struct {

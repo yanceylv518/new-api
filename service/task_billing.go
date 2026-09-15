@@ -334,8 +334,17 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
+	quota, reason, clamp, ok := taskQuotaByTokens(task, totalTokens)
+	if ok {
+		RecalculateTaskQuota(ctx, task, quota, reason, clamp)
+	}
+	return ok
+}
+
+// taskQuotaByTokens 只计算额度，供原有结算和视频原子终态事务共用同一倍率规则。
+func taskQuotaByTokens(task *model.Task, totalTokens int) (int, string, *common.QuotaClamp, bool) {
 	if totalTokens <= 0 {
-		return false
+		return 0, "", nil, false
 	}
 
 	modelName := taskModelName(task)
@@ -344,7 +353,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
 	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
-		return false
+		return 0, "", nil, false
 	}
 
 	// 获取用户和组的倍率信息
@@ -356,7 +365,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		}
 	}
 	if group == "" {
-		return false
+		return 0, "", nil, false
 	}
 
 	groupRatio := ratio_setting.GetGroupRatio(group)
@@ -379,8 +388,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	actualQuota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
-	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
-	return true
+	return actualQuota, reason, clamp, true
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task

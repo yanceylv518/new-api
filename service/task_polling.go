@@ -97,6 +97,16 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.FailReason = reason
 		}
 
+		// 超时退款与正常终态共用事务；保留明确不退款的历史迁移边界。
+		if !isLegacy && atomicVideoTask(task) {
+			won, err := FinalizeVideoTaskBilling(ctx, task, oldStatus, 0, reason, nil)
+			if err != nil {
+				logger.LogError(ctx, fmt.Sprintf("video timeout settlement failed task=%s: %v", task.TaskID, err))
+			} else if won {
+				timedOutCount++
+			}
+			continue
+		}
 		won, err := task.UpdateWithStatus(oldStatus)
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
@@ -140,6 +150,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	}
 
 	common.SysLog("任务进度轮询开始")
+	if err := model.RetryVideoTaskLogs(ctx); err != nil {
+		logger.LogWarn(ctx, "video billing log retry pending: "+err.Error())
+	}
 	sweepTimedOutTasks(ctx)
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
@@ -172,8 +185,13 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
 			}
-			taskM[upstreamID] = task
-			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
+			// 视频上游 ID 只在其账号内唯一，轮询工作项必须以网关记录标识隔离。
+			taskKey := upstreamID
+			if atomicVideoTask(task) {
+				taskKey = fmt.Sprintf("task:%d", task.ID)
+			}
+			taskM[taskKey] = task
+			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], taskKey)
 		}
 		if len(nullTaskIds) > 0 {
 			summary.NullTasksFailed += len(nullTaskIds)
@@ -421,6 +439,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
+		// 查询故障不等同上游任务失败；视频任务保留非终态，恢复后重试或由超时策略结算。
+		for _, taskKey := range taskIds {
+			if task := taskM[taskKey]; task != nil && atomicVideoTask(task) {
+				return fmt.Errorf("video polling channel lookup failed: %w", err)
+			}
+		}
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
@@ -507,6 +531,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task == nil {
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
+	}
+	// 已结束任务不再进入结算；渠道归属不一致时拒绝发起上游请求。
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return nil
+	}
+	if task.ChannelId != ch.Id {
+		return fmt.Errorf("task %s does not belong to polling channel", task.TaskID)
 	}
 	key := ch.Key
 
@@ -630,6 +661,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	// 两个视频插件将终态与资金调整一起提交，数据库故障不能留下不可重试的半结算任务。
+	if isDone && snap.Status != task.Status && atomicVideoSettlementEnabled(adaptor) {
+		return settleAtomicVideoTask(ctx, adaptor, task, snap.Status, taskResult)
+	}
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
@@ -837,6 +872,10 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		task.FinishTime = now
 	}
 	task.FailReason = reason
+	// 轮询确认失败也必须与退款原子提交，不能在存储故障后留下终态未退款记录。
+	if atomicVideoSettlementEnabled(adaptor) {
+		return settleAtomicVideoTask(ctx, adaptor, task, fromStatus, relaycommon.FailTaskInfo(reason))
+	}
 	won, err := task.UpdateWithStatus(fromStatus)
 	if err != nil {
 		return err

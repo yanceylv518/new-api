@@ -62,6 +62,7 @@ func cacheInitToken(token Token) (int, error) {
 		allowIps = *token.AllowIps
 	}
 	const script = `
+if tonumber(redis.call('HGET',KEYS[3],'TaskID') or '0')>0 then return -2 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return 0
 end
@@ -74,12 +75,13 @@ redis.call('HSET', KEYS[1],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16])
+  'AutoGroups', ARGV[14], 'RemainQuota', redis.call('HGET',KEYS[3],'RemainQuota') or ARGV[15], 'UsedQuota', redis.call('HGET',KEYS[3],'UsedQuota') or ARGV[16])
+redis.call('DEL',KEYS[3])
 redis.call('EXPIRE', KEYS[1], ARGV[17])
 return 1`
 
 	return common.RDB.Eval(context.Background(), script, []string{
-		getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key),
+		getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key), videoTokenQuotaKey(token.Key),
 	},
 		token.Id, token.UserId, token.Status, token.Name,
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
@@ -92,6 +94,21 @@ return 1`
 
 // cacheGetTokenByKey 从缓存读取 token；不完整的哈希（如仅有配额字段）会被拒绝。
 func cacheGetTokenByKey(key string) (*Token, error) {
+	token, err := cacheReadTokenByKey(key)
+	if err == nil && token.VideoQuotaPending > 0 {
+		if err := recoverVideoTokenQuotaCache(context.Background(), key); err != nil {
+			return nil, err
+		}
+		token, err = cacheReadTokenByKey(key)
+		if err == nil && token.VideoQuotaPending > 0 {
+			return nil, ErrQuotaCachePending
+		}
+	}
+	return token, err
+}
+
+// 原始读取不触发恢复事务，供持锁的缓存初始化使用。
+func cacheReadTokenByKey(key string) (*Token, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}

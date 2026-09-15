@@ -440,6 +440,10 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		path := t.TempDir() + "/audit.db"
 		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 		require.NoError(t, err)
+		// Windows删除临时数据库前必须释放连接；与上层清理重复关闭也是安全的。
+		connection, err := db.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, connection.Close()) })
 		return db, path
 	}
 	require.NotEmpty(t, dsn)
@@ -682,6 +686,10 @@ func TestAuditDatabaseMatrix(t *testing.T) {
 					}
 					for range 2 {
 						require.NoError(t, model.InitDB())
+						// 重复启动测试会创建新连接池，每个池都必须在临时目录清理前关闭。
+						connection, err := model.DB.DB()
+						require.NoError(t, err)
+						t.Cleanup(func() { assert.NoError(t, connection.Close()) })
 						require.NoError(t, model.InitLogDB())
 					}
 					if !upgrade {

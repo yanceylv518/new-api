@@ -142,7 +142,7 @@ type asyncTaskPollHandler struct{}
 func (asyncTaskPollHandler) Type() string { return model.SystemTaskTypeAsyncTaskPoll }
 
 func (asyncTaskPollHandler) Enabled() bool {
-	return constant.UpdateTask && model.HasUnfinishedSyncTasks()
+	return constant.UpdateTask && (model.HasUnfinishedSyncTasks() || model.HasPendingVideoTaskLogs())
 }
 
 func (asyncTaskPollHandler) Interval() time.Duration { return 15 * time.Second }

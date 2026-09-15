@@ -599,7 +599,7 @@ func taskPluginNativeChannelOwned(meta pluginruntime.Meta, channelModel *model.C
 }
 
 // markTaskPluginTaskCancelled 仅在上游确认取消后关闭本地任务。
-// CAS 防止已完成终态的轮询 worker 重复退款；CAS 失败时重新加载任务，避免向调用方返回过期状态。
+// 终态和退款同事务提交；未获胜时重新加载任务，避免向调用方返回过期状态。
 // 返回 false 表示本地更新或退款尚未完成，调用方必须返回待处理错误。
 func markTaskPluginTaskCancelled(c *gin.Context, task *model.Task) bool {
 	if task == nil || task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
@@ -613,7 +613,7 @@ func markTaskPluginTaskCancelled(c *gin.Context, task *model.Task) bool {
 	if task.FinishTime == 0 {
 		task.FinishTime = time.Now().Unix()
 	}
-	won, err := task.UpdateWithStatus(previousStatus)
+	won, err := service.FinalizeVideoTaskBilling(c, task, previousStatus, 0, model.TaskCancelledReason, nil)
 	if err != nil {
 		logger.LogError(c, fmt.Sprintf("取消任务本地状态更新失败 task=%s err=%v", task.TaskID, err))
 		*task = original
@@ -627,23 +627,6 @@ func markTaskPluginTaskCancelled(c *gin.Context, task *model.Task) bool {
 			*task = *latest
 		}
 		return loadErr == nil && exists && latest != nil && (task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure)
-	}
-	if !service.RefundTaskQuota(c, task, model.TaskCancelledReason) {
-		logger.LogError(c, fmt.Sprintf("上游任务已取消但本地退款失败 task=%s quota=%d", task.TaskID, task.Quota))
-		// 退款失败时保留可轮询的非终态，让后台轮询再次观察上游取消并重试退款。
-		*task = original
-		restored, restoreErr := task.UpdateWithStatus(model.TaskStatusFailure)
-		if restoreErr != nil {
-			logger.LogError(c, fmt.Sprintf("退款失败后恢复任务状态失败 task=%s err=%v", task.TaskID, restoreErr))
-		} else if !restored {
-			latest, exists, loadErr := model.GetByTaskId(task.UserId, task.TaskID)
-			if loadErr != nil {
-				logger.LogError(c, fmt.Sprintf("退款失败后 CAS 恢复失败且无法重新加载 task=%s err=%v", task.TaskID, loadErr))
-			} else if exists && latest != nil {
-				*task = *latest
-			}
-		}
-		return false
 	}
 	return true
 }

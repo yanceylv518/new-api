@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,6 +13,8 @@ import (
 )
 
 type Token struct {
+	// 缓存恢复标记不进入数据库和公开响应。
+	VideoQuotaPending  int64          `json:"-" gorm:"-"`
 	Id                 int            `json:"id"`
 	UserId             int            `json:"user_id" gorm:"index"`
 	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
@@ -287,15 +290,40 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Don't return error - fall through to DB
 	}
 	token = &Token{}
+	if common.RedisEnabled {
+		if err = recoverVideoTokenQuotaCache(context.Background(), key); err != nil {
+			return nil, err
+		}
+		// 令牌行锁保护冷快照；视频恢复在锁外执行，遵守用户到令牌的锁顺序。
+		err = DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockSQLiteQuotaCache(tx.Model(&Token{}).Where(commonKeyCol+" = ?", key)); err != nil {
+				return err
+			}
+			if err := lockForUpdate(tx).Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+				return err
+			}
+			result, err := cacheInitToken(*token)
+			if err != nil {
+				return err
+			}
+			if result == -2 {
+				return ErrQuotaCachePending
+			}
+			if result != 0 {
+				cached, err := cacheReadTokenByKey(key)
+				if err != nil {
+					return err
+				}
+				if !fromDB {
+					token = cached
+				}
+			}
+			return nil
+		})
+		return token, err
+	}
 	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
 		return nil, err
-	}
-	if common.RedisEnabled {
-		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
-		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
-		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
-			common.SysLog("failed to init token cache: " + cacheErr.Error())
-		}
 	}
 	return token, nil
 }

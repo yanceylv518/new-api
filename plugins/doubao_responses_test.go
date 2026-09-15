@@ -140,7 +140,56 @@ func TestDoubaoResponsesProtocol(t *testing.T) {
 	})
 }
 
+// 错误类型的上游 Token 数必须保留预估，不能把 true/[1] 转成一个 Token 后低额结算。
+func TestDoubaoCompletionRejectsCoercedTokens(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	for _, invalid := range []any{true, false, []any{1}, []any{}, " ", 1.5, -1, "Infinity"} {
+		body := map[string]any{"status": "succeeded", "usage": map[string]any{"completion_tokens": invalid, "total_tokens": invalid}}
+		facts, callErr := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", nil, nil, body)
+		require.NoError(t, callErr)
+		assert.NotContains(t, facts.(map[string]any), "tokens", "invalid=%#v", invalid)
+		parsed, callErr := plugin.Engine.Call(t.Context(), "parseTaskResult", nil, body)
+		require.NoError(t, callErr)
+		assert.NotContains(t, parsed.(map[string]any), "completionTokens", "invalid=%#v", invalid)
+	}
+	// 明确零用量必须传递给表达式，不能当成缺失继续按预估收费。
+	for _, usage := range []map[string]any{{"completion_tokens": 0}, {"total_tokens": 0}, {"completion_tokens": 0, "total_tokens": 0}} {
+		facts, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", nil, nil, map[string]any{"status": "succeeded", "usage": usage})
+		require.NoError(t, err)
+		assert.EqualValues(t, 0, facts.(map[string]any)["tokens"])
+	}
+}
+
 // 原生接口必须保留官方请求字段、素材引用和状态，并正确解释空的删除成功响应。
+// 兼容入口的 duration 必须实际发往上游，所有入口的隐藏 metadata 数量都要校验。
+func TestDoubaoEffectiveDurationAndMetadataBounds(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	for _, duration := range []any{10, "10", -1} {
+		value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"duration": duration}})
+		require.NoError(t, err)
+		want := 10
+		if duration == -1 {
+			want = -1
+		}
+		assert.EqualValues(t, want, value.(map[string]any)["body"].(map[string]any)["duration"])
+	}
+	for _, request := range []map[string]any{
+		{"seconds": 0.9}, {"duration": 1e20}, {"seconds": []any{5}},
+		{"metadata": map[string]any{"duration": 1e20}}, {"metadata": map[string]any{"frames": 1e20}},
+	} {
+		for _, hook := range []string{"buildSubmitRequest", "extractUsage"} {
+			_, err := plugin.Engine.Call(t.Context(), hook, map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": request})
+			require.Error(t, err, "hook=%s request=%v", hook, request)
+		}
+	}
+}
+
 func TestDoubaoNativeContract(t *testing.T) {
 	source, err := builtinplugins.Source("doubao")
 	require.NoError(t, err)

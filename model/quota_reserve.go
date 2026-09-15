@@ -15,9 +15,11 @@ const (
 	cacheQuotaInsufficient cacheQuotaResult = iota
 	cacheQuotaOK
 	cacheQuotaMiss
+	cacheQuotaPending
 )
 
 const userQuotaReserveScript = `
+if tonumber(redis.call('HGET',KEYS[2],'TaskID') or '0')>0 or tonumber(redis.call('HGET',KEYS[1],'VideoQuotaPending') or '0')>0 then return -2 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[3])
   or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
@@ -31,6 +33,7 @@ redis.call('HINCRBY', KEYS[1], 'Quota', -tonumber(ARGV[1]))
 return 1`
 
 const userQuotaDeltaScript = `
+if redis.call('HEXISTS',KEYS[2],'Quota')==1 then redis.call('HINCRBY',KEYS[2],'Quota',ARGV[1]) end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[3])
   or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
@@ -40,6 +43,7 @@ redis.call('HINCRBY', KEYS[1], 'Quota', ARGV[1])
 return 1`
 
 const tokenQuotaReserveScript = `
+if tonumber(redis.call('HGET',KEYS[2],'TaskID') or '0')>0 or tonumber(redis.call('HGET',KEYS[1],'VideoQuotaPending') or '0')>0 then return -2 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0
   or redis.call('HEXISTS', KEYS[1], 'UsedQuota') == 0 then
@@ -55,6 +59,10 @@ redis.call('HSET', KEYS[1], 'AccessedTime', ARGV[3])
 return 1`
 
 const tokenQuotaDeltaScript = `
+if redis.call('HEXISTS',KEYS[2],'RemainQuota')==1 then
+ redis.call('HINCRBY',KEYS[2],'RemainQuota',ARGV[1])
+ redis.call('HINCRBY',KEYS[2],'UsedQuota',-tonumber(ARGV[1]))
+end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0
   or redis.call('HEXISTS', KEYS[1], 'UsedQuota') == 0 then
@@ -74,6 +82,8 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 		return cacheQuotaOK, nil
 	case 0:
 		return cacheQuotaInsufficient, nil
+	case -2:
+		return cacheQuotaPending, nil
 	default:
 		return cacheQuotaMiss, nil
 	}
@@ -81,25 +91,25 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 
 func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), userQuotaReserveScript,
-		[]string{getUserCacheKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID), videoUserQuotaKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
 	return quotaResultFromLua(result, err)
 }
 
 func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), userQuotaDeltaScript,
-		[]string{getUserCacheKey(userID)}, delta, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID), videoUserQuotaKey(userID)}, delta, userID, userCacheSchemaVersion).Int()
 	return quotaResultFromLua(result, err)
 }
 
 func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), tokenQuotaReserveScript,
-		[]string{getTokenCacheKey(key)}, amount, id, common.GetTimestamp()).Int()
+		[]string{getTokenCacheKey(key), videoTokenQuotaKey(key)}, amount, id, common.GetTimestamp()).Int()
 	return quotaResultFromLua(result, err)
 }
 
 func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), tokenQuotaDeltaScript,
-		[]string{getTokenCacheKey(key)}, delta, id, common.GetTimestamp()).Int()
+		[]string{getTokenCacheKey(key), videoTokenQuotaKey(key)}, delta, id, common.GetTimestamp()).Int()
 	return quotaResultFromLua(result, err)
 }
 
@@ -161,7 +171,7 @@ func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 
 // TryReserveUserQuota atomically checks and deducts a user's wallet quota.
 // 缓存命中时以缓存余额为准（避免批量模式下过期的数据库余额放大并发超扣）；
-// Redis 异常或水合失败时降级为数据库条件更新，保证服务可用。
+// Redis 异常或水合失败时拒绝预扣，避免使用尚未接收批量扣费的旧数据库余额。
 func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota 不能为负数！")
@@ -174,16 +184,19 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	}
 
 	result, err := cacheTryReserveUserQuota(id, int64(quota))
+	if err == nil && result == cacheQuotaPending {
+		if err = recoverVideoQuotaCache(context.Background(), id); err == nil {
+			result, err = cacheTryReserveUserQuota(id, int64(quota))
+		}
+	}
 	if err == nil && result == cacheQuotaMiss {
 		if _, hydrateErr := GetUserCache(id); hydrateErr == nil {
 			result, err = cacheTryReserveUserQuota(id, int64(quota))
 		}
 	}
-	if err != nil || result == cacheQuotaMiss {
-		if err != nil {
-			common.SysLog("user quota cache reserve unavailable, falling back to database: " + err.Error())
-		}
-		return reserveUserQuotaDB(id, quota)
+	if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
+		// Redis启用时可能存在尚未批量落库的预扣；故障不能回退到更高的旧DB余额。
+		return false, ErrQuotaCachePending
 	}
 	if result == cacheQuotaInsufficient {
 		return false, nil
@@ -215,16 +228,18 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	}
 
 	result, err := cacheTryReserveTokenQuota(id, key, int64(quota))
+	if err == nil && result == cacheQuotaPending {
+		if err = recoverVideoTokenQuotaCache(context.Background(), key); err == nil {
+			result, err = cacheTryReserveTokenQuota(id, key, int64(quota))
+		}
+	}
 	if err == nil && result == cacheQuotaMiss {
 		if _, hydrateErr := GetTokenByKey(key, true); hydrateErr == nil {
 			result, err = cacheTryReserveTokenQuota(id, key, int64(quota))
 		}
 	}
-	if err != nil || result == cacheQuotaMiss {
-		if err != nil {
-			common.SysLog("token quota cache reserve unavailable, falling back to database: " + err.Error())
-		}
-		return reserveTokenQuotaDB(id, quota)
+	if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
+		return false, ErrQuotaCachePending
 	}
 	if result == cacheQuotaInsufficient {
 		return false, nil

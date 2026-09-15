@@ -11,7 +11,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.1.1",
+  version: "1.1.2",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -154,6 +154,24 @@ function requestResolution(model, req) {
   return resolution;
 }
 
+// metadata 与兼容接口顶层参数都可能携带计费数量，必须在构建请求和预扣前执行同一边界。
+function validateGenerationParameters(req) {
+  const metadata = req.metadata || {};
+  const raw = req.seconds !== undefined ? req.seconds : req.duration !== undefined ? req.duration : metadata.duration;
+  if (raw !== undefined) {
+    const duration = typeof raw === "number" || (typeof raw === "string" && raw.trim() !== "") ? Number(raw) : NaN;
+    if (!Number.isInteger(duration) || (duration !== -1 && (duration < 2 || duration > 30))) {
+      throw new Error("duration must be -1 or an integer between 2 and 30");
+    }
+  }
+  if (
+    metadata.frames !== undefined &&
+    (!Number.isInteger(metadata.frames) || metadata.frames < 29 || metadata.frames > 289 || (metadata.frames - 25) % 4 !== 0)
+  ) {
+    throw new Error("frames must be an integer between 29 and 289 matching 25 + 4n");
+  }
+}
+
 function hasVideo(content) {
   return Array.isArray(content) && content.some((item) => item && (item.type === "video_url" || Object.prototype.hasOwnProperty.call(item, "video_url")));
 }
@@ -172,6 +190,13 @@ function resolutionMaxPixels(resolution) {
 function estimateTokens(seconds, resolution) {
   const dims = resolutionMaxPixels(resolution);
   return (seconds * dims[0] * dims[1] * 24) / 1024;
+}
+
+// 明确的零用量与缺失不同；错误类型返回 null，禁止 JS 隐式转换造成低额结算。
+function billingTokenCount(value) {
+  if ((typeof value !== "number" && typeof value !== "string") || String(value).trim() === "") return null;
+  const tokens = Number(value);
+  return Number.isSafeInteger(tokens) && tokens >= 0 ? tokens : null;
 }
 
 function videoInputRatio(model, resolution, content) {
@@ -348,6 +373,7 @@ export const native = {
 
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody;
+  validateGenerationParameters(req);
   const metadata = req.metadata || {};
   const body = Object.assign({ model: req.model || "", content: [] }, metadata);
   const imageContent = [];
@@ -360,8 +386,9 @@ export function buildSubmitRequest(ctx) {
   if (!metadataContent.some((item) => item && item.type === "text") && (trimmed(req.prompt) || !hasReference))
     body.content.push({ type: "text", text: req.prompt || "" });
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
-  const seconds = Number.parseInt(req.seconds || "", 10);
-  if (seconds > 0) body.duration = seconds;
+  // duration 别名和智能时长 -1 都必须真正发送；不能截断小数后丢失请求数量。
+  const seconds = req.seconds !== undefined ? req.seconds : req.duration;
+  if (seconds !== undefined) body.duration = Number(seconds);
   body.model = ctx.upstreamModel || body.model;
   // 渠道别名映射后再次校验；兼容接口的 size/resolution 必须与实际发往上游的值一致。
   requestResolution(body.model, req);
@@ -386,6 +413,7 @@ export function parseSubmitResponse(ctx, resp) {
 
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
+  validateGenerationParameters(req);
   const metadata = req.metadata || {};
   const resolution = requestResolution(ctx.upstreamModel || ctx.model || req.model, req);
   if (ctx.usagePurpose === "billing_ratios") {
@@ -445,8 +473,8 @@ export function parseTaskResult(ctx, body) {
   if (body.status === "succeeded") {
     const result = { status: "SUCCESS", progress: "100%", url: body.content && body.content.video_url ? body.content.video_url : "" };
     const usage = body.usage || {};
-    const completionTokens = Number(usage.completion_tokens || 0);
-    const totalTokens = Number(usage.total_tokens || 0);
+    const completionTokens = billingTokenCount(usage.completion_tokens);
+    const totalTokens = billingTokenCount(usage.total_tokens);
     if (Number.isFinite(completionTokens) && completionTokens > 0) result.completionTokens = completionTokens;
     if (Number.isFinite(totalTokens) && totalTokens > 0) result.totalTokens = totalTokens;
     return result;
@@ -485,9 +513,10 @@ export function extractUsageOnComplete(task, taskResult, body) {
   if (!body || body.status !== "succeeded") return {};
   const facts = {};
   const usage = body.usage || {};
-  let tokens = Number(usage.completion_tokens);
-  if (!Number.isFinite(tokens) || tokens <= 0) tokens = Number(usage.total_tokens);
-  if (Number.isFinite(tokens) && tokens > 0) facts.tokens = tokens;
+  let tokens = billingTokenCount(usage.completion_tokens);
+  const totalTokens = billingTokenCount(usage.total_tokens);
+  if (tokens === null || (tokens === 0 && totalTokens !== null)) tokens = totalTokens;
+  if (tokens !== null) facts.tokens = tokens;
   const content = body.content || {};
   const resolution = trimmed(content.resolution || body.resolution).toLowerCase();
   if (["480p", "720p", "1080p", "4k"].includes(resolution)) facts.resolution = resolution;
@@ -522,6 +551,7 @@ export const protocols = {
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.seconds = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
+      validateGenerationParameters(requestBody);
       const intent = { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
       const originTaskIds = draftTaskIds(metadata.content);
       if (originTaskIds.length) intent.originTaskIds = originTaskIds;
@@ -585,6 +615,7 @@ protocols.openai_video = {
       if (!ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
       const req = ctx.body.value;
       requestResolution(ctx.model, req);
+      validateGenerationParameters(req);
       const seconds = req.seconds === undefined ? req.duration : req.seconds;
       if (seconds !== undefined && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600))
         throw new Error("seconds must be between 1 and 3600");
@@ -617,6 +648,7 @@ protocols.openai_video = {
     }
     if ((ctx.body.files || []).length) throw new Error("Doubao requires image and video references to be URLs inside metadata.content");
     requestResolution(ctx.model, req);
+    validateGenerationParameters(req);
     if (req.seconds !== undefined) req.seconds = Number(req.seconds);
     else if (req.duration !== undefined) req.seconds = Number(req.duration);
     const seconds = req.seconds === undefined ? req.duration : req.seconds;
