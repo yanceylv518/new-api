@@ -629,6 +629,10 @@ describe('user model pricing dialog', () => {
       '[data-slot="model-pricing-list"]'
     )
     assert.ok(modelPricingList)
+    const modelPricingStage = document.querySelector<HTMLElement>(
+      '[data-slot="model-pricing-stage"]'
+    )
+    assert.ok(modelPricingStage)
     assert.equal(modelPricingList.contains(modelPricingPagination), false)
     assert.equal(
       modelPricingList.closest('form')?.contains(modelPricingPagination),
@@ -642,6 +646,7 @@ describe('user model pricing dialog', () => {
     assert.ok(dialogBody)
     assert.equal(dialogBody.classList.contains('flex'), true)
     assert.equal(dialogBody.classList.contains('overflow-y-hidden'), true)
+    assert.equal(dialogBody.classList.contains('flex-1'), true)
 
     const dialogBodyContent = dialogBody.firstElementChild
     assert.ok(dialogBodyContent)
@@ -654,9 +659,14 @@ describe('user model pricing dialog', () => {
     assert.ok(form)
     assert.equal(form.classList.contains('flex-1'), true)
     assert.equal(form.classList.contains('overflow-hidden'), true)
+    assert.equal(modelPricingStage.classList.contains('flex'), true)
+    assert.equal(modelPricingStage.classList.contains('flex-col'), true)
+    assert.equal(modelPricingStage.classList.contains('flex-1'), true)
+    assert.equal(modelPricingStage.classList.contains('overflow-hidden'), true)
     assert.equal(modelPricingList.classList.contains('flex'), true)
-    assert.equal(modelPricingList.classList.contains('flex-1'), false)
+    assert.equal(modelPricingList.classList.contains('flex-1'), true)
     assert.equal(modelPricingScroll.classList.contains('flex-1'), true)
+    assert.equal(modelPricingPagination.classList.contains('shrink-0'), true)
 
     await act(async () => nextPageButton.click())
     await act(async () =>
@@ -703,12 +713,18 @@ describe('user model pricing dialog', () => {
     )
     assert.ok(modelList)
     assert.equal(modelList.classList.contains('flex-1'), false)
+    const modelPricingStage = document.querySelector<HTMLElement>(
+      '[data-slot="model-pricing-stage"]'
+    )
+    assert.ok(modelPricingStage)
+    assert.equal(modelPricingStage.classList.contains('flex-1'), false)
 
     const dialogBody = document.querySelector<HTMLElement>(
       '[data-slot="dialog-body"]'
     )
     assert.ok(dialogBody)
     assert.equal(dialogBody.classList.contains('overflow-y-hidden'), true)
+    assert.equal(dialogBody.classList.contains('flex-1'), false)
   })
 
   // 编辑入口只展示当前用户已配置且仍启用的模型，不再把未改模型混入列表。

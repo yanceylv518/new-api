@@ -454,7 +454,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       contentClassName='flex max-h-[calc(100dvh-2rem)] sm:max-h-[85vh] sm:max-w-3xl'
       contentHeight='auto'
       bodyClassName='flex min-h-0 flex-1 flex-col overflow-hidden'
-      bodyWrapperClassName='flex flex-col overflow-y-hidden'
+      bodyWrapperClassName={cn(
+        'flex min-h-0 flex-col overflow-y-hidden',
+        // 分页列表需要占满弹窗主体的剩余高度，给底部分页栏留下稳定空间。
+        showPagination && 'flex-1'
+      )}
       footerClassName='flex-row justify-end [&>button]:flex-1 sm:[&>button]:flex-none'
       footer={
         <>
@@ -568,7 +572,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               </span>
             </div>
 
-            <div data-slot='model-pricing-stage' className='relative min-h-0'>
+            <div
+              data-slot='model-pricing-stage'
+              className={cn(
+                'relative flex min-h-0 flex-col',
+                // 仅分页场景锁定中间区域，避免列表内容延伸到分页栏下面。
+                showPagination && 'flex-1 overflow-hidden'
+              )}
+            >
               {totalFilteredModels === 0 ? (
                 <div
                   data-slot='model-pricing-list'
@@ -581,7 +592,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               ) : (
                 <div
                   data-slot='model-pricing-list'
-                  className='flex min-h-0 flex-col overflow-hidden rounded-md border'
+                  className={cn(
+                    'flex min-h-0 flex-col overflow-hidden rounded-md border',
+                    showPagination && 'flex-1'
+                  )}
                 >
                   <div
                     data-slot='model-pricing-scroll'
