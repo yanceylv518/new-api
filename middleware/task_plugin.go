@@ -90,7 +90,14 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		}
 		bodyObject, _ := requestContext.Body.(map[string]any)
 		bodyKind, _ := bodyObject["kind"].(string)
-		if pinned.Route.Type == pluginruntime.RouteTypeQuery && bodyKind != string(pluginruntime.BodyNone) || pinned.Route.Type != pluginruntime.RouteTypeQuery && bodyKind != string(pluginruntime.BodyJSON) {
+		// 查询和管理接口无需 JSON 提交体，管理意图仍须在解码后匹配声明的操作和模型。
+		managementRoute := pinned.Route.Type == pluginruntime.RouteTypeDynamic && (pinned.Route.Action == "list" || pinned.Route.Action == "delete")
+		bodyRequiresJSON := pinned.Route.Type != pluginruntime.RouteTypeQuery
+		if managementRoute {
+			bodyRequiresJSON = false
+		}
+		if (pinned.Route.Type == pluginruntime.RouteTypeQuery && bodyKind != string(pluginruntime.BodyNone)) ||
+			(bodyRequiresJSON && bodyKind != string(pluginruntime.BodyJSON)) {
 			logger.LogWarn(
 				c,
 				"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=request_decode reason=body_kind_mismatch body_kind=%q",
@@ -118,7 +125,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			return
 		}
 
-		if len(pinned.Route.Models) > 0 {
+		if len(pinned.Route.Models) > 0 && !managementRoute {
 			bodyValue, _ := bodyObject["value"].(map[string]any)
 			claimedModel, _ := bodyValue["model"].(string)
 			if claimedModel == "" || !slices.Contains(pinned.Route.Models, claimedModel) {
@@ -171,6 +178,42 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			)
 			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
 			return
+		}
+		if pinned.Route.Type == pluginruntime.RouteTypeDynamic && pinned.Route.Action == "list" && kind != string(pluginruntime.RouteTypeQuery) {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=list_result_kind_mismatch kind=%q",
+				generation,
+				pinned.Plugin.Meta.Key,
+				kind,
+			)
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+			return
+		}
+		if pinned.Route.Type == pluginruntime.RouteTypeDynamic && pinned.Route.Action == "delete" && kind != "delete" {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=delete_result_kind_mismatch kind=%q",
+				generation,
+				pinned.Plugin.Meta.Key,
+				kind,
+			)
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+			return
+		}
+		if managementRoute && len(pinned.Route.Models) > 0 {
+			modelName, valid := resolved["model"].(string)
+			if !valid || !slices.Contains(pinned.Route.Models, modelName) {
+				logger.LogWarn(
+					c,
+					"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=management_model_not_allowed model=%q",
+					generation,
+					pinned.Plugin.Meta.Key,
+					modelName,
+				)
+				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, fmt.Sprintf("model %q is not allowed on this route", modelName))
+				return
+			}
 		}
 		if _, forbidden := resolved["renderer"]; forbidden {
 			logger.LogWarn(c, "task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=forbidden_renderer", generation, pinned.Plugin.Meta.Key)
@@ -279,6 +322,20 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
 				return
 			}
+			if pinned.Route.Action == "list" {
+				// 管理列表由控制器读取当前用户的本地任务快照，避免把无主的上游账号历史暴露给用户。
+				c.Set(pluginruntime.ContextKeyNativeRouteIntent, resolved)
+				logger.LogDebug(
+					c,
+					"task_plugin subsystem=route event=resolved generation=%d plugin=%q kind=list renderer=%q distribute=false elapsed_ms=%d",
+					generation,
+					pinned.Plugin.Meta.Key,
+					pinned.Route.Render,
+					time.Since(hookStarted).Milliseconds(),
+				)
+				c.Next()
+				return
+			}
 			taskIDs, valid := resolvedTaskPluginIDs(resolved["taskIds"])
 			if !valid {
 				logger.LogWarn(
@@ -300,6 +357,38 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				time.Since(hookStarted).Milliseconds(),
 			)
 			renderTaskPluginQuery(c, pinned, requestContext, taskIDs, pinned.Route.Render, true)
+		case "delete":
+			if pinned.Route.Type != pluginruntime.RouteTypeDynamic || pinned.Route.Action != "delete" {
+				logger.LogWarn(
+					c,
+					"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=delete_from_non_management_route",
+					generation,
+					pinned.Plugin.Meta.Key,
+				)
+				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+				return
+			}
+			taskID, valid := resolved["taskId"].(string)
+			if !valid || strings.TrimSpace(taskID) == "" {
+				logger.LogWarn(
+					c,
+					"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=invalid_delete_result",
+					generation,
+					pinned.Plugin.Meta.Key,
+				)
+				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+				return
+			}
+			// 删除操作由控制器按用户、插件平台和任务渠道再次校验后执行。
+			c.Set(pluginruntime.ContextKeyNativeRouteIntent, resolved)
+			logger.LogDebug(
+				c,
+				"task_plugin subsystem=route event=resolved generation=%d plugin=%q kind=delete task_id_present=true distribute=false elapsed_ms=%d",
+				generation,
+				pinned.Plugin.Meta.Key,
+				time.Since(hookStarted).Milliseconds(),
+			)
+			c.Next()
 		default:
 			logger.LogWarn(
 				c,
@@ -501,8 +590,7 @@ func TaskPluginEndpointOnly(handler gin.HandlerFunc) gin.HandlerFunc {
 }
 
 // PrepareTaskPluginEndpoint normalizes a claimed shared request through the
-// deterministic parser pinned before distribution. A shared-model request can
-// later rebind to another declared legacy provider from the same generation.
+// candidates pinned before distribution, retaining only plugins that accept it.
 func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
@@ -604,80 +692,79 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			UpstreamModel:       pinned.MappedModel,
 			Stream:              stream,
 		}
-		c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
 		hookStarted := time.Now()
-		// Parsing belongs to the durable task submission path. A client
-		// disconnect only stops the later Responses observation.
-		resolvedValue, callErr := pinned.Plugin.Engine.CallPathWithAdmissionTimeout(
-			context.WithoutCancel(c.Request.Context()),
-			pluginruntime.DefaultCallTimeout,
-			"protocols",
-			[]string{pinned.Protocol, "decodeRequest"},
-			protocolContext.JSValue(),
-		)
-		if callErr != nil {
-			logger.LogWarn(
-				c,
-				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=hook_failed err=%q elapsed_ms=%d",
-				pinned.Generation.Number,
-				pinned.Plugin.Meta.Key,
-				callErr.Error(),
-				time.Since(hookStarted).Milliseconds(),
+		candidates := pinned.Candidates
+		if len(candidates) == 0 {
+			candidates = []pluginruntime.ProtocolBinding{{Plugin: pinned.Plugin, Protocol: pinned.Protocol, Operation: pinned.Operation, Model: pinned.Model}}
+		}
+		accepted := make([]pluginruntime.ProtocolBinding, 0, len(candidates))
+		var resolved map[string]any
+		var failures []string
+		rejectedPlugins := make(map[string][]string)
+		for _, candidate := range candidates {
+			candidateContext := protocolContext
+			candidateContext.Protocol = candidate.Protocol
+			candidateContext.Operation = candidate.Operation.Name
+			// Parsing belongs to durable submission; disconnecting only stops
+			// the later Responses observation.
+			resolvedValue, callErr := candidate.Plugin.Engine.CallPathWithAdmissionTimeout(
+				context.WithoutCancel(c.Request.Context()), pluginruntime.DefaultCallTimeout,
+				"protocols", []string{candidate.Protocol, "decodeRequest"}, candidateContext.JSValue(),
 			)
-			detail := taskPluginHookDetail(callErr)
-			if detail == "" {
-				detail = "Invalid task protocol request"
+			result, resultOK := resolvedValue.(map[string]any)
+			detail := ""
+			reason := ""
+			if callErr != nil {
+				reason = "hook_failed"
+				detail = taskPluginHookDetail(callErr)
+				if detail == "" {
+					detail = "Invalid task protocol request"
+				}
+			} else if !resultOK {
+				reason = "result_not_object"
+				detail = taskPluginInvalidRouteResult
+			} else if kind, _ := result["kind"].(string); kind != string(pluginruntime.RouteTypeSubmit) {
+				reason = "unsupported_kind"
+				detail = taskPluginInvalidRouteResult
+			} else if model, _ := result["model"].(string); strings.TrimSpace(model) == "" {
+				reason = "invalid_model"
+				detail = "decoded request is missing a model"
+			} else if model != pinned.Model || (pinned.MappedModel == "" && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
+				reason = "resolved_model_not_owned"
+				detail = fmt.Sprintf("model %q is not served by this plugin", model)
 			}
-			abortWithOpenAiMessage(c, http.StatusBadRequest, detail)
+			if detail != "" {
+				logger.LogWarn(c, "task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s err=%q elapsed_ms=%d",
+					pinned.Generation.Number, candidate.Plugin.Meta.Key, reason, detail, time.Since(hookStarted).Milliseconds())
+				if _, seen := rejectedPlugins[detail]; !seen {
+					failures = append(failures, detail)
+				}
+				rejectedPlugins[detail] = append(rejectedPlugins[detail], candidate.Plugin.Meta.Key)
+				continue
+			}
+			accepted = append(accepted, candidate)
+			if resolved == nil {
+				resolved = result
+				protocolContext = candidateContext
+			}
+		}
+		if len(accepted) == 0 {
+			if len(candidates) > 1 {
+				for index, detail := range failures {
+					failures[index] = strings.Join(rejectedPlugins[detail], ", ") + ": " + detail
+				}
+			}
+			abortWithOpenAiMessage(c, http.StatusBadRequest, strings.Join(failures, "; "))
 			return
 		}
-		resolved, ok := resolvedValue.(map[string]any)
-		if !ok {
-			logger.LogWarn(
-				c,
-				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=result_not_object elapsed_ms=%d",
-				pinned.Generation.Number,
-				pinned.Plugin.Meta.Key,
-				time.Since(hookStarted).Milliseconds(),
-			)
-			abortWithOpenAiMessage(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
-			return
-		}
-		if kind, _ := resolved["kind"].(string); kind != string(pluginruntime.RouteTypeSubmit) {
-			logger.LogWarn(
-				c,
-				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=unsupported_kind",
-				pinned.Generation.Number,
-				pinned.Plugin.Meta.Key,
-			)
-			abortWithOpenAiMessage(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
-			return
-		}
-		resolvedModel, ok := resolved["model"].(string)
-		if !ok || strings.TrimSpace(resolvedModel) == "" {
-			logger.LogWarn(
-				c,
-				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=invalid_model",
-				pinned.Generation.Number,
-				pinned.Plugin.Meta.Key,
-			)
-			abortWithOpenAiMessage(c, http.StatusBadRequest, "decoded request is missing a model")
-			return
-		}
-		modelOwned := slices.Contains(pinned.Plugin.Meta.Models, resolvedModel)
-		mappedPin := pinned.MappedModel != ""
-		if resolvedModel != pinned.Model || (!modelOwned && !mappedPin) {
-			logger.LogWarn(
-				c,
-				"task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=resolved_model_not_owned claimed_model=%q resolved_model=%q",
-				pinned.Generation.Number,
-				pinned.Plugin.Meta.Key,
-				pinned.Model,
-				resolvedModel,
-			)
-			abortWithOpenAiMessage(c, http.StatusBadRequest, fmt.Sprintf("model %q is not served by this plugin", resolvedModel))
-			return
-		}
+		pinned.Candidates = accepted
+		pinned.Plugin = accepted[0].Plugin
+		pinned.Protocol = accepted[0].Protocol
+		pinned.Operation = accepted[0].Operation
+		c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
+		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: pinned.Generation, Plugin: pinned.Plugin})
+		c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
+		resolvedModel := pinned.Model
 
 		action := ""
 		if resolvedAction, present := resolved["action"]; present {
@@ -1163,6 +1250,18 @@ func renderTaskPluginQuery(
 	)
 	tasksByID := make(map[string]*model.Task, len(tasks))
 	for _, task := range tasks {
+		if !taskPluginRouteMatchesTaskModel(pinned.Route, task) {
+			logger.LogDebug(
+				c,
+				"task_plugin subsystem=query event=lookup_failed generation=%d plugin=%q reason=task_model_not_allowed requested=%d found=%d",
+				generation,
+				pinned.Plugin.Meta.Key,
+				len(taskIDs),
+				len(tasks),
+			)
+			abortTaskPluginRouteError(c, http.StatusNotFound)
+			return
+		}
 		tasksByID[task.TaskID] = task
 	}
 	views := make([]map[string]any, 0, len(taskIDs))
@@ -1229,6 +1328,19 @@ func renderTaskPluginQuery(
 	c.JSON(http.StatusOK, result)
 }
 
+// taskPluginRouteMatchesTaskModel 将查询路由的模型范围应用到持久化任务。
+// 查询路由没有请求体，模型约束必须在用户归属查询之后执行。
+func taskPluginRouteMatchesTaskModel(route pluginruntime.Route, task *model.Task) bool {
+	if len(route.Models) == 0 {
+		return true
+	}
+	if task == nil {
+		return false
+	}
+	return slices.Contains(route.Models, strings.TrimSpace(task.Properties.OriginModelName)) ||
+		slices.Contains(route.Models, strings.TrimSpace(task.Properties.UpstreamModelName))
+}
+
 // RespondTaskPluginError gives a pinned plugin a sanitized error DTO and writes
 // its native error body. The host-provided status remains authoritative.
 func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
@@ -1241,6 +1353,11 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	// 上游管理错误已在响应边界脱敏；本地内部错误继续沿用原有隐藏策略。
+	if taskErr.UpstreamError != nil && !taskErr.LocalError {
+		sanitized.Code = taskErr.UpstreamError.Code
+		sanitized.Message = taskErr.UpstreamError.Message
+	}
 	requestID := c.GetString(common.RequestIdKey)
 	hasRenderer, err := pinned.Plugin.Engine.HasCallablePath(c.Request.Context(), "native", "error")
 	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)

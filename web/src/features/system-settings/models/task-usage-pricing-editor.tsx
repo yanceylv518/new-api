@@ -16,18 +16,32 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Combobox } from '@/components/ui/combobox'
 import { AlertTriangle } from 'lucide-react'
 import { memo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { Combobox } from '@/components/ui/combobox'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  formatPricingAmount,
+  USD_PRICING_CURRENCY,
+  type PricingCurrency,
+} from '@/features/model-pricing/currency'
+import { PricingAmountInput } from '@/features/model-pricing/pricing-amount-input'
 import {
   combineBillingExpr,
   splitBillingExprAndRequestRules,
@@ -43,23 +57,32 @@ import {
   getTaskEnumCombinations,
   getTaskEnumFields,
   getTaskNumberFields,
-  taskMatrixRowLabel,
+  getTaskUsageField,
+  normalizeTaskUsageSample,
   taskMatrixToTiers,
   tryParseTaskMatrixConfig,
   tryParseTaskVisualConfig,
   type TaskMatrixRow,
   type TaskVisualConfig,
 } from '@/features/pricing/lib/task-expr'
+import {
+  taskPriceLabel,
+  taskUsageUnitLabel,
+  taskEnumLabel,
+  taskPricingConditions,
+} from '@/features/pricing/lib/task-price-display'
 import type {
   BillingUsageExample,
   BillingUsageSchema,
 } from '@/features/pricing/types'
-import { resolveLocalizedText } from '@/lib/localized-text'
 
 import { formatPricingNumber } from './pricing-format'
+import { RequestSimulation } from './request-simulation'
+import { TaskFreeAllowanceInput } from './task-free-allowance-input'
 import { TaskPricingMatrix } from './task-pricing-matrix'
 
 type TaskUsagePricingEditorProps = {
+  currency?: PricingCurrency
   billingExpr: string
   requestRuleExpr: string
   usageSchema: BillingUsageSchema
@@ -71,8 +94,8 @@ type TaskUsagePricingEditorProps = {
 type EditorMode = 'visual' | 'raw'
 
 type TaskBillingPreviewProps = {
+  currency?: PricingCurrency
   config: TaskVisualConfig | null
-  matchedRowLabel: string | null
   requestRuleExpr: string
   sample: Record<string, number | string>
   usageSchema: BillingUsageSchema
@@ -82,51 +105,51 @@ type TaskBillingPreviewProps = {
 }
 
 function TaskBillingPreview(props: TaskBillingPreviewProps) {
-  const { t } = useTranslation()
-  const enumFields = getTaskEnumFields(props.usageSchema)
-  const numberFields = getTaskNumberFields(props.usageSchema)
-    const result = props.config
-      ? evaluateTaskVisualConfig(
-          props.config,
-          props.sample,
-          props.usageSchema
-        )
-      : null
+  const { t, i18n } = useTranslation()
+  const enumFields = getTaskEnumFields(props.usageSchema, props.sample)
+  const numberFields = getTaskNumberFields(props.usageSchema, props.sample)
+  const result = props.config
+    ? evaluateTaskVisualConfig(props.config, props.sample, props.usageSchema)
+    : null
 
-  if (!result) {
-    return (
-      <div className='bg-muted/30 rounded-md border p-3'>
-        <p className='text-muted-foreground text-xs'>
-          {t('Preview is unavailable for custom expressions.')}
-        </p>
-      </div>
-    )
-  }
-
-  const formulaParts = result.parts.map((part) => {
+  const formulaParts = (result?.parts ?? []).map((part) => {
     if (part.kind === 'constant') {
-      return `$${formatPricingNumber(part.amount)}`
+      return `${t('Additional charge')}: ${formatPricingAmount(part.amount, props.currency)}`
     }
 
     const definition = props.usageSchema[part.field ?? '']
     const quantityUnitKey = getTaskUsageQuantityUnitLabelKey(definition?.unit)
     const priceUnitKey = getTaskUsagePriceUnitLabelKey(definition?.unit)
-    const quantityUnitLabel = t(quantityUnitKey)
+    const quantityUnitLabel = taskUsageUnitLabel(
+      definition,
+      i18n.language,
+      t(quantityUnitKey)
+    )
+    const priceUnitLabel = taskUsageUnitLabel(
+      definition,
+      i18n.language,
+      t(priceUnitKey)
+    )
     const quantityLabel =
       definition?.unit === 'second'
         ? `${formatPricingNumber(part.quantity)}${quantityUnitLabel}`
         : `${formatPricingNumber(part.quantity)} ${quantityUnitLabel}`
-    return `${quantityLabel} × $${formatPricingNumber(part.unitPrice)}/${t(priceUnitKey)}`
+    return `${taskPriceLabel(definition?.description, part.field ?? '', i18n.language)}: ${quantityLabel} × ${formatPricingAmount(part.unitPrice ?? 0, props.currency)}/${priceUnitLabel}`
   })
-  const formulaLeft = formulaParts.length > 0 ? formulaParts.join(' + ') : '$0'
-  const formula = `${formulaLeft} = $${formatPricingNumber(result.total)}`
+  const formulaLeft =
+    formulaParts.length > 0
+      ? formulaParts.join(' + ')
+      : formatPricingAmount(0, props.currency)
+  const formula = `${formulaLeft} = ${formatPricingAmount(result?.total ?? 0, props.currency)}`
 
   return (
     <div className='bg-muted/30 flex flex-col gap-3 rounded-md border p-3'>
       <div className='flex flex-col gap-1'>
-        <h4 className='text-sm font-medium'>{t('Preview')}</h4>
+        <h4 className='text-sm font-medium'>{t('Cost calculator')}</h4>
         <p className='text-muted-foreground text-xs'>
-          {t('Preview excludes group ratios and request rule multipliers.')}
+          {t(
+            'Enter sample usage to estimate the cost. Group and request multipliers are not included.'
+          )}
           {props.requestRuleExpr ? (
             <> {t('Request rules apply on top of this amount.')}</>
           ) : null}
@@ -136,26 +159,26 @@ function TaskBillingPreview(props: TaskBillingPreviewProps) {
         <Field className='gap-1.5'>
           <FieldLabel>{t('Example spec')}</FieldLabel>
           <Combobox
-options={props.usageExamples.map((example) => ({
+            options={props.usageExamples.map((example) => ({
               value: example.label,
               label: example.label,
             }))}
-value={
+            value={
               props.usageExamples.find((example) =>
                 Object.entries(example.facts).every(
                   ([field, value]) => props.sample[field] === value
                 )
               )?.label ?? null
             }
-onValueChange={(label) => {
+            onValueChange={(label) => {
               const example = props.usageExamples?.find(
                 (item) => item.label === label
               )
               if (example) props.onSampleReplace({ ...example.facts })
             }}
-className='w-full'
-placeholder={t('Example spec')}
-/>
+            className='w-full'
+            placeholder={t('Example spec')}
+          />
         </Field>
       ) : null}
       {enumFields.length + numberFields.length > 0 ? (
@@ -163,32 +186,50 @@ placeholder={t('Example spec')}
           {enumFields.map(([field, definition]) => {
             const items = (definition.enum ?? []).map((value) => ({
               value,
-              label: value,
+              label: taskEnumLabel(definition, value, i18n.language),
             }))
             return (
               <Field key={field} className='gap-1.5'>
                 <FieldLabel>
-                  <code>{field}</code>
+                  {taskPriceLabel(definition.description, field, i18n.language)}
                 </FieldLabel>
                 <Combobox
-options={items}
-value={String(props.sample[field] ?? '')}
-onValueChange={(value) =>
+                  aria-label={taskPriceLabel(
+                    definition.description,
+                    field,
+                    i18n.language
+                  )}
+                  options={items}
+                  value={String(props.sample[field] ?? '')}
+                  onValueChange={(value) =>
                     value !== null && props.onSampleChange(field, value)
                   }
-className='w-full'
-/>
+                  className='w-full'
+                />
               </Field>
             )
           })}
           {numberFields.map(([field, definition]) => (
             <Field key={field} className='gap-1.5'>
               <FieldLabel>
-                <code>{field}</code>
+                {t('Usage · {{price}}', {
+                  price: taskPriceLabel(
+                    definition.description,
+                    field,
+                    i18n.language
+                  ),
+                })}
               </FieldLabel>
               <div className='flex items-center gap-2'>
                 <Input
                   type='number'
+                  aria-label={t('Usage · {{price}}', {
+                    price: taskPriceLabel(
+                      definition.description,
+                      field,
+                      i18n.language
+                    ),
+                  })}
                   min={0}
                   step={1}
                   value={props.sample[field] ?? 0}
@@ -202,19 +243,38 @@ className='w-full'
                   className='font-mono'
                 />
                 <span className='text-muted-foreground shrink-0 text-xs'>
-                  {t(getTaskUsageQuantityUnitLabelKey(definition.unit))}
+                  {taskUsageUnitLabel(
+                    definition,
+                    i18n.language,
+                    t(getTaskUsageQuantityUnitLabelKey(definition.unit))
+                  )}
                 </span>
               </div>
             </Field>
           ))}
         </div>
       ) : null}
-      <div className='border-primary/50 bg-primary/10 flex flex-col gap-2 rounded-md border p-3 text-sm'>
-        <Badge variant='outline' className='text-xs'>
-          {t('Hit tier')}: {props.matchedRowLabel ?? result.tier.label}
-        </Badge>
-        <code className='font-mono text-xs break-words'>{formula}</code>
-      </div>
+      {result ? (
+        <div className='border-primary/50 bg-primary/10 flex flex-col gap-2 rounded-md border p-3 text-sm'>
+          <Badge variant='outline' className='text-xs'>
+            {t('Current pricing conditions')}:{' '}
+            {taskPricingConditions(
+              enumFields.map(([field]) => ({
+                field,
+                value: String(props.sample[field] ?? ''),
+              })),
+              props.usageSchema,
+              i18n.language,
+              t
+            ) || t('All requests')}
+          </Badge>
+          <code className='font-mono text-xs break-words'>{formula}</code>
+        </div>
+      ) : (
+        <p className='text-muted-foreground text-xs'>
+          {t('Preview is unavailable for custom expressions.')}
+        </p>
+      )}
     </div>
   )
 }
@@ -236,10 +296,11 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     )
     return (parsed ?? createDefaultTaskMatrixConfig(props.usageSchema)).rows
   })
+  const [confirmVisualSwitch, setConfirmVisualSwitch] = useState(false)
   const [rawExpr, setRawExpr] = useState(() =>
     combineBillingExpr(props.billingExpr, props.requestRuleExpr)
   )
-  const [previewSample, setPreviewSample] = useState<
+  const [previewSampleState, setPreviewSample] = useState<
     Record<string, number | string>
   >(() => {
     if (props.usageExamples?.[0]) {
@@ -254,6 +315,11 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     }
     return sample
   })
+  // 从当前操作派生合法用量，无需 effect 追改选择器和隐藏输入。
+  const previewSample = normalizeTaskUsageSample(
+    props.usageSchema,
+    previewSampleState
+  )
   const enumFields = getTaskEnumFields(props.usageSchema)
   const numberFields = getTaskNumberFields(props.usageSchema)
   const combinations = getTaskEnumCombinations(props.usageSchema)
@@ -262,7 +328,6 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   let previewConfig: TaskVisualConfig | null = null
   let previewRequestRuleExpr = props.requestRuleExpr
   let matchedRowIndex: number | null = null
-  let matchedRowLabel: string | null = null
   if (editorMode === 'visual') {
     const generatedExpression = generateTaskExprFromConfig(
       { tiers: visualTiers },
@@ -276,7 +341,6 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     )
     if (nextMatchedRowIndex >= 0) {
       matchedRowIndex = nextMatchedRowIndex
-      matchedRowLabel = taskMatrixRowLabel(combinations[nextMatchedRowIndex])
     }
   } else {
     const split = splitBillingExprAndRequestRules(rawExpr)
@@ -308,6 +372,9 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   const handleFillColumn = (priceKey: string, value: number) => {
     const nextRows = matrixRows.map((row) => {
       if (priceKey === 'constant') return { ...row, constant: value }
+      if (!getTaskUsageField(props.usageSchema[priceKey], row.combination)) {
+        return row
+      }
       return {
         ...row,
         unitPrices: { ...row.unitPrices, [priceKey]: value },
@@ -323,34 +390,36 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     props.onRequestRuleExprChange(split.requestRuleExpr)
   }
 
+  const rawSplit = splitBillingExprAndRequestRules(rawExpr)
+  const rawMatrix = tryParseTaskMatrixConfig(
+    rawSplit.billingExpr,
+    props.usageSchema
+  )
+
   const handleModeChange = (nextMode: EditorMode) => {
+    if (nextMode === editorMode) return
     if (nextMode === 'visual') {
-      const split = splitBillingExprAndRequestRules(rawExpr)
-      const parsed = tryParseTaskMatrixConfig(
-        split.billingExpr,
-        props.usageSchema
-      )
-      const nextRows = (
-        parsed ?? createDefaultTaskMatrixConfig(props.usageSchema)
-      ).rows
-      setMatrixRows(nextRows)
-      props.onBillingExprChange(
-        generateTaskExprFromConfig(
-          {
-            tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema),
-          },
-          props.usageSchema
-        )
-      )
-      props.onRequestRuleExprChange(split.requestRuleExpr)
-    } else {
-      const expression = generateTaskExprFromConfig(
-        { tiers: visualTiers },
-        props.usageSchema
-      )
-      setRawExpr(combineBillingExpr(expression, props.requestRuleExpr))
+      setConfirmVisualSwitch(true)
+      return
     }
-    setEditorMode(nextMode)
+    setRawExpr(combineBillingExpr(props.billingExpr, props.requestRuleExpr))
+    setEditorMode('raw')
+  }
+
+  const handleConfirmVisualSwitch = () => {
+    const nextRows = (
+      rawMatrix ?? createDefaultTaskMatrixConfig(props.usageSchema)
+    ).rows
+    setMatrixRows(nextRows)
+    props.onBillingExprChange(
+      generateTaskExprFromConfig(
+        { tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema) },
+        props.usageSchema
+      )
+    )
+    props.onRequestRuleExprChange(rawMatrix ? rawSplit.requestRuleExpr : '')
+    setConfirmVisualSwitch(false)
+    setEditorMode('visual')
   }
 
   const handlePreviewSampleChange = (field: string, value: number | string) => {
@@ -362,14 +431,26 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       row.constant === 0 &&
       numberFields.every(([field]) => !(row.unitPrices[field] > 0))
   )
-  const showRawMatrixHint = Boolean(
-    props.billingExpr &&
-    enumFields.length > 0 &&
-    !tryParseTaskMatrixConfig(props.billingExpr, props.usageSchema)
-  )
 
   return (
     <div className='space-y-5'>
+      <ConfirmDialog
+        open={confirmVisualSwitch}
+        onOpenChange={setConfirmVisualSwitch}
+        title={t('Switch to visual pricing?')}
+        desc={
+          rawMatrix
+            ? t(
+                'Switching regenerates the expression from the price table and replaces its original formatting and tier names. Changes apply only after saving.'
+              )
+            : t(
+                'This expression cannot be represented by the price table. Switching discards the entire expression, including request rules, and resets all prices to zero. Configure prices before saving.'
+              )
+        }
+        confirmText={t('Switch to visual editor')}
+        destructive={!rawMatrix}
+        handleConfirm={handleConfirmVisualSwitch}
+      />
       <div className='grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end'>
         <Field className='gap-2'>
           <FieldLabel>{t('Editor mode')}</FieldLabel>
@@ -383,7 +464,11 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
               value !== null && handleModeChange(value as EditorMode)
             }
           >
-            <SelectTrigger className='w-full sm:w-56' size='sm'>
+            <SelectTrigger
+              aria-label={t('Editor mode')}
+              className='w-full sm:w-56'
+              size='sm'
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent alignItemWithTrigger={false}>
@@ -399,7 +484,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       <Alert>
         <AlertDescription className='text-xs'>
           {t(
-            'Task usage prices are USD per declared unit. Token fields use dollars per 1M tokens; the editor writes / 1000000 into the expression. Other units are not divided by one million.'
+            'Prices are in {{currency}}, with units shown below. Use USD when editing expressions directly.',
+            { currency: (props.currency ?? USD_PRICING_CURRENCY).label }
           )}
         </AlertDescription>
       </Alert>
@@ -410,11 +496,12 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
             {enumFields.length > 0 ? (
               <div className='flex flex-col gap-3'>
                 <p className='text-muted-foreground text-xs'>
-                  {t('Each row prices one combination of {{fields}}.', {
-                    fields: enumFields.map(([field]) => field).join(', '),
-                  })}
+                  {t(
+                    'Set prices and free quantities for each condition. Only usage above the free quantity is charged. Token prices are per million tokens.'
+                  )}
                 </p>
                 <TaskPricingMatrix
+                  currency={props.currency}
                   rows={matrixRows}
                   usageSchema={props.usageSchema}
                   matchedRowIndex={matchedRowIndex}
@@ -441,18 +528,18 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                     </Label>
                     <div className='grid gap-3 sm:grid-cols-2'>
                       {numberFields.map(([field, definition]) => {
-                        const description = resolveLocalizedText(
+                        const description = taskPriceLabel(
                           definition.description,
+                          field,
                           i18n.language
                         )
                         return (
                           <Field key={field} className='gap-1.5'>
-                            <FieldLabel>
-                              <code>{field}</code>
-                            </FieldLabel>
+                            <FieldLabel>{description}</FieldLabel>
                             <div className='flex items-center gap-2'>
-                              <Input
-                                type='number'
+                              <PricingAmountInput
+                                currency={props.currency}
+                                aria-label={field}
                                 min={0}
                                 step={0.000001}
                                 value={matrixRows[0].unitPrices[field] ?? 0}
@@ -461,8 +548,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                                     event.currentTarget.select()
                                   }
                                 }}
-                                onChange={(event) => {
-                                  const value = Number(event.target.value)
+                                onChange={(usd) => {
+                                  const value = Number(usd)
                                   handleRowChange(0, {
                                     ...matrixRows[0],
                                     unitPrices: {
@@ -477,20 +564,48 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                                 className='font-mono'
                               />
                               <span className='text-muted-foreground shrink-0 text-xs'>
-                                $/{t(getTaskUsagePriceUnitLabelKey(definition.unit))}
+                                {
+                                  (props.currency ?? USD_PRICING_CURRENCY)
+                                    .symbol
+                                }
+                                /
+                                {taskUsageUnitLabel(
+                                  definition,
+                                  i18n.language,
+                                  t(
+                                    getTaskUsagePriceUnitLabelKey(
+                                      definition.unit
+                                    )
+                                  )
+                                )}
                               </span>
                             </div>
-                            {description ? (
-                              <FieldDescription>{description}</FieldDescription>
-                            ) : null}
+                            {definition.unit === 'count' && (
+                              <TaskFreeAllowanceInput
+                                label={description}
+                                value={
+                                  matrixRows[0].freeAllowances?.[field] ?? 0
+                                }
+                                onChange={(value) =>
+                                  handleRowChange(0, {
+                                    ...matrixRows[0],
+                                    freeAllowances: {
+                                      ...matrixRows[0].freeAllowances,
+                                      [field]: value,
+                                    },
+                                  })
+                                }
+                              />
+                            )}
                           </Field>
                         )
                       })}
                       <Field className='gap-1.5'>
-                        <FieldLabel>{t('Base charge')}</FieldLabel>
+                        <FieldLabel>{t('Additional charge')}</FieldLabel>
                         <div className='flex items-center gap-2'>
-                          <Input
-                            type='number'
+                          <PricingAmountInput
+                            currency={props.currency}
+                            aria-label={t('Additional charge')}
                             min={0}
                             step={0.000001}
                             value={matrixRows[0].constant}
@@ -499,8 +614,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                                 event.currentTarget.select()
                               }
                             }}
-                            onChange={(event) => {
-                              const value = Number(event.target.value)
+                            onChange={(usd) => {
+                              const value = Number(usd)
                               handleRowChange(0, {
                                 ...matrixRows[0],
                                 constant:
@@ -512,7 +627,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                             className='font-mono'
                           />
                           <span className='text-muted-foreground shrink-0 text-xs'>
-                            $/{t('request')}
+                            {(props.currency ?? USD_PRICING_CURRENCY).symbol}/
+                            {t('request')}
                           </span>
                         </div>
                       </Field>
@@ -523,8 +639,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
             )}
 
             <TaskBillingPreview
+              currency={props.currency}
               config={previewConfig}
-              matchedRowLabel={matchedRowLabel}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
               usageSchema={props.usageSchema}
@@ -567,16 +683,17 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                   {t('Functions')}: <code>tier(name, value)</code>,{' '}
                   <code>header(name)</code>, <code>param(path)</code>
                 </div>
-                {showRawMatrixHint ? (
+                {!rawMatrix ? (
                   <div>
                     {t(
-                      'This expression does not price each combination exactly once, so it opens as a raw expression. Sparse or custom pricing stays in this editor.'
+                      'This expression cannot be represented by the price table. You can switch to visual editing by confirming that the expression will be discarded.'
                     )}
                   </div>
                 ) : null}
               </AlertDescription>
             </Alert>
             <Textarea
+              aria-label={t('Billing expression')}
               value={rawExpr}
               onChange={(event) => handleRawChange(event.target.value)}
               placeholder='tier("base", u("seconds") * 0.4)'
@@ -585,8 +702,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
               spellCheck={false}
             />
             <TaskBillingPreview
+              currency={props.currency}
               config={previewConfig}
-              matchedRowLabel={matchedRowLabel}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
               usageSchema={props.usageSchema}
@@ -597,6 +714,23 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
           </div>
         )}
       </div>
+      <RequestSimulation
+        expression={
+          editorMode === 'raw'
+            ? rawExpr
+            : combineBillingExpr(
+                generateTaskExprFromConfig(
+                  { tiers: visualTiers },
+                  props.usageSchema
+                ),
+                props.requestRuleExpr
+              )
+        }
+        usage={previewSample}
+        usageSchema={props.usageSchema}
+        currency={props.currency}
+        mode='task'
+      />
     </div>
   )
 })

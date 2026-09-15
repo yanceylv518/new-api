@@ -29,11 +29,23 @@ export type PricingVendor = {
 
 export type BillingUsageUnit = 'second' | 'count' | 'token' | 'credit'
 
+// 匹配任一无条件枚举选择器时字段适用，enum 可进一步限制该字段的选项。
+export type BillingUsageFieldCondition = {
+  field: string
+  values: string[]
+  enum?: string[]
+}
+
 export type BillingUsageFieldSchema = {
   type?: 'number' | 'boolean'
+  // 插件声明价格列顺序，避免 JSON 对象键排序改变业务展示顺序。
+  displayOrder?: number
   unit?: BillingUsageUnit
+  unitLabel?: string | Record<string, string>
   enum?: string[]
+  enumLabels?: Record<string, string | Record<string, string>>
   description?: string | Record<string, string>
+  when?: BillingUsageFieldCondition[]
 }
 
 export type BillingUsageSchema = Record<string, BillingUsageFieldSchema>
@@ -43,7 +55,18 @@ export type BillingUsageExample = {
   facts: Record<string, string | number>
 }
 
+export type BillingPluginVariant = {
+  plugin_key: string
+  plugin_name: string
+  icon?: string
+  billing_expr: string
+  billing_mode?: 'ratio' | 'tiered_expr'
+  billing_usage_schema: BillingUsageSchema
+  billing_usage_examples?: BillingUsageExample[]
+}
+
 export type PricingModel = {
+  billing_plugin_variants?: BillingPluginVariant[]
   id: number
   model_name: string
   description?: string

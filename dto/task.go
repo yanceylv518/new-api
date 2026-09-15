@@ -5,12 +5,16 @@ import (
 )
 
 type TaskError struct {
+	// NoRetry prevents duplicate upstream work after a response has been accepted.
+	NoRetry    bool   `json:"-"`
 	Code       string `json:"code"`
 	Message    string `json:"message"`
 	Data       any    `json:"data"`
 	StatusCode int    `json:"-"`
 	LocalError bool   `json:"-"`
 	Error      error  `json:"-"`
+	// UpstreamError 仅承载已脱敏且限长的上游业务错误，避免原生接口再次丢失错误码和原因。
+	UpstreamError *TaskPluginError `json:"-"`
 }
 
 type TaskData interface {

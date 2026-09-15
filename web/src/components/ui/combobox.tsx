@@ -48,12 +48,14 @@ type LegacyComboboxProps = {
   searchPlaceholder?: string
   emptyText?: string
   allowCustomValue?: boolean
+  showSelectedIcon?: boolean
   className?: string
   id?: string
   openOnFocus?: boolean
   disabled?: boolean
   name?: string
   onBlur?: React.FocusEventHandler<HTMLInputElement>
+  onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>
   ref?: React.Ref<HTMLInputElement>
   'aria-label'?: string
   'aria-labelledby'?: string
@@ -75,6 +77,10 @@ function Combobox(
     return (
       <LegacyComboboxInput
         id={props.id}
+        aria-label={props['aria-label']}
+        aria-labelledby={props['aria-labelledby']}
+        aria-invalid={props['aria-invalid']}
+        onKeyDown={props.onKeyDown}
         options={props.options}
         value={props.value ?? ''}
         onValueChange={(value) => props.onValueChange?.(value)}
@@ -130,6 +136,7 @@ function OptionCombobox(props: LegacyComboboxProps) {
           id={props.id}
           disabled={props.disabled}
           onBlur={props.onBlur}
+          onKeyDown={props.onKeyDown}
           onFocus={() => {
             if (props.openOnFocus !== false) setOpen(true)
           }}
@@ -142,7 +149,13 @@ function OptionCombobox(props: LegacyComboboxProps) {
           }
           triggerAriaLabel={props['aria-label'] ?? t('Open')}
           className='h-full min-h-8 w-full'
-        />
+        >
+          {props.showSelectedIcon && !open && selected?.icon && (
+            <InputGroupAddon align='inline-start' aria-hidden='true'>
+              {selected.icon}
+            </InputGroupAddon>
+          )}
+        </ComboboxInput>
       </div>
       <ComboboxContent anchor={anchor}>
         <ComboboxEmpty>

@@ -28,7 +28,6 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { Field, FieldLabel } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
 import {
   Popover,
   PopoverContent,
@@ -50,22 +49,36 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  USD_PRICING_CURRENCY,
+  type PricingCurrency,
+} from '@/features/model-pricing/currency'
+import { PricingAmountInput } from '@/features/model-pricing/pricing-amount-input'
 import { getTaskUsagePriceUnitLabelKey } from '@/features/pricing/lib/dynamic-price'
 import {
   getTaskEnumFields,
   getTaskNumberFields,
-  taskMatrixRowLabel,
+  getTaskUsageField,
   type TaskMatrixRow,
 } from '@/features/pricing/lib/task-expr'
+import {
+  taskPriceLabel,
+  taskUsageUnitLabel,
+  taskEnumLabel,
+  taskPricingConditions,
+} from '@/features/pricing/lib/task-price-display'
 import type {
   BillingUsageFieldSchema,
   BillingUsageSchema,
 } from '@/features/pricing/types'
 import { cn } from '@/lib/utils'
 
+import { TaskFreeAllowanceInput } from './task-free-allowance-input'
+
 const TASK_MATRIX_GROUP_THRESHOLD = 24
 
 type TaskPricingMatrixProps = {
+  currency?: PricingCurrency
   rows: TaskMatrixRow[]
   usageSchema: BillingUsageSchema
   matchedRowIndex: number | null
@@ -79,6 +92,7 @@ type IndexedTaskMatrixRow = {
 }
 
 type FillColumnPopoverProps = {
+  currency?: PricingCurrency
   priceKey: string
   initialValue: number
   onFillColumn: (priceKey: string, value: number) => void
@@ -86,6 +100,7 @@ type FillColumnPopoverProps = {
 
 function FillColumnPopover(props: FillColumnPopoverProps) {
   const { t } = useTranslation()
+  const inputRef = useRef<HTMLInputElement>(null)
   const [open, setOpen] = useState(false)
   const [value, setValue] = useState(props.initialValue)
 
@@ -95,6 +110,7 @@ function FillColumnPopover(props: FillColumnPopoverProps) {
   }
 
   const handleSubmit = () => {
+    if (inputRef.current && !inputRef.current.reportValidity()) return
     const nextValue = Number(value)
     props.onFillColumn(
       props.priceKey,
@@ -124,8 +140,9 @@ function FillColumnPopover(props: FillColumnPopoverProps) {
         </PopoverHeader>
         <Field className='gap-2'>
           <FieldLabel className='sr-only'>{t('Fill entire column')}</FieldLabel>
-          <Input
-            type='number'
+          <PricingAmountInput
+            ref={inputRef}
+            currency={props.currency}
             min={0}
             step={0.000001}
             value={value}
@@ -135,7 +152,7 @@ function FillColumnPopover(props: FillColumnPopoverProps) {
                 event.currentTarget.select()
               }
             }}
-            onChange={(event) => setValue(Number(event.target.value))}
+            onChange={(usd) => setValue(Number(usd))}
             onKeyDown={(event) => {
               if (event.key !== 'Enter') return
               event.preventDefault()
@@ -153,6 +170,7 @@ function FillColumnPopover(props: FillColumnPopoverProps) {
 }
 
 type TaskMatrixTableProps = {
+  currency?: PricingCurrency
   entries: IndexedTaskMatrixRow[]
   enumFields: [string, BillingUsageFieldSchema][]
   numberFields: [string, BillingUsageFieldSchema][]
@@ -170,7 +188,11 @@ type TaskMatrixTableProps = {
 }
 
 function TaskMatrixTable(props: TaskMatrixTableProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const usageSchema = Object.fromEntries([
+    ...props.enumFields,
+    ...props.numberFields,
+  ])
   const visibleEnumFields = props.enumFields.filter(
     ([field]) => field !== props.hiddenEnumField
   )
@@ -179,21 +201,35 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
     <Table className='min-w-max'>
       <TableHeader>
         <TableRow>
-          {visibleEnumFields.map(([field]) => (
+          {visibleEnumFields.map(([field, definition]) => (
             <TableHead key={field} scope='col'>
-              <code>{field}</code>
+              <span className='block max-w-64 break-words whitespace-normal'>
+                {taskPriceLabel(definition.description, field, i18n.language)}
+              </span>
             </TableHead>
           ))}
           {props.numberFields.map(([field, definition]) => (
             <TableHead key={field} scope='col' className='min-w-40'>
               <div className='flex items-center justify-between gap-2'>
                 <div className='flex flex-col gap-0.5'>
-                  <code>{field}</code>
+                  <span className='max-w-64 break-words whitespace-normal'>
+                    {taskPriceLabel(
+                      definition.description,
+                      t('Unit price: {{field}}', { field }),
+                      i18n.language
+                    )}
+                  </span>
                   <span className='text-muted-foreground text-[11px] font-normal'>
-                    $/{t(getTaskUsagePriceUnitLabelKey(definition.unit))}
+                    {(props.currency ?? USD_PRICING_CURRENCY).symbol}/
+                    {taskUsageUnitLabel(
+                      definition,
+                      i18n.language,
+                      t(getTaskUsagePriceUnitLabelKey(definition.unit))
+                    )}
                   </span>
                 </div>
                 <FillColumnPopover
+                  currency={props.currency}
                   priceKey={field}
                   initialValue={props.firstRow.unitPrices[field] ?? 0}
                   onFillColumn={props.onFillColumn}
@@ -204,12 +240,19 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
           <TableHead scope='col' className='min-w-40'>
             <div className='flex items-center justify-between gap-2'>
               <div className='flex flex-col gap-0.5'>
-                <span>{t('Base charge')}</span>
+                <span>{t('Additional charge')}</span>
+                <span className='text-muted-foreground max-w-48 text-xs font-normal whitespace-normal'>
+                  {t(
+                    'Added to the usage cost. Set to 0 for no additional charge.'
+                  )}
+                </span>
                 <span className='text-muted-foreground text-[11px] font-normal'>
-                  $/{t('request')}
+                  {(props.currency ?? USD_PRICING_CURRENCY).symbol}/
+                  {t('request')}
                 </span>
               </div>
               <FillColumnPopover
+                currency={props.currency}
                 priceKey='constant'
                 initialValue={props.firstRow.constant}
                 onFillColumn={props.onFillColumn}
@@ -228,7 +271,15 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
             props.numberFields.every(
               ([field]) => !(entry.row.unitPrices[field] > 0)
             )
-          const rowLabel = taskMatrixRowLabel(entry.row.combination)
+          const rowLabel = taskPricingConditions(
+            Object.entries(entry.row.combination).map(([field, value]) => ({
+              field,
+              value,
+            })),
+            usageSchema,
+            i18n.language,
+            t
+          )
           return (
             <TableRow
               key={`${rowLabel}:${entry.index}`}
@@ -239,58 +290,93 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
             >
               {visibleEnumFields.map(([field]) => (
                 <TableCell key={field}>
-                  <code>{entry.row.combination[field]}</code>
+                  <span className='break-words whitespace-normal'>
+                    {entry.row.combination[field] === undefined
+                      ? '—'
+                      : taskEnumLabel(
+                          usageSchema[field],
+                          entry.row.combination[field],
+                          i18n.language
+                        )}
+                  </span>
                 </TableCell>
               ))}
               {props.numberFields.map(([field]) => (
                 <TableCell key={field}>
-                  <Input
-                    type='number'
-                    min={0}
-                    step={0.000001}
-                    value={entry.row.unitPrices[field] ?? 0}
-                    data-matrix-col={field}
-                    data-matrix-row={entry.index}
-                    aria-label={`${field}: ${rowLabel}`}
-                    onFocus={(event) => {
-                      if (Number(event.currentTarget.value) === 0) {
-                        event.currentTarget.select()
-                      }
-                    }}
-                    onChange={(event) => {
-                      const value = Number(event.target.value)
-                      props.onRowChange(entry.index, {
-                        ...entry.row,
-                        unitPrices: {
-                          ...entry.row.unitPrices,
-                          [field]:
-                            Number.isFinite(value) && value >= 0 ? value : 0,
-                        },
-                      })
-                    }}
-                    onKeyDown={(event) =>
-                      props.onPriceKeyDown(event, entry.index, field)
-                    }
-                    className='min-w-28 font-mono'
-                  />
+                  {/* 不适用的价格项不提供输入框，避免产生无效定价。 */}
+                  {getTaskUsageField(
+                    usageSchema[field],
+                    entry.row.combination
+                  ) ? (
+                    <>
+                      <PricingAmountInput
+                        currency={props.currency}
+                        min={0}
+                        step={0.000001}
+                        value={entry.row.unitPrices[field] ?? 0}
+                        data-matrix-col={field}
+                        data-matrix-row={entry.index}
+                        aria-label={`${taskPriceLabel(usageSchema[field]?.description, t('Unit price: {{field}}', { field }), i18n.language)}: ${rowLabel}`}
+                        onFocus={(event) => {
+                          if (Number(event.currentTarget.value) === 0) {
+                            event.currentTarget.select()
+                          }
+                        }}
+                        onChange={(usd) => {
+                          const value = Number(usd)
+                          props.onRowChange(entry.index, {
+                            ...entry.row,
+                            unitPrices: {
+                              ...entry.row.unitPrices,
+                              [field]:
+                                Number.isFinite(value) && value >= 0
+                                  ? value
+                                  : 0,
+                            },
+                          })
+                        }}
+                        onKeyDown={(event) =>
+                          props.onPriceKeyDown(event, entry.index, field)
+                        }
+                        className='min-w-28 font-mono'
+                      />
+                      {usageSchema[field]?.unit === 'count' && (
+                        <TaskFreeAllowanceInput
+                          label={`${taskPriceLabel(usageSchema[field].description, field, i18n.language)}: ${rowLabel}`}
+                          value={entry.row.freeAllowances?.[field] ?? 0}
+                          onChange={(value) =>
+                            props.onRowChange(entry.index, {
+                              ...entry.row,
+                              freeAllowances: {
+                                ...entry.row.freeAllowances,
+                                [field]: value,
+                              },
+                            })
+                          }
+                        />
+                      )}
+                    </>
+                  ) : (
+                    <span className='text-muted-foreground'>—</span>
+                  )}
                 </TableCell>
               ))}
               <TableCell>
-                <Input
-                  type='number'
+                <PricingAmountInput
+                  currency={props.currency}
                   min={0}
                   step={0.000001}
                   value={entry.row.constant}
                   data-matrix-col='constant'
                   data-matrix-row={entry.index}
-                  aria-label={`${t('Base charge')}: ${rowLabel}`}
+                  aria-label={`${t('Additional charge')}: ${rowLabel}`}
                   onFocus={(event) => {
                     if (Number(event.currentTarget.value) === 0) {
                       event.currentTarget.select()
                     }
                   }}
-                  onChange={(event) => {
-                    const value = Number(event.target.value)
+                  onChange={(usd) => {
+                    const value = Number(usd)
                     props.onRowChange(entry.index, {
                       ...entry.row,
                       constant:
@@ -341,7 +427,7 @@ type TaskMatrixGroupProps = Omit<TaskMatrixTableProps, 'hiddenEnumField'> & {
 }
 
 function TaskMatrixGroup(props: TaskMatrixGroupProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const freeCount = props.entries.filter(
     (entry) =>
       entry.row.constant === 0 &&
@@ -363,7 +449,13 @@ function TaskMatrixGroup(props: TaskMatrixGroupProps) {
         }
       >
         <span className='flex min-w-0 items-center gap-2'>
-          <code>{props.groupValue}</code>
+          <span className='break-words whitespace-normal'>
+            {taskEnumLabel(
+              Object.fromEntries(props.enumFields)[props.groupField],
+              props.groupValue,
+              i18n.language
+            )}
+          </span>
           <span className='text-muted-foreground text-xs'>
             {t('{{count}} combinations', { count: props.entries.length })}
           </span>
@@ -424,7 +516,17 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
   ) => {
     if (event.key !== 'Enter' || rowIndex >= props.rows.length - 1) return
     event.preventDefault()
-    const selector = `input[data-matrix-col="${CSS.escape(priceKey)}"][data-matrix-row="${rowIndex + 1}"]`
+    // 跳过该列不适用的行，保留连续录入价格的键盘操作。
+    const nextRowIndex = props.rows.findIndex(
+      (row, index) =>
+        index > rowIndex &&
+        (priceKey === 'constant' ||
+          Boolean(
+            getTaskUsageField(props.usageSchema[priceKey], row.combination)
+          ))
+    )
+    if (nextRowIndex < 0) return
+    const selector = `input[data-matrix-col="${CSS.escape(priceKey)}"][data-matrix-row="${nextRowIndex}"]`
     const nextInput =
       containerRef.current?.querySelector<HTMLInputElement>(selector)
     if (nextInput) {
@@ -433,7 +535,7 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
     }
 
     const nextGroupValue = firstEnumField
-      ? props.rows[rowIndex + 1]?.combination[firstEnumField[0]]
+      ? props.rows[nextRowIndex]?.combination[firstEnumField[0]]
       : undefined
     if (!shouldGroup || !nextGroupValue) return
     setOpenGroups((current) =>
@@ -463,6 +565,7 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
           <div className='flex flex-col gap-2'>
             {(firstEnumField[1].enum ?? []).map((groupValue) => (
               <TaskMatrixGroup
+                currency={props.currency}
                 key={groupValue}
                 entries={entries.filter(
                   (entry) =>
@@ -494,6 +597,7 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
           </div>
         ) : (
           <TaskMatrixTable
+            currency={props.currency}
             entries={entries}
             enumFields={enumFields}
             numberFields={numberFields}

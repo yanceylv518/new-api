@@ -1,3 +1,7 @@
+// Fast、Mini 的官方输出范围独立于标准版，元数据和提交校验共用此声明。
+const LOW_RESOLUTION_MODELS = ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615"];
+const LOW_RESOLUTIONS = ["480p", "720p"];
+
 export const meta = {
   apiVersion: 1,
   key: "doubao",
@@ -7,7 +11,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.0.1",
+  version: "1.1.1",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -22,27 +26,28 @@ export const meta = {
   ],
   fetchMode: "per_task",
   usageSchema: {
+    // Upstream billing tokens (estimated at submit, actual on completion).
     tokens: {
       type: "number",
       unit: "token",
-      description: {
-        en: "Upstream billing tokens (estimated at submit, actual on completion).",
-        zh: "上游计费 token（提交时预估，完成后按实际值）。",
-      },
+      description: { en: "Billing token unit price", zh: "计费 Token 单价" },
     },
+    // Output video resolution; Seedance token unit price varies by resolution tier.
     resolution: {
       enum: ["480p", "720p", "1080p", "4k"],
-      description: {
-        en: "Output video resolution; Seedance token unit price varies by resolution tier.",
-        zh: "输出视频分辨率；Seedance token 单价随分辨率档位变化。",
+      enumLabels: {
+        "480p": { en: "480p", zh: "480p" },
+        "720p": { en: "720p", zh: "720p" },
+        "1080p": { en: "1080p", zh: "1080p" },
+        "4k": { en: "4k", zh: "4k" },
       },
+      description: { en: "Output video resolution", zh: "输出视频分辨率" },
     },
+    // Whether the request includes reference video input; Seedance prices video-to-video tokens at a lower unit rate.
     video_input: {
       enum: ["none", "video"],
-      description: {
-        en: "Whether the request includes reference video input; Seedance prices video-to-video tokens at a lower unit rate.",
-        zh: "请求是否包含参考视频输入；Seedance 对视频生视频 token 按更低单价计费。",
-      },
+      enumLabels: { none: { en: "No reference video", zh: "无参考视频" }, video: { en: "With reference video", zh: "有参考视频" } },
+      description: { en: "Reference video input", zh: "参考视频输入" },
     },
   },
   // Official Ark formula tokens = (input + output seconds) × W × H × 24 / 1024,
@@ -58,9 +63,32 @@ export const meta = {
   routes: [
     { method: "POST", path: "/doubao/api/v3/contents/generations/tasks", type: "submit", decode: "createTask", render: "taskCreated" },
     { method: "GET", path: "/doubao/api/v3/contents/generations/tasks/:task_id", type: "query", render: "taskStatus" },
+    { method: "GET", path: "/doubao/api/v3/contents/generations/tasks", type: "dynamic", action: "list", decode: "listTasks", render: "taskList" },
+    {
+      method: "DELETE",
+      path: "/doubao/api/v3/contents/generations/tasks/:task_id",
+      type: "dynamic",
+      action: "delete",
+      decode: "deleteTask",
+      render: "taskDeleted",
+    },
   ],
   protocols: [{ name: "openai_responses", supports: ["stream", "sync", "background"] }, "openai_video"],
 };
+
+// profile 完整替换默认 schema/examples，避免价格矩阵和计算器仍展开无效分辨率。
+meta.usageProfiles = [
+  {
+    models: LOW_RESOLUTION_MODELS,
+    schema: Object.assign({}, meta.usageSchema, {
+      resolution: {
+        enum: LOW_RESOLUTIONS,
+        description: meta.usageSchema.resolution.description,
+      },
+    }),
+    examples: meta.usageExamples.filter((example) => LOW_RESOLUTIONS.includes(example.facts.resolution)),
+  },
+];
 
 function trimmed(value) {
   return String(value || "").trim();
@@ -111,6 +139,19 @@ function normalizeResolution(value) {
   if (max >= 1920) return "1080p";
   if (max >= 1280) return "720p";
   return "480p";
+}
+
+// 统一原生、兼容接口及最终渠道映射后的分辨率校验，缺省时按模型可用上限预估。
+function requestResolution(model, req) {
+  const metadata = req.metadata || {};
+  const raw = trimmed(metadata.resolution || req.resolution || req.size).toLowerCase();
+  const restricted = LOW_RESOLUTION_MODELS.includes(trimmed(model).toLowerCase());
+  const recognized = ["480p", "720p", "1080p", "4k"].includes(raw) || /^\d+[x*]\d+$/.test(raw);
+  const resolution = recognized ? normalizeResolution(raw) : restricted ? "720p" : "1080p";
+  if (restricted && raw && (!recognized || !LOW_RESOLUTIONS.includes(resolution))) {
+    throw new Error(model + " only supports 480p and 720p resolution");
+  }
+  return resolution;
 }
 
 function hasVideo(content) {
@@ -196,6 +237,20 @@ function responsesVideoText(ctx) {
   return '<video controls src="' + escaped + '"></video>';
 }
 
+// 原生单查和列表共用任务视图；取消后的本地状态优先于尚未更新的上游快照。
+function nativeTask(task) {
+  const data = task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : {};
+  const output = Object.assign({}, data, { id: task.task_id });
+  const statusMap = { NOT_START: "queued", SUBMITTED: "queued", QUEUED: "queued", IN_PROGRESS: "running", SUCCESS: "succeeded", FAILURE: "failed" };
+  output.status = statusMap[task.status] || "queued";
+  if (task.fail_reason === "task cancelled by user") output.status = "cancelled";
+  else if (task.status === "FAILURE" && data.status === "expired") output.status = "expired";
+  if (!output.created_at && task.created_at) output.created_at = task.created_at;
+  if (!output.updated_at && task.updated_at) output.updated_at = task.updated_at;
+  if (task.fail_reason && output.status === "failed" && !output.error) output.error = { message: task.fail_reason };
+  return output;
+}
+
 export const native = {
   createTask: function (ctx) {
     if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
@@ -203,6 +258,14 @@ export const native = {
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
     const model = trimmed(body.model);
     if (!model) throw new Error("model is required");
+    requestResolution(model, { metadata: body });
+    // 原生数值字段保持官方类型；智能时长 -1 保留，拒绝绕过预扣估算的异常数量。
+    if (body.duration !== undefined && (!Number.isInteger(body.duration) || (body.duration !== -1 && (body.duration < 2 || body.duration > 30)))) {
+      throw new Error("duration must be -1 or an integer between 2 and 30");
+    }
+    if (body.frames !== undefined && (!Number.isInteger(body.frames) || body.frames < 29 || body.frames > 289 || (body.frames - 25) % 4 !== 0)) {
+      throw new Error("frames must be an integer between 29 and 289 matching 25 + 4n");
+    }
     if (body.content !== undefined && !Array.isArray(body.content)) throw new Error("content must be an array");
     const content = Array.isArray(body.content) ? body.content : [];
     const texts = [];
@@ -230,15 +293,53 @@ export const native = {
     return intent;
   },
   taskCreated: function (ctx, task) {
-    const data = task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : {};
-    return Object.assign({}, data, { id: task.task_id });
+    return { id: task.task_id };
   },
   taskStatus: function (ctx, task) {
-    if (task.data && typeof task.data === "object" && !Array.isArray(task.data)) return Object.assign({}, task.data, { id: task.task_id });
-    const statusMap = { NOT_START: "queued", SUBMITTED: "queued", QUEUED: "queued", IN_PROGRESS: "running", SUCCESS: "succeeded", FAILURE: "failed" };
-    const output = { id: task.task_id, status: statusMap[task.status] || "queued" };
-    if (task.fail_reason) output.error = { message: task.fail_reason };
-    return output;
+    return nativeTask(task);
+  },
+  // 官方列表只覆盖最近七天；宿主按用户归属查询本地任务，避免共享渠道泄漏其他用户记录。
+  listTasks: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "none") throw new Error("request body is not allowed");
+    const query = ctx.query || {};
+    const allowed = ["page_num", "page_size", "filter.model", "filter.status", "filter.service_tier", "filter.task_ids"];
+    for (const key of Object.keys(query)) {
+      if (!allowed.includes(key)) throw new Error("unsupported query parameter: " + key);
+      if (key !== "filter.task_ids" && query[key].length !== 1) throw new Error(key + " must be provided once");
+    }
+    const model = trimmed((query["filter.model"] || [""])[0]);
+    if (model.length > 191) throw new Error("filter.model is too long");
+    const serviceTier = (query["filter.service_tier"] || ["default"])[0];
+    if (!["default", "flex"].includes(serviceTier)) throw new Error("filter.service_tier must be default or flex");
+    const status = (query["filter.status"] || [""])[0];
+    if (!["", "queued", "running", "cancelled", "succeeded", "failed"].includes(status)) throw new Error("filter.status is invalid");
+    const pagination = {};
+    for (const field of ["page_num", "page_size"]) {
+      const raw = (query[field] || [field === "page_num" ? "1" : "20"])[0];
+      if (!/^\d+$/.test(raw) || Number(raw) < 1 || Number(raw) > 500) throw new Error(field + " must be an integer between 1 and 500");
+      pagination[field] = Number(raw);
+    }
+    const taskIds = query["filter.task_ids"] || [];
+    if (taskIds.length > 100 || taskIds.some((id) => !trimmed(id) || id.length > 191)) throw new Error("filter.task_ids is invalid");
+    return {
+      kind: "query",
+      model: model,
+      taskIds: taskIds.map(trimmed),
+      listOptions: { pageNum: pagination.page_num, pageSize: pagination.page_size, serviceTier: serviceTier, lookbackSeconds: 604800 },
+    };
+  },
+  taskList: function (ctx, result) {
+    return { items: result.items.map(nativeTask), total: result.total };
+  },
+  deleteTask: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "none") throw new Error("request body is not allowed");
+    const taskId = trimmed(ctx.params && ctx.params.task_id);
+    if (!taskId) throw new Error("task_id is required");
+    return { kind: "delete", taskId: taskId };
+  },
+  taskDeleted: function () {
+    // 方舟官方 DELETE 的成功响应固定为空 JSON 对象。
+    return {};
   },
   error: function (ctx, error) {
     return { error: { code: error.code, message: error.message } };
@@ -253,13 +354,19 @@ export function buildSubmitRequest(ctx) {
   const images = Array.isArray(req.images) ? req.images : [];
   for (const url of images) imageContent.push({ type: "image_url", image_url: { url: url } });
   const metadataContent = Array.isArray(body.content) ? body.content : [];
-  body.content = imageContent.concat(metadataContent).filter((item) => item && item.type !== "text");
-  const hasReference = body.content.length > 0;
-  if (trimmed(req.prompt) || !hasReference) body.content.push({ type: "text", text: req.prompt || "" });
+  // 原生 content 的顺序、多个文本项和素材引用都必须原样保留。
+  body.content = imageContent.concat(metadataContent);
+  const hasReference = body.content.some((item) => item && item.type !== "text");
+  if (!metadataContent.some((item) => item && item.type === "text") && (trimmed(req.prompt) || !hasReference))
+    body.content.push({ type: "text", text: req.prompt || "" });
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
   const seconds = Number.parseInt(req.seconds || "", 10);
   if (seconds > 0) body.duration = seconds;
   body.model = ctx.upstreamModel || body.model;
+  // 渠道别名映射后再次校验；兼容接口的 size/resolution 必须与实际发往上游的值一致。
+  requestResolution(body.model, req);
+  if (!body.resolution && req.resolution) body.resolution = req.resolution;
+  if (!body.resolution && req.size) body.resolution = normalizeResolution(req.size);
   return {
     url: ctx.baseUrl + "/api/v3/contents/generations/tasks",
     method: "POST",
@@ -272,27 +379,27 @@ export function buildSubmitRequest(ctx) {
 
 export function parseSubmitResponse(ctx, resp) {
   if (!resp.body || !resp.body.id) throw new Error("task_id is empty");
-  return { taskId: resp.body.id, taskData: resp.body };
+  // 提交响应只有 ID，先保存服务等级，使第一次轮询前的列表筛选也准确。
+  const metadata = (ctx.requestBody && ctx.requestBody.metadata) || {};
+  return { taskId: resp.body.id, taskData: Object.assign({ service_tier: metadata.service_tier || "default" }, resp.body) };
 }
 
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
   const metadata = req.metadata || {};
+  const resolution = requestResolution(ctx.upstreamModel || ctx.model || req.model, req);
   if (ctx.usagePurpose === "billing_ratios") {
-    const ratio = videoInputRatio(ctx.upstreamModel || ctx.model, metadata.resolution, metadata.content);
+    const ratio = videoInputRatio(ctx.upstreamModel || ctx.model, metadata.resolution || req.resolution || (req.size ? resolution : ""), metadata.content);
     return ratio === 1 ? null : { video_input_ratio: ratio };
   }
-  let seconds = Number(req.seconds || req.duration || metadata.duration || 0);
+  // 官方 frames 优先于 duration；非整数秒不能向下取整后少预扣。
+  const frames = Number(metadata.frames);
+  let seconds = Number.isFinite(frames) && frames > 0 ? frames / 24 : Number(req.seconds || req.duration || metadata.duration || 0);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    const frames = Number(metadata.frames);
-    seconds = Number.isFinite(frames) && frames > 0 ? Math.floor(frames / 24) : 15;
+    seconds = (ctx.upstreamModel || ctx.model || req.model) === "doubao-seedance-2-5-260628" ? 30 : 15;
   }
   if (seconds <= 0) seconds = 5;
   seconds = Math.min(seconds, 3600);
-  const rawResolution = metadata.resolution || req.size;
-  const raw = trimmed(rawResolution).toLowerCase();
-  const recognized = ["480p", "720p", "1080p", "4k"].includes(raw) || raw.replace("*", "x").split("x").length === 2;
-  const resolution = recognized ? normalizeResolution(rawResolution) : "1080p";
   return {
     tokens: estimateTokens(seconds, resolution),
     resolution: resolution,
@@ -302,10 +409,34 @@ export function extractUsage(ctx) {
 
 export function buildQueryRequest(ctx) {
   return {
-    url: ctx.baseUrl + "/api/v3/contents/generations/tasks/" + ctx.taskId,
+    url: ctx.baseUrl + "/api/v3/contents/generations/tasks/" + encodeURIComponent(ctx.taskId),
     method: "GET",
     headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
   };
+}
+
+// 管理操作继续使用渠道密钥和真实上游任务 ID，客户端只持有网关公开 ID。
+export function buildTaskActionRequest(ctx) {
+  if (ctx.operation !== "delete") throw new Error("unsupported task operation");
+  return {
+    url: ctx.baseUrl + "/api/v3/contents/generations/tasks/" + encodeURIComponent(ctx.taskId),
+    method: "DELETE",
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
+  };
+}
+
+// 空成功响应不区分取消和删除；非终态必须由宿主再次查询确认，不能凭提交前状态直接退款。
+export function parseTaskActionResponse(ctx, response) {
+  if (
+    response.statusCode !== 200 ||
+    !response.body ||
+    typeof response.body !== "object" ||
+    Array.isArray(response.body) ||
+    Object.keys(response.body).length !== 0
+  ) {
+    throw new Error("unexpected task deletion response");
+  }
+  return { action: ctx.status === "SUCCESS" || ctx.status === "FAILURE" ? "deleted" : "unknown" };
 }
 
 export function parseTaskResult(ctx, body) {
@@ -321,7 +452,7 @@ export function parseTaskResult(ctx, body) {
     return result;
   }
   if (body.status === "failed" || body.status === "expired" || body.status === "cancelled") {
-    const reason = body.error && body.error.message ? body.error.message : body.status;
+    const reason = body.status === "cancelled" ? "task cancelled by user" : body.error && body.error.message ? body.error.message : body.status;
     return { status: "FAILURE", progress: "100%", reason: reason };
   }
   return { status: "UNKNOWN", reason: "unrecognized status: " + String(body.status || "") };
@@ -386,6 +517,7 @@ export const protocols = {
       if (Object.prototype.hasOwnProperty.call(req, "resolution")) metadata.resolution = req.resolution;
       else if (req.size && !metadata.resolution) metadata.resolution = normalizeResolution(req.size);
       const requestBody = { model: model, prompt: prompt, metadata: metadata };
+      requestResolution(model, requestBody);
       if (images.length) requestBody.images = images;
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.seconds = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
@@ -452,6 +584,7 @@ protocols.openai_video = {
     if (ctx.body.kind === "json") {
       if (!ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
       const req = ctx.body.value;
+      requestResolution(ctx.model, req);
       const seconds = req.seconds === undefined ? req.duration : req.seconds;
       if (seconds !== undefined && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600))
         throw new Error("seconds must be between 1 and 3600");
@@ -483,6 +616,7 @@ protocols.openai_video = {
       req.metadata = parsed;
     }
     if ((ctx.body.files || []).length) throw new Error("Doubao requires image and video references to be URLs inside metadata.content");
+    requestResolution(ctx.model, req);
     if (req.seconds !== undefined) req.seconds = Number(req.seconds);
     else if (req.duration !== undefined) req.seconds = Number(req.duration);
     const seconds = req.seconds === undefined ? req.duration : req.seconds;

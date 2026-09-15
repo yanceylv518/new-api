@@ -114,6 +114,17 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, bindi
 			c.Writer.Status(),
 		)
 	}
+	// 管理接口操作已有任务，不重新选渠道或预扣费；控制器按原任务归属校验。
+	if binding.Route.Type == jsplugin.RouteTypeDynamic && (binding.Route.Action == "list" || binding.Route.Action == "delete") {
+		return []gin.HandlerFunc{
+			pinRoute,
+			middleware.TokenAuth(),
+			middleware.SystemPerformanceCheck(),
+			middleware.ModelRequestRateLimit(),
+			middleware.PrepareTaskPluginRoute(),
+			controller.RelayTaskPluginNativeAction,
+		}
+	}
 	return []gin.HandlerFunc{
 		pinRoute,
 		middleware.TokenAuth(),
@@ -542,11 +553,8 @@ func routePatternsIntersect(leftPath, rightPath string) bool {
 func routesGinCompatible(leftPath, rightPath string) bool {
 	left := parseRoutePattern(leftPath)
 	right := parseRoutePattern(rightPath)
-	limit := len(left)
-	if len(right) < limit {
-		limit = len(right)
-	}
-	for index := 0; index < limit; index++ {
+	limit := min(len(right), len(left))
+	for index := range limit {
 		leftSegment := left[index]
 		rightSegment := right[index]
 		if !leftSegment.dynamic && !rightSegment.dynamic {

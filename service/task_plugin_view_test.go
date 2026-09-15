@@ -35,6 +35,7 @@ func TestBuildTaskPluginViewRewritesOnlyStructuredTaskIDFields(t *testing.T) {
 	require.NoError(t, err)
 	task := &model.Task{
 		TaskID: publicTaskID,
+		Action: "context_ir",
 		PrivateData: model.TaskPrivateData{
 			UpstreamTaskID: privateTaskID,
 		},
@@ -52,6 +53,7 @@ func TestBuildTaskPluginViewRewritesOnlyStructuredTaskIDFields(t *testing.T) {
 	assert.Equal(t, resultURL, data["url"])
 	assert.Equal(t, "completed upstream-task-123", data["message"])
 	assert.Equal(t, "opaque map key", data[privateTaskID])
+	assert.Equal(t, "context_ir", view.Action)
 
 	nested, ok := data["nested"].([]any)
 	require.True(t, ok)

@@ -58,6 +58,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
 
 import { getTaskArtifacts } from '../api'
@@ -323,7 +324,8 @@ function TaskArtifacts(props: TaskArtifactsProps) {
   const { t } = useTranslation()
   const artifactsQuery = useQuery({
     queryKey: ['usage-logs', 'task-artifacts', props.taskId],
-    queryFn: ({ signal }) => getTaskArtifacts(props.taskId, signal),
+    queryFn: async ({ signal }) =>
+      requireServerSuccess(await getTaskArtifacts(props.taskId, signal)),
     enabled: props.enabled,
     retry: false,
     staleTime: 30_000,

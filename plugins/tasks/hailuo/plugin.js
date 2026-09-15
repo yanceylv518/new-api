@@ -1,13 +1,105 @@
+// 视频时长是所有视频模型共有的计费数量，具体模型的可选分辨率由 profile 限定。
+const VIDEO_SECONDS_FIELD = {
+  type: "number",
+  unit: "second",
+  description: { en: "Video generation unit price", zh: "视频生成单价" },
+};
+
+const RESOLUTION_DESCRIPTION = { en: "Output video resolution", zh: "输出视频分辨率" };
+
+// H3 再生成需要一个可供表达式区分的操作枚举，字段值是事实而不是价格。
+const H3_OPERATION_FIELD = {
+  enum: ["generation", "regeneration", "context_ir"],
+  enumLabels: {
+    generation: { en: "Generation", zh: "普通生成" },
+    regeneration: { en: "Regeneration", zh: "视频再生成" },
+    context_ir: { en: "H3-Context-IR", zh: "H3-Context-IR" },
+  },
+  description: { en: "Video operation", zh: "视频操作" },
+};
+
+// H3 普通生成与再生成共用时长、分辨率和输入媒体计费维度。
+const H3_USAGE_SCHEMA = {
+  seconds: VIDEO_SECONDS_FIELD,
+  resolution: {
+    enum: ["768P", "2K"],
+    description: RESOLUTION_DESCRIPTION,
+  },
+  input_images: {
+    type: "number",
+    unit: "count",
+    unitLabel: { en: "image", zh: "张" },
+    description: { en: "Input image unit price", zh: "输入图片单价" },
+  },
+  input_video_seconds: {
+    type: "number",
+    unit: "second",
+    description: { en: "Input video unit price", zh: "输入视频单价" },
+  },
+};
+
+// 按操作声明有效的计费字段，避免价格编辑器生成“再生成 768P”或为文本任务按秒定价。
+const H3_VIDEO_PRICE_WHEN = [{ field: "operation", values: ["generation", "regeneration"] }];
+const H3_BILLING_USAGE_SCHEMA = {
+  operation: H3_OPERATION_FIELD,
+  resolution: Object.assign({}, H3_USAGE_SCHEMA.resolution, {
+    when: [
+      { field: "operation", values: ["generation"] },
+      { field: "operation", values: ["regeneration"], enum: ["2K"] },
+    ],
+  }),
+  // 显式声明价格列顺序，避免后端 map 序列化将视频单价挤到素材价格之后。
+  seconds: Object.assign({}, VIDEO_SECONDS_FIELD, { displayOrder: 10, when: H3_VIDEO_PRICE_WHEN }),
+  input_images: Object.assign({}, H3_USAGE_SCHEMA.input_images, { displayOrder: 40, when: H3_VIDEO_PRICE_WHEN }),
+  input_video_seconds: Object.assign({}, H3_USAGE_SCHEMA.input_video_seconds, { displayOrder: 50, when: H3_VIDEO_PRICE_WHEN }),
+  // 官方 usage 分别报告 prompt_tokens 和 completion_tokens，均按百万 Token 编辑单价。
+  prompt_tokens: {
+    type: "number",
+    unit: "token",
+    displayOrder: 20,
+    description: { en: "H3-Context-IR input token unit price", zh: "H3-Context-IR 输入 Token 单价" },
+    when: [{ field: "operation", values: ["context_ir"] }],
+  },
+  completion_tokens: {
+    type: "number",
+    unit: "token",
+    displayOrder: 30,
+    description: { en: "H3-Context-IR output token unit price", zh: "H3-Context-IR 输出 Token 单价" },
+    when: [{ field: "operation", values: ["context_ir"] }],
+  },
+};
+
+// 2.3/02 和 01 系列保留原有 profile，避免 H3 专用字段污染其他模型的价格编辑器。
+const HAILUO_23_USAGE_SCHEMA = {
+  seconds: VIDEO_SECONDS_FIELD,
+  resolution: {
+    enum: ["768P", "1080P"],
+    description: RESOLUTION_DESCRIPTION,
+  },
+};
+
+const HAILUO_02_USAGE_SCHEMA = {
+  seconds: VIDEO_SECONDS_FIELD,
+  resolution: {
+    enum: ["512P", "768P", "1080P"],
+    description: RESOLUTION_DESCRIPTION,
+  },
+};
+
+const HAILUO_01_USAGE_SCHEMA = {
+  seconds: VIDEO_SECONDS_FIELD,
+};
+
 export const meta = {
   apiVersion: 1,
   key: "hailuo",
   name: "Hailuo Video",
   icon: "Hailuo.Color",
   description: {
-    en: "MiniMax Hailuo video generation (text-to-video, image-to-video, and MiniMax-H3 multimodal reference)",
-    zh: "MiniMax 海螺视频生成（文生视频、图生视频、MiniMax-H3 多模态参考生视频）",
+    en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
+    zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.1.2",
+  version: "1.3.4",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -23,36 +115,13 @@ export const meta = {
     "S2V-01",
   ],
   fetchMode: "per_task",
-  usageSchema: {
-    seconds: {
-      type: "number",
-      unit: "second",
-      description: {
-        en: "Requested video duration in seconds. MiniMax-H3 allows 4 to 15; Hailuo 2.3/02/2.3-Fast allow 6 or 10; 01-series allow 6.",
-        zh: "请求的视频时长，单位为秒。MiniMax-H3 允许 4 到 15；Hailuo 2.3/02/2.3-Fast 允许 6 或 10；01 系列允许 6。",
-      },
-    },
+  // 未映射别名使用全部模型维度，具体模型优先使用下方 profile。
+  usageSchema: Object.assign({}, H3_USAGE_SCHEMA, {
     resolution: {
       enum: ["512P", "768P", "720P", "1080P", "2K"],
-      description: { en: "Requested output video resolution.", zh: "请求的输出视频分辨率。" },
+      description: RESOLUTION_DESCRIPTION,
     },
-    input_images: {
-      type: "number",
-      unit: "count",
-      description: {
-        en: "H3 input image count (estimated at submit, actual on completion).",
-        zh: "H3 输入图片数量（提交时预估，完成后按实际值）。",
-      },
-    },
-    input_video_seconds: {
-      type: "number",
-      unit: "second",
-      description: {
-        en: "H3 input video duration in seconds (reserved at the request maximum, actual on completion).",
-        zh: "H3 输入视频时长，单位为秒（提交时按请求上限预留，完成后按实际值）。",
-      },
-    },
-  },
+  }),
   usageExamples: [
     { label: "2.3/02 768P 6s", facts: { seconds: 6, resolution: "768P", input_images: 0, input_video_seconds: 0 } },
     { label: "2.3/02 768P 10s", facts: { seconds: 10, resolution: "768P", input_images: 0, input_video_seconds: 0 } },
@@ -63,6 +132,130 @@ export const meta = {
     { label: "H3 768P 5s", facts: { seconds: 5, resolution: "768P", input_images: 0, input_video_seconds: 0 } },
     { label: "H3 2K 5s · 9 images", facts: { seconds: 5, resolution: "2K", input_images: 9, input_video_seconds: 0 } },
     { label: "H3 2K 5s · input video", facts: { seconds: 5, resolution: "2K", input_images: 0, input_video_seconds: 15 } },
+  ],
+  usageProfiles: [
+    {
+      models: ["MiniMax-H3"],
+      schema: H3_BILLING_USAGE_SCHEMA,
+      examples: [
+        {
+          label: "H3 generation 768P 5s",
+          facts: {
+            seconds: 5,
+            resolution: "768P",
+            input_images: 0,
+            input_video_seconds: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            operation: "generation",
+          },
+        },
+        {
+          label: "H3 generation 2K 5s",
+          facts: {
+            seconds: 5,
+            resolution: "2K",
+            input_images: 0,
+            input_video_seconds: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            operation: "generation",
+          },
+        },
+        {
+          label: "H3 regeneration 2K 5s",
+          facts: {
+            seconds: 5,
+            resolution: "2K",
+            input_images: 0,
+            input_video_seconds: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            operation: "regeneration",
+          },
+        },
+        {
+          label: "H3 regeneration 2K 9 images",
+          facts: {
+            seconds: 5,
+            resolution: "2K",
+            input_images: 9,
+            input_video_seconds: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            operation: "regeneration",
+          },
+        },
+        {
+          label: "H3-Context-IR 5664 input + 3426 output tokens",
+          facts: {
+            seconds: 0,
+            resolution: "768P",
+            input_images: 0,
+            input_video_seconds: 0,
+            prompt_tokens: 5664,
+            completion_tokens: 3426,
+            operation: "context_ir",
+          },
+        },
+      ],
+    },
+    {
+      models: ["MiniMax-Hailuo-2.3", "MiniMax-Hailuo-2.3-Fast"],
+      schema: HAILUO_23_USAGE_SCHEMA,
+      examples: [
+        { label: "2.3 768P 6s", facts: { seconds: 6, resolution: "768P" } },
+        { label: "2.3 768P 10s", facts: { seconds: 10, resolution: "768P" } },
+        { label: "2.3 1080P 6s", facts: { seconds: 6, resolution: "1080P" } },
+      ],
+    },
+    {
+      models: ["MiniMax-Hailuo-02"],
+      schema: HAILUO_02_USAGE_SCHEMA,
+      examples: [
+        { label: "02 512P 6s", facts: { seconds: 6, resolution: "512P" } },
+        { label: "02 512P 10s", facts: { seconds: 10, resolution: "512P" } },
+        { label: "02 768P 6s", facts: { seconds: 6, resolution: "768P" } },
+        { label: "02 768P 10s", facts: { seconds: 10, resolution: "768P" } },
+        { label: "02 1080P 6s", facts: { seconds: 6, resolution: "1080P" } },
+      ],
+    },
+    {
+      models: ["T2V-01-Director", "T2V-01", "I2V-01-Director", "I2V-01-live", "I2V-01", "S2V-01"],
+      schema: HAILUO_01_USAGE_SCHEMA,
+      examples: [{ label: "01-series 720P 6s", facts: { seconds: 6 } }],
+    },
+  ],
+  routes: [
+    { method: "POST", path: "/hailuo/v2/video_generation", type: "submit", models: ["MiniMax-H3"], decode: "createH3VideoTask", render: "h3TaskCreated" },
+    { method: "GET", path: "/hailuo/v2/query/video_generation/:task_id", type: "query", models: ["MiniMax-H3"], render: "h3TaskStatus" },
+    {
+      method: "GET",
+      path: "/hailuo/v2/query/video_generation",
+      type: "dynamic",
+      action: "list",
+      models: ["MiniMax-H3"],
+      decode: "decodeH3TaskList",
+      render: "h3TaskList",
+    },
+    {
+      method: "DELETE",
+      path: "/hailuo/v2/video_generation/:task_id",
+      type: "dynamic",
+      action: "delete",
+      models: ["MiniMax-H3"],
+      decode: "decodeH3TaskDelete",
+      render: "h3TaskDeleted",
+    },
+    { method: "POST", path: "/hailuo/v2/h3_context_ir", type: "submit", models: ["MiniMax-H3"], decode: "createH3ContextIRTask", render: "h3TaskCreated" },
+    {
+      method: "POST",
+      path: "/hailuo/v2/video_regeneration",
+      type: "submit",
+      models: ["MiniMax-H3"],
+      decode: "createH3RegenerationTask",
+      render: "h3TaskCreated",
+    },
   ],
   protocols: [{ name: "openai_responses", supports: ["stream", "sync", "background"] }, "openai_video"],
 };
@@ -126,6 +319,17 @@ const H3_MAX_REFERENCE_VIDEOS = 3;
 const H3_MAX_REFERENCE_AUDIOS = 3;
 const H3_MAX_INPUT_VIDEO_SECONDS = 15;
 const H3_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
+const H3_REGENERATION_ACTION = "regeneration";
+const H3_CONTEXT_IR_ACTION = "context_ir";
+const H3_GENERATION_OPERATION = "generation";
+const H3_REGENERATION_OPERATION = "regeneration";
+const H3_CONTEXT_IR_OPERATION = "context_ir";
+// 官方 task_type 与内部计费 operation 使用不同名称，不能直接互换。
+const H3_CONTEXT_IR_TASK_TYPE = "h3_context_ir";
+const H3_REGENERATION_RESOLUTION = "2K";
+// 输出增强提示词无法事先分词，沿用原有固定预留量作为输出估算。
+const H3_CONTEXT_IR_ESTIMATED_OUTPUT_TOKENS = 10000;
+const H3_CONTEXT_IR_MAX_TOKENS = 2147483647;
 
 // MiniMax-H3 speaks the /v2 video generation contract: a multimodal `content`
 // array instead of flat frame fields, an explicit `ratio`, 768P/2K resolutions,
@@ -240,12 +444,321 @@ function validateH3Content(items) {
 
 // metadata.content is the full multimodal passthrough; otherwise the content
 // array is assembled from prompt, frame images, and reference media.
+// 读取 H3 的完整 content，兼容 OpenAI Video 顶层字段和历史 metadata 字段。
+function h3RequestContent(req) {
+  const metadata = (req && req.metadata) || {};
+  if (req && Object.prototype.hasOwnProperty.call(req, "content")) return req.content;
+  if (Object.prototype.hasOwnProperty.call(metadata, "content")) return metadata.content;
+  return undefined;
+}
+
+// 统一校验再生成使用的源任务标识，后续只接受网关公开的任务 ID。
+function h3SourceTaskID(req) {
+  const value = req && req.source_task_id;
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string" || !trimmed(value)) throw new Error(H3_MODEL + " source_task_id must be a non-empty string");
+  return trimmed(value);
+}
+
+function h3MediaURL(item, key) {
+  const media = item && item[key];
+  if (typeof media === "string") return trimmed(media);
+  if (media && typeof media === "object" && !Array.isArray(media)) return trimmed(media.url);
+  return "";
+}
+
+function h3HasBaseVideo(req) {
+  const content = h3RequestContent(req);
+  if (!Array.isArray(content)) return false;
+  return content.some(function (item) {
+    return item && typeof item === "object" && item.type === "video_url" && trimmed(item.role) === "base_video";
+  });
+}
+
+// 再生成允许保留原始输入，同时把 base_video 从普通参考视频计数中排除。
+function validateH3RegenerationContent(items) {
+  if (!Array.isArray(items)) throw new Error(H3_MODEL + " regeneration content must be an array");
+  let hasText = false;
+  let hasFrame = false;
+  let hasReference = false;
+  let baseVideos = 0;
+  let firstFrames = 0;
+  let lastFrames = 0;
+  let referenceImages = 0;
+  let referenceVideos = 0;
+  let referenceAudios = 0;
+  let inputImages = 0;
+  for (const item of items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(H3_MODEL + " regeneration content items must be objects");
+    const type = trimmed(item.type);
+    const role = trimmed(item.role);
+    if (type === "text") {
+      if (trimmed(item.text)) hasText = true;
+      continue;
+    }
+    if (type === "image_url") {
+      if (!h3MediaURL(item, "image_url")) throw new Error(H3_MODEL + " image_url must include a URL");
+      inputImages += 1;
+      if (!role || role === "first_frame") {
+        firstFrames += 1;
+        hasFrame = true;
+      } else if (role === "last_frame") {
+        lastFrames += 1;
+        hasFrame = true;
+      } else if (role === "middle_frame") {
+        hasFrame = true;
+      } else if (role === "reference_image") {
+        referenceImages += 1;
+        hasReference = true;
+      } else {
+        throw new Error(H3_MODEL + " image role is invalid");
+      }
+      continue;
+    }
+    if (type === "video_url") {
+      if (!h3MediaURL(item, "video_url")) throw new Error(H3_MODEL + " video_url must include a URL");
+      if (role === "base_video") {
+        baseVideos += 1;
+      } else {
+        if (role && role !== "reference_video") throw new Error(H3_MODEL + " video role is invalid");
+        referenceVideos += 1;
+        hasReference = true;
+      }
+      continue;
+    }
+    if (type === "audio_url") {
+      if (!h3MediaURL(item, "audio_url")) throw new Error(H3_MODEL + " audio_url must include a URL");
+      if (role && role !== "reference_audio") throw new Error(H3_MODEL + " audio role is invalid");
+      referenceAudios += 1;
+      hasReference = true;
+      continue;
+    }
+    throw new Error(H3_MODEL + " regeneration content type is invalid");
+  }
+  if (!hasText) throw new Error(H3_MODEL + " regeneration requires a non-empty text item");
+  if (baseVideos !== 1) throw new Error(H3_MODEL + " regeneration requires exactly one base_video item");
+  if (firstFrames > 1) throw new Error(H3_MODEL + " accepts at most one first_frame image");
+  if (lastFrames > 1) throw new Error(H3_MODEL + " accepts at most one last_frame image");
+  if (referenceImages > H3_MAX_REFERENCE_IMAGES || inputImages > H3_MAX_REFERENCE_IMAGES)
+    throw new Error(H3_MODEL + " accepts at most " + H3_MAX_REFERENCE_IMAGES + " images");
+  if (referenceVideos > H3_MAX_REFERENCE_VIDEOS) throw new Error(H3_MODEL + " accepts at most " + H3_MAX_REFERENCE_VIDEOS + " reference videos");
+  if (referenceAudios > H3_MAX_REFERENCE_AUDIOS) throw new Error(H3_MODEL + " accepts at most " + H3_MAX_REFERENCE_AUDIOS + " reference audios");
+  if (hasFrame && hasReference) throw new Error(H3_MODEL + " cannot mix frame images with reference media");
+  return items;
+}
+
+// 官方再生成要求 content 保留源视频生成时的最终输入，缺少文本时使用兼容层的 prompt。
+function h3RegenerationContent(req, fallbackPrompt) {
+  const raw = h3RequestContent(req);
+  if (!Array.isArray(raw)) throw new Error(H3_MODEL + " regeneration requires content with a base_video item");
+  const items = raw.slice();
+  const hasText = items.some(function (item) {
+    return item && item.type === "text" && trimmed(item.text);
+  });
+  const prompt = trimmed(req && req.prompt) || trimmed(fallbackPrompt);
+  if (!hasText && prompt) items.unshift({ type: "text", text: prompt });
+  return validateH3RegenerationContent(items);
+}
+
+function h3RegenerationResolution(req) {
+  const metadata = (req && req.metadata) || {};
+  const raw = req && req.resolution !== undefined ? req.resolution : req && req.size !== undefined ? req.size : metadata.resolution;
+  if (raw === undefined || raw === null || raw === "") return H3_REGENERATION_RESOLUTION;
+  if (trimmed(raw).toUpperCase() !== H3_REGENERATION_RESOLUTION) throw new Error(H3_MODEL + " regeneration resolution must be 2K");
+  return H3_REGENERATION_RESOLUTION;
+}
+
+function h3RegenerationRequested(req) {
+  if (req && Object.prototype.hasOwnProperty.call(req, "source_task_id")) return true;
+  return h3HasBaseVideo(req);
+}
+
+// 源任务模式不允许再携带普通生成输入，避免旧调用路径静默丢弃字段。
+function h3HasGenerationContent(req) {
+  return (
+    h3RequestContent(req) !== undefined ||
+    req.input !== undefined ||
+    req.images !== undefined ||
+    req.image !== undefined ||
+    req.input_reference !== undefined ||
+    Boolean(trimmed(req.prompt))
+  );
+}
+
+function h3RegenerationRequestedDuration(req) {
+  const raw = req && req.duration !== undefined ? req.duration : req && req.seconds;
+  if (raw === undefined || raw === null || raw === "") return H3_MAX_DURATION;
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds < H3_MIN_DURATION || seconds > H3_MAX_DURATION) {
+    throw new Error(H3_MODEL + " regeneration duration estimate must be an integer between " + H3_MIN_DURATION + " and " + H3_MAX_DURATION + " seconds");
+  }
+  return seconds;
+}
+
+// 任务数据可能来自初始提交、轮询响应或网关包装层，逐层定位上游 H3 task 对象。
+function h3TaskPayload(value) {
+  let current = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return null;
+    if (current.model || current.resolution || current.task_type || current.usage || current.content) return current;
+    if (current.task && typeof current.task === "object" && !Array.isArray(current.task)) return current.task;
+    if (current.data && typeof current.data === "object" && !Array.isArray(current.data)) {
+      current = current.data;
+      continue;
+    }
+    return current;
+  }
+  return null;
+}
+
+function h3OriginTaskForRegeneration(ctx) {
+  const origins = ctx && ctx.originTasks;
+  if (!Array.isArray(origins) || origins.length !== 1) throw new Error(H3_MODEL + " regeneration source task is unavailable");
+  const origin = origins[0];
+  if (!origin || trimmed(origin.status).toUpperCase() !== "SUCCESS") throw new Error(H3_MODEL + " regeneration source task must be successful");
+  const upstreamTaskId = trimmed(origin.upstreamTaskId);
+  if (!upstreamTaskId) throw new Error(H3_MODEL + " regeneration source task has no upstream task ID");
+  const payload = h3TaskPayload(origin.data);
+  if (!payload || trimmed(payload.model) !== H3_MODEL) throw new Error(H3_MODEL + " regeneration requires a successful H3 source task");
+  if (trimmed(payload.resolution).toUpperCase() !== "768P") throw new Error(H3_MODEL + " regeneration requires a 768P source task");
+  if (trimmed(payload.task_type).toLowerCase() === H3_REGENERATION_OPERATION)
+    throw new Error(H3_MODEL + " regeneration cannot use a regeneration task as its source");
+  return { origin: origin, payload: payload, upstreamTaskId: upstreamTaskId };
+}
+
+function h3PayloadSeconds(payload) {
+  const usage = payload && payload.usage && typeof payload.usage === "object" && !Array.isArray(payload.usage) ? payload.usage : {};
+  const candidates = [payload && payload.duration, usage.output_seconds, usage.total_seconds];
+  for (const candidate of candidates) {
+    const seconds = Number(candidate);
+    if (Number.isFinite(seconds) && seconds >= H3_MIN_DURATION && seconds <= H3_MAX_DURATION) return seconds;
+  }
+  return H3_MAX_DURATION;
+}
+
+function h3OptionalRegenerationFields(req, body) {
+  const metadata = (req && req.metadata) || {};
+  for (const key of ["callback_url", "aigc_watermark"]) {
+    const value = req && req[key] !== undefined ? req[key] : metadata[key];
+    if (value !== undefined && value !== null) body[key] = value;
+  }
+}
+
+// 把网关公开任务 ID 映射为已校验的上游任务 ID，避免把用户可见 ID 直接发给 MiniMax。
+function h3BuildRegenerationBody(ctx, req) {
+  const body = { model: ctx.upstreamModel || ctx.model || H3_MODEL, resolution: H3_REGENERATION_RESOLUTION };
+  const sourceTaskId = h3SourceTaskID(req);
+  h3RegenerationResolution(req);
+  if (sourceTaskId) {
+    if (h3HasGenerationContent(req)) throw new Error(H3_MODEL + " source_task_id cannot be combined with generation content");
+    const source = h3OriginTaskForRegeneration(ctx);
+    if (trimmed(source.origin.taskId) !== sourceTaskId) throw new Error(H3_MODEL + " regeneration source task does not match the resolved origin task");
+    body.source_task_id = source.upstreamTaskId;
+  } else {
+    body.content = h3RegenerationContent(req);
+  }
+  h3OptionalRegenerationFields(req, body);
+  return body;
+}
+
+// 提交阶段为再生成预留安全额度；无法从 URL 得知源视频时长时按 15 秒预留。
+function h3RegenerationUsage(ctx, req) {
+  const sourceTaskId = h3SourceTaskID(req);
+  let seconds = H3_MAX_DURATION;
+  let content = [];
+  let sourceImageCount;
+  if (sourceTaskId) {
+    const source = h3OriginTaskForRegeneration(ctx);
+    seconds = h3PayloadSeconds(source.payload);
+    // 再生成会重新收取原素材费用。优先读取源任务实际总张数，缺失时按允许的上限预留。
+    sourceImageCount = H3_MAX_REFERENCE_IMAGES;
+    const rawCount = source.payload.usage && source.payload.usage.input_image_count;
+    if ((typeof rawCount === "number" || typeof rawCount === "string") && String(rawCount).trim() !== "") {
+      const count = Number(rawCount);
+      if (Number.isInteger(count) && count >= 0 && count <= H3_MAX_REFERENCE_IMAGES) sourceImageCount = count;
+    }
+  } else {
+    content = h3RegenerationContent(req);
+    seconds = h3RegenerationRequestedDuration(req);
+  }
+  const inputImages = content.filter(function (item) {
+    return item && item.type === "image_url";
+  }).length;
+  const hasReferenceVideo = content.some(function (item) {
+    return item && item.type === "video_url" && trimmed(item.role) !== "base_video";
+  });
+  return {
+    seconds: seconds,
+    resolution: H3_REGENERATION_RESOLUTION,
+    input_images: sourceImageCount === undefined ? inputImages : sourceImageCount,
+    input_video_seconds: hasReferenceVideo ? H3_MAX_INPUT_VIDEO_SECONDS : 0,
+    operation: H3_REGENERATION_OPERATION,
+  };
+}
+
+// 上游未提供预估接口：输入按文本和媒体复杂度估算，输出独立预留，完成后逐项结算。
+function h3ContextIRUsage(ctx, req) {
+  if (ctx.usagePurpose === "billing_ratios") return null;
+  const content = h3Content(req);
+  let textCharacters = 0;
+  let mediaCount = 0;
+  for (const item of content) {
+    if (item && item.type === "text") textCharacters += String(item.text || "").length;
+    else if (item && (item.type === "image_url" || item.type === "video_url" || item.type === "audio_url")) mediaCount += 1;
+  }
+  // 输入与输出之和保持有界；新提交只提供已声明的两项用量，避免触发未声明数量的宿主上限。
+  const promptTokens = Math.min(H3_CONTEXT_IR_MAX_TOKENS - H3_CONTEXT_IR_ESTIMATED_OUTPUT_TOKENS, Math.ceil(textCharacters / 2) + mediaCount * 1024);
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: H3_CONTEXT_IR_ESTIMATED_OUTPUT_TOKENS,
+    operation: H3_CONTEXT_IR_OPERATION,
+  };
+}
+
+// 识别上游 task_type 和网关持久化 action，确保结算阶段仍保留再生成维度。
+function h3CompletionOperation(task, body) {
+  const payload = h3QueryTask(body);
+  const taskType = trimmed(payload && payload.task_type).toLowerCase();
+  if (taskType === H3_REGENERATION_OPERATION) return H3_REGENERATION_OPERATION;
+  if (taskType === H3_CONTEXT_IR_TASK_TYPE) return H3_CONTEXT_IR_OPERATION;
+  if (task && trimmed(task.action).toLowerCase() === H3_REGENERATION_ACTION) return H3_REGENERATION_OPERATION;
+  if (task && trimmed(task.action).toLowerCase() === H3_CONTEXT_IR_ACTION) return H3_CONTEXT_IR_OPERATION;
+  return H3_GENERATION_OPERATION;
+}
+
+// 协议解码统一处理两种官方再生成模式，并将源任务交给宿主做权限和渠道校验。
+function h3DecodeRegenerationRequest(req, model, fallbackPrompt, upstreamModel) {
+  if (!isH3(model) && !isH3(upstreamModel)) return null;
+  const hasSourceTaskId = req && Object.prototype.hasOwnProperty.call(req, "source_task_id");
+  const sourceTaskId = h3SourceTaskID(req);
+  const hasBaseVideo = h3HasBaseVideo(req);
+  if (hasSourceTaskId) {
+    if (!sourceTaskId) throw new Error(H3_MODEL + " source_task_id must be a non-empty string");
+    if (h3HasGenerationContent(req)) {
+      throw new Error(H3_MODEL + " source_task_id cannot be combined with generation content");
+    }
+  } else if (!hasBaseVideo) {
+    return null;
+  } else {
+    h3RegenerationContent(req, fallbackPrompt);
+  }
+  h3RegenerationResolution(req);
+  const requestBody = Object.assign({}, req, { model: model });
+  // Responses input 提供的最终提示词必须保留到驱动阶段，不能只在解码校验时临时使用。
+  if (!hasSourceTaskId) requestBody.content = h3RegenerationContent(req, fallbackPrompt);
+  const intent = { kind: "submit", model: model, action: H3_REGENERATION_ACTION, requestBody: requestBody };
+  if (hasSourceTaskId) intent.originTaskIds = [sourceTaskId];
+  return intent;
+}
+
+// metadata.content 或顶层 content 都是完整多模态输入，统一走同一套校验。
 function h3Content(req) {
   const metadata = req.metadata || {};
   const prompt = trimmed(req.prompt);
-  if (metadata.content !== undefined && metadata.content !== null) {
-    if (!Array.isArray(metadata.content)) throw new Error("metadata.content must be an array");
-    const items = metadata.content;
+  const suppliedContent = h3RequestContent(req);
+  if (suppliedContent !== undefined && suppliedContent !== null) {
+    if (!Array.isArray(suppliedContent)) throw new Error("metadata.content must be an array");
+    const items = suppliedContent;
     const hasText = items.some(function (item) {
       return item && item.type === "text" && trimmed(item.text);
     });
@@ -275,11 +788,28 @@ function h3HasVisualContent(content) {
 // aspect ratio can be inherited from a visual input.
 function h3Ratio(req, content) {
   const metadata = req.metadata || {};
-  const ratio = trimmed(metadata.ratio);
+  const ratio = trimmed(metadata.ratio) || trimmed(req.ratio);
   if (!ratio) return h3HasVisualContent(content) ? "adaptive" : "16:9";
   if (!H3_RATIOS.includes(ratio)) throw new Error(H3_MODEL + " ratio must be one of " + H3_RATIOS.join(", "));
   if (ratio === "adaptive" && !h3HasVisualContent(content)) throw new Error(H3_MODEL + " ratio adaptive requires an image or video input");
   return ratio;
+}
+
+// H3-Context-IR 与视频生成共用多模态 content 校验，但上游只返回增强提示词。
+function h3ContextIRBody(req) {
+  const content = h3Content(req);
+  const metadata = req.metadata || {};
+  const body = {
+    model: H3_MODEL,
+    content: content,
+    duration: h3Duration(req),
+    ratio: h3Ratio(req, content),
+  };
+  ["callback_url"].forEach(function (key) {
+    const value = req[key] !== undefined ? req[key] : metadata[key];
+    if (value !== undefined && value !== null) body[key] = value;
+  });
+  return body;
 }
 
 function h3QueryTask(body) {
@@ -372,6 +902,24 @@ export function buildSubmitRequest(ctx) {
   const model = ctx.upstreamModel;
   const metadata = req.metadata || {};
   if (isH3(model)) {
+    if (ctx.action === H3_CONTEXT_IR_ACTION) {
+      return {
+        url: ctx.baseUrl + "/v2/h3_context_ir",
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+        body: h3ContextIRBody(req),
+        action: H3_CONTEXT_IR_ACTION,
+      };
+    }
+    if (ctx.action === H3_REGENERATION_ACTION || h3RegenerationRequested(req)) {
+      return {
+        url: ctx.baseUrl + "/v2/video_regeneration",
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+        body: h3BuildRegenerationBody(ctx, req),
+        action: H3_REGENERATION_ACTION,
+      };
+    }
     const content = h3Content(req);
     const h3Body = {
       model: model,
@@ -381,7 +929,9 @@ export function buildSubmitRequest(ctx) {
       ratio: h3Ratio(req, content),
     };
     ["callback_url", "aigc_watermark"].forEach(function (key) {
-      if (metadata[key] !== undefined && metadata[key] !== null) h3Body[key] = metadata[key];
+      // 原生接口使用顶层字段；兼容接口仍可通过 metadata 传递，显式 false 必须保留。
+      const value = req[key] !== undefined ? req[key] : metadata[key];
+      if (value !== undefined && value !== null) h3Body[key] = value;
     });
     return {
       url: ctx.baseUrl + "/v2/video_generation",
@@ -432,6 +982,8 @@ export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
   const model = ctx.upstreamModel || req.model;
   if (isH3(model)) {
+    if (ctx.action === H3_CONTEXT_IR_ACTION) return h3ContextIRUsage(ctx, req);
+    if (ctx.action === H3_REGENERATION_ACTION || h3RegenerationRequested(req)) return h3RegenerationUsage(ctx, req);
     const content = h3Content(req);
     return {
       seconds: h3Duration(req),
@@ -439,6 +991,7 @@ export function extractUsage(ctx) {
       input_images: content.filter(function (item) {
         return item && item.type === "image_url";
       }).length,
+      operation: H3_GENERATION_OPERATION,
       // Input URLs do not expose duration. Reserve the documented total limit;
       // polling replaces it with usage.input_seconds after success.
       input_video_seconds: content.some(function (item) {
@@ -483,7 +1036,9 @@ export function parseTaskResult(ctx, body) {
       if (url) h3Result.url = url;
     }
     if (h3Status === "FAILURE") {
-      h3Result.reason = trimmed(h3Task.error && h3Task.error.message) || "task " + trimmed(h3Task.status);
+      // 与主动取消入口使用相同标记，后台轮询确认的取消也可按 cancelled 查询。
+      h3Result.reason =
+        h3Task.status === "cancelled" ? "task cancelled by user" : trimmed(h3Task.error && h3Task.error.message) || "task " + trimmed(h3Task.status);
     }
     return h3Result;
   }
@@ -537,11 +1092,24 @@ export function buildContentRequest(ctx) {
   };
 }
 
-export function extractUsageOnComplete(_task, _taskResult, body) {
+export function extractUsageOnComplete(task, _taskResult, body) {
   const h3Task = h3QueryTask(body);
   if (h3Task) {
     const resolution = trimmed(h3Task.resolution).toUpperCase();
-    const facts = {};
+    const facts = { operation: h3CompletionOperation(task, body) };
+    if (facts.operation === H3_CONTEXT_IR_OPERATION) {
+      const usage = h3Task.usage && typeof h3Task.usage === "object" && !Array.isArray(h3Task.usage) ? h3Task.usage : {};
+      // null、空字符串和布尔值不是实际用量，保留预扣估算，防止被 Number 转成零后全退。
+      // 总量仅保留给升级前冻结的结算快照；新定价只使用输入、输出，不从总量推算缺失的一侧。
+      const fields = { tokens: "total_tokens", prompt_tokens: "prompt_tokens", completion_tokens: "completion_tokens" };
+      for (const key of Object.keys(fields)) {
+        const rawTokens = usage[fields[key]];
+        if ((typeof rawTokens !== "number" && typeof rawTokens !== "string") || String(rawTokens).trim() === "") continue;
+        const tokens = Number(rawTokens);
+        if (Number.isInteger(tokens) && tokens >= 0 && tokens <= H3_CONTEXT_IR_MAX_TOKENS) facts[key] = tokens;
+      }
+      return facts;
+    }
     if (resolution === "2K" || resolution === "768P") facts.resolution = resolution;
     const usage = h3Task.usage && typeof h3Task.usage === "object" && !Array.isArray(h3Task.usage) ? h3Task.usage : {};
     const fields = [
@@ -565,6 +1133,135 @@ export function extractUsageOnComplete(_task, _taskResult, body) {
   return { resolution: resolutionFor(width + "x" + height, "") };
 }
 
+function nativeJSONBody(ctx) {
+  if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
+  const body = ctx.body.value;
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
+  return body;
+}
+
+function nativeH3Model(body) {
+  const model = trimmed(body.model);
+  if (model !== H3_MODEL) throw new Error("model must be " + H3_MODEL);
+  return model;
+}
+
+function nativeH3VideoRequest(body) {
+  const model = nativeH3Model(body);
+  if (!Array.isArray(body.content)) throw new Error("content must be an array");
+  const content = validateH3Content(body.content);
+  if (!Object.prototype.hasOwnProperty.call(body, "duration")) throw new Error("duration is required");
+  if (!Object.prototype.hasOwnProperty.call(body, "resolution")) throw new Error("resolution is required");
+  const requestBody = {
+    model: model,
+    content: content,
+    resolution: h3Resolution(body),
+    duration: h3Duration(body),
+    ratio: h3Ratio(body, content),
+  };
+  ["callback_url", "aigc_watermark"].forEach(function (key) {
+    if (body[key] !== undefined && body[key] !== null) requestBody[key] = body[key];
+  });
+  return requestBody;
+}
+
+function nativeH3TaskStatus(task) {
+  if (task && trimmed(task.fail_reason).toLowerCase() === "task cancelled by user") return "cancelled";
+  const statuses = { NOT_START: "queued", SUBMITTED: "queued", QUEUED: "queued", IN_PROGRESS: "running", SUCCESS: "succeeded", FAILURE: "failed" };
+  return statuses[task && task.status] || "queued";
+}
+
+function nativeH3Task(task) {
+  const source = task && task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data.task : null;
+  const result = source && typeof source === "object" && !Array.isArray(source) ? Object.assign({}, source) : {};
+  const model = trimmed(result.model) || H3_MODEL;
+  const action = trimmed(task && task.action).toLowerCase();
+  result.id = task && task.task_id ? task.task_id : trimmed(result.id);
+  result.model = model;
+  result.status = nativeH3TaskStatus(task);
+  if (!result.created_at && task && task.created_at) result.created_at = task.created_at;
+  if (!result.updated_at && task && task.updated_at) result.updated_at = task.updated_at;
+  if (!result.task_type)
+    result.task_type =
+      action === H3_CONTEXT_IR_ACTION ? H3_CONTEXT_IR_TASK_TYPE : action === H3_REGENERATION_ACTION ? H3_REGENERATION_OPERATION : H3_GENERATION_OPERATION;
+  if (!result.modality) result.modality = result.task_type === H3_CONTEXT_IR_TASK_TYPE ? "text" : "video";
+  if (result.status === "failed" && !result.error) result.error = { message: trimmed(task && task.fail_reason) || "task failed" };
+  return result;
+}
+
+// native 路由输出官方 H3 包络，同时只向调用方暴露网关公开任务 ID。
+export const native = {
+  createH3VideoTask: function (ctx) {
+    const body = nativeJSONBody(ctx);
+    const requestBody = nativeH3VideoRequest(body);
+    return { kind: "submit", model: H3_MODEL, action: h3HasVisualContent(requestBody.content) ? "image_to_video" : "text_to_video", requestBody: requestBody };
+  },
+  createH3ContextIRTask: function (ctx) {
+    const body = nativeJSONBody(ctx);
+    nativeH3Model(body);
+    if (!Array.isArray(body.content)) throw new Error("content must be an array");
+    if (!Object.prototype.hasOwnProperty.call(body, "duration")) throw new Error("duration is required");
+    const requestBody = h3ContextIRBody(body);
+    return { kind: "submit", model: H3_MODEL, action: H3_CONTEXT_IR_ACTION, requestBody: requestBody };
+  },
+  createH3RegenerationTask: function (ctx) {
+    const body = nativeJSONBody(ctx);
+    if (!Object.prototype.hasOwnProperty.call(body, "resolution")) throw new Error("resolution is required");
+    const intent = h3DecodeRegenerationRequest(body, nativeH3Model(body), "", H3_MODEL);
+    if (!intent) throw new Error(H3_MODEL + " regeneration requires a source task or base_video");
+    return intent;
+  },
+  decodeH3TaskList: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "none") throw new Error("request body is not allowed");
+    const query = ctx.query || {};
+    const modelValues = query["filter.model"] || [];
+    if (modelValues.length > 1) throw new Error("filter.model must be provided once");
+    const model = trimmed(modelValues[0]) || H3_MODEL;
+    if (model !== H3_MODEL) throw new Error("filter.model must be " + H3_MODEL);
+    const taskIds = query["filter.task_ids"] || [];
+    if (taskIds.length > 100) throw new Error("filter.task_ids accepts at most 100 task IDs");
+    return {
+      kind: "query",
+      model: model,
+      taskIds: taskIds.map(function (taskId) {
+        return trimmed(taskId);
+      }),
+    };
+  },
+  decodeH3TaskDelete: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "none") throw new Error("request body is not allowed");
+    const taskId = trimmed(ctx.params && ctx.params.task_id);
+    if (!taskId) throw new Error("task_id is required");
+    return { kind: "delete", model: H3_MODEL, taskId: taskId };
+  },
+  h3TaskCreated: function (ctx, task) {
+    return { task_id: task.task_id };
+  },
+  h3TaskStatus: function (ctx, task) {
+    return { task: nativeH3Task(task) };
+  },
+  h3TaskList: function (ctx, result) {
+    const items = result && Array.isArray(result.items) ? result.items.map(nativeH3Task) : [];
+    return { items: items, total: Number(result && result.total) || 0 };
+  },
+  h3TaskDeleted: function (ctx, result) {
+    return { task_id: result.task_id, action: result.action, status: result.status };
+  },
+  error: function (ctx, error) {
+    return { type: "error", error: { type: error.code, message: error.message, http_code: String(error.httpStatus) } };
+  },
+};
+
+export function buildTaskActionRequest(ctx) {
+  if (ctx.operation !== "delete") throw new Error("unsupported task operation");
+  if (!isH3(ctx.upstreamModel || ctx.model)) throw new Error("task operation requires " + H3_MODEL);
+  return {
+    url: ctx.baseUrl + "/v2/video_generation/" + encodeURIComponent(ctx.taskId),
+    method: "DELETE",
+    headers: { Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+  };
+}
+
 export const protocols = {
   openai_responses: {
     decodeRequest: function (ctx) {
@@ -578,6 +1275,8 @@ export const protocols = {
       if (req.metadata !== undefined && (!req.metadata || typeof req.metadata !== "object" || Array.isArray(req.metadata)))
         throw new Error("metadata must be an object");
       const input = responsesInput(req);
+      const regeneration = h3DecodeRegenerationRequest(req, model, input.prompt, ctx.upstreamModel);
+      if (regeneration) return regeneration;
       const prompt = input.prompt || trimmed(req.prompt);
       const images = [];
       for (const image of [req.image, req.input_reference].concat(req.images || [], input.images)) {
@@ -684,6 +1383,11 @@ protocols.openai_video = {
       if (req.seconds !== undefined) req.seconds = Number(req.seconds);
       else if (req.duration !== undefined) req.seconds = Number(req.duration);
     }
+    if (hasInputReferenceFile && (Object.prototype.hasOwnProperty.call(req, "source_task_id") || h3HasBaseVideo(req))) {
+      throw new Error(H3_MODEL + " regeneration currently requires a JSON content body");
+    }
+    const regeneration = h3DecodeRegenerationRequest(req, ctx.model, "", ctx.upstreamModel);
+    if (regeneration) return regeneration;
     const seconds = req.seconds === undefined ? req.duration : req.seconds;
     if (seconds !== undefined) req.duration = Number(seconds);
     if (hasInputReferenceFile) {

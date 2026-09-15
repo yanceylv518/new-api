@@ -160,7 +160,8 @@ export function SeedanceAssets() {
       void invalidate()
       toast.success(t('Created successfully'))
     },
-    onError: handleServerError,
+    // mutation 的后续参数是业务变量和上下文，不能传给错误处理器作为提示文案。
+    onError: (error) => handleServerError(error),
   })
   const updateGroupMutation = useMutation({
     mutationFn: (payload: { id: number; name: string }) =>
@@ -171,7 +172,7 @@ export function SeedanceAssets() {
       void invalidate()
       toast.success(t('Saved successfully'))
     },
-    onError: handleServerError,
+    onError: (error) => handleServerError(error),
   })
   const deleteGroupMutation = useMutation({
     mutationFn: (group: SeedanceAssetGroup) =>
@@ -202,7 +203,7 @@ export function SeedanceAssets() {
       })
       updateAssetCache(response.data)
     },
-    onError: handleServerError,
+    onError: (error) => handleServerError(error),
   })
   const deleteAssetMutation = useMutation({
     mutationFn: deleteSeedanceAsset,

@@ -21,12 +21,13 @@ import type {
   BillingUsageFieldSchema,
   BillingUsageSchema,
 } from '../types'
-
-export const TASK_TOKEN_PRICE_SCALE = 1_000_000
 import {
   parseTaskTiersFromExpr,
   splitBillingExprAndRequestRules,
 } from './billing-expr'
+import { evaluateBillingExpression } from './billing-expression/runtime'
+
+export const TASK_TOKEN_PRICE_SCALE = 1_000_000
 
 export type TaskVisualCondition = {
   field: string
@@ -38,6 +39,7 @@ export type TaskVisualTier = {
   conditions: TaskVisualCondition[]
   constant: number
   unitPrices: Record<string, number>
+  freeAllowances?: Record<string, number>
 }
 
 export type TaskVisualConfig = {
@@ -48,6 +50,7 @@ export type TaskMatrixRow = {
   combination: Record<string, string>
   constant: number
   unitPrices: Record<string, number>
+  freeAllowances?: Record<string, number>
 }
 
 export type TaskMatrixConfig = {
@@ -66,21 +69,64 @@ export type TaskPreviewResult = {
   }[]
 }
 
+// 编辑器、价格展示和计算器共用字段适用规则，避免各页面硬编码具体厂商。
+export function getTaskUsageField(
+  field: BillingUsageFieldSchema,
+  sample?: Record<string, string | number>
+): BillingUsageFieldSchema | undefined {
+  if (!sample || !field.when) return field
+  // 原始表达式的部分条件尚未指定选择器时，不推断字段无效。
+  if (field.when.some((condition) => sample[condition.field] === undefined)) {
+    return field
+  }
+  const matches = field.when.filter((condition) =>
+    condition.values.includes(String(sample[condition.field] ?? ''))
+  )
+  if (matches.length === 0) return undefined
+  if (!field.enum) return field
+  return {
+    ...field,
+    enum: field.enum.filter((value) =>
+      matches.some(
+        (condition) => !condition.enum || condition.enum.includes(value)
+      )
+    ),
+  }
+}
+
 export function getTaskNumberFields(
-  schema: BillingUsageSchema | null | undefined
+  schema: BillingUsageSchema | null | undefined,
+  sample?: Record<string, string | number>
 ): [string, BillingUsageFieldSchema][] {
   if (!schema) return []
-  return Object.entries(schema)
-    .filter((entry) => entry[1].type === 'number' && Boolean(entry[1].unit))
-    .sort(([left], [right]) => left.localeCompare(right))
+  return (
+    Object.entries(schema)
+      .filter(
+        (entry) =>
+          entry[1].type === 'number' &&
+          Boolean(entry[1].unit) &&
+          Boolean(getTaskUsageField(entry[1], sample))
+      )
+      // 使用插件声明的业务顺序；未声明或同序时保持原来的字段名排序。
+      .sort(
+        ([left, leftField], [right, rightField]) =>
+          (leftField.displayOrder ?? 0) - (rightField.displayOrder ?? 0) ||
+          left.localeCompare(right)
+      )
+  )
 }
 
 export function getTaskEnumFields(
-  schema: BillingUsageSchema | null | undefined
+  schema: BillingUsageSchema | null | undefined,
+  sample?: Record<string, string | number>
 ): [string, BillingUsageFieldSchema][] {
   if (!schema) return []
   return Object.entries(schema)
-    .filter((entry) => Boolean(entry[1].enum?.length))
+    .flatMap(([name, field]): [string, BillingUsageFieldSchema][] => {
+      if (!field.enum?.length) return []
+      const applicable = getTaskUsageField(field, sample)
+      return applicable ? [[name, applicable]] : []
+    })
     .sort(([left], [right]) => left.localeCompare(right))
 }
 
@@ -88,16 +134,54 @@ export function getTaskEnumCombinations(
   schema: BillingUsageSchema | null | undefined
 ): Record<string, string>[] {
   let combinations: Record<string, string>[] = [{}]
-  for (const [field, definition] of getTaskEnumFields(schema)) {
+  // 宿主保证条件只依赖无条件枚举，因此只需先展开选择器，无需递归依赖解析。
+  const fields = getTaskEnumFields(schema).sort(
+    (left, right) =>
+      Number(Boolean(left[1].when)) - Number(Boolean(right[1].when))
+  )
+  for (const [field, definition] of fields) {
     const nextCombinations: Record<string, string>[] = []
     for (const combination of combinations) {
-      for (const value of definition.enum ?? []) {
+      const applicable = getTaskUsageField(definition, combination)
+      if (!applicable) {
+        nextCombinations.push(combination)
+        continue
+      }
+      for (const value of applicable.enum ?? []) {
         nextCombinations.push({ ...combination, [field]: value })
       }
     }
     combinations = nextCombinations
   }
   return combinations
+}
+
+// 切换操作时移除不适用的枚举并将其数值用量归零，模拟结果才能与实际提交事实一致。
+export function normalizeTaskUsageSample(
+  schema: BillingUsageSchema,
+  sample: Record<string, string | number>
+): Record<string, string | number> {
+  if (!Object.values(schema).some((field) => field.when)) return sample
+  const normalized = { ...sample }
+  const fields = Object.entries(schema).sort(
+    (left, right) =>
+      Number(Boolean(left[1].when)) - Number(Boolean(right[1].when))
+  )
+  for (const [name, definition] of fields) {
+    const applicable = getTaskUsageField(definition, normalized)
+    if (!applicable) {
+      if (definition.type === 'number') normalized[name] = 0
+      else delete normalized[name]
+    } else if (
+      applicable.enum?.length &&
+      !applicable.enum.includes(String(normalized[name] ?? ''))
+    ) {
+      normalized[name] = applicable.enum[0]
+    } else if (applicable.type === 'number' && normalized[name] === undefined) {
+      normalized[name] = 0
+    }
+  }
+  return normalized
 }
 
 export function createDefaultTaskVisualConfig(
@@ -141,26 +225,39 @@ export function taskMatrixRowLabel(
   return values.length > 0 ? values.join('·') : 'base'
 }
 
-function taskMatrixCombinationKey(
-  combination: Record<string, string>,
-  enumFields: [string, BillingUsageFieldSchema][]
-): string {
-  return JSON.stringify(enumFields.map(([field]) => combination[field]))
-}
-
 export function taskMatrixToTiers(
   config: TaskMatrixConfig,
   schema: BillingUsageSchema
 ): TaskVisualTier[] {
   const numberFields = getTaskNumberFields(schema)
-  const firstRow = config.rows[0]
+  // 无效字段即使残留旧价格也不能进入该行新生成的计费表达式。
+  const rows = config.rows.map((row) => ({
+    ...row,
+    freeAllowances: normalizeTaskFreeAllowances(
+      row.freeAllowances,
+      schema,
+      row.combination
+    ),
+    unitPrices: Object.fromEntries(
+      numberFields.map(([field, definition]) => [
+        field,
+        getTaskUsageField(definition, row.combination)
+          ? (row.unitPrices[field] ?? 0)
+          : 0,
+      ])
+    ),
+  }))
+  const firstRow = rows[0]
   if (numberFields.length === 0 || !firstRow) return []
 
-  const isUniform = config.rows.every(
+  const isUniform = rows.every(
     (row) =>
       row.constant === firstRow.constant &&
       numberFields.every(
-        ([field]) => row.unitPrices[field] === firstRow.unitPrices[field]
+        ([field]) =>
+          row.unitPrices[field] === firstRow.unitPrices[field] &&
+          (row.freeAllowances?.[field] ?? 0) ===
+            (firstRow.freeAllowances?.[field] ?? 0)
       )
   )
   if (isUniform) {
@@ -169,6 +266,9 @@ export function taskMatrixToTiers(
         label: 'base',
         conditions: [],
         constant: firstRow.constant,
+        ...(firstRow.freeAllowances
+          ? { freeAllowances: firstRow.freeAllowances }
+          : {}),
         unitPrices: Object.fromEntries(
           numberFields.map(([field]) => [
             field,
@@ -179,15 +279,16 @@ export function taskMatrixToTiers(
     ]
   }
 
-  return config.rows.map((row, index) => ({
+  return rows.map((row, index) => ({
     label: taskMatrixRowLabel(row.combination),
     conditions:
-      index === config.rows.length - 1
+      index === rows.length - 1
         ? []
         : Object.entries(row.combination)
             .sort(([left], [right]) => left.localeCompare(right))
             .map(([field, value]) => ({ field, value })),
     constant: row.constant,
+    ...(row.freeAllowances ? { freeAllowances: row.freeAllowances } : {}),
     unitPrices: Object.fromEntries(
       numberFields.map(([field]) => [field, row.unitPrices[field] ?? 0])
     ),
@@ -202,78 +303,44 @@ export function tryParseTaskMatrixConfig(
   const tiers = parseTaskTiersFromExpr(expression, schema)
   if (tiers.length === 0) return null
 
-  const enumFields = getTaskEnumFields(schema)
   const numberFields = getTaskNumberFields(schema)
   const combinations = getTaskEnumCombinations(schema)
-
-  if (tiers.length === 1 && tiers[0].conditions.length === 0) {
-    return {
-      rows: combinations.map((combination) => ({
-        combination,
-        constant: tiers[0].constant,
-        unitPrices: Object.fromEntries(
-          numberFields.map(([field]) => [
-            field,
-            tiers[0].unitPrices[field] ?? 0,
-          ])
-        ),
-      })),
-    }
-  }
-
-  if (tiers.length !== combinations.length) return null
   const fallbackTier = tiers.at(-1)
   if (!fallbackTier || fallbackTier.conditions.length !== 0) return null
 
-  const tiersByCombination = new Map<string, (typeof tiers)[number]>()
-  for (const tier of tiers.slice(0, -1)) {
-    if (tier.conditions.length !== enumFields.length) return null
-
-    const valuesByField = new Map<string, string>()
-    for (const condition of tier.conditions) {
-      const definition = schema[condition.field]
-      if (
-        valuesByField.has(condition.field) ||
-        !definition?.enum?.includes(condition.value)
-      ) {
-        return null
-      }
-      valuesByField.set(condition.field, condition.value)
-    }
-    if (valuesByField.size !== enumFields.length) return null
-
-    const combination = Object.fromEntries(
-      enumFields.map(([field]) => [field, valuesByField.get(field) ?? ''])
-    )
-    const key = taskMatrixCombinationKey(combination, enumFields)
-    if (tiersByCombination.has(key)) return null
-    tiersByCombination.set(key, tier)
+  for (const tier of tiers) {
+    const fields = new Set(tier.conditions.map((condition) => condition.field))
+    if (fields.size !== tier.conditions.length) return null
   }
 
-  const missingCombinations = combinations.filter(
-    (combination) =>
-      !tiersByCombination.has(taskMatrixCombinationKey(combination, enumFields))
-  )
-  if (missingCombinations.length !== 1) return null
-  tiersByCombination.set(
-    taskMatrixCombinationKey(missingCombinations[0], enumFields),
-    fallbackTier
-  )
-
-  const rows: TaskMatrixRow[] = []
-  for (const combination of combinations) {
-    const tier = tiersByCombination.get(
-      taskMatrixCombinationKey(combination, enumFields)
+  const rows = combinations.map((combination) => {
+    // Conditions only constrain the fields they mention. Preserve the original
+    // first-match order when several branches cover the same combination.
+    const tier =
+      tiers.find((candidate) =>
+        candidate.conditions.every(
+          (condition) => combination[condition.field] === condition.value
+        )
+      ) ?? fallbackTier
+    const freeAllowances = normalizeTaskFreeAllowances(
+      tier.freeAllowances,
+      schema,
+      combination
     )
-    if (!tier) return null
-    rows.push({
+    return {
       combination,
       constant: tier.constant,
+      ...(freeAllowances ? { freeAllowances } : {}),
       unitPrices: Object.fromEntries(
-        numberFields.map(([field]) => [field, tier.unitPrices[field] ?? 0])
+        numberFields.map(([field, definition]) => [
+          field,
+          getTaskUsageField(definition, combination)
+            ? (tier.unitPrices[field] ?? 0)
+            : 0,
+        ])
       ),
-    })
-  }
+    }
+  })
   return { rows }
 }
 
@@ -282,6 +349,8 @@ export function evaluateTaskVisualConfig(
   sample: Record<string, number | string>,
   schema?: BillingUsageSchema
 ): TaskPreviewResult | null {
+  // 示例和计算器都使用规范化后的事实，避免隐藏的旧输入仍参与费用计算。
+  if (schema) sample = normalizeTaskUsageSample(schema, sample)
   const fallback = config.tiers.at(-1)
   if (!fallback) return null
 
@@ -300,10 +369,8 @@ export function evaluateTaskVisualConfig(
   if (!Number.isFinite(constant) || constant < 0) return null
 
   const parts: TaskPreviewResult['parts'] = []
-  let total = 0
   if (constant > 0) {
     parts.push({ kind: 'constant', amount: constant })
-    total += constant
   }
 
   for (const [field, rawUnitPrice] of Object.entries(matchedTier.unitPrices)) {
@@ -311,19 +378,42 @@ export function evaluateTaskVisualConfig(
     if (!Number.isFinite(unitPrice) || unitPrice < 0) return null
     if (unitPrice === 0) continue
 
-    const quantity = Number(sample[field])
-    if (!Number.isFinite(quantity) || quantity < 0) return null
+    const rawQuantity = Number(sample[field])
+    const freeAllowance = matchedTier.freeAllowances?.[field] ?? 0
+    if (
+      !Number.isFinite(rawQuantity) ||
+      rawQuantity < 0 ||
+      !Number.isSafeInteger(freeAllowance) ||
+      freeAllowance < 0
+    ) {
+      return null
+    }
+    // 预览按收费数量形成费用明细；下方求和不再重复扣除免费额度。
+    const quantity = Math.max(rawQuantity - freeAllowance, 0)
     const amount =
       schema?.[field]?.unit === 'token'
         ? (quantity * unitPrice) / TASK_TOKEN_PRICE_SCALE
         : quantity * unitPrice
     if (!Number.isFinite(amount)) return null
     parts.push({ kind: 'usage', field, amount, quantity, unitPrice })
-    total += amount
   }
 
-  if (!Number.isFinite(total)) return null
-  return { tier: matchedTier, total, parts }
+  // Keep visual row selection and itemization, but share expression arithmetic
+  // and unit semantics with raw simulation. Zero-price fields remain optional.
+  const terms = [String(constant)]
+  const normalizedUsage = { ...sample }
+  for (const part of parts) {
+    if (part.kind !== 'usage' || !part.field) continue
+    normalizedUsage[part.field] = part.quantity ?? 0
+    const scale = schema?.[part.field]?.unit === 'token' ? ' / 1000000' : ''
+    terms.push(`u(${JSON.stringify(part.field)}) * ${part.unitPrice}${scale}`)
+  }
+  const result = evaluateBillingExpression(
+    `tier(${JSON.stringify(matchedTier.label)}, ${terms.join(' + ')})`,
+    { usage: normalizedUsage }
+  )
+  if (result.status !== 'success') return null
+  return { tier: matchedTier, total: result.cost, parts }
 }
 
 export function evaluateTaskUsageExamples(
@@ -368,6 +458,10 @@ export function normalizeTaskVisualConfig(
         })
       )
       const constant = Number(tier.constant)
+      const freeAllowances = normalizeTaskFreeAllowances(
+        tier.freeAllowances,
+        schema
+      )
       return {
         label: tier.label || (index === 0 ? 'base' : `tier_${index + 1}`),
         conditions: (tier.conditions ?? []).filter((condition) =>
@@ -375,6 +469,7 @@ export function normalizeTaskVisualConfig(
         ),
         constant: Number.isFinite(constant) && constant >= 0 ? constant : 0,
         unitPrices,
+        ...(freeAllowances ? { freeAllowances } : {}),
       }
     }),
   }
@@ -394,7 +489,12 @@ function generateTaskTierBody(
       )
       continue
     }
-    parts.push(`u(${JSON.stringify(field)}) * ${price}`)
+    const freeAllowance = tier.freeAllowances?.[field] ?? 0
+    const quantity =
+      freeAllowance > 0
+        ? `max(u(${JSON.stringify(field)}) - ${freeAllowance}, 0)`
+        : `u(${JSON.stringify(field)})`
+    parts.push(`${quantity} * ${price}`)
   }
   return parts.join(' + ')
 }
@@ -455,8 +555,25 @@ export function tryParseTaskVisualConfig(
         conditions: tier.conditions,
         constant: tier.constant,
         unitPrices: tier.unitPrices,
+        ...(tier.freeAllowances ? { freeAllowances: tier.freeAllowances } : {}),
       })),
     },
     schema
   )
+}
+
+// 免费额度只适用于按数量计费的有效字段；零额度等同未设置，保持已有价格结构可往返。
+function normalizeTaskFreeAllowances(
+  allowances: Record<string, number> | undefined,
+  schema: BillingUsageSchema,
+  sample?: Record<string, string | number>
+): Record<string, number> | undefined {
+  const entries = Object.entries(allowances ?? {}).filter(
+    ([field, value]) =>
+      schema[field]?.unit === 'count' &&
+      getTaskUsageField(schema[field], sample) &&
+      Number.isSafeInteger(value) &&
+      value > 0
+  )
+  return entries.length ? Object.fromEntries(entries) : undefined
 }

@@ -200,12 +200,163 @@ func TestHailuoH3BuildSubmitRequest(t *testing.T) {
 	}
 }
 
+// H3 再生成必须把公开任务 ID 解析为宿主提供的上游任务 ID，避免越过任务归属校验。
+func TestHailuoH3RegenerationBuildSubmitRequest(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	schema, examples := plugin.Meta.UsageForModel("MiniMax-H3")
+	_, operationDeclared := schema["operation"]
+	require.True(t, operationDeclared)
+	require.NotEmpty(t, examples)
+	sourceTask := map[string]any{
+		"taskId":         "task-public",
+		"upstreamTaskId": "424010985738629",
+		"status":         "SUCCESS",
+		"data": map[string]any{
+			"task": map[string]any{
+				"model":      "MiniMax-H3",
+				"resolution": "768P",
+				"duration":   5,
+			},
+		},
+	}
+
+	t.Run("source task id", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{
+			"source_task_id": "task-public",
+			"resolution":     "2K",
+			"metadata":       map[string]any{"aigc_watermark": true},
+		})
+		ctx["action"] = "regeneration"
+		ctx["originTasks"] = []any{sourceTask}
+		descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", ctx)
+		assert.Equal(t, "https://api.minimax.example/v2/video_regeneration", descriptor["url"])
+		assert.Equal(t, "POST", descriptor["method"])
+		assert.Equal(t, "regeneration", descriptor["action"])
+		body, err := common.Marshal(descriptor["body"])
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"model":"MiniMax-H3","source_task_id":"424010985738629","resolution":"2K","aigc_watermark":true}`, string(body))
+	})
+
+	t.Run("base video content", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": "revise the lighting"},
+				map[string]any{"type": "image_url", "role": "first_frame", "image_url": map[string]any{"url": "https://cdn.example/frame.png"}},
+				map[string]any{"type": "video_url", "role": "base_video", "video_url": map[string]any{"url": "https://cdn.example/source.mp4"}},
+			},
+			"resolution": "2K",
+		})
+		ctx["action"] = "regeneration"
+		descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", ctx)
+		assert.Equal(t, "https://api.minimax.example/v2/video_regeneration", descriptor["url"])
+		body, err := common.Marshal(descriptor["body"])
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"model":"MiniMax-H3","content":[{"type":"text","text":"revise the lighting"},{"type":"image_url","role":"first_frame","image_url":{"url":"https://cdn.example/frame.png"}},{"type":"video_url","role":"base_video","video_url":{"url":"https://cdn.example/source.mp4"}}],"resolution":"2K"}`, string(body))
+	})
+
+	t.Run("source task requires a resolved origin", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{"source_task_id": "task-public"})
+		ctx["action"] = "regeneration"
+		_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+		require.ErrorContains(t, err, "source task is unavailable")
+	})
+
+	t.Run("request builder rejects mixed source inputs", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{
+			"source_task_id": "task-public",
+			"prompt":         "must be rejected",
+		})
+		ctx["action"] = "regeneration"
+		_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+		require.ErrorContains(t, err, "cannot be combined")
+	})
+
+	t.Run("request builder rejects a non-2K target", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": "revise"},
+				map[string]any{"type": "video_url", "role": "base_video", "video_url": map[string]any{"url": "https://cdn.example/source.mp4"}},
+			},
+			"resolution": "768P",
+		})
+		ctx["action"] = "regeneration"
+		_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+		require.ErrorContains(t, err, "resolution must be 2K")
+	})
+}
+
+// 两个宿主协议都要返回 originTaskIds，才能由网关完成所有权和渠道固定。
+func TestHailuoH3RegenerationDecode(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	for _, protocol := range []string{"openai_video", "openai_responses"} {
+		t.Run(protocol, func(t *testing.T) {
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{protocol, "decodeRequest"}, map[string]any{
+				"body":          map[string]any{"kind": "json", "value": map[string]any{"model": "MiniMax-H3", "source_task_id": "task-public", "resolution": "2K"}},
+				"model":         "MiniMax-H3",
+				"upstreamModel": "MiniMax-H3",
+			})
+			require.NoError(t, err)
+			encoded, marshalErr := common.Marshal(value)
+			require.NoError(t, marshalErr)
+			var intent map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &intent))
+			assert.Equal(t, "submit", intent["kind"])
+			assert.Equal(t, "regeneration", intent["action"])
+			assert.Equal(t, []any{"task-public"}, intent["originTaskIds"])
+		})
+	}
+
+	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"body": map[string]any{"kind": "json", "value": map[string]any{
+			"model":          "MiniMax-H3",
+			"source_task_id": "task-public",
+			"content":        []any{map[string]any{"type": "text", "text": "not allowed"}},
+		}},
+		"model": "MiniMax-H3",
+	})
+	require.ErrorContains(t, err, "cannot be combined")
+}
+
+// 再生成按源任务时读取源视频时长，按源视频 URL 时在未知时长下安全预留上限。
+func TestHailuoH3RegenerationUsageFacts(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	t.Run("source task duration", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{"source_task_id": "task-public"})
+		ctx["action"] = "regeneration"
+		ctx["originTasks"] = []any{map[string]any{
+			"taskId":         "task-public",
+			"upstreamTaskId": "424010985738629",
+			"status":         "SUCCESS",
+			"data": map[string]any{"task": map[string]any{
+				"model": "MiniMax-H3", "resolution": "768P", "duration": 7,
+				"usage": map[string]any{"input_image_count": 0},
+			}},
+		}}
+		assert.Equal(t, map[string]any{
+			"seconds": float64(7), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+		}, callHailuoHook(t, plugin, "extractUsage", ctx))
+	})
+
+	t.Run("base video reserves maximum when duration is absent", func(t *testing.T) {
+		ctx := hailuoH3SubmitContext(map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": "revise"},
+				map[string]any{"type": "video_url", "role": "base_video", "video_url": map[string]any{"url": "https://cdn.example/source.mp4"}},
+			},
+		})
+		ctx["action"] = "regeneration"
+		assert.Equal(t, map[string]any{
+			"seconds": float64(15), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+		}, callHailuoHook(t, plugin, "extractUsage", ctx))
+	})
+}
+
 // Every MiniMax-H3 request bound is rejected before the upstream call, so an
 // out-of-range duration can never reach quota calculation as a billing fact.
 func TestHailuoH3RejectsOutOfContractRequests(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
 	tenReferenceImages := make([]any, 0, 10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tenReferenceImages = append(tenReferenceImages, map[string]any{
 			"type": "image_url", "role": "reference_image", "image_url": map[string]any{"url": "u"},
 		})
@@ -342,7 +493,7 @@ func TestHailuoParseTaskResult(t *testing.T) {
 		{"H3 running", `{"task":{"id":"1","status":"running"}}`, "IN_PROGRESS", "", ""},
 		{"H3 succeeded", `{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`, "SUCCESS", "https://cdn.example/h3.mp4", ""},
 		{"H3 failed", `{"task":{"id":"1","status":"failed","error":{"code":"1026","message":"sensitive content"}}}`, "FAILURE", "", "sensitive content"},
-		{"H3 cancelled", `{"task":{"id":"1","status":"cancelled"}}`, "FAILURE", "", "task cancelled"},
+		{"H3 cancelled", `{"task":{"id":"1","status":"cancelled"}}`, "FAILURE", "", "task cancelled by user"},
 		{"H3 permanent query error", `{"type":"error","error":{"type":"authorized_error","message":"login failed","http_code":"401"}}`, "FAILURE", "", "login failed"},
 		{"legacy success", `{"task_id":"1","status":"Success","file_id":"f1","base_resp":{"status_code":0}}`, "SUCCESS", "", ""},
 		{"legacy processing", `{"task_id":"1","status":"Processing","base_resp":{"status_code":0}}`, "IN_PROGRESS", "", ""},
@@ -372,7 +523,7 @@ func TestHailuoParseTaskResult(t *testing.T) {
 func TestHailuoExtractUsageFacts(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
 	nineReferenceImages := make([]any, 0, 9)
-	for i := 0; i < 9; i++ {
+	for range 9 {
 		nineReferenceImages = append(nineReferenceImages, map[string]any{
 			"type": "image_url", "role": "reference_image", "image_url": map[string]any{"url": "image"},
 		})
@@ -384,18 +535,18 @@ func TestHailuoExtractUsageFacts(t *testing.T) {
 		want    map[string]any
 	}{
 		{"H3 defaults", "MiniMax-H3", map[string]any{"prompt": "p"}, map[string]any{
-			"seconds": float64(5), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0),
+			"seconds": float64(5), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "generation",
 		}},
 		{"H3 2K", "MiniMax-H3", map[string]any{"prompt": "p", "duration": 12, "size": "2K"}, map[string]any{
-			"seconds": float64(12), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0),
+			"seconds": float64(12), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "generation",
 		}},
 		{"H3 reference images", "MiniMax-H3", map[string]any{"prompt": "p", "metadata": map[string]any{"content": nineReferenceImages}}, map[string]any{
-			"seconds": float64(5), "resolution": "768P", "input_images": float64(9), "input_video_seconds": float64(0),
+			"seconds": float64(5), "resolution": "768P", "input_images": float64(9), "input_video_seconds": float64(0), "operation": "generation",
 		}},
 		{"H3 reference video reserves total duration limit", "MiniMax-H3", map[string]any{"prompt": "p", "metadata": map[string]any{
 			"reference_video": []any{"one.mp4", "two.mp4", "three.mp4"},
 		}}, map[string]any{
-			"seconds": float64(5), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(15),
+			"seconds": float64(5), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(15), "operation": "generation",
 		}},
 		{"legacy model", "MiniMax-Hailuo-2.3", map[string]any{"prompt": "p", "duration": 10}, map[string]any{
 			"seconds": float64(10), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0),
@@ -421,27 +572,27 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		{
 			name: "actual usage replaces submission estimates",
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"2K","usage":{"output_seconds":5,"input_seconds":7.5,"input_image_count":6}}}`,
-			want: map[string]any{"seconds": float64(5), "resolution": "2K", "input_images": float64(6), "input_video_seconds": float64(7.5)},
+			want: map[string]any{"seconds": float64(5), "resolution": "2K", "input_images": float64(6), "input_video_seconds": float64(7.5), "operation": "generation"},
 		},
 		{
 			name: "zero actual usage is retained for settlement",
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"768P","usage":{"output_seconds":4,"input_seconds":0,"input_image_count":0}}}`,
-			want: map[string]any{"seconds": float64(4), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0)},
+			want: map[string]any{"seconds": float64(4), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "generation"},
 		},
 		{
 			name: "zero output cannot erase the submission reservation",
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"768P","usage":{"output_seconds":0,"input_seconds":0,"input_image_count":0}}}`,
-			want: map[string]any{"resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0)},
+			want: map[string]any{"resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "generation"},
 		},
 		{
 			name: "missing usage leaves submission estimates untouched",
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"768P"}}`,
-			want: map[string]any{"resolution": "768P"},
+			want: map[string]any{"resolution": "768P", "operation": "generation"},
 		},
 		{
 			name: "out of contract usage cannot become a billing multiplier",
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"2K","usage":{"output_seconds":16,"input_seconds":16,"input_image_count":10}}}`,
-			want: map[string]any{"resolution": "2K"},
+			want: map[string]any{"resolution": "2K", "operation": "generation"},
 		},
 	}
 	for _, testCase := range testCases {
@@ -452,6 +603,17 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		})
 	}
 
+	t.Run("regeneration task type is preserved for settlement", func(t *testing.T) {
+		var body any
+		require.NoError(t, common.UnmarshalJsonStr(
+			`{"task":{"id":"1","status":"succeeded","task_type":"regeneration","resolution":"2K","usage":{"output_seconds":6,"input_seconds":0,"input_image_count":0}}}`,
+			&body,
+		))
+		assert.Equal(t, map[string]any{
+			"seconds": float64(6), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+		}, callHailuoHook(t, plugin, "extractUsageOnComplete", map[string]any{"action": "regeneration"}, nil, body))
+	})
+
 	t.Run("polling adaptor carries actual facts into task settlement", func(t *testing.T) {
 		adaptor := taskplugin.New(plugin)
 		result, err := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(
@@ -459,7 +621,7 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		))
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{
-			"seconds": float64(5), "resolution": "2K", "input_images": float64(6), "input_video_seconds": float64(7.5),
+			"seconds": float64(5), "resolution": "2K", "input_images": float64(6), "input_video_seconds": float64(7.5), "operation": "generation",
 		}, result.UsageFacts)
 	})
 }

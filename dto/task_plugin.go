@@ -7,12 +7,13 @@ type TaskPluginError struct {
 	Retryable  bool   `json:"retryable"`
 }
 
-// TaskView is the only persisted-task shape exposed to JavaScript plugins.
-// It deliberately excludes ownership, channel, quota, properties, and private
-// upstream identifiers.
+// TaskView 是唯一暴露给 JavaScript 插件的持久化任务形状。
+// 它排除归属、渠道、额度、Properties 和上游私有标识，但保留任务动作以便
+// 原生查询在任务尚未完成时仍能还原正确的任务类型。
 type TaskView struct {
 	TaskID     string `json:"task_id"`
 	Platform   string `json:"platform"`
+	Action     string `json:"action"`
 	Status     string `json:"status"`
 	Progress   string `json:"progress"`
 	FailReason string `json:"fail_reason"`

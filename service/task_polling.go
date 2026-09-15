@@ -15,7 +15,6 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
@@ -471,6 +470,29 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	return nil
 }
 
+// RefreshTaskForManagement 在取消或删除前同步未完成任务，复用轮询的 CAS 和差额结算。
+// 避免本地仍处于排队状态时先删除已完成的上游记录，导致结果丢失后被错误全额退款。
+func RefreshTaskForManagement(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, task *model.Task) (*model.Task, error) {
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return task, nil
+	}
+	adaptor.Init(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: ch.GetBaseURL(), ApiKey: ch.Key},
+	})
+	upstreamID := task.GetUpstreamTaskID()
+	if err := updateVideoSingleTask(ctx, adaptor, ch, upstreamID, map[string]*model.Task{upstreamID: task}); err != nil {
+		return nil, err
+	}
+	latest, exists, err := model.GetByTaskId(task.UserId, task.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || latest == nil || latest.PrivateData.PollFailures > 0 {
+		return nil, fmt.Errorf("task state could not be synchronized")
+	}
+	return latest, nil
+}
+
 func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, taskId string, taskM map[string]*model.Task) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -493,8 +515,20 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	snap := task.Snapshot()
-	resp, err := adaptor.FetchTask(baseURL, key, task, proxy)
+	var resp *http.Response
+	var err error
+	// 插件同步查询支持调用方取消；传统适配器继续使用既有接口。
+	if scoped, ok := adaptor.(interface {
+		FetchTaskWithContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
+	}); ok {
+		resp, err = scoped.FetchTaskWithContext(ctx, baseURL, key, task, proxy)
+	} else {
+		resp, err = adaptor.FetchTask(baseURL, key, task, proxy)
+	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
@@ -669,14 +703,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		if task.Status == model.TaskStatusFailure {
 			return false
 		}
-		usageFacts := make(map[string]any, len(bc.TieredSnapshot.UsageFacts)+len(taskResult.UsageFacts))
-		for key, value := range bc.TieredSnapshot.UsageFacts {
-			usageFacts[key] = value
-		}
-		for key, value := range taskResult.UsageFacts {
-			usageFacts[key] = value
-		}
-		result, err := billingexpr.ComputeTieredQuotaWithRequest(bc.TieredSnapshot, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: usageFacts})
+		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
 		if err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算失败，保留预扣额度: %v", task.TaskID, err))
 			return true
