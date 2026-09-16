@@ -334,6 +334,7 @@ func TestHailuoH3RegenerationUsageFacts(t *testing.T) {
 		}}
 		assert.Equal(t, map[string]any{
 			"seconds": float64(7), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+			"prompt_tokens": float64(0), "completion_tokens": float64(0),
 		}, callHailuoHook(t, plugin, "extractUsage", ctx))
 	})
 
@@ -347,6 +348,7 @@ func TestHailuoH3RegenerationUsageFacts(t *testing.T) {
 		ctx["action"] = "regeneration"
 		assert.Equal(t, map[string]any{
 			"seconds": float64(15), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+			"prompt_tokens": float64(0), "completion_tokens": float64(0),
 		}, callHailuoHook(t, plugin, "extractUsage", ctx))
 	})
 }
@@ -557,6 +559,10 @@ func TestHailuoExtractUsageFacts(t *testing.T) {
 			ctx := hailuoH3SubmitContext(testCase.request)
 			ctx["model"] = testCase.model
 			ctx["upstreamModel"] = testCase.model
+			// H3 视频补齐不适用的 Token 字段，旧模型不引入 H3 专用计费维度。
+			if testCase.model == "MiniMax-H3" {
+				testCase.want["prompt_tokens"], testCase.want["completion_tokens"] = float64(0), float64(0)
+			}
 			assert.Equal(t, testCase.want, callHailuoHook(t, plugin, "extractUsage", ctx))
 		})
 	}
@@ -599,6 +605,8 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			var body any
 			require.NoError(t, common.UnmarshalJsonStr(testCase.body, &body))
+			// 不适用的 Token 为零；视频实际用量依然按有效性决定是否覆盖估算。
+			testCase.want["prompt_tokens"], testCase.want["completion_tokens"] = float64(0), float64(0)
 			assert.Equal(t, testCase.want, callHailuoHook(t, plugin, "extractUsageOnComplete", nil, nil, body))
 		})
 	}
@@ -611,6 +619,7 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		))
 		assert.Equal(t, map[string]any{
 			"seconds": float64(6), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0), "operation": "regeneration",
+			"prompt_tokens": float64(0), "completion_tokens": float64(0),
 		}, callHailuoHook(t, plugin, "extractUsageOnComplete", map[string]any{"action": "regeneration"}, nil, body))
 	})
 
@@ -622,6 +631,7 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{
 			"seconds": float64(5), "resolution": "2K", "input_images": float64(6), "input_video_seconds": float64(7.5), "operation": "generation",
+			"prompt_tokens": float64(0), "completion_tokens": float64(0),
 		}, result.UsageFacts)
 	})
 }

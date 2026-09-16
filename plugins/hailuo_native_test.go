@@ -110,7 +110,7 @@ func TestHailuoNativeContextIRHooks(t *testing.T) {
 	completionFacts := callHailuoHook(t, plugin, "extractUsageOnComplete", map[string]any{
 		"action": "context_ir",
 	}, nil, completion)
-	assert.Equal(t, map[string]any{"operation": "context_ir", "tokens": float64(9090), "prompt_tokens": float64(5664), "completion_tokens": float64(3426)}, completionFacts)
+	assert.Equal(t, map[string]any{"operation": "context_ir", "tokens": float64(9090), "prompt_tokens": float64(5664), "completion_tokens": float64(3426), "seconds": float64(0), "input_images": float64(0), "input_video_seconds": float64(0)}, completionFacts)
 }
 
 // 原生创建和再生成路由必须把官方请求转换为宿主可持久化的提交意图。
@@ -248,6 +248,8 @@ func TestHailuoNativeContextIRCompletionTokenBoundaries(t *testing.T) {
 		{"overflow", map[string]any{"total_tokens": 2147483648}, map[string]any{"operation": "context_ir"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// 不适用的视频用量恒为零，实际 Token 缺失时仍不输出该字段。
+			tc.want["seconds"], tc.want["input_images"], tc.want["input_video_seconds"] = float64(0), float64(0), float64(0)
 			assert.Equal(t, tc.want, callHailuoHook(t, plugin, "extractUsageOnComplete", nil, nil, map[string]any{
 				"task": map[string]any{"task_type": "h3_context_ir", "usage": tc.usage},
 			}))
@@ -281,7 +283,7 @@ func TestHailuoNativeContextIRSplitTokenBoundaries(t *testing.T) {
 				facts := callHailuoHook(t, plugin, "extractUsageOnComplete", nil, nil, map[string]any{
 					"task": map[string]any{"task_type": "h3_context_ir", "usage": map[string]any{"total_tokens": 9090, field: tc.value}},
 				})
-				want := map[string]any{"operation": "context_ir", "tokens": float64(9090)}
+				want := map[string]any{"operation": "context_ir", "tokens": float64(9090), "seconds": float64(0), "input_images": float64(0), "input_video_seconds": float64(0)}
 				if tc.want != nil {
 					want[field] = tc.want
 				}

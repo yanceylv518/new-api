@@ -99,7 +99,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.3.5",
+  version: "1.3.6",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -693,6 +693,9 @@ function h3RegenerationUsage(ctx, req) {
     input_images: sourceImageCount === undefined ? inputImages : sourceImageCount,
     input_video_seconds: hasReferenceVideo ? H3_MAX_INPUT_VIDEO_SECONDS : 0,
     operation: H3_REGENERATION_OPERATION,
+    // 视频操作不产生 Context-IR Token；显式零值兼容编辑器保留的零价项。
+    prompt_tokens: 0,
+    completion_tokens: 0,
   };
 }
 
@@ -712,6 +715,10 @@ function h3ContextIRUsage(ctx, req) {
     prompt_tokens: promptTokens,
     completion_tokens: H3_CONTEXT_IR_ESTIMATED_OUTPUT_TOKENS,
     operation: H3_CONTEXT_IR_OPERATION,
+    // Context-IR 只生成文本，这些视频计费数量为零，不影响输入 Token 的媒体估算。
+    seconds: 0,
+    input_images: 0,
+    input_video_seconds: 0,
   };
 }
 
@@ -995,6 +1002,9 @@ export function extractUsage(ctx) {
         return item && item.type === "image_url";
       }).length,
       operation: H3_GENERATION_OPERATION,
+      // 不适用的数值字段必须存在，避免完整价格表达式执行 nil * 0。
+      prompt_tokens: 0,
+      completion_tokens: 0,
       // Input URLs do not expose duration. Reserve the documented total limit;
       // polling replaces it with usage.input_seconds after success.
       input_video_seconds: content.some(function (item) {
@@ -1101,6 +1111,10 @@ export function extractUsageOnComplete(task, _taskResult, body) {
     const resolution = trimmed(h3Task.resolution).toUpperCase();
     const facts = { operation: h3CompletionOperation(task, body) };
     if (facts.operation === H3_CONTEXT_IR_OPERATION) {
+      // 同时修复升级前缺少这些字段的冻结快照；缺失的实际 Token 仍保留估算。
+      facts.seconds = 0;
+      facts.input_images = 0;
+      facts.input_video_seconds = 0;
       const usage = h3Task.usage && typeof h3Task.usage === "object" && !Array.isArray(h3Task.usage) ? h3Task.usage : {};
       // null、空字符串和布尔值不是实际用量，保留预扣估算，防止被 Number 转成零后全退。
       // 总量仅保留给升级前冻结的结算快照；新定价只使用输入、输出，不从总量推算缺失的一侧。
@@ -1113,6 +1127,9 @@ export function extractUsageOnComplete(task, _taskResult, body) {
       }
       return facts;
     }
+    // 只补齐本操作不适用的字段，不能将缺失的实际视频用量填零后错误退款。
+    facts.prompt_tokens = 0;
+    facts.completion_tokens = 0;
     if (resolution === "2K" || resolution === "768P") facts.resolution = resolution;
     const usage = h3Task.usage && typeof h3Task.usage === "object" && !Array.isArray(h3Task.usage) ? h3Task.usage : {};
     const fields = [

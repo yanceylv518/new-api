@@ -11,7 +11,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.1.2",
+  version: "1.1.3",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -515,7 +515,8 @@ export function extractUsageOnComplete(task, taskResult, body) {
   const usage = body.usage || {};
   let tokens = billingTokenCount(usage.completion_tokens);
   const totalTokens = billingTokenCount(usage.total_tokens);
-  if (tokens === null || (tokens === 0 && totalTokens !== null)) tokens = totalTokens;
+  // 明确的 completion_tokens=0 是有效计费用量，只有缺失或非法值才回退总量。
+  if (tokens === null) tokens = totalTokens;
   if (tokens !== null) facts.tokens = tokens;
   const content = body.content || {};
   const resolution = trimmed(content.resolution || body.resolution).toLowerCase();
