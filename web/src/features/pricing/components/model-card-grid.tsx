@@ -30,6 +30,9 @@ import type { PricingModel, TokenUnit } from '../types'
 import { ModelCard } from './model-card'
 import type { ModelPerfBadgeData } from './model-perf-badge'
 
+// 模型广场只维护一个汇总查询，低频刷新即可覆盖异步任务完成后的最新样本。
+const PERF_METRICS_REFRESH_INTERVAL_MS = 30_000
+
 export interface ModelCardGridProps {
   models: PricingModel[]
   onModelClick: (modelName: string) => void
@@ -52,6 +55,8 @@ export function ModelCardGrid(props: ModelCardGridProps) {
     queryKey: ['perf-metrics-summary', 24],
     queryFn: async () => requireServerSuccess(await getPerfMetricsSummary(24)),
     staleTime: 60 * 1000,
+    refetchInterval: PERF_METRICS_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: 'always',
     retry: false,
   })
 

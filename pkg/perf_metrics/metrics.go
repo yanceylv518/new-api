@@ -54,6 +54,24 @@ func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens i
 	})
 }
 
+// RecordTaskCompletion 记录异步任务的终态性能样本。
+// 任务没有流式 token 输出，因此只统计请求数、成功率和提交到完成的总延迟，TPS 留给文本响应路径计算。
+func RecordTaskCompletion(modelName, group string, submitTime, finishTime int64, success bool) {
+	latencyMs := int64(0)
+	if submitTime > 0 && finishTime >= submitTime {
+		elapsedSeconds := finishTime - submitTime
+		if elapsedSeconds <= math.MaxInt64/1000 {
+			latencyMs = elapsedSeconds * 1000
+		}
+	}
+	Record(Sample{
+		Model:     modelName,
+		Group:     group,
+		LatencyMs: latencyMs,
+		Success:   success,
+	})
+}
+
 func Record(sample Sample) {
 	setting := perf_metrics_setting.GetSetting()
 	if !setting.Enabled || sample.Model == "" {

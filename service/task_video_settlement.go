@@ -44,6 +44,9 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 	if err != nil {
 		return false, err
 	}
+	if won {
+		RecordTaskPerformance(task)
+	}
 	if model.LOG_DB != model.DB {
 		// 终态重放也尝试补日志，但绝不再次调整账务。
 		if err := model.DeliverVideoTaskLog(ctx, task.ID); err != nil {

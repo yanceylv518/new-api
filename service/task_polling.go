@@ -15,6 +15,7 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
@@ -62,6 +63,31 @@ type BatchTaskResult struct {
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
+
+// RecordTaskPerformance 在任务终态已被当前轮询者确认后异步写入性能聚合。
+// 先复制必要的标量快照，避免后台写入读取会被下一轮轮询修改的 Task 指针；CAS 由调用方保证每个任务只进入一次。
+func RecordTaskPerformance(task *model.Task) {
+	if task == nil || (task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure) {
+		return
+	}
+	modelName := task.Properties.OriginModelName
+	if modelName == "" && task.PrivateData.BillingContext != nil {
+		modelName = task.PrivateData.BillingContext.OriginModelName
+	}
+	if modelName == "" {
+		modelName = task.Properties.UpstreamModelName
+	}
+	if modelName == "" {
+		return
+	}
+	group := task.Group
+	submitTime := task.SubmitTime
+	finishTime := task.FinishTime
+	success := task.Status == model.TaskStatusSuccess
+	gopool.Go(func() {
+		perfmetrics.RecordTaskCompletion(modelName, group, submitTime, finishTime, success)
+	})
+}
 
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
@@ -117,6 +143,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
+		RecordTaskPerformance(task)
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
@@ -389,6 +416,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			continue
 		}
 		if terminalTransition {
+			RecordTaskPerformance(task)
 			billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, &responseItem.TaskInfo)
 			if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
 				RefundTaskQuota(ctx, task, task.FailReason)
@@ -684,6 +712,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	if shouldFinalizeBilling {
+		RecordTaskPerformance(task)
 		billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 		if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, task.FailReason)
@@ -883,6 +912,7 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 	if !won {
 		return nil
 	}
+	RecordTaskPerformance(task)
 	taskResult := relaycommon.FailTaskInfo(reason)
 	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 	if !billingSettled && task.Quota != 0 {

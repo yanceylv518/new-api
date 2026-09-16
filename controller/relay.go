@@ -787,6 +787,7 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
+	service.RecordTaskPerformance(task)
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

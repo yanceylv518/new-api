@@ -564,6 +564,7 @@ func retainTaskPluginUnsettledDeletion(c *gin.Context, task *model.Task) bool {
 			return false
 		}
 		if won {
+			service.RecordTaskPerformance(task)
 			logger.LogWarn(c, fmt.Sprintf("上游删除与完成竞态，保留预扣待对账 task=%s quota=%d", task.TaskID, task.Quota))
 			return false
 		}

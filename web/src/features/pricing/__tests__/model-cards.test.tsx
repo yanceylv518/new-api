@@ -437,6 +437,65 @@ describe('model cards', () => {
     expect(onModelClick).toHaveBeenCalledWith('example-model')
   })
 
+  it('refreshes performance metrics while the model cards stay mounted', async () => {
+    vi.useFakeTimers()
+    const request = vi
+      .spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: { success: true, data: { models: [] } },
+      } as never)
+      .mockResolvedValue({
+        data: {
+          success: true,
+          data: {
+            models: [
+              {
+                model_name: 'example-model',
+                avg_latency_ms: 2000,
+                avg_tps: 0,
+                success_rate: 100,
+              },
+            ],
+          },
+        },
+      } as never)
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ModelCardGrid models={[pricingModel()]} onModelClick={vi.fn()} />
+      </QueryClientProvider>
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(
+      within(
+        screen.getByLabelText('Performance metrics for the last 24 hours')
+      ).getByText('—%')
+    ).toBeVisible()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(request.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(
+      within(
+        screen.getByLabelText('Performance metrics for the last 24 hours')
+      ).getByText('100.0%')
+    ).toBeVisible()
+    expect(
+      within(
+        screen.getByLabelText('Performance metrics for the last 24 hours')
+      ).getByText('2.00s')
+    ).toBeVisible()
+  })
+
   it('paginates the model cards and disables navigation at both boundaries', async () => {
     queryClient.setQueryData(['perf-metrics-summary', 24], {
       success: true,
