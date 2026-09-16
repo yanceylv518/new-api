@@ -826,4 +826,7 @@ export const STATIC_I18N_KEYS = [
   'Vendor name and icon must not exceed 128 characters.',
   'Shown',
   'Not shown',
+  // 视频插件任务类型由映射表动态引用。
+  'Video Regeneration',
+  'H3-Context-IR',
 ] as const

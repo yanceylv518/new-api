@@ -1,6 +1,6 @@
 # Hailuo Video 自定义接口文档
 
-本文档对应内置 Hailuo Video 插件 **1.3.6** 的自定义路由。文档只描述
+本文档对应内置 Hailuo Video 插件 **1.3.7** 的自定义路由。文档只描述
 插件声明的 `/hailuo/v2/...` 接口，不包含网关的 OpenAI 兼容接口、通用任务
 接口或宿主素材接口。
 
@@ -104,11 +104,11 @@ curl --request POST "$BASE_URL/hailuo/v2/video_generation" \
 | `resolution` | string | 是 | `768P`、`2K` | 输出分辨率 |
 | `duration` | integer | 是 | 4 到 15 | 输出视频时长，单位为秒 |
 | `ratio` | string | 否 | `adaptive`、`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16` | 画面比例 |
-| `callback_url` | string | 否 | 上游可访问的回调地址 | 透传给上游 |
+| `callback_url` | string | 否 | HTTP/HTTPS 回调地址 | 网关校验类型和URL基本格式；上游执行 challenge 和可达性验证 |
 | `aigc_watermark` | boolean | 否 | `true`、`false` | 是否添加水印，显式 `false` 会保留 |
 
 不传 `ratio` 时，纯文本输入默认为 `16:9`，含图片或视频时默认为
-`adaptive`。`adaptive` 必须和视觉输入一起使用。
+`adaptive`。显式 `adaptive` 也支持音频参考输入，纯文本输入不能使用它。
 
 ### `content` 项
 
@@ -117,7 +117,6 @@ curl --request POST "$BASE_URL/hailuo/v2/video_generation" \
 | `text` | 无 | `{ "text": "..." }` | 视频提示词 |
 | `image_url` | `first_frame` | `{ "image_url": { "url": "https://..." } }` | 首帧 |
 | `image_url` | `last_frame` | 同上 | 尾帧 |
-| `image_url` | `middle_frame` | 同上 | 中间帧 |
 | `image_url` | `reference_image` | 同上 | 参考图 |
 | `video_url` | `reference_video` | `{ "video_url": { "url": "https://..." } }` | 参考视频 |
 | `audio_url` | `reference_audio` | `{ "audio_url": { "url": "https://..." } }` | 参考音频 |
@@ -223,7 +222,7 @@ curl --request POST "$BASE_URL/hailuo/v2/video_regeneration" \
 
 ### 源视频内容模式
 
-直接内容模式需要在 `content` 中提供一个 `base_video`，并提供原始或修改后的
+直接内容模式需要在 `content` 中提供一个 `base_video`，并提供生成源视频时的最终
 非空提示词。
 
 ```bash

@@ -62,6 +62,37 @@ export const protocols = {openai_video: {
 }};
 `
 
+// 智能时长须能穿过宿主请求校验，但负计费事实仍拒绝，且上游保留 -1 而预估为正数。
+func TestDoubaoSmartDurationRequestAndBillingBoundaries(t *testing.T) {
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{Key: "doubao"})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	for _, field := range []string{"duration", "seconds"} {
+		for _, sentinel := range []any{-1, "-1"} {
+			request := map[string]any{"model": "doubao-seedance-2-0-mini-260615", "prompt": "test", field: sentinel, "metadata": map[string]any{"resolution": "480p"}}
+			require.NoError(t, adaptor.validateResolvedUsageRequest(request, "doubao-seedance-2-0-oinone"))
+			ctx := map[string]any{"requestBody": request, "upstreamModel": "doubao-seedance-2-0-oinone", "baseUrl": "https://upstream.example", "usagePurpose": "facts"}
+			value, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			facts := value.(map[string]any)
+			_, err = adaptor.validatedUsageRatios(facts, "doubao-seedance-2-0-oinone")
+			require.NoError(t, err)
+			assert.Greater(t, facts["tokens"].(float64), float64(0))
+			built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.NoError(t, err)
+			assert.EqualValues(t, -1, built.(map[string]any)["body"].(map[string]any)["duration"])
+		}
+		require.Error(t, adaptor.validateResolvedUsageRequest(map[string]any{field: -2}, ""))
+		require.NoError(t, adaptor.validateResolvedUsageRequest(map[string]any{"metadata": map[string]any{field: -1}}, ""))
+		_, err = adaptor.validatedUsageRatios(map[string]any{field: -1}, "")
+		require.Error(t, err)
+		_, err = adaptor.validatedCompletionUsageFacts(map[string]any{field: -1}, "")
+		require.Error(t, err)
+	}
+}
+
 func TestTaskAdaptorRejectsDeprecatedClientResponse(t *testing.T) {
 	source := strings.Replace(mockPlugin, `taskData: {accepted: true, status: resp.statusCode},`, `taskData: {}, clientResponse: {id: ctx.publicTaskId},`, 1)
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})

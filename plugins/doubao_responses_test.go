@@ -1,6 +1,7 @@
 package plugins_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -62,7 +63,7 @@ func TestDoubaoResolutionRequestContract(t *testing.T) {
 				}
 				// 表单上传与 JSON 共用相同限制，不能通过 size 绕过分辨率校验。
 				multipart := map[string]any{"model": model, "body": map[string]any{"kind": "multipart", "fields": map[string]any{
-					"size": []string{tc.resolution}, "seconds": []string{"5"},
+					"size": []string{tc.resolution}, "seconds": []string{"5"}, "prompt": []string{"test"},
 				}}}
 				_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, multipart)
 				if tc.valid {
@@ -102,7 +103,7 @@ func TestDoubaoResolutionRequestContract(t *testing.T) {
 	}{
 		{"1920x1080", "1080p", 243000}, {"3840x2160", "4k", 972000},
 	} {
-		ctx := map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"seconds": 5, "size": tc.size}}
+		ctx := map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"seconds": 5, "size": tc.size, "prompt": "test"}}
 		built, callErr := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
 		require.NoError(t, callErr)
 		assert.Equal(t, tc.resolution, built.(map[string]any)["body"].(map[string]any)["resolution"])
@@ -171,7 +172,7 @@ func TestDoubaoEffectiveDurationAndMetadataBounds(t *testing.T) {
 	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
 	require.NoError(t, err)
 	for _, duration := range []any{10, "10", -1} {
-		value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"duration": duration}})
+		value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"duration": duration, "prompt": "test"}})
 		require.NoError(t, err)
 		want := 10
 		if duration == -1 {
@@ -188,6 +189,181 @@ func TestDoubaoEffectiveDurationAndMetadataBounds(t *testing.T) {
 			require.Error(t, err, "hook=%s request=%v", hook, request)
 		}
 	}
+}
+
+// 官方不同模型的时长、帧数和服务等级限制必须在所有提交入口保持一致。
+func TestDoubaoModelCapabilityValidation(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	textContent := []any{map[string]any{"type": "text", "text": "test"}}
+	callNative := func(model string, body map[string]any) error {
+		body["model"] = model
+		body["content"] = textContent
+		_, callErr := plugin.Engine.CallMember(t.Context(), "native", "createTask", map[string]any{"body": map[string]any{"kind": "json", "value": body}})
+		return callErr
+	}
+	for _, tc := range []struct {
+		name, model string
+		duration    any
+		valid       bool
+	}{
+		{"2.0 minimum", "doubao-seedance-2-0-260128", 4, true},
+		{"2.0 rejects 16 seconds", "doubao-seedance-2-0-260128", 16, false},
+		{"fast accepts smart duration", "doubao-seedance-2-0-fast-260128", -1, true},
+		{"mini rejects short duration", "doubao-seedance-2-0-mini-260615", 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := callNative(tc.model, map[string]any{"duration": tc.duration})
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, model string
+		body        map[string]any
+		valid       bool
+		want        string
+	}{
+		{"2.0 rejects frames", "doubao-seedance-2-0-260128", map[string]any{"frames": 57}, false, "does not support frames"},
+		{"2.0 rejects flex", "doubao-seedance-2-0-260128", map[string]any{"service_tier": "flex"}, false, "does not support service_tier"},
+		{"2.0 rejects draft", "doubao-seedance-2-0-260128", map[string]any{"draft": true, "resolution": "480p"}, false, "does not support draft tasks"},
+		{"invalid ratio", "doubao-seedance-2-0-260128", map[string]any{"ratio": "2:1"}, false, "ratio must be"},
+		{"priority upper bound", "doubao-seedance-2-0-260128", map[string]any{"priority": 10}, false, "priority must be"},
+		{"zero resolution is not default", "doubao-seedance-2-0-260128", map[string]any{"resolution": 0}, false, "must be a string"},
+		{"false ratio is not default", "doubao-seedance-2-0-260128", map[string]any{"ratio": false}, false, "ratio must be a string"},
+		{"camera_fixed rejected before upstream", "doubao-seedance-2-0-260128", map[string]any{"camera_fixed": true}, false, "does not support camera_fixed"},
+		{"mov rejected before upstream", "doubao-seedance-2-0-260128", map[string]any{"output_format": "mov"}, false, "only supports mp4 output_format"},
+		{"mp4 is accepted", "doubao-seedance-2-0-260128", map[string]any{"output_format": "mp4"}, true, ""},
+		{"callback syntax", "doubao-seedance-2-0-260128", map[string]any{"callback_url": "not-a-url"}, false, "callback_url must be"},
+		{"callback accepted", "doubao-seedance-2-0-260128", map[string]any{"callback_url": "https://callback.example/path?task=test"}, true, ""},
+		{"safety identifier wrong type", "doubao-seedance-2-0-260128", map[string]any{"safety_identifier": 123}, false, "safety_identifier must be"},
+		{"safety identifier limit", "doubao-seedance-2-0-260128", map[string]any{"safety_identifier": strings.Repeat("a", 64)}, true, ""},
+		{"safety identifier overflow", "doubao-seedance-2-0-260128", map[string]any{"safety_identifier": strings.Repeat("a", 65)}, false, "safety_identifier must be"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := callNative(tc.model, tc.body)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.want)
+			}
+		})
+	}
+	draftContent := []any{map[string]any{"type": "draft_task", "draft_task": map[string]any{"id": "draft-public"}}}
+	_, err = plugin.Engine.CallMember(t.Context(), "native", "createTask", map[string]any{"body": map[string]any{"kind": "json", "value": map[string]any{
+		"model": "doubao-seedance-2-0-260128", "content": draftContent,
+	}}})
+	require.ErrorContains(t, err, "does not support draft_task")
+}
+
+// 内容角色和模型能力的组合错误必须在预扣前被拦截，合法参考场景仍应透传。
+func TestDoubaoContentCapabilityValidation(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	call := func(model string, content []any) error {
+		_, callErr := plugin.Engine.CallMember(t.Context(), "native", "createTask", map[string]any{"body": map[string]any{"kind": "json", "value": map[string]any{
+			"model": model, "duration": 5, "content": content,
+		}}})
+		return callErr
+	}
+	textItem := map[string]any{"type": "text", "text": "test"}
+	videoItem := map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "https://cdn.example/ref.mp4"}}
+	audioItem := map[string]any{"type": "audio_url", "role": "reference_audio", "audio_url": map[string]any{"url": "https://cdn.example/ref.mp3"}}
+	imageItem := map[string]any{"type": "image_url", "role": "reference_image", "image_url": map[string]any{"url": "https://cdn.example/ref.png"}}
+	for _, tc := range []struct {
+		name, model, want string
+		content           []any
+		valid             bool
+	}{
+		{"reference video is valid on 2.0", "doubao-seedance-2-0-260128", "", []any{textItem, videoItem}, true},
+		{"audio requires visual input", "doubao-seedance-2-0-260128", "audio input requires", []any{textItem, audioItem}, false},
+		{"frame and reference are exclusive", "doubao-seedance-2-0-260128", "cannot be mixed", []any{textItem, map[string]any{"type": "image_url", "role": "first_frame", "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}, imageItem}, false},
+		{"unknown image role is rejected", "doubao-seedance-2-0-260128", "image role is invalid", []any{textItem, map[string]any{"type": "image_url", "role": "middle_frame", "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}}, false},
+		{"zero image role is rejected", "doubao-seedance-2-0-260128", "role must be a string", []any{textItem, map[string]any{"type": "image_url", "role": 0, "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := call(tc.model, tc.content)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.want)
+			}
+		})
+	}
+}
+
+// OpenAI 兼容解码产生的顶层 content 和官方选项必须完整进入最终上游请求。
+func TestDoubaoCompatibilityPreservesOfficialContent(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	content := []any{
+		map[string]any{"type": "text", "text": "test"},
+		map[string]any{"type": "image_url", "role": "reference_image", "image_url": map[string]any{"url": "asset://reference"}},
+	}
+	decoded, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"model":         "doubao-seedance-2-0-260128",
+		"upstreamModel": "doubao-seedance-2-0-260128",
+		"body": map[string]any{"kind": "json", "value": map[string]any{
+			"model": "doubao-seedance-2-0-260128", "content": content, "duration": 5,
+			"resolution": "720p", "generate_audio": true, "priority": 3,
+		}},
+	})
+	require.NoError(t, err)
+	intent := decoded.(map[string]any)
+	built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"requestBody": intent["requestBody"], "upstreamModel": "doubao-seedance-2-0-260128",
+		"baseUrl": "https://upstream.example", "apiKey": "fixture-key",
+	})
+	require.NoError(t, err)
+	body := built.(map[string]any)["body"].(map[string]any)
+	assert.Equal(t, true, body["generate_audio"])
+	assert.EqualValues(t, 3, body["priority"])
+	assert.Equal(t, content, body["content"])
+
+	// 表单字符串必须转换为官方标量类型，不能把 false/0 丢掉或作为字符串透传。
+	decoded, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"model": "doubao-seedance-2-0-260128", "upstreamModel": "doubao-seedance-2-0-260128",
+		"body": map[string]any{"kind": "multipart", "fields": map[string]any{
+			"prompt": []string{"test"}, "duration": []string{"4"}, "resolution": []string{"480p"},
+			"generate_audio": []string{"false"}, "seed": []string{"0"}, "priority": []string{"0"},
+		}},
+	})
+	require.NoError(t, err)
+	intent = decoded.(map[string]any)
+	built, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"requestBody": intent["requestBody"], "upstreamModel": "doubao-seedance-2-0-260128", "baseUrl": "https://upstream.example",
+	})
+	require.NoError(t, err)
+	body = built.(map[string]any)["body"].(map[string]any)
+	assert.Equal(t, false, body["generate_audio"])
+	assert.EqualValues(t, 0, body["seed"])
+	assert.EqualValues(t, 0, body["priority"])
+
+	// 真实上游Mini回显seed不一致时，网关必须仍保留调用者的值，不能用回填掩盖上游差异。
+	native, err := plugin.Engine.CallMember(t.Context(), "native", "createTask", map[string]any{
+		"body": map[string]any{"kind": "json", "value": map[string]any{
+			"model": "doubao-seedance-2-0-mini-260615", "duration": 4, "resolution": "720p", "seed": 123, "priority": 1,
+			"content": []any{map[string]any{"type": "text", "text": "test"}},
+		}},
+	})
+	require.NoError(t, err)
+	built, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"requestBody": native.(map[string]any)["requestBody"], "upstreamModel": "doubao-seedance-2-0-oinone", "baseUrl": "https://upstream.example",
+	})
+	require.NoError(t, err)
+	body = built.(map[string]any)["body"].(map[string]any)
+	assert.Equal(t, "doubao-seedance-2-0-oinone", body["model"])
+	assert.EqualValues(t, 123, body["seed"])
+	assert.EqualValues(t, 1, body["priority"])
 }
 
 func TestDoubaoNativeContract(t *testing.T) {
@@ -219,7 +395,7 @@ func TestDoubaoNativeContract(t *testing.T) {
 	request := map[string]any{
 		"model": "doubao-seedance-2-5-260628", "duration": -1, "resolution": "720p", "seed": 0,
 		"generate_audio": false, "watermark": false, "camera_fixed": false, "return_last_frame": true,
-		"output_format": "mov", "service_tier": "flex", "omni_reference_task_type": "reference",
+		"output_format": "mov", "omni_reference_task_type": "reference",
 		"content": []any{
 			map[string]any{"type": "text", "text": "first instruction"},
 			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://private-asset"}, "role": "reference_image"},
@@ -241,7 +417,7 @@ func TestDoubaoNativeContract(t *testing.T) {
 	assert.EqualValues(t, 51300, framesUsage["tokens"])
 
 	submitted := call("parseSubmitResponse", "", driverContext, map[string]any{"body": map[string]any{"id": "upstream-id"}})
-	assert.Equal(t, "flex", submitted["taskData"].(map[string]any)["service_tier"])
+	assert.Equal(t, "default", submitted["taskData"].(map[string]any)["service_tier"])
 	created := call("native", "taskCreated", map[string]any{}, map[string]any{"task_id": "public-id", "data": submitted["taskData"]})
 	assert.Equal(t, map[string]any{"id": "public-id"}, created)
 	status := call("native", "taskStatus", map[string]any{}, map[string]any{"task_id": "public-id", "status": "FAILURE", "fail_reason": "task cancelled by user", "data": map[string]any{"id": "upstream-id", "status": "queued"}})

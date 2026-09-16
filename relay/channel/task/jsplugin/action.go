@@ -132,7 +132,10 @@ func (a *TaskAdaptor) ExecuteTaskAction(ctx context.Context, operation string, t
 	// 厂商成功响应各不相同；可选解析器只归一化操作结果，不改变 HTTP 错误处理。
 	if response.StatusCode >= 200 && response.StatusCode < 300 && a.hasHook(ctx, "parseTaskActionResponse") {
 		var body any
-		if err = common.Unmarshal(responseBody, &body); err != nil {
+		// 官方 DELETE 可能以空响应体表示成功，空体交给插件作为 nil 处理。
+		if len(bytes.TrimSpace(responseBody)) == 0 {
+			body = nil
+		} else if err = common.Unmarshal(responseBody, &body); err != nil {
 			return nil, fmt.Errorf("task action response is invalid JSON")
 		}
 		value, parseErr := a.plugin.Engine.Call(ctx, "parseTaskActionResponse", queryContext, map[string]any{"statusCode": response.StatusCode, "body": body})

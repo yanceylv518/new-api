@@ -199,7 +199,8 @@ function BillingBreakdown(props: {
     } else {
       rows.push({
         label: t('Matched Tier'),
-        value: other.matched_tier || t('No matching results'),
+        // 未记录档位与没有命中计价规则并不等价，不能把显示能力限制当作计费错误。
+        value: other.matched_tier || t('Not available'),
       })
     }
   } else if (isPerCall) {

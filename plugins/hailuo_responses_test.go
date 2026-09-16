@@ -71,6 +71,35 @@ func TestHailuoArtifactContentProxy(t *testing.T) {
 	assert.False(t, descriptor.Credentialless)
 }
 
+// Responses 顶层原生内容和显式 false 必须到达上游，音频参考允许自适应比例。
+func TestHailuoH3ResponsesPreservesNativeContent(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	content := []any{map[string]any{"type": "text", "text": "test"}, map[string]any{"type": "audio_url", "role": "reference_audio", "audio_url": map[string]any{"url": "https://cdn.example/reference.mp3"}}}
+	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_responses", "decodeRequest"}, map[string]any{
+		"upstreamModel": "MiniMax-H3", "body": map[string]any{"kind": "json", "value": map[string]any{
+			"model": "MiniMax-H3", "content": content, "duration": 4, "resolution": "768P", "ratio": "adaptive", "aigc_watermark": false,
+		}},
+	})
+	require.NoError(t, err)
+	intent := value.(map[string]any)
+	built := callHailuoHook(t, plugin, "buildSubmitRequest", map[string]any{"upstreamModel": "MiniMax-H3", "requestBody": intent["requestBody"], "baseUrl": "https://upstream.example"})
+	body := built["body"].(map[string]any)
+	assert.Equal(t, content, body["content"])
+	assert.Equal(t, "adaptive", body["ratio"])
+	assert.Equal(t, false, body["aigc_watermark"])
+	// multipart 的 false 必须被还原为布尔值，不能被新的类型校验误拒绝。
+	value, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"model": "MiniMax-H3", "upstreamModel": "MiniMax-H3",
+		"body": map[string]any{"kind": "multipart", "fields": map[string]any{
+			"prompt": []string{"test"}, "seconds": []string{"4"}, "resolution": []string{"768P"}, "aigc_watermark": []string{"false"},
+		}},
+	})
+	require.NoError(t, err)
+	intent = value.(map[string]any)
+	built = callHailuoHook(t, plugin, "buildSubmitRequest", map[string]any{"upstreamModel": "MiniMax-H3", "requestBody": intent["requestBody"], "baseUrl": "https://upstream.example"})
+	assert.Equal(t, false, built["body"].(map[string]any)["aigc_watermark"])
+}
+
 func loadHailuoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	t.Helper()
 	source, err := builtinplugins.Source("hailuo")
@@ -373,8 +402,29 @@ func TestHailuoH3RejectsOutOfContractRequests(t *testing.T) {
 		{"fractional duration", map[string]any{"prompt": "p", "duration": 5.5}, "duration must be an integer between 4 and 15"},
 		{"unsupported resolution", map[string]any{"prompt": "p", "size": "1080P"}, "resolution must be 768P or 2K"},
 		{"unknown ratio", map[string]any{"prompt": "p", "metadata": map[string]any{"ratio": "16:10"}}, "ratio must be one of"},
-		{"adaptive ratio without a visual input", map[string]any{"prompt": "p", "metadata": map[string]any{"ratio": "adaptive"}}, "ratio adaptive requires an image or video input"},
+		{"false ratio is not default", map[string]any{"prompt": "p", "ratio": false}, "ratio must be a string"},
+		{"zero resolution is not default", map[string]any{"prompt": "p", "size": 0}, "resolution must be a string"},
+		{"zero role is not omitted", map[string]any{"prompt": "p", "content": []any{map[string]any{"type": "image_url", "role": 0, "image_url": map[string]any{"url": "https://image.example/test.png"}}}}, "role must be a string"},
+		{"watermark type", map[string]any{"prompt": "p", "aigc_watermark": "not-bool"}, "aigc_watermark must be a boolean"},
+		{"callback URL syntax", map[string]any{"prompt": "p", "metadata": map[string]any{"callback_url": "not-a-url"}}, "callback_url must be an HTTP or HTTPS URL"},
+		{"adaptive ratio without media", map[string]any{"prompt": "p", "metadata": map[string]any{"ratio": "adaptive"}}, "ratio adaptive requires a media input"},
 		{"too many frame images", map[string]any{"prompt": "p", "images": []any{"a.png", "b.png", "c.png"}}, "at most 2 frame images"},
+		{"middle frame role is removed", map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+			map[string]any{"type": "image_url", "role": "middle_frame", "image_url": map[string]any{"url": "u"}},
+		}}}, "image role is invalid"},
+		{"unknown image role", map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+			map[string]any{"type": "image_url", "role": "thumbnail", "image_url": map[string]any{"url": "u"}},
+		}}}, "image role is invalid"},
+		{"missing image URL", map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+			map[string]any{"type": "image_url", "role": "first_frame", "image_url": map[string]any{}},
+		}}}, "image_url must include a URL"},
+		{"missing video role", map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+			map[string]any{"type": "video_url", "video_url": map[string]any{"url": "u"}},
+		}}}, "video role must be reference_video"},
+		{"multiple unlabeled images require roles", map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "u1"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "u2"}},
+		}}}, "an image role is required when multiple images are provided"},
 		{"media without text", map[string]any{"images": []any{"a.png"}}, "requires a non-empty text item"},
 		{"content is not an array", map[string]any{"prompt": "p", "metadata": map[string]any{"content": "nope"}}, "metadata.content must be an array"},
 		{
@@ -403,10 +453,10 @@ func TestHailuoH3RejectsOutOfContractRequests(t *testing.T) {
 		{
 			name: "too many reference videos",
 			request: map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
-				map[string]any{"type": "video_url", "video_url": map[string]any{"url": "u1"}},
-				map[string]any{"type": "video_url", "video_url": map[string]any{"url": "u2"}},
-				map[string]any{"type": "video_url", "video_url": map[string]any{"url": "u3"}},
-				map[string]any{"type": "video_url", "video_url": map[string]any{"url": "u4"}},
+				map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "u1"}},
+				map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "u2"}},
+				map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "u3"}},
+				map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "u4"}},
 			}}},
 			wantErr: "at most 3 reference videos",
 		},

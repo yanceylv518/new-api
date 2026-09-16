@@ -99,7 +99,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.3.6",
+  version: "1.3.7",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -350,11 +350,15 @@ function h3Duration(req) {
 
 function h3Resolution(req) {
   const metadata = req.metadata || {};
+  // 兼容入口也必须区分未提供和错误类型，0/false不能悄悄变成默认分辨率。
+  for (const value of [metadata.resolution, req.resolution, req.size]) {
+    if (value !== undefined && value !== null && typeof value !== "string") throw new Error(H3_MODEL + " resolution must be a string");
+  }
   const raw = trimmed(metadata.resolution) || trimmed(req.resolution) || trimmed(req.size);
   if (!raw) return "768P";
   const value = raw.toUpperCase();
-  if (value.includes("2K")) return "2K";
-  if (value.includes("768")) return "768P";
+  if (value === "2K") return "2K";
+  if (value === "768P") return "768P";
   throw new Error(H3_MODEL + " resolution must be 768P or 2K");
 }
 
@@ -389,6 +393,7 @@ function h3FrameImages(req) {
 }
 
 function validateH3Content(items) {
+  if (!Array.isArray(items)) throw new Error(H3_MODEL + " content must be an array");
   let hasText = false;
   let hasFrame = false;
   let hasReference = false;
@@ -398,40 +403,56 @@ function validateH3Content(items) {
   let referenceVideos = 0;
   let referenceAudios = 0;
   let inputImages = 0;
+  let unlabeledImages = 0;
   for (const item of items) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(H3_MODEL + " content items must be objects");
+    if (item.role !== undefined && item.role !== null && typeof item.role !== "string") throw new Error(H3_MODEL + " role must be a string");
+    const type = trimmed(item.type);
     const role = trimmed(item.role);
-    if (item.type === "text" && trimmed(item.text)) {
+    if (type === "text") {
+      if (typeof item.text !== "string" || !trimmed(item.text)) throw new Error(H3_MODEL + " text items must be non-empty strings");
       hasText = true;
       continue;
     }
-    if (item.type === "image_url") {
+    if (type === "image_url") {
+      if (!h3MediaURL(item, "image_url")) throw new Error(H3_MODEL + " image_url must include a URL");
       inputImages += 1;
-      if (!role || role === "first_frame") {
+      if (!role) {
+        unlabeledImages += 1;
+        firstFrames += 1;
+        hasFrame = true;
+      } else if (role === "first_frame") {
         firstFrames += 1;
         hasFrame = true;
       } else if (role === "last_frame") {
         lastFrames += 1;
         hasFrame = true;
-      } else if (role === "middle_frame") {
-        hasFrame = true;
       } else if (role === "reference_image") {
         referenceImages += 1;
         hasReference = true;
+      } else {
+        throw new Error(H3_MODEL + " image role is invalid");
       }
       continue;
     }
-    if (item.type === "video_url") {
+    if (type === "video_url") {
+      if (!h3MediaURL(item, "video_url")) throw new Error(H3_MODEL + " video_url must include a URL");
+      if (role !== "reference_video") throw new Error(H3_MODEL + " video role must be reference_video");
       referenceVideos += 1;
       hasReference = true;
       continue;
     }
-    if (item.type === "audio_url") {
+    if (type === "audio_url") {
+      if (!h3MediaURL(item, "audio_url")) throw new Error(H3_MODEL + " audio_url must include a URL");
+      if (role !== "reference_audio") throw new Error(H3_MODEL + " audio role must be reference_audio");
       referenceAudios += 1;
       hasReference = true;
+      continue;
     }
+    throw new Error(H3_MODEL + " content type is invalid");
   }
   if (!hasText) throw new Error(H3_MODEL + " requires a non-empty text item");
+  if (unlabeledImages > 0 && inputImages !== 1) throw new Error(H3_MODEL + " an image role is required when multiple images are provided");
   if (firstFrames > 1) throw new Error(H3_MODEL + " accepts at most one first_frame image");
   if (lastFrames > 1) throw new Error(H3_MODEL + " accepts at most one last_frame image");
   if (referenceImages > H3_MAX_REFERENCE_IMAGES) throw new Error(H3_MODEL + " accepts at most " + H3_MAX_REFERENCE_IMAGES + " reference images");
@@ -460,10 +481,13 @@ function h3SourceTaskID(req) {
   return trimmed(value);
 }
 
+// 接受官方 URL 结构和宿主 multipart 引用，不下载媒体或改写协议。
 function h3MediaURL(item, key) {
   const media = item && item[key];
-  if (typeof media === "string") return trimmed(media);
-  if (media && typeof media === "object" && !Array.isArray(media)) return trimmed(media.url);
+  if (!media || typeof media !== "object" || Array.isArray(media)) return "";
+  if (typeof media.url === "string") return trimmed(media.url);
+  // multipart 文件在宿主解析前以内部占位符存在，不能误判为缺失 URL。
+  if (media.url && typeof media.url === "object" && !Array.isArray(media.url)) return trimmed(media.url.__fileRef);
   return "";
 }
 
@@ -488,24 +512,29 @@ function validateH3RegenerationContent(items) {
   let referenceVideos = 0;
   let referenceAudios = 0;
   let inputImages = 0;
+  let unlabeledImages = 0;
   for (const item of items) {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(H3_MODEL + " regeneration content items must be objects");
+    if (item.role !== undefined && item.role !== null && typeof item.role !== "string") throw new Error(H3_MODEL + " role must be a string");
     const type = trimmed(item.type);
     const role = trimmed(item.role);
     if (type === "text") {
-      if (trimmed(item.text)) hasText = true;
+      if (typeof item.text !== "string" || !trimmed(item.text)) throw new Error(H3_MODEL + " regeneration text items must be non-empty strings");
+      hasText = true;
       continue;
     }
     if (type === "image_url") {
       if (!h3MediaURL(item, "image_url")) throw new Error(H3_MODEL + " image_url must include a URL");
       inputImages += 1;
-      if (!role || role === "first_frame") {
+      if (!role) {
+        unlabeledImages += 1;
+        firstFrames += 1;
+        hasFrame = true;
+      } else if (role === "first_frame") {
         firstFrames += 1;
         hasFrame = true;
       } else if (role === "last_frame") {
         lastFrames += 1;
-        hasFrame = true;
-      } else if (role === "middle_frame") {
         hasFrame = true;
       } else if (role === "reference_image") {
         referenceImages += 1;
@@ -520,7 +549,7 @@ function validateH3RegenerationContent(items) {
       if (role === "base_video") {
         baseVideos += 1;
       } else {
-        if (role && role !== "reference_video") throw new Error(H3_MODEL + " video role is invalid");
+        if (role !== "reference_video") throw new Error(H3_MODEL + " video role must be reference_video");
         referenceVideos += 1;
         hasReference = true;
       }
@@ -528,7 +557,7 @@ function validateH3RegenerationContent(items) {
     }
     if (type === "audio_url") {
       if (!h3MediaURL(item, "audio_url")) throw new Error(H3_MODEL + " audio_url must include a URL");
-      if (role && role !== "reference_audio") throw new Error(H3_MODEL + " audio role is invalid");
+      if (role !== "reference_audio") throw new Error(H3_MODEL + " audio role must be reference_audio");
       referenceAudios += 1;
       hasReference = true;
       continue;
@@ -537,6 +566,7 @@ function validateH3RegenerationContent(items) {
   }
   if (!hasText) throw new Error(H3_MODEL + " regeneration requires a non-empty text item");
   if (baseVideos !== 1) throw new Error(H3_MODEL + " regeneration requires exactly one base_video item");
+  if (unlabeledImages > 0 && inputImages !== 1) throw new Error(H3_MODEL + " an image role is required when multiple images are provided");
   if (firstFrames > 1) throw new Error(H3_MODEL + " accepts at most one first_frame image");
   if (lastFrames > 1) throw new Error(H3_MODEL + " accepts at most one last_frame image");
   if (referenceImages > H3_MAX_REFERENCE_IMAGES || inputImages > H3_MAX_REFERENCE_IMAGES)
@@ -766,7 +796,7 @@ function h3Content(req) {
   const metadata = req.metadata || {};
   const prompt = trimmed(req.prompt);
   const suppliedContent = h3RequestContent(req);
-  if (suppliedContent !== undefined && suppliedContent !== null) {
+  if (suppliedContent !== undefined) {
     if (!Array.isArray(suppliedContent)) throw new Error("metadata.content must be an array");
     const items = suppliedContent;
     const hasText = items.some(function (item) {
@@ -794,14 +824,18 @@ function h3HasVisualContent(content) {
   });
 }
 
-// ratio is mandatory upstream and `adaptive` is only meaningful when the
-// aspect ratio can be inherited from a visual input.
+// 官方允许音频参考使用 adaptive；仅纯文本输入不能推导比例。
 function h3Ratio(req, content) {
   const metadata = req.metadata || {};
+  // 布尔false或数字0不是省略ratio，必须先检查类型再应用缺省值。
+  for (const value of [metadata.ratio, req.ratio]) {
+    if (value !== undefined && value !== null && typeof value !== "string") throw new Error(H3_MODEL + " ratio must be a string");
+  }
   const ratio = trimmed(metadata.ratio) || trimmed(req.ratio);
   if (!ratio) return h3HasVisualContent(content) ? "adaptive" : "16:9";
   if (!H3_RATIOS.includes(ratio)) throw new Error(H3_MODEL + " ratio must be one of " + H3_RATIOS.join(", "));
-  if (ratio === "adaptive" && !h3HasVisualContent(content)) throw new Error(H3_MODEL + " ratio adaptive requires an image or video input");
+  if (ratio === "adaptive" && !content.some((item) => item && ["image_url", "video_url", "audio_url"].includes(item.type)))
+    throw new Error(H3_MODEL + " ratio adaptive requires a media input");
   return ratio;
 }
 
@@ -907,11 +941,22 @@ function responsesVideoText(ctx) {
   return '<video controls src="' + escaped + '"></video>';
 }
 
+// 共用原生、Responses 和 multipart 的可选参数校验；网络可达性和challenge由上游验证。
+function validateH3OptionalFields(req) {
+  const metadata = req.metadata || {};
+  const watermark = req.aigc_watermark !== undefined ? req.aigc_watermark : metadata.aigc_watermark;
+  if (watermark !== undefined && watermark !== null && typeof watermark !== "boolean") throw new Error("aigc_watermark must be a boolean");
+  const callback = req.callback_url !== undefined ? req.callback_url : metadata.callback_url;
+  if (callback !== undefined && callback !== null && (typeof callback !== "string" || !/^https?:\/\/[^\s/?#]+(?:[/?#][^\s]*)?$/.test(callback)))
+    throw new Error("callback_url must be an HTTP or HTTPS URL");
+}
+
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
   const model = ctx.upstreamModel;
   const metadata = req.metadata || {};
   if (isH3(model)) {
+    validateH3OptionalFields(req);
     if (ctx.action === H3_CONTEXT_IR_ACTION) {
       return {
         url: ctx.baseUrl + "/v2/h3_context_ir",
@@ -1167,12 +1212,16 @@ function nativeH3Model(body) {
   return model;
 }
 
+function hasH3RequiredField(body, key) {
+  return Object.prototype.hasOwnProperty.call(body, key) && body[key] !== null && body[key] !== undefined && trimmed(body[key]) !== "";
+}
+
 function nativeH3VideoRequest(body) {
   const model = nativeH3Model(body);
   if (!Array.isArray(body.content)) throw new Error("content must be an array");
   const content = validateH3Content(body.content);
-  if (!Object.prototype.hasOwnProperty.call(body, "duration")) throw new Error("duration is required");
-  if (!Object.prototype.hasOwnProperty.call(body, "resolution")) throw new Error("resolution is required");
+  if (!hasH3RequiredField(body, "duration") || typeof body.duration !== "number") throw new Error("duration is required");
+  if (!hasH3RequiredField(body, "resolution") || typeof body.resolution !== "string") throw new Error("resolution is required");
   const requestBody = {
     model: model,
     content: content,
@@ -1221,13 +1270,13 @@ export const native = {
     const body = nativeJSONBody(ctx);
     nativeH3Model(body);
     if (!Array.isArray(body.content)) throw new Error("content must be an array");
-    if (!Object.prototype.hasOwnProperty.call(body, "duration")) throw new Error("duration is required");
+    if (!hasH3RequiredField(body, "duration") || typeof body.duration !== "number") throw new Error("duration is required");
     const requestBody = h3ContextIRBody(body);
     return { kind: "submit", model: H3_MODEL, action: H3_CONTEXT_IR_ACTION, requestBody: requestBody };
   },
   createH3RegenerationTask: function (ctx) {
     const body = nativeJSONBody(ctx);
-    if (!Object.prototype.hasOwnProperty.call(body, "resolution")) throw new Error("resolution is required");
+    if (!hasH3RequiredField(body, "resolution") || typeof body.resolution !== "string") throw new Error("resolution is required");
     const intent = h3DecodeRegenerationRequest(body, nativeH3Model(body), "", H3_MODEL);
     if (!intent) throw new Error(H3_MODEL + " regeneration requires a source task or base_video");
     return intent;
@@ -1303,16 +1352,30 @@ export const protocols = {
       for (const image of [req.image, req.input_reference].concat(req.images || [], input.images)) {
         if (trimmed(image) && !images.includes(trimmed(image))) images.push(trimmed(image));
       }
-      if (!prompt && images.length === 0) throw new Error("input is required");
+      const hasSuppliedContent = Array.isArray(req.content) || (req.metadata && Array.isArray(req.metadata.content));
+      if (!prompt && images.length === 0 && !hasSuppliedContent) throw new Error("input is required");
       const metadata = Object.assign({}, req.metadata || {});
       if (images.length && !metadata.first_frame_image) metadata.first_frame_image = images[0];
       if (images.length > 1 && !metadata.last_frame_image) metadata.last_frame_image = images[1];
       const requestBody = { model: model, prompt: prompt, metadata: metadata };
+      // 原生多模态 content 也可通过 Responses 提交，不能只保留转换后的图片。
+      if (Object.prototype.hasOwnProperty.call(req, "content")) requestBody.content = req.content;
       if (images.length) requestBody.images = images;
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.duration = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.duration = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
       else if (Object.prototype.hasOwnProperty.call(req, "resolution")) requestBody.size = req.resolution;
+      if (isH3(ctx.upstreamModel || model)) {
+        // H3 官方顶层选项不能在兼容解码时丢失，尤其是显式 false。
+        for (const key of ["ratio", "callback_url", "aigc_watermark"]) {
+          if (Object.prototype.hasOwnProperty.call(req, key)) requestBody[key] = req[key];
+        }
+        const content = h3Content(requestBody);
+        h3Duration(requestBody);
+        h3Resolution(requestBody);
+        h3Ratio(requestBody, content);
+        return { kind: "submit", model: model, action: h3HasVisualContent(content) ? "image_to_video" : "text_to_video", requestBody: requestBody };
+      }
       return { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
     },
     renderEvents: function (ctx, task, previousState) {
@@ -1386,6 +1449,9 @@ protocols.openai_video = {
       for (const name of Object.keys(fields)) {
         req[name] = first(name);
       }
+      // 表单布尔值以字符串到达；恢复类型后与原生 JSON 共用校验，保留显式 false。
+      if (req.aigc_watermark === "true") req.aigc_watermark = true;
+      else if (req.aigc_watermark === "false") req.aigc_watermark = false;
       for (const file of ctx.body.files || []) {
         if (file.field !== "input_reference") throw new Error("unexpected file field: " + file.field);
         if (hasInputReferenceFile) throw new Error("input_reference must be provided once");
@@ -1422,9 +1488,15 @@ protocols.openai_video = {
         if (!req.metadata.first_frame_image) req.metadata.first_frame_image = image;
       }
     }
+    const comboModel = ctx.upstreamModel || ctx.model;
+    if (isH3(comboModel)) {
+      const content = h3Content(req);
+      h3Duration(req);
+      h3Resolution(req);
+      h3Ratio(req, content);
+    }
     const hasImage = hasHailuoImage(req, hasInputReferenceFile);
     const duration = req.duration === undefined ? undefined : Number(req.duration);
-    const comboModel = ctx.upstreamModel || ctx.model;
     validateHailuoCombo(comboModel, duration, outboundResolution(req, comboModel), hasImage);
     return {
       kind: "submit",

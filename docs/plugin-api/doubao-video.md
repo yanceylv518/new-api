@@ -1,6 +1,6 @@
 # Doubao Video 自定义接口文档
 
-本文档对应内置 Doubao Video 插件 **1.1.3** 的自定义路由。文档只描述
+本文档对应内置 Doubao Video 插件 **1.1.4** 的自定义路由。文档只描述
 插件声明的 `/doubao/api/v3/...` 接口，不包含网关的 OpenAI 兼容接口、
 通用任务接口或宿主素材接口。
 
@@ -83,8 +83,8 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
     "model": "doubao-seedance-2-0-fast-260128",
     "content": [
       {"type": "text", "text": "让画面中的人物向镜头走来"},
-      {"type": "image_url", "image_url": {"url": "https://cdn.example/reference.png"}},
-      {"type": "video_url", "video_url": {"url": "https://cdn.example/motion.mp4"}}
+      {"type": "image_url", "role": "reference_image", "image_url": {"url": "https://cdn.example/reference.png"}},
+      {"type": "video_url", "role": "reference_video", "video_url": {"url": "https://cdn.example/motion.mp4"}}
     ],
     "resolution": "720p",
     "duration": 5
@@ -98,10 +98,16 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 | `model` | string | 是 | 当前插件声明的模型之一 | 模型名称会参与渠道选择 |
 | `content` | array | 是 | 至少一个文本或媒体项 | 插件保留并透传内容项 |
 | `resolution` | string | 否 | 由模型能力决定 | `480p`、`720p`、`1080p`、`4k` |
-| `duration` | integer | 否 | `-1` 或 2 到 30 | `-1` 表示上游智能时长 |
-| `frames` | integer | 否 | 29 到 289，且满足 `frames = 25 + 4n` | 与上游帧数参数一致 |
-| `service_tier` | string | 否 | `default`、`flex` | 服务等级，缺省为 `default` |
+| `duration` | integer | 否 | 2.0 标准版/Fast/Mini：`-1` 或 4 到 15 | `-1` 表示上游智能时长；其他模型以官方文档为准 |
+| `frames` | integer | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型沿用通用帧数边界和上游校验 |
+| `service_tier` | string | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型以官方文档为准 |
+| `ratio` | string | 否 | `adaptive`、`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16` | 2.0 系列支持以上取值 |
+| `generate_audio` | boolean | 否 | 2.0 系列支持 | 是否生成有声视频 |
+| `priority` | integer | 否 | 0 到 9 | 任务优先级，需使用支持该字段的模型 |
+| `camera_fixed` | boolean | 否 | 2.0 标准版/Fast/Mini 不支持 | 在网关校验时拒绝，避免无效预扣 |
+| `output_format` | string | 否 | 2.0 标准版/Fast/Mini 只接受 `mp4` | `mov` 会在网关校验时拒绝 |
 | `callback_url` | string | 否 | 上游可访问地址 | 作为官方字段透传 |
+| `safety_identifier` | string | 否 | 不超过64字符的英文字符串 | 建议使用终端用户标识的哈希，不传入个人信息 |
 | 其他官方字段 | 对应官方类型 | 否 | 以渠道和上游接口为准 | 未被插件改写的字段会随请求体透传 |
 
 `content` 中的文本项用于构建上游 `prompt`，媒体项用于识别文生视频、图生
@@ -123,9 +129,18 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 }
 ```
 
-如果 `content` 中包含 `draft_task`，其 `draft_task.id` 应是网关公开任务 ID；
+2.0 标准版/Fast/Mini 的 `content` 中图片如只有一张可以省略 `role`，多张图片必须明确写出
+`first_frame`、`last_frame` 或 `reference_image`。首尾帧和参考媒体不能混用；
+音频至少需要同时提供一张图片或一个参考视频。`content` 中如果包含
+`draft_task`，其 `draft_task.id` 应是网关公开任务 ID；
 网关会在发送给上游前将其替换为已验证的上游任务 ID。这样可以安全地使用
 已有任务作为视频生视频或参考任务输入。
+
+2.0 标准版/Fast/Mini 不支持 `draft_task` 和 `draft: true`。
+
+`duration: -1` 是智能时长控制值；OpenAI 兼容接口的 `seconds: -1` 具有相同含义。
+宿主仅对 Doubao 请求中的这两个控制字段放行 `-1`，计费预估仍使用正数时长，
+完成用量仍必须非负。渠道模型别名不会导致该控制值被误判为负计费用量。
 
 ### 分辨率能力
 
@@ -273,7 +288,7 @@ curl --request DELETE "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_g
 - 上游空成功响应无法区分取消和删除时，网关会再次查询确认。
 - 无法确认最终状态时返回错误，不会把未确认操作当成成功退款。
 
-成功删除响应按官方接口返回空 JSON 对象：
+上游成功删除可返回空响应体或空 JSON 对象；网关保持返回空 JSON 对象：
 
 ```json
 {}

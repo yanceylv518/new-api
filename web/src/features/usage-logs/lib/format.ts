@@ -169,6 +169,11 @@ export function parseLogOther(other: string): LogOtherData | null {
   }
 }
 
+/** 历史任务结算日志没有 is_task，使用任务标识和用量快照识别其计价协议。 */
+export function isTaskBillingLog(other: LogOtherData | null): boolean {
+  return Boolean(other?.is_task || (other?.task_id && other.usage_facts))
+}
+
 export function getReasoningEffortVariant(
   effort: string | undefined
 ): StatusBadgeProps['variant'] {

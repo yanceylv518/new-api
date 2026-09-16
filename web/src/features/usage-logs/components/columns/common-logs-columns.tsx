@@ -58,6 +58,7 @@ import {
   formatModelName,
   decodeBillingExprB64,
   getTieredBillingSummary,
+  isTaskBillingLog,
   hasAnyCacheTokens,
   parseLogOther,
   isViolationFeeLog,
@@ -185,7 +186,7 @@ function buildTypeDetailSegments(
   }
   const isTieredExpr = other.billing_mode === 'tiered_expr'
   const tieredSummary = getTieredBillingSummary(other)
-  if (isTieredExpr && other.is_task) {
+  if (isTieredExpr && isTaskBillingLog(other)) {
     const tiers = parseTaskTiersFromExpr(
       decodeBillingExprB64(other.expr_b64),
       usageSchema,
@@ -214,7 +215,8 @@ function buildTypeDetailSegments(
       })
     } else {
       segments.push({
-        text: `${t('Dynamic Pricing')} · ${t('No matching results')}`,
+        // 显示解析失败不代表服务端未匹配，优先保留历史日志中的真实档位。
+        text: `${t('Dynamic Pricing')} · ${other.matched_tier || t('Not available')}`,
         muted: true,
       })
     }
@@ -270,7 +272,7 @@ function buildTypeDetailSegments(
       }
     } else {
       segments.push({
-        text: `${t('Dynamic Pricing')} · ${t('No matching results')}`,
+        text: `${t('Dynamic Pricing')} · ${other.matched_tier || t('Not available')}`,
         muted: true,
       })
     }
@@ -799,8 +801,8 @@ export function useCommonLogsColumns(
 
         const pricingData = usePricingData(
           log.type === 2 &&
-            other?.is_task === true &&
-            other.billing_mode === 'tiered_expr'
+            isTaskBillingLog(other) &&
+            other?.billing_mode === 'tiered_expr'
         )
         const usageSchema = pluginUsageSchema(
           pricingData.models.find(

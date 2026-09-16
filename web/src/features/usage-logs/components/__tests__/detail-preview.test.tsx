@@ -301,6 +301,30 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   ).toHaveTextContent('images · images $0.25/张')
 })
 
+// 历史结算日志缺少 is_task，仍须以任务表达式显示记录的档位及单价。
+test('task settlement without is_task shows historical task pricing', () => {
+  client.setQueryData(['pricing'], {
+    data: [
+      {
+        model_name: 'wan2.5-i2v-preview',
+        billing_usage_schema: { tokens: { type: 'number', unit: 'token' } },
+      },
+    ],
+    vendors: [],
+  })
+  const preview = renderPreview({
+    task_id: 'task-settlement',
+    usage_facts: { tokens: 50638 },
+    billing_mode: 'tiered_expr',
+    expr_b64: Buffer.from(
+      'tier("480p·none", u("tokens") * 37 / 1000000)'
+    ).toString('base64'),
+    matched_tier: '480p·none',
+  })
+  expect(preview).toHaveTextContent('480p·none · tokens $37/1M token')
+  expect(preview).not.toHaveTextContent('No matching results')
+})
+
 test('task log prices select the executing provider’s schema', () => {
   client.setQueryData(['pricing'], {
     data: [
@@ -361,6 +385,8 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
       expr_b64: Buffer.from(expression).toString('base64'),
       matched_tier: scenario === 'unknown tier' ? 'old' : 'music',
     })
-    expect(preview.textContent).toBe('Dynamic Pricing · No matching results')
+    expect(preview.textContent).toBe(
+      `Dynamic Pricing · ${scenario === 'unknown tier' ? 'old' : 'music'}`
+    )
   }
 )

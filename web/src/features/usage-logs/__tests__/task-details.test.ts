@@ -20,6 +20,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 
 import { resolveTaskDetailAccess } from '../lib/task-details'
+import { taskActionMapper } from '../lib/mappers'
 import type { TaskLog } from '../types'
 
 const task: TaskLog = {
@@ -57,6 +58,20 @@ const task: TaskLog = {
 }
 
 describe('task detail access', () => {
+  // 插件新动作与旧任务共用映射，真实未知动作仍应保留 Unknown 回退。
+  test('labels video plugin actions without changing legacy actions', () => {
+    for (const [action, label] of Object.entries({
+      text_to_video: 'Text to Video',
+      image_to_video: 'Image to Video',
+      regeneration: 'Video Regeneration',
+      context_ir: 'H3-Context-IR',
+      textGenerate: 'Text to Video',
+      generate: 'Image to Video',
+      unrecognized_action: 'Unknown',
+    })) {
+      assert.equal(taskActionMapper.getLabel(action), label)
+    }
+  })
   test('does not expose elevated fields in a self view', () => {
     assert.deepEqual(resolveTaskDetailAccess(task, false, false), {})
   })

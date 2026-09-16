@@ -90,6 +90,33 @@ export function buildTaskActionRequest(ctx) { return {url:ctx.baseUrl+"/tasks/"+
 	assert.JSONEq(t, `{"task_id":"upstream-task","action":"cancelled","status":"cancelled"}`, string(response.Body))
 }
 
+// 官方管理接口允许 200 空响应体，宿主应把它交给插件确认而不是误判为非法 JSON。
+func TestTaskAdaptorExecuteTaskActionAllowsEmptyResponse(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	plugin, err := pluginruntime.NewRegistry().Register(`
+export const meta = {apiVersion:1,key:"empty-action",name:"Empty Action",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task"};
+export function buildSubmitRequest() { return {url:"https://example.com/submit"}; }
+export function parseSubmitResponse() { return {taskId:"upstream-task"}; }
+export function buildQueryRequest() { return {url:"https://example.com/query"}; }
+export function parseTaskResult() { return {status:"SUCCESS"}; }
+export function buildTaskActionRequest(ctx) { return {url:ctx.baseUrl+"/tasks/"+ctx.taskId,method:"DELETE",headers:{Authorization:"Bearer "+ctx.apiKey}}; }
+export function parseTaskActionResponse(ctx, response) { if (response.body !== null) throw new Error("empty body was not normalized"); return {action:"unknown"}; }
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+
+	response, err := New(plugin).ExecuteTaskAction(context.Background(), "delete", &model.Task{
+		TaskID: "public-task", PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-task"},
+		Properties: model.Properties{OriginModelName: "model"},
+	}, server.URL, "secret", "")
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, "unknown", response.Action)
+}
+
 // 宿主必须拒绝插件试图借管理钩子发送非 DELETE 或无凭证请求的行为。
 func TestTaskAdaptorExecuteTaskActionRejectsUnsafeDescriptor(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(`
