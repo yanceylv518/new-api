@@ -102,7 +102,7 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 | `frames` | integer | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型沿用通用帧数边界和上游校验 |
 | `service_tier` | string | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型以官方文档为准 |
 | `ratio` | string | 否 | `adaptive`、`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16` | 2.0 系列支持以上取值 |
-| `generate_audio` | boolean | 否 | 2.0 系列支持 | 是否生成有声视频 |
+| `generate_audio` | boolean | 否 | 2.0 系列支持 | `false` 用于请求无声视频；显式布尔值会保留并透传 |
 | `priority` | integer | 否 | 0 到 9 | 任务优先级，需使用支持该字段的模型 |
 | `camera_fixed` | boolean | 否 | 2.0 标准版/Fast/Mini 不支持 | 在网关校验时拒绝，避免无效预扣 |
 | `output_format` | string | 否 | 2.0 标准版/Fast/Mini 只接受 `mp4` | `mov` 会在网关校验时拒绝 |
@@ -141,6 +141,16 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 `duration: -1` 是智能时长控制值；OpenAI 兼容接口的 `seconds: -1` 具有相同含义。
 宿主仅对 Doubao 请求中的这两个控制字段放行 `-1`，计费预估仍使用正数时长，
 完成用量仍必须非负。渠道模型别名不会导致该控制值被误判为负计费用量。
+
+### 临时媒体地址与回调
+
+`asset://<AssetId>` 与普通公网媒体 URL 是两种输入方式。2026-09-17 实测同一图片
+使用素材引用和有效 OSS 临时预览 URL 都完成了 Fast 首帧生成。预览地址可能在
+排队或读取前过期，稳定复用素材优先使用 `asset://`；不能把裸 `asset_id` 当 URL。
+
+标准版和 Fast 实测可发送状态及成功回调，也能在回调地址不可达时完成生成。
+不要承诺“可达性预检通过才受理”。本轮没有观察到这两个模型的 challenge；
+Fast 曾出现 running 先于 queued 到达，客户端必须处理乱序、重复，并保留查询能力。
 
 ### 分辨率能力
 

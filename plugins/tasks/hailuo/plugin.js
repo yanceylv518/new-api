@@ -1220,7 +1220,9 @@ function nativeH3VideoRequest(body) {
   const model = nativeH3Model(body);
   if (!Array.isArray(body.content)) throw new Error("content must be an array");
   const content = validateH3Content(body.content);
-  if (!hasH3RequiredField(body, "duration") || typeof body.duration !== "number") throw new Error("duration is required");
+  // 缺失字段与错误类型分别提示，避免调用方已传字符串时仍被误导为未填写。
+  if (body.duration === undefined || body.duration === null) throw new Error("duration is required");
+  if (typeof body.duration !== "number") throw new Error("duration must be an integer between 4 and 15 seconds");
   if (!hasH3RequiredField(body, "resolution") || typeof body.resolution !== "string") throw new Error("resolution is required");
   const requestBody = {
     model: model,
@@ -1270,7 +1272,9 @@ export const native = {
     const body = nativeJSONBody(ctx);
     nativeH3Model(body);
     if (!Array.isArray(body.content)) throw new Error("content must be an array");
-    if (!hasH3RequiredField(body, "duration") || typeof body.duration !== "number") throw new Error("duration is required");
+    // Context-IR 与视频生成保持同一原生时长契约，不隐式转换字符串或布尔值。
+    if (body.duration === undefined || body.duration === null) throw new Error("duration is required");
+    if (typeof body.duration !== "number") throw new Error("duration must be an integer between 4 and 15 seconds");
     const requestBody = h3ContextIRBody(body);
     return { kind: "submit", model: H3_MODEL, action: H3_CONTEXT_IR_ACTION, requestBody: requestBody };
   },

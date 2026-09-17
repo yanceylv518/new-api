@@ -104,7 +104,7 @@ curl --request POST "$BASE_URL/hailuo/v2/video_generation" \
 | `resolution` | string | 是 | `768P`、`2K` | 输出分辨率 |
 | `duration` | integer | 是 | 4 到 15 | 输出视频时长，单位为秒 |
 | `ratio` | string | 否 | `adaptive`、`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16` | 画面比例 |
-| `callback_url` | string | 否 | HTTP/HTTPS 回调地址 | 网关校验类型和URL基本格式；上游执行 challenge 和可达性验证 |
+| `callback_url` | string | 否 | HTTP/HTTPS 回调地址 | 网关校验类型和基本格式后传递给上游；受理成功不保证回调可达 |
 | `aigc_watermark` | boolean | 否 | `true`、`false` | 是否添加水印，显式 `false` 会保留 |
 
 不传 `ratio` 时，纯文本输入默认为 `16:9`，含图片或视频时默认为
@@ -249,6 +249,24 @@ curl --request POST "$BASE_URL/hailuo/v2/video_regeneration" \
 - 普通参考媒体可以继续提供，但帧图片不能和参考媒体混用。
 - 支持可选 `callback_url` 和 `aigc_watermark`。
 - 直接内容模式不能通过 JSON 以外的文件上传方式替代 `base_video`。
+
+### 外部视频规格与读取
+
+2026-09-17 当前渠道实测：宽高不能被 32 整除、无音轨、100 帧的 `base_video`
+分别被上游拒绝；帧数错误要求为 107–362、步长 17。768×768、24 FPS、124 帧、
+带 AAC 音轨的 MP4 成功再生成。额外参考视频在 20/61 FPS 时被拒绝，上游提示
+范围为 23.976–60 FPS。上述是实际样本及错误证据，不代表已穷举所有素材边界。
+
+媒体地址必须在上游读取时仍可访问。已有 H3 产物签名 URL 也可能被上游拒绝；
+本轮一例返回 `media URL cannot access a private address`，不能据此推断所有
+签名 URL 都不支持。优先使用源任务 ID；外部内容模式必要时将视频转存至自己的
+对象存储。受理成功不代表后续素材校验通过，应继续查询终态及退款记录。
+
+### 回调行为
+
+Hailuo 实测发送 `challenge`，接收端应以 JSON 原样返回其值，随后接收状态通知。
+但可达性不是提交前置门槛：不可达回调地址下的 H3 生成和 Context-IR 仍受理并
+完成。回调消费者需处理重复、乱序，避免旧状态覆盖终态，并以任务查询作为补充。
 
 ## 查询单个任务
 

@@ -49,6 +49,46 @@ func TestHailuoNativeRoutesAndContextIR(t *testing.T) {
 	}
 }
 
+// 两个原生入口须区分字段缺失与类型错误，并在提交上游前拒绝非法时长。
+func TestHailuoNativeDurationValidation(t *testing.T) {
+	plugin := loadHailuoPlugin(t)
+	for _, hook := range []string{"createH3VideoTask", "createH3ContextIRTask"} {
+		for _, tc := range []struct {
+			name      string
+			value     any
+			missing   bool
+			wantError string
+		}{
+			{"missing", nil, true, "duration is required"},
+			{"null", nil, false, "duration is required"},
+			{"string", "5", false, "duration must be an integer between 4 and 15 seconds"},
+			{"empty", "", false, "duration must be an integer between 4 and 15 seconds"},
+			{"boolean", false, false, "duration must be an integer between 4 and 15 seconds"},
+			{"fractional", 5.5, false, "duration must be an integer between 4 and 15 seconds"},
+			{"below_minimum", 3, false, "duration must be an integer between 4 and 15 seconds"},
+			{"above_maximum", 16, false, "duration must be an integer between 4 and 15 seconds"},
+			{"minimum", 4, false, ""},
+			{"maximum", 15, false, ""},
+		} {
+			t.Run(hook+"/"+tc.name, func(t *testing.T) {
+				body := map[string]any{"model": "MiniMax-H3", "content": []any{map[string]any{"type": "text", "text": "a blue sphere"}}}
+				if hook == "createH3VideoTask" {
+					body["resolution"] = "768P"
+				}
+				if !tc.missing {
+					body["duration"] = tc.value
+				}
+				_, err := plugin.Engine.CallPath(t.Context(), "native", []string{hook}, map[string]any{"body": map[string]any{"kind": "json", "value": body}})
+				if tc.wantError != "" {
+					require.ErrorContains(t, err, tc.wantError)
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
+	}
+}
+
 func TestHailuoNativeContextIRHooks(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
 	request := map[string]any{
