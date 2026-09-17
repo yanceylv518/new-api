@@ -27,6 +27,10 @@ import { api } from '@/lib/api'
 import { DetailsDialog } from '../components/dialogs/details-dialog'
 import { TaskArtifactsCell } from '../components/task-artifacts'
 import { usageLogSchema } from '../data/schema'
+import {
+  resolveTaskPreviewMode,
+  shouldLoadTaskArtifacts,
+} from '../lib/task-artifacts'
 import type { TaskLog } from '../types'
 
 const originalAdapter = api.defaults.adapter
@@ -73,6 +77,41 @@ test('keeps task media actions beside each other', () => {
 
   expect(preview.parentElement).toHaveClass('flex-nowrap')
   expect(preview.parentElement).toContainElement(copy)
+})
+
+// 文本任务在各状态下都不能暴露提示词、视频入口或触发产物请求，包括携带旧视频标记的记录。
+test.each(['SUCCESS', 'IN_PROGRESS', 'QUEUED', 'FAILURE'])(
+  'Context-IR shows only its text type in %s state',
+  (status) => {
+    const adapter = vi.fn<AxiosAdapter>()
+    api.defaults.adapter = adapter
+    const log: TaskLog = {
+      ...task,
+      action: 'context_ir',
+      status,
+      properties: { origin_model_name: 'MiniMax-H3' },
+      data: { task: { content: { prompt: 'private enhanced prompt' } } },
+      admin_info: { task_plugin: { key: 'hailuo', name: 'Hailuo' } },
+    }
+    renderTask(log)
+    expect(screen.getByText('Text')).toBeVisible()
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByText('private enhanced prompt')).not.toBeInTheDocument()
+    expect(resolveTaskPreviewMode(log, true)).toBe('none')
+    expect(shouldLoadTaskArtifacts(log, true)).toBe(false)
+    expect(adapter).not.toHaveBeenCalled()
+  }
+)
+
+// 同一 MiniMax-H3 模型的视频生成仍保留原有预览及链接复制能力。
+test('H3 video generation keeps media actions', () => {
+  renderTask({
+    ...task,
+    action: 'text_to_video',
+    properties: { origin_model_name: 'MiniMax-H3' },
+  })
+  expect(screen.getByRole('button', { name: 'Preview video' })).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Copy Link' })).toBeVisible()
 })
 
 test('copies a single video beside the list preview using the authorized projection only on click', async () => {

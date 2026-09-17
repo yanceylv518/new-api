@@ -168,18 +168,24 @@ export function parseTaskArtifactsResponse(
   return projection
 }
 
+// Context-IR 的持久化动作决定文本任务身份；不依据模型名误伤同模型的视频任务。
+export function isContextIRTask(log: TaskLog): boolean {
+  return log.action === 'context_ir'
+}
+
 export function shouldLoadTaskArtifacts(
   log: TaskLog,
   dialogOpen: boolean
 ): boolean {
-  return dialogOpen && log.status === TASK_STATUS.SUCCESS
+  return dialogOpen && log.status === TASK_STATUS.SUCCESS && !isContextIRTask(log)
 }
 
 export function resolveTaskPreviewMode(
   log: TaskLog,
   hasProjectedArtifacts = false
 ): TaskPreviewMode {
-  if (log.status !== TASK_STATUS.SUCCESS) return 'none'
+  // 文本任务不应被旧视频标记或插件产物提示重新带入媒体预览。
+  if (isContextIRTask(log) || log.status !== TASK_STATUS.SUCCESS) return 'none'
   if (hasProjectedArtifacts) return 'plugin'
   if (log.admin_info?.task_plugin) return 'plugin'
   if (log.platform === 'suno') return 'legacy-suno'

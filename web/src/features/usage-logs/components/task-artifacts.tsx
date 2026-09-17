@@ -63,6 +63,7 @@ import { cn } from '@/lib/utils'
 
 import { getTaskArtifacts } from '../api'
 import {
+  isContextIRTask,
   resolveTaskPreviewMode,
   shouldLoadTaskArtifacts,
 } from '../lib/task-artifacts'
@@ -461,6 +462,10 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
     }
   }
 
+  // 仅显示任务类型；文本结果不在任务日志中展开，也不提供产物或复制入口。
+  if (isContextIRTask(props.log)) {
+    return <span className='text-muted-foreground text-xs'>{t('Text')}</span>
+  }
   if (!shouldLoadTaskArtifacts(props.log, true)) {
     return <span className='text-muted-foreground/60 text-xs'>-</span>
   }
