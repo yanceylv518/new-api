@@ -437,11 +437,16 @@ H3 任务会把以下事实交给网关表达式引擎：
 | --- | --- | --- |
 | `operation` | `generation` 或 `regeneration` | `context_ir` |
 | `resolution` | 生成是 `768P`/`2K`，再生成是 `2K` | 不适用 |
-| `seconds` | 输出视频秒数 | `0` |
+| `seconds` | 上游输出计费秒数，可能与媒体文件小数时长不同 | `0` |
 | `input_images` | 输入图片总数 | `0` |
 | `input_video_seconds` | 输入视频秒数，提交时未知则按上限预留 | `0` |
 | `prompt_tokens` | `0` | 输入 Token 数 |
 | `completion_tokens` | `0` | 输出 Token 数 |
+
+实测再生成输入与产物经 `ffprobe` 检测均为 5.166667 秒、24 FPS、124 帧，上游
+`output_seconds=6`，网关按 6 秒结算。若配置 $0.30/秒且无其他费用，净扣为
+$1.80；本例按上限预扣 $4.50，完成后退回 $2.70。其他时长以上游实际用量为准，
+价格由管理员配置，不应把预扣或文件时长当作最终费用。
 
 例如：
 
