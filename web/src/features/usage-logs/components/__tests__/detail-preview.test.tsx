@@ -301,6 +301,21 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   ).toHaveTextContent('images · images $0.25/张')
 })
 
+// 补扣预览优先解释差额，不能把最终费用当作本条消费再次显示。
+test('settlement charge preview identifies the additional amount', () => {
+  const preview = renderPreview(
+    {
+      task_id: 'task-settlement',
+      pre_consumed_quota: 10000,
+      actual_quota: 15000,
+    },
+    false
+  )
+  expect(preview).toHaveTextContent('Task settlement surcharge')
+  expect(preview).toHaveTextContent('Settlement surcharge amount: $0.01')
+  expect(preview).not.toHaveTextContent('Async task refund')
+})
+
 // 历史结算日志缺少 is_task，仍须以任务表达式显示记录的档位及单价。
 test('task settlement without is_task shows historical task pricing', () => {
   client.setQueryData(['pricing'], {

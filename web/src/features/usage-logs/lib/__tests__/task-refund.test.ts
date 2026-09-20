@@ -21,13 +21,54 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 
 import type { LogOtherData } from '../../types'
-import { getTaskSettlementRefund } from '../task-refund'
+import { getTaskSettlementAdjustment } from '../task-refund'
 
 // 保护历史账务记录的展示分类，不依赖 token 重算等可变原因文案。
-describe('task settlement refunds', () => {
+describe('task settlement adjustments', () => {
+  // 补扣必须有有效任务及完整快照，不能从普通消费推测结算信息。
+  test('recognizes surcharges and rejects invalid charge snapshots', () => {
+    for (const pre of [0, 710955]) {
+      assert.deepEqual(
+        getTaskSettlementAdjustment(2, {
+          task_id: 'task_video',
+          pre_consumed_quota: pre,
+          actual_quota: 750989,
+        }),
+        { preConsumedQuota: pre, actualQuota: 750989 }
+      )
+    }
+    for (const [pre, actual] of [
+      [-1, 10],
+      [10, 10],
+      [20, 10],
+      [0.5, 10],
+      [0, Infinity],
+      [Number.NaN, 10],
+    ]) {
+      assert.equal(
+        getTaskSettlementAdjustment(2, {
+          task_id: 'task_video',
+          pre_consumed_quota: pre,
+          actual_quota: actual,
+        }),
+        null
+      )
+    }
+    assert.equal(
+      getTaskSettlementAdjustment(2, { task_id: 'task_video' }),
+      null
+    )
+    assert.equal(
+      getTaskSettlementAdjustment(2, {
+        pre_consumed_quota: 0,
+        actual_quota: 10,
+      }),
+      null
+    )
+  })
   test('recognizes a historical refund with pre-consumed and actual quotas', () => {
     assert.deepEqual(
-      getTaskSettlementRefund(6, {
+      getTaskSettlementAdjustment(6, {
         task_id: 'task_video',
         pre_consumed_quota: 250000,
         actual_quota: 108900,
@@ -38,7 +79,7 @@ describe('task settlement refunds', () => {
 
   test('recognizes an explicit zero-cost settlement', () => {
     assert.deepEqual(
-      getTaskSettlementRefund(6, {
+      getTaskSettlementAdjustment(6, {
         task_id: 'task_video',
         pre_consumed_quota: 250000,
         actual_quota: 0,
@@ -56,13 +97,13 @@ describe('task settlement refunds', () => {
       { pre_consumed_quota: 250000, actual_quota: 108900 },
     ]
     for (const other of records) {
-      assert.equal(getTaskSettlementRefund(6, other), null)
+      assert.equal(getTaskSettlementAdjustment(6, other), null)
     }
   })
 
   test('does not label charges or invalid quota snapshots as settlement refunds', () => {
     assert.equal(
-      getTaskSettlementRefund(2, {
+      getTaskSettlementAdjustment(2, {
         task_id: 'task_video',
         pre_consumed_quota: 250000,
         actual_quota: 108900,
@@ -78,7 +119,7 @@ describe('task settlement refunds', () => {
       [250000, 0.5],
     ]) {
       assert.equal(
-        getTaskSettlementRefund(6, {
+        getTaskSettlementAdjustment(6, {
           task_id: 'task_video',
           pre_consumed_quota: pre,
           actual_quota: actual,

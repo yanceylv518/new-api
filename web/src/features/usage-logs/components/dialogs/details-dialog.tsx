@@ -81,7 +81,7 @@ import {
   renderAuditContent,
 } from '../../lib/format'
 import { buildQuotaAuditOperation } from '../../lib/quota-audit-operation'
-import { getTaskSettlementRefund } from '../../lib/task-refund'
+import { getTaskSettlementAdjustment } from '../../lib/task-refund'
 import {
   getLogTypeConfig,
   isPerCallBilling,
@@ -483,7 +483,14 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const isViolation = isViolationFeeLog(other)
   const isRefund = props.log.type === 6
   // 直接读取历史日志的额度快照，随所选日志更新，不依赖原因文案或新增状态。
-  const taskSettlementRefund = getTaskSettlementRefund(props.log.type, other)
+  const taskSettlement = getTaskSettlementAdjustment(props.log.type, other)
+  const isSurcharge = props.log.type === 2 && taskSettlement !== null
+  let settlementLabel = t('Refund Details')
+  if (taskSettlement) {
+    settlementLabel = isSurcharge
+      ? t('Task settlement surcharge')
+      : t('Task settlement refund')
+  }
   const isConsume = props.log.type === 2
   const isTopup = props.log.type === 1
   const isManage = props.log.type === 3
@@ -865,42 +872,49 @@ export function DetailsDialog(props: DetailsDialogProps) {
           </DetailSection>
         )}
 
-        {/* 退差额展示实际结算金额；其他任务退款继续展示原有原因。 */}
-        {isRefund && other && (other.task_id || other.reason) && (
-          <DetailSection
-            label={
-              taskSettlementRefund
-                ? t('Task settlement refund')
-                : t('Refund Details')
-            }
-          >
-            {other.task_id && (
-              <DetailRow label={t('Task ID')} value={other.task_id} mono />
-            )}
-            {taskSettlementRefund && (
-              <>
-                <DetailRow
-                  label={t('Pre-consumed')}
-                  value={formatLogQuota(taskSettlementRefund.preConsumedQuota)}
-                  mono
-                />
-                <DetailRow
-                  label={t('Actual cost')}
-                  value={formatLogQuota(taskSettlementRefund.actualQuota)}
-                  mono
-                />
-                <DetailRow
-                  label={t('Refund amount')}
-                  value={formatLogQuota(props.log.quota)}
-                  mono
-                />
-              </>
-            )}
-            {other.reason && (
-              <DetailRow label={t('Reason')} value={other.reason} />
-            )}
-          </DetailSection>
-        )}
+        {/* 补扣和退差额共用历史快照；本条金额始终是差额，不与最终费用重复相加。 */}
+        {(isRefund || isSurcharge) &&
+          other &&
+          (other.task_id || other.reason) && (
+            <DetailSection label={settlementLabel}>
+              {isSurcharge && (
+                <p className='text-muted-foreground text-xs wrap-break-word'>
+                  {t(
+                    'The final cost exceeded the pre-consumed amount. This entry charges only the difference, not another generation request.'
+                  )}
+                </p>
+              )}
+              {other.task_id && (
+                <DetailRow label={t('Task ID')} value={other.task_id} mono />
+              )}
+              {taskSettlement && (
+                <>
+                  <DetailRow
+                    label={t('Pre-consumed')}
+                    value={formatLogQuota(taskSettlement.preConsumedQuota)}
+                    mono
+                  />
+                  <DetailRow
+                    label={t('Actual cost')}
+                    value={formatLogQuota(taskSettlement.actualQuota)}
+                    mono
+                  />
+                  <DetailRow
+                    label={
+                      isSurcharge
+                        ? t('Settlement surcharge amount')
+                        : t('Refund amount')
+                    }
+                    value={formatLogQuota(props.log.quota)}
+                    mono
+                  />
+                </>
+              )}
+              {other.reason && (
+                <DetailRow label={t('Reason')} value={other.reason} />
+              )}
+            </DetailSection>
+          )}
 
         {props.isAdmin && adminInfo?.task_plugin ? (
           <DetailSection label={t('Task Plugin')}>

@@ -96,7 +96,9 @@ test.each(['SUCCESS', 'IN_PROGRESS', 'QUEUED', 'FAILURE'])(
     renderTask(log)
     expect(screen.getByText('Text')).toBeVisible()
     expect(screen.queryByRole('button')).not.toBeInTheDocument()
-    expect(screen.queryByText('private enhanced prompt')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('private enhanced prompt')
+    ).not.toBeInTheDocument()
     expect(resolveTaskPreviewMode(log, true)).toBe('none')
     expect(shouldLoadTaskArtifacts(log, true)).toBe(false)
     expect(adapter).not.toHaveBeenCalled()
@@ -228,6 +230,48 @@ test('a failed artifact request copies nothing and can be retried from the list'
   expect(write).not.toHaveBeenCalled()
   await user.click(copy)
   await waitFor(() => expect(write).toHaveBeenCalledWith(videoUrl))
+})
+
+// 用真实结算快照验证补扣解释，避免把差额误当成另一次完整生成费用。
+test('surcharge details show reserved, final and additional costs', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const log = usageLogSchema.parse({
+    id: 2,
+    user_id: 7,
+    created_at: 1,
+    type: 2,
+    quota: 40034,
+    content: 'video task settlement',
+    other: JSON.stringify({
+      task_id: 'task-video',
+      pre_consumed_quota: 710955,
+      actual_quota: 750989,
+    }),
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <DetailsDialog
+        log={log}
+        isAdmin={false}
+        isRoot={false}
+        open
+        onOpenChange={() => {}}
+      />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Task settlement surcharge')).toBeVisible()
+  expect(screen.getByText('Pre-consumed')).toBeVisible()
+  expect(screen.getByText('Actual cost')).toBeVisible()
+  expect(screen.getByText('Settlement surcharge amount')).toBeVisible()
+  expect(
+    screen.getByText(
+      'The final cost exceeded the pre-consumed amount. This entry charges only the difference, not another generation request.'
+    )
+  ).toBeVisible()
+  expect(screen.queryByText('Refund amount')).toBeNull()
 })
 
 test('refund details read public settlement fields while preserving ordinary failure refunds', async () => {

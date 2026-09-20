@@ -18,15 +18,15 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { LogOtherData } from '../types'
 
-/** 根据结构化额度快照识别结算退差额，避免把任务失败退款误标为成功结算。 */
-export function getTaskSettlementRefund(
+/** 根据结构化快照和资金方向识别结算差额，不推测普通消费或失败退款的金额。 */
+export function getTaskSettlementAdjustment(
   logType: number,
   other: LogOtherData | null
 ): { preConsumedQuota: number; actualQuota: number } | null {
   const preConsumedQuota = other?.pre_consumed_quota
   const actualQuota = other?.actual_quota
   if (
-    logType !== 6 ||
+    (logType !== 6 && logType !== 2) ||
     typeof other?.task_id !== 'string' ||
     !other.task_id.trim() ||
     typeof preConsumedQuota !== 'number' ||
@@ -34,7 +34,9 @@ export function getTaskSettlementRefund(
     typeof actualQuota !== 'number' ||
     !Number.isSafeInteger(actualQuota) ||
     actualQuota < 0 ||
-    preConsumedQuota <= actualQuota
+    preConsumedQuota < 0 ||
+    (logType === 6 && preConsumedQuota <= actualQuota) ||
+    (logType === 2 && preConsumedQuota >= actualQuota)
   ) {
     return null
   }

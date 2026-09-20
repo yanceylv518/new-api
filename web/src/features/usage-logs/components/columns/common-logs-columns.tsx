@@ -64,7 +64,7 @@ import {
   isViolationFeeLog,
   renderAuditContent,
 } from '../../lib/format'
-import { getTaskSettlementRefund } from '../../lib/task-refund'
+import { getTaskSettlementAdjustment } from '../../lib/task-refund'
 import {
   isDisplayableLogType,
   isTimingLogType,
@@ -142,9 +142,16 @@ function buildTypeDetailSegments(
     return text ? [{ text }] : []
   }
 
+  // 列表直接标明差额方向和本次补扣，避免被误读为第二次完整消费。
+  const settlement = getTaskSettlementAdjustment(log.type, other)
+  if (log.type === 2 && settlement) {
+    return [
+      {
+        text: `${t('Task settlement surcharge')} · ${t('Settlement surcharge amount')}: ${formatLogQuota(log.quota)}`,
+      },
+    ]
+  }
   if (log.type === 6) {
-    // 列表与详情使用同一份结算快照区分退差额和普通任务退款。
-    const settlement = getTaskSettlementRefund(log.type, other)
     return [
       {
         text: settlement ? t('Task settlement refund') : t('Async task refund'),
