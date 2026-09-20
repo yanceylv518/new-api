@@ -128,10 +128,12 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.PUT("/setting", controller.UpdateUserSetting)
 				// 素材接口继承用户鉴权与禁用缓存，并按用户限制操作速率。
 				selfRoute.GET("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssetGroups)
+				selfRoute.GET("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.GetSeedanceAssetGroup)
 				selfRoute.POST("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAssetGroup)
 				selfRoute.PUT("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.UpdateSeedanceAssetGroup)
 				selfRoute.DELETE("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAssetGroup)
 				selfRoute.GET("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssets)
+				selfRoute.GET("/seedance/assets/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.GetSeedanceAsset)
 				selfRoute.POST("/seedance/assets/upload", middleware.SeedanceAssetRateLimit(), middleware.UploadRateLimit(), middleware.DisableCache(), controller.UploadSeedanceAsset)
 				selfRoute.POST("/seedance/assets", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAsset)
 				selfRoute.POST("/seedance/assets/batch-delete", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.DeleteSeedanceAssetBatch)

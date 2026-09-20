@@ -144,6 +144,9 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 
 ### 临时媒体地址与回调
 
+API Key 上传和管理私域素材请参见[私域素材库 API](seedance-assets.md)。同一网关
+用户的有效 API Key 共享该用户的素材组和媒体，后台上传的数据也可直接查询。
+
 `asset://<AssetId>` 与普通公网媒体 URL 是两种输入方式。有效且上游可访问的
 临时预览 URL 可作为普通媒体地址输入，仍须满足模型的素材要求。预览地址可能在
 排队或读取前过期，稳定复用素材优先使用 `asset://`；不能把裸 `asset_id` 当 URL。

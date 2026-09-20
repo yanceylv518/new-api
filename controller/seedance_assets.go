@@ -19,6 +19,8 @@ import (
 
 type seedanceAssetGroupRequest struct {
 	Name string `json:"name" binding:"required,max=64"`
+	// 仅在建组时选择上游，已有素材的归属仍由认证用户和组绑定决定。
+	Model string `json:"model" binding:"max=191"`
 }
 
 const seedanceAssetGroupCleanupWorkerSize = 4
@@ -241,9 +243,30 @@ func seedanceAssetPreviewURLWithStorage(ctx context.Context, asset *model.Seedan
 
 // ListSeedanceAssetGroups 只返回当前用户自己的素材组。
 func ListSeedanceAssetGroups(c *gin.Context) {
+	options, err := parseSeedanceLibraryQuery(c, true)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	query := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAssetGroup{}).Where("user_id = ?", c.GetInt("id"))
+	query = options.filter(options.scope(query), true)
+	var total int64
+	// 无分页参数时保留旧页面全量数组行为，显式分页才计算总数。
+	if options.paginated {
+		if err := query.Count(&total).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		options.page.Page = max(1, min(options.page.Page, int((total+int64(options.page.PageSize)-1)/int64(options.page.PageSize))))
+		query = query.Offset(options.page.GetStartIdx()).Limit(options.page.PageSize)
+	}
 	var groups []model.SeedanceAssetGroup
-	if err := model.DB.Where("user_id = ?", c.GetInt("id")).Order("id desc").Find(&groups).Error; err != nil {
+	if err := query.Order(options.order).Find(&groups).Error; err != nil {
 		common.ApiError(c, err)
+		return
+	}
+	if options.paginated {
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": groups, "total": total, "page": options.page.Page, "page_size": options.page.PageSize})
 		return
 	}
 	common.ApiSuccess(c, groups)
@@ -270,7 +293,7 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgGroupNameExists)
 		return
 	}
-	channel, err := service.FindSeedanceAssetChannel()
+	channel, err := selectSeedanceAssetGroupChannel(c, strings.TrimSpace(req.Model))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -308,10 +331,13 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 
 // ListSeedanceAssets 返回当前用户素材，GroupID 为空时返回全部素材。
 func ListSeedanceAssets(c *gin.Context) {
-	query := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAsset{}).Where("user_id = ?", c.GetInt("id"))
-	if groupID := strings.TrimSpace(c.Query("group_id")); groupID != "" {
-		query = query.Where("group_id = ?", groupID)
+	options, err := parseSeedanceLibraryQuery(c, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
 	}
+	query := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAsset{}).Where("user_id = ?", c.GetInt("id"))
+	query = options.scope(query)
 	// 当前页即使只显示终态，也要在同组仍有审核任务时更新筛选结果。
 	var pendingMarker struct {
 		ID uint
@@ -320,46 +346,18 @@ func ListSeedanceAssets(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	// 搜索和筛选在分页前执行，旧素材不会因落在其他页而无法检索。
-	if keyword := strings.TrimSpace(c.Query("search")); keyword != "" {
-		if utf8.RuneCountInString(keyword) > 128 {
-			common.ApiErrorI18n(c, "invalid_params")
-			return
-		}
-		keyword = "%" + strings.NewReplacer("#", "##", "%", "#%", "_", "#_").Replace(strings.ToLower(keyword)) + "%"
-		query = query.Where("(LOWER(name) LIKE ? ESCAPE '#' OR LOWER(asset_id) LIKE ? ESCAPE '#')", keyword, keyword)
-	}
-	if assetType := strings.ToLower(c.Query("asset_type")); assetType != "" && assetType != "all" {
-		if assetType != "image" && assetType != "video" && assetType != "audio" {
-			common.ApiErrorI18n(c, "invalid_params")
-			return
-		}
-		query = query.Where("LOWER(asset_type) = ?", assetType)
-	}
-	switch strings.ToLower(c.Query("status")) {
-	case "", "all":
-	case "processing":
-		query = query.Where("LOWER(status) IN ?", []string{"processing", "pending"})
-	case "deleting":
-		query = query.Where("LOWER(status) = ?", "deleting")
-	case "active":
-		query = query.Where("LOWER(status) IN ?", []string{"active", "success", "succeeded"})
-	case "failed":
-		query = query.Where("LOWER(status) = ?", "failed")
-	default:
-		common.ApiErrorI18n(c, "invalid_params")
-		return
-	}
+	// 全部筛选先于计数和分页，has_pending 保持组范围内的轮询语义。
+	query = options.filter(query, false)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	page := common.GetPageQuery(c)
+	page := options.page
 	page.PageSize = max(1, min(100, page.PageSize))
 	page.Page = max(1, min(page.Page, int((total+int64(page.PageSize)-1)/int64(page.PageSize))))
 	var assets []model.SeedanceAsset
-	if err := query.Order("id desc").Offset(page.GetStartIdx()).Limit(page.PageSize).Find(&assets).Error; err != nil {
+	if err := query.Order(options.order).Offset(page.GetStartIdx()).Limit(page.PageSize).Find(&assets).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
