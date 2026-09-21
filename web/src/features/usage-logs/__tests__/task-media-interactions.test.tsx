@@ -233,7 +233,7 @@ test('a failed artifact request copies nothing and can be retried from the list'
 })
 
 // 用真实结算快照验证补扣解释，避免把差额误当成另一次完整生成费用。
-test('surcharge details show reserved, final and additional costs', async () => {
+test('surcharge details show reserved and final costs without a duplicate amount row', async () => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -265,7 +265,7 @@ test('surcharge details show reserved, final and additional costs', async () => 
   expect(await screen.findByText('Task settlement surcharge')).toBeVisible()
   expect(screen.getByText('Pre-consumed')).toBeVisible()
   expect(screen.getByText('Actual cost')).toBeVisible()
-  expect(screen.getByText('Settlement surcharge amount')).toBeVisible()
+  expect(screen.queryByText('Settlement surcharge amount')).toBeNull()
   expect(
     screen.getByText(
       'The final cost exceeded the pre-consumed amount. This entry charges only the difference, not another generation request.'

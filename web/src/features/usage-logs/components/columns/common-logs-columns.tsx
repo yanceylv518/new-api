@@ -142,12 +142,12 @@ function buildTypeDetailSegments(
     return text ? [{ text }] : []
   }
 
-  // 列表直接标明差额方向和本次补扣，避免被误读为第二次完整消费。
+  // 列表直接标明任务结算补扣，避免被误读为第二次完整消费。
   const settlement = getTaskSettlementAdjustment(log.type, other)
   if (log.type === 2 && settlement) {
     return [
       {
-        text: `${t('Task settlement surcharge')} · ${t('Settlement surcharge amount')}: ${formatLogQuota(log.quota)}`,
+        text: t('Task settlement surcharge'),
       },
     ]
   }

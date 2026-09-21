@@ -301,8 +301,8 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   ).toHaveTextContent('images · images $0.25/张')
 })
 
-// 补扣预览优先解释差额，不能把最终费用当作本条消费再次显示。
-test('settlement charge preview identifies the additional amount', () => {
+// 补扣预览只显示结算类型，不能把最终费用当作本条消费再次显示。
+test('settlement charge preview uses the settlement surcharge label', () => {
   const preview = renderPreview(
     {
       task_id: 'task-settlement',
@@ -312,7 +312,7 @@ test('settlement charge preview identifies the additional amount', () => {
     false
   )
   expect(preview).toHaveTextContent('Task settlement surcharge')
-  expect(preview).toHaveTextContent('Settlement surcharge amount: $0.01')
+  expect(preview).not.toHaveTextContent('Settlement surcharge amount')
   expect(preview).not.toHaveTextContent('Async task refund')
 })
 

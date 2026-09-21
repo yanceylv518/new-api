@@ -899,15 +899,13 @@ export function DetailsDialog(props: DetailsDialogProps) {
                     value={formatLogQuota(taskSettlement.actualQuota)}
                     mono
                   />
-                  <DetailRow
-                    label={
-                      isSurcharge
-                        ? t('Settlement surcharge amount')
-                        : t('Refund amount')
-                    }
-                    value={formatLogQuota(props.log.quota)}
-                    mono
-                  />
+                  {!isSurcharge && (
+                    <DetailRow
+                      label={t('Refund amount')}
+                      value={formatLogQuota(props.log.quota)}
+                      mono
+                    />
+                  )}
                 </>
               )}
               {other.reason && (
