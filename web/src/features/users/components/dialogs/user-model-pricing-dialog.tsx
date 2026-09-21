@@ -28,7 +28,7 @@ import {
   X,
 } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
-import { useForm, type FieldErrors } from 'react-hook-form'
+import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -69,6 +69,9 @@ interface UserModelPricingDialogProps {
 
 // 固定每页模型数量，配合列表滚动避免大量模型撑开弹窗。
 const MODEL_PAGE_SIZE = 25
+// 批量折扣输入的默认值；只有偏离该值时才要求显式应用后保存。
+const DEFAULT_BATCH_DISCOUNT_VALUE = FULL_PRICE_DISCOUNT_BPS / 100
+const DEFAULT_BATCH_DISCOUNT = String(DEFAULT_BATCH_DISCOUNT_VALUE)
 
 // 表头与数据行共用同一套列模板和水平内边距，确保复选框、模型名和折扣输入严格对齐。
 const MODEL_PRICING_GRID_CLASS =
@@ -180,7 +183,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const [currentPage, setCurrentPage] = useState(1)
   // 以规范化模型名保存选择，翻页和搜索不改变批量操作的目标。
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set())
-  const [batchDiscount, setBatchDiscount] = useState('100')
+  const [batchDiscount, setBatchDiscount] = useState(DEFAULT_BATCH_DISCOUNT)
+  // 记录批量值最近一次被明确应用，防止只修改输入框或逐行修改后直接保存。
+  const [appliedBatchDiscount, setAppliedBatchDiscount] = useState<
+    number | null
+  >(null)
   const [batchError, setBatchError] = useState<string | null>(null)
   // 将筛选计算延后到输入空闲时，避免模型数量较大时阻塞搜索框输入。
   const deferredSearchTerm = useDeferredValue(searchTerm)
@@ -191,6 +198,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     // 分页和筛选会卸载不可见行，但提交时必须保留这些行的值。
     shouldUnregister: false,
   })
+  // 订阅完整草稿值，让保存按钮能随跨页选中模型的输入变化实时更新。
+  const watchedItems = useWatch({ control: form.control, name: 'items' })
   const query = useQuery({
     queryKey: ['user-model-pricing', props.user.id],
     queryFn: () => getUserModelPricing(props.user.id),
@@ -210,7 +219,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   if (!props.open && editorSnapshot) {
     setEditorSnapshot(null)
     setSelectedModels(new Set())
-    setBatchDiscount('100')
+    setBatchDiscount(DEFAULT_BATCH_DISCOUNT)
+    setAppliedBatchDiscount(null)
     setBatchError(null)
   } else if (
     props.open &&
@@ -224,7 +234,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   ) {
     // 选择和批量输入只属于当前编辑会话，切换用户或重新打开时全部重置。
     setSelectedModels(new Set())
-    setBatchDiscount('100')
+    setBatchDiscount(DEFAULT_BATCH_DISCOUNT)
+    setAppliedBatchDiscount(null)
     setBatchError(null)
     const normalizedEnabledNames = new Set(
       collection.model_names.map(normalizeUserModelPricingModelName)
@@ -393,15 +404,43 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const allFilteredSelected =
     totalFilteredModels > 0 && selectedFilteredCount === totalFilteredModels
 
+  const batchDiscountResult = useMemo(
+    () =>
+      formSchema.shape.items.element.shape.discount_percent.safeParse(
+        batchDiscount.trim() === '' ? undefined : Number(batchDiscount)
+      ),
+    [batchDiscount, formSchema]
+  )
+  const selectedItems = useMemo(
+    () =>
+      (watchedItems ?? []).filter((item) =>
+        selectedModels.has(item.model_name)
+      ),
+    [selectedModels, watchedItems]
+  )
+  // 仅在多选且批量值偏离默认值时锁定保存，单选和普通逐行编辑保持原有流程。
+  const requiresBatchApply =
+    selectedModels.size > 1 &&
+    (!batchDiscountResult.success ||
+      batchDiscountResult.data !== DEFAULT_BATCH_DISCOUNT_VALUE)
+  const selectedDiscountsMatchBatch =
+    batchDiscountResult.success &&
+    selectedItems.length === selectedModels.size &&
+    selectedItems.every(
+      (item) => item.discount_percent === batchDiscountResult.data
+    )
+  const batchApplySatisfied =
+    !requiresBatchApply ||
+    (batchDiscountResult.success &&
+      appliedBatchDiscount === batchDiscountResult.data &&
+      selectedDiscountsMatchBatch)
+
   // 复用单行校验，并一次检查完整规则数量；应用只更新草稿，不发起保存请求。
   const applyBatchDiscount = () => {
     if (mutation.isPending || !activeSnapshot || selectedModels.size === 0) {
       return
     }
-    const result =
-      formSchema.shape.items.element.shape.discount_percent.safeParse(
-        batchDiscount.trim() === '' ? undefined : Number(batchDiscount)
-      )
+    const result = batchDiscountResult
     if (!result.success) {
       setBatchError(result.error.issues[0].message)
       return
@@ -431,6 +470,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       changedFields.push(name)
     })
     setBatchError(null)
+    setAppliedBatchDiscount(result.data)
     // 批量写完再统一更新字段错误，避免每写一行就对完整表单重复校验。
     void form.trigger(changedFields)
   }
@@ -473,7 +513,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
             type='submit'
             form='user-model-pricing-form'
             disabled={
-              mutation.isPending || !activeSnapshot || isLoading || hasLoadError
+              mutation.isPending ||
+              !activeSnapshot ||
+              isLoading ||
+              hasLoadError ||
+              !batchApplySatisfied
             }
           >
             {mutation.isPending && <Loader2 className='animate-spin' />}
@@ -506,10 +550,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
           <form
             id='user-model-pricing-form'
             noValidate
-            onSubmit={form.handleSubmit(
-              (values) => mutation.mutate(values),
-              handleInvalid
-            )}
+            onSubmit={form.handleSubmit((values) => {
+              // 除了禁用保存按钮，提交入口也要拦截回车等绕过点击的路径。
+              if (!batchApplySatisfied) return
+              mutation.mutate(values)
+            }, handleInvalid)}
             className='flex min-h-0 flex-1 flex-col gap-3 overflow-hidden'
           >
             <div className='flex shrink-0 flex-col gap-2'>
@@ -564,6 +609,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     }
                     return next
                   })
+                  setAppliedBatchDiscount(null)
                 }}
               />
               <span>{t('Model')}</span>
@@ -630,6 +676,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                 else next.delete(model.model_name)
                                 return next
                               })
+                              setAppliedBatchDiscount(null)
                             }}
                           />
                           <div className='min-w-0 py-2.5'>
@@ -703,11 +750,13 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                   disabled={mutation.isPending}
                   onValueChange={(value) => {
                     setBatchDiscount(value)
+                    setAppliedBatchDiscount(null)
                     setBatchError(null)
                   }}
                   onApply={applyBatchDiscount}
                   onClear={() => {
                     setSelectedModels(new Set())
+                    setAppliedBatchDiscount(null)
                     setBatchError(null)
                   }}
                 />

@@ -355,6 +355,97 @@ describe('user model pricing dialog', () => {
     )
   })
 
+  // 多选修改批量折扣后，必须显式应用且所有选中模型已同步才能保存。
+  test('requires applying a changed batch discount before saving multiple selections', async () => {
+    const selectedModels = models.slice(0, 3)
+    installApiFixtures(selectedModels, configuredItemsFor(selectedModels))
+    await renderDialog(3)
+
+    const selectFirst = document.querySelector<HTMLElement>(
+      '[aria-label="Select model model-01"]'
+    )
+    const selectSecond = document.querySelector<HTMLElement>(
+      '[aria-label="Select model model-02"]'
+    )
+    assert.ok(selectFirst)
+    assert.ok(selectSecond)
+    await act(async () => selectFirst.click())
+    await act(async () => selectSecond.click())
+
+    const batch = document.querySelector<HTMLInputElement>(
+      '[aria-label="Batch discount percentage"]'
+    )
+    const apply = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Apply discount')
+    const save = document.querySelector<HTMLButtonElement>(
+      'button[type="submit"][form="user-model-pricing-form"]'
+    )
+    assert.ok(batch)
+    assert.ok(apply)
+    assert.ok(save)
+    assert.equal(save.disabled, false)
+
+    await changeInput(batch, '75')
+    assert.equal(save.disabled, true)
+
+    let submitted: unknown
+    apiClient.put = async (_url, payload) => {
+      submitted = payload
+      return { data: { success: true } }
+    }
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () =>
+      form.dispatchEvent(
+        new domWindow.Event('submit', {
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event
+      )
+    )
+    assert.equal(submitted, undefined)
+
+    await changeInput(getModelInput('model-01'), '75')
+    await changeInput(getModelInput('model-02'), '75')
+    assert.equal(save.disabled, true)
+
+    await act(async () => apply.click())
+    assert.equal(save.disabled, false)
+
+    await changeInput(getModelInput('model-01'), '80')
+    assert.equal(save.disabled, true)
+    await changeInput(getModelInput('model-01'), '75')
+    assert.equal(save.disabled, false)
+  })
+
+  // 单选仍允许直接编辑批量输入，不把多选确认规则扩展到单个模型。
+  test('allows saving a changed batch discount for a single selection', async () => {
+    const selectedModels = models.slice(0, 3)
+    installApiFixtures(selectedModels, configuredItemsFor(selectedModels))
+    await renderDialog(3)
+
+    const selectFirst = document.querySelector<HTMLElement>(
+      '[aria-label="Select model model-01"]'
+    )
+    const save = document.querySelector<HTMLButtonElement>(
+      'button[type="submit"][form="user-model-pricing-form"]'
+    )
+    assert.ok(selectFirst)
+    assert.ok(save)
+    await act(async () => selectFirst.click())
+
+    const batch = document.querySelector<HTMLInputElement>(
+      '[aria-label="Batch discount percentage"]'
+    )
+    assert.ok(batch)
+    await changeInput(batch, '75')
+
+    assert.equal(save.disabled, false)
+  })
+
   // 全选只覆盖当前已配置模型；原价批量设置清除专属折扣，关闭后不能残留选择。
   test('selects configured models and resets selection when reopened', async () => {
     installApiFixtures()
@@ -387,7 +478,7 @@ describe('user model pricing dialog', () => {
     assert.equal(getModelInput('model-03').value, '80')
   })
 
-  // 空值及越界值不能写入所选模型，也不能让未应用的批量输入阻止保存草稿。
+  // 空值及越界值不能写入所选模型，多选时未应用的批量输入会继续锁定保存。
   test('rejects invalid batch values and clears the selection explicitly', async () => {
     installApiFixtures(
       models.slice(0, 3),
