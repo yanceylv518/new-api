@@ -26,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 type TaskSubmitResult struct {
@@ -306,8 +307,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		discount := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(modelName)))
 		if discount >= 1 && discount < 10000 && !info.IsChannelTest {
 			priceData.AddOtherRatio(types.UserModelDiscountRatioKey, float64(discount)/10000)
-			value := cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
-			quota, clamp = common.QuotaRoundChecked(value)
+			beforeValue := decimal.NewFromFloat(cost).
+				Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
+				Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+			quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, priceData.UserModelDiscountMultiplier())
 			if original > 0 && quota == 0 {
 				quota = 1
 			}
@@ -353,13 +356,27 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if info.TieredBillingSnapshot == nil {
 		base := float64(info.PriceData.Quota)
 		info.PriceData.BaseQuota, info.PriceData.HasBaseQuota = info.PriceData.Quota, true
-		before := base
-		if !common.StringsContains(constant.TaskPricePatches, modelName) {
-			before *= info.PriceData.OtherRatioMultiplierBeforeDiscount()
+		discountRatio := info.PriceData.UserModelDiscountMultiplier()
+		var original int
+		var originalClamp *common.QuotaClamp
+		var quota int
+		var clamp *common.QuotaClamp
+		if discountRatio != 1 {
+			// 用户折扣只改变折后额度；多项请求倍率先用十进制合并，再统一取整。
+			beforeValue := decimal.NewFromInt(int64(info.PriceData.BaseQuota))
+			if !common.StringsContains(constant.TaskPricePatches, modelName) {
+				beforeValue = info.PriceData.ApplyOtherRatiosBeforeDiscount(beforeValue)
+			}
+			original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+			quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
+		} else {
+			before := base
+			if !common.StringsContains(constant.TaskPricePatches, modelName) {
+				before *= info.PriceData.OtherRatioMultiplierBeforeDiscount()
+			}
+			original, originalClamp = common.QuotaFromFloatChecked(before)
+			quota, clamp = common.QuotaFromFloatChecked(before)
 		}
-		original, originalClamp := common.QuotaFromFloatChecked(before)
-		discounted := before * info.PriceData.UserModelDiscountMultiplier()
-		quota, clamp := common.QuotaFromFloatChecked(discounted)
 		if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() != 1 {
 			quota = 1
 		}
@@ -487,11 +504,23 @@ func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float6
 	if !info.PriceData.ReplaceOtherRatios(mergedRatios) {
 		return 0, false
 	}
-	// 应用新的 ratios
-	result := info.PriceData.ApplyOtherRatiosToFloat(baseQuota)
-	quota, clamp := common.QuotaFromFloatChecked(result)
+	// 应用新的 ratios；有用户折扣时在折扣边界统一取整，避免先乘后截断。
+	discountRatio := info.PriceData.UserModelDiscountMultiplier()
+	var quota int
+	var clamp *common.QuotaClamp
+	var original int
+	var originalClamp *common.QuotaClamp
+	if discountRatio != 1 {
+		// 提交后的倍率调整同样从整数基础额度重建十进制折前值。
+		beforeValue := adjustedPriceData.ApplyOtherRatiosBeforeDiscount(decimal.NewFromInt(int64(baseQuota)))
+		quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
+		original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+	} else {
+		result := info.PriceData.ApplyOtherRatiosToFloat(baseQuota)
+		quota, clamp = common.QuotaFromFloatChecked(result)
+		original, originalClamp = common.QuotaFromFloatChecked(baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount())
+	}
 	noteTaskQuotaClamp(info, clamp)
-	original, originalClamp := common.QuotaFromFloatChecked(baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount())
 	noteTaskQuotaClamp(info, originalClamp)
 	if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() < 1 {
 		quota = 1

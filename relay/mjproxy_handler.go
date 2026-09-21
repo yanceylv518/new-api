@@ -211,9 +211,15 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 			Description: err.Error(),
 		}
 	}
-	discountedQuota := float64(priceData.Quota) * priceData.UserModelDiscountMultiplier()
 	originalQuota := priceData.Quota
-	priceData.Quota, info.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	discountRatio := priceData.UserModelDiscountMultiplier()
+	discountedQuota := float64(originalQuota) * discountRatio
+	if discountRatio != 1 {
+		// 用户折扣在固定额度边界统一按十进制契约取整。
+		priceData.Quota, info.QuotaClamp = common.QuotaDiscountRoundedChecked(float64(originalQuota), discountRatio)
+	} else {
+		priceData.Quota, info.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	}
 	if discountedQuota > 0 && priceData.Quota == 0 {
 		priceData.Quota = 1
 	}
@@ -533,9 +539,15 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			Description: err.Error(),
 		}
 	}
-	discountedQuota := float64(priceData.Quota) * priceData.UserModelDiscountMultiplier()
 	originalQuota := priceData.Quota
-	priceData.Quota, relayInfo.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	discountRatio := priceData.UserModelDiscountMultiplier()
+	discountedQuota := float64(originalQuota) * discountRatio
+	if discountRatio != 1 {
+		// 用户折扣在固定额度边界统一按十进制契约取整。
+		priceData.Quota, relayInfo.QuotaClamp = common.QuotaDiscountRoundedChecked(float64(originalQuota), discountRatio)
+	} else {
+		priceData.Quota, relayInfo.QuotaClamp = common.QuotaFromFloatChecked(discountedQuota)
+	}
 	if discountedQuota > 0 && priceData.Quota == 0 {
 		priceData.Quota = 1
 	}

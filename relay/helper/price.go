@@ -18,6 +18,7 @@ import (
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 func modelPriceNotConfiguredError(modelName string, userId int) error {
@@ -144,7 +145,18 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio
 		preConsumeValue := float64(preConsumedTokens) * ratio
-		quota, err := common.QuotaFromFloatStrict(preConsumeValue)
+		var quota int
+		var err error
+		if discountRatio != 1 {
+			// 有用户折扣时，所有倍率先用十进制相乘，再统一按半远离零规则取整。
+			beforeValue := decimal.NewFromInt(int64(preConsumedTokens)).
+				Mul(decimal.NewFromFloat(modelRatio)).
+				Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+			quota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
+		} else {
+			// 无用户折扣时保留原有预扣取整行为，避免改变旧版本账单。
+			quota, err = common.QuotaFromFloatStrict(preConsumeValue)
+		}
 		if err != nil {
 			return hosttypes.PriceData{}, err
 		}
@@ -240,12 +252,28 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	// 管理员折扣是保留倍率，必须在适配器附加倍率写入后重新冻结，防止同名参数覆盖。
 	addUserModelDiscount(info, &priceData)
 	if usePrice {
-		quotaToPreConsume := priceData.ApplyOtherRatiosToFloat(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
-		quota, err := common.QuotaFromFloatStrict(quotaToPreConsume)
+		baseValue := decimal.NewFromFloat(modelPrice).
+			Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
+			Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+		discountRatio := priceData.UserModelDiscountMultiplier()
+		var quota int
+		var err error
+		var quotaToPreConsume float64
+		if discountRatio != 1 {
+			// 固定价格、请求倍率和用户折扣共用同一精确的折后预扣结果。
+			beforeValue := priceData.ApplyOtherRatiosBeforeDiscount(baseValue)
+			discountedValue := beforeValue.Mul(decimal.NewFromFloat(discountRatio))
+			quota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
+			quotaToPreConsume = discountedValue.InexactFloat64()
+		} else {
+			// 无用户折扣时保留原始浮点计算顺序，避免改变旧版固定价格预扣结果。
+			quotaToPreConsume = priceData.ApplyOtherRatiosToFloat(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
+			quota, err = common.QuotaFromFloatStrict(quotaToPreConsume)
+		}
 		if err != nil {
 			return hosttypes.PriceData{}, err
 		}
-		if priceData.UserModelDiscountMultiplier() < 1 && quotaToPreConsume >= priceData.UserModelDiscountMultiplier() && quota == 0 {
+		if discountRatio < 1 && quotaToPreConsume >= discountRatio && quota == 0 {
 			quota = 1
 		}
 		priceData.QuotaToPreConsume = quota
@@ -389,12 +417,22 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	priceData := hosttypes.PriceData{GroupRatioInfo: groupRatioInfo}
 	addUserModelDiscount(info, &priceData)
 	preConsumeValue := quotaBeforeGroup * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
-	preConsumedQuota, err := billingexpr.QuotaRoundStrict(preConsumeValue)
+	discountRatio := priceData.UserModelDiscountMultiplier()
+	var preConsumedQuota int
+	var originalEstimate int
+	var originalClamp *common.QuotaClamp
+	if discountRatio != 1 {
+		// 阶梯计费的折前、折后预扣都从同一份十进制基础额度计算。
+		beforeValue := decimal.NewFromFloat(quotaBeforeGroup).Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+		preConsumedQuota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
+		originalEstimate, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+	} else {
+		preConsumedQuota, err = billingexpr.QuotaRoundStrict(preConsumeValue)
+		originalEstimate, originalClamp = common.QuotaRoundChecked(quotaBeforeGroup * groupRatioInfo.GroupRatio)
+	}
 	if err != nil {
 		return hosttypes.PriceData{}, err
 	}
-	// 阶梯回退预扣时使用同一表达式的原始估算，保留取整前的原价来源。
-	originalEstimate, originalClamp := common.QuotaRoundChecked(quotaBeforeGroup * groupRatioInfo.GroupRatio)
 	if info.QuotaClamp == nil {
 		info.QuotaClamp = originalClamp
 	}

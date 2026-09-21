@@ -128,6 +128,26 @@ func TestQuotaFromDecimalChecked(t *testing.T) {
 	}
 }
 
+// 用户折扣必须在十进制乘法后统一半远离零取整，避免 29*0.95 被截断为 27。
+func TestQuotaDiscountUsesUnifiedRounding(t *testing.T) {
+	quota, clamp := QuotaDiscountRoundedChecked(29, 0.95)
+	assert.Equal(t, 28, quota)
+	assert.Nil(t, clamp)
+
+	quota, clamp = QuotaDiscountDecimalChecked(decimal.NewFromInt(29), 0.95)
+	assert.Equal(t, 28, quota)
+	assert.Nil(t, clamp)
+
+	quota, err := QuotaDiscountDecimalStrict(decimal.NewFromInt(29), 0.95)
+	require.NoError(t, err)
+	assert.Equal(t, 28, quota)
+
+	// 旧导出接口的显式截断选项保持兼容，但用户折扣业务不再调用该分支。
+	quota, clamp = QuotaDiscountChecked(29, 0.95, true)
+	assert.Equal(t, 27, quota)
+	assert.Nil(t, clamp)
+}
+
 func TestWalletQuotaFromDecimalStrict(t *testing.T) {
 	quota, err := WalletQuotaFromDecimalStrict(decimal.NewFromInt(4_294_500_000))
 	require.NoError(t, err)

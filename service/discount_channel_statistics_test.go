@@ -74,7 +74,7 @@ func TestDiscountLogRejectsCorruptSnapshot(t *testing.T) {
 	assert.Equal(t, map[string]any{"quota_before_discount": 200, "quota_after_discount": 58, "discount_quota": 142}, other.Snapshot())
 }
 
-// token 重算沿用截断规则，但十进制折扣不能因浮点误差将精确的 58 额度扣成 57。
+// token 重算使用统一的十进制折扣取整，不能因浮点误差或旧截断规则少扣额度。
 func TestDiscountTaskTokenRoundingAndLogAmounts(t *testing.T) {
 	truncate(t)
 	const id = 74
@@ -103,6 +103,41 @@ func TestDiscountTaskTokenRoundingAndLogAmounts(t *testing.T) {
 	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &details))
 	assert.Equal(t, types.DiscountAmounts{Before: 200, After: 58, Savings: 142}, details.DiscountAmounts)
 	assert.Equal(t, "task_total", details.Scope)
+}
+
+// 真实任务结算验证 29*95% 应按统一契约得到 28，并同步用户、令牌、渠道和日志快照。
+func TestDiscountTaskTokenRoundsFractionalQuota(t *testing.T) {
+	truncate(t)
+	const id = 76
+	seedUser(t, id, 9900)
+	seedToken(t, id, id, "discount-fractional-rounding-test", 9900)
+	seedChannel(t, id)
+	seedChargedAccounting(t, id, id, id, 100, 1)
+	task := makeTask(id, id, 100, id, BillingSourceWallet, 0)
+	task.PrivateData.DiscountAmounts = types.NewDiscountAmounts(100, 100)
+	task.PrivateData.BillingContext = &model.TaskBillingContext{
+		OriginModelName: "fractional-rounding-test",
+		ModelRatio:      0.29,
+		GroupRatio:      1,
+		OtherRatios: map[string]float64{
+			types.UserModelDiscountRatioKey: 0.95,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	require.True(t, RecalculateTaskQuotaByTokens(context.Background(), task, 100))
+	assert.Equal(t, 28, task.Quota)
+	assert.Equal(t, 9972, getUserQuota(t, id))
+	assert.Equal(t, 9972, getTokenRemainQuota(t, id))
+	assert.EqualValues(t, 29, getChannelUsedQuota(t, id))
+
+	entry := getLastLog(t)
+	require.NotNil(t, entry)
+	var details struct {
+		types.DiscountAmounts
+	}
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &details))
+	assert.Equal(t, types.DiscountAmounts{Before: 29, After: 28, Savings: 1}, details.DiscountAmounts)
 }
 
 // 折扣任务按提交快照做补扣、退差额与全退；渠道保留历史用量并始终调整折前差额。

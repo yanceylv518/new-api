@@ -42,6 +42,55 @@ func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {
 	}
 }
 
+// 折扣预扣沿用统一的十进制取整；没有折扣时仍由原有浮点预扣路径处理。
+func TestModelDiscountPreConsumeRoundsDiscountedQuota(t *testing.T) {
+	saved := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(saved)) })
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"discount-rounding-model":0.029}`))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "discount-rounding-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{
+			"discount-rounding-model": 9500,
+		}),
+	}
+
+	price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 28, price.QuotaToPreConsume)
+}
+
+// 固定价格预扣同样只在存在用户折扣时切换到统一的十进制取整。
+func TestFixedPriceDiscountPreConsumeRoundsDiscountedQuota(t *testing.T) {
+	saved := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(saved)) })
+	priceJSON, err := common.Marshal(map[string]float64{
+		"discount-fixed-price": 29 / common.QuotaPerUnit,
+	})
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(priceJSON)))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "discount-fixed-price",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{
+			"discount-fixed-price": 9500,
+		}),
+	}
+
+	price, err := ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.True(t, price.UsePrice)
+	assert.Equal(t, 28, price.QuotaToPreConsume)
+}
+
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

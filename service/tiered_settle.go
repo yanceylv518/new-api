@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 // TieredResultWrapper wraps billingexpr.TieredResult for use at the service layer.
@@ -151,14 +152,26 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 		return snap, nil
 	}
 
-	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio * relayInfo.PriceData.UserModelDiscountMultiplier()
-	estimatedQuota, err := billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
+	discountRatio := relayInfo.PriceData.UserModelDiscountMultiplier()
+	var estimatedQuota int
+	var err error
+	var original int
+	var originalClamp *common.QuotaClamp
+	if discountRatio != 1 {
+		// 路由切换时也从十进制折前额度计算用户折后预扣，避免浮点边界漂移。
+		beforeValue := decimal.NewFromFloat(snap.EstimatedQuotaBeforeGroup).Mul(decimal.NewFromFloat(groupRatio))
+		estimatedQuota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
+		original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+	} else {
+		estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio
+		estimatedQuota, err = billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
+		original, originalClamp = common.QuotaRoundChecked(snap.EstimatedQuotaBeforeGroup * groupRatio)
+	}
 	if err != nil {
 		return nil, err
 	}
 	snap.GroupRatio = groupRatio
 	snap.EstimatedQuotaAfterGroup = estimatedQuota
-	original, originalClamp := common.QuotaRoundChecked(snap.EstimatedQuotaBeforeGroup * groupRatio)
 	noteQuotaClamp(relayInfo, originalClamp)
 	if original > 0 && estimatedQuota == 0 && relayInfo.PriceData.UserModelDiscountMultiplier() < 1 {
 		estimatedQuota = 1
@@ -249,13 +262,18 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 	originalQuota := tr.ActualQuotaAfterGroup
 	discountRatio := relayInfo.PriceData.UserModelDiscountMultiplier()
 	if discountRatio != 1 {
-		beforeDiscount := tr.ActualQuotaBeforeGroup * snap.GroupRatio
+		beforeValue := decimal.NewFromFloat(tr.ActualQuotaBeforeGroup).Mul(decimal.NewFromFloat(snap.GroupRatio))
+		var originalClamp *common.QuotaClamp
+		originalQuota, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
 		var discountClamp *common.QuotaClamp
-		// 与任务终态共享同一十进制折扣契约，统一处理半额度和非有限输入。
-		tr.ActualQuotaAfterGroup, discountClamp = common.QuotaDiscountChecked(beforeDiscount, discountRatio, false)
+		// 与任务终态共享同一十进制折扣契约，统一处理半额度和倍率累积误差。
+		tr.ActualQuotaAfterGroup, discountClamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
 		// 折后未饱和也必须保留折前异常，供渠道统计和管理员审计。
 		if tr.Clamp == nil {
 			tr.Clamp = discountClamp
+		}
+		if tr.Clamp == nil {
+			tr.Clamp = originalClamp
 		}
 		if originalQuota > 0 && tr.ActualQuotaAfterGroup == 0 {
 			tr.ActualQuotaAfterGroup = 1
