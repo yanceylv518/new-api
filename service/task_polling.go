@@ -22,6 +22,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 )
 
 // TaskPollingAdaptor 定义轮询所需的最小适配器接口，避免 service -> relay 的循环依赖
@@ -692,8 +693,10 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		// 终态表达式使用提交时折扣，折前和折后都从本次表达式结果计算。
 		before, after := result.ActualQuotaAfterGroup, result.ActualQuotaAfterGroup
 		if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
+			beforeValue := decimal.NewFromFloat(result.ActualQuotaBeforeGroup).
+				Mul(decimal.NewFromFloat(bc.TieredSnapshot.GroupRatio))
 			var clamp *common.QuotaClamp
-			after, clamp = common.QuotaDiscountChecked(result.ActualQuotaBeforeGroup*bc.TieredSnapshot.GroupRatio, price.UserModelDiscountMultiplier(), false)
+			after, clamp = common.QuotaDiscountDecimalChecked(beforeValue, price.UserModelDiscountMultiplier())
 			if result.Clamp == nil {
 				result.Clamp = clamp
 			}
@@ -714,9 +717,8 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		before := actualQuota
 		var clamp *common.QuotaClamp
 		if price := taskBillingContextPriceData(task.PrivateData.BillingContext); price != nil {
-			value := float64(before) * price.UserModelDiscountMultiplier()
-			actualQuota, clamp = common.QuotaDiscountChecked(float64(before), price.UserModelDiscountMultiplier(), true)
-			if value > 0 && actualQuota == 0 {
+			actualQuota, clamp = common.QuotaDiscountRoundedChecked(float64(before), price.UserModelDiscountMultiplier())
+			if before > 0 && actualQuota == 0 {
 				actualQuota = 1
 			}
 		}

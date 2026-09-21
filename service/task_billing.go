@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
@@ -367,12 +368,26 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
 	originalValue := float64(totalTokens) * modelRatio * finalGroupRatio * beforeMultiplier
-	// 折前沿用任务既有计价；只将用户折扣改为十进制乘法，避免 200*0.29 截断成 57。
-	// 先截断再走统一饱和转换器，保留任务的截断契约及非有限输入的审计行为。
-	if priceData != nil && priceData.UserModelDiscountMultiplier() != 1 {
-		actualQuota, clamp = common.QuotaDiscountChecked(originalValue, priceData.UserModelDiscountMultiplier(), true)
+	// 折前沿用任务既有计价；用户折扣统一按十进制乘法和半远离零规则取整。
+	discountRatio := 1.0
+	if priceData != nil {
+		discountRatio = priceData.UserModelDiscountMultiplier()
 	}
-	originalQuota, originalClamp := common.QuotaFromFloatChecked(originalValue)
+	var originalQuota int
+	var originalClamp *common.QuotaClamp
+	if discountRatio != 1 {
+		// 有用户折扣时，先用十进制重建折前基础额度，避免多项浮点倍率累积误差。
+		beforeValue := decimal.NewFromInt(int64(totalTokens)).
+			Mul(decimal.NewFromFloat(modelRatio)).
+			Mul(decimal.NewFromFloat(finalGroupRatio))
+		if priceData != nil {
+			beforeValue = priceData.ApplyOtherRatiosBeforeDiscount(beforeValue)
+		}
+		originalQuota, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+		actualQuota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
+	} else {
+		originalQuota, originalClamp = common.QuotaFromFloatChecked(originalValue)
+	}
 	if originalQuota > 0 && actualQuota == 0 && otherMultiplier != beforeMultiplier {
 		actualQuota = 1
 	}

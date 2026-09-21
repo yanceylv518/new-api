@@ -147,20 +147,42 @@ func QuotaRoundStrict(value float64) (int, error) {
 	return strictQuota(QuotaRoundChecked(value))
 }
 
-// QuotaDiscountChecked 在用户折扣边界使用十进制乘法；truncate 保留任务路径的截断规则。
-// 非有限数继续通过统一转换器产生审计标记，不允许 decimal.NewFromFloat panic。
+// QuotaDiscountChecked 保留旧调用方可选择截断或舍入的折扣转换契约。
+// 新的用户折扣计费链路必须调用 QuotaDiscountRoundedChecked，避免继续使用截断分支。
 func QuotaDiscountChecked(value, discount float64, truncate bool) (int, *QuotaClamp) {
-	if math.IsNaN(value) || math.IsInf(value, 0) || math.IsNaN(discount) || math.IsInf(discount, 0) {
-		if truncate {
+	if truncate {
+		if math.IsNaN(value) || math.IsInf(value, 0) || math.IsNaN(discount) || math.IsInf(discount, 0) {
 			return QuotaFromFloatChecked(value * discount)
 		}
+		amount := decimal.NewFromFloat(value).Mul(decimal.NewFromFloat(discount)).Truncate(0)
+		return QuotaFromDecimalChecked(amount)
+	}
+	return QuotaDiscountRoundedChecked(value, discount)
+}
+
+// QuotaDiscountRoundedChecked 统一计算用户折扣后的整数额度；折扣结果使用十进制乘法并按半远离零规则取整。
+// 非有限数继续通过统一转换器产生审计标记，不允许 decimal.NewFromFloat panic。
+func QuotaDiscountRoundedChecked(value, discount float64) (int, *QuotaClamp) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.IsNaN(discount) || math.IsInf(discount, 0) {
 		return QuotaRoundChecked(value * discount)
 	}
-	amount := decimal.NewFromFloat(value).Mul(decimal.NewFromFloat(discount))
-	if truncate {
-		amount = amount.Truncate(0)
+	return QuotaDiscountDecimalChecked(decimal.NewFromFloat(value), discount)
+}
+
+// QuotaDiscountDecimalChecked 在调用方已经完成多项价格倍率的十进制计算时复用同一折扣取整契约。
+func QuotaDiscountDecimalChecked(value decimal.Decimal, discount float64) (int, *QuotaClamp) {
+	if math.IsNaN(discount) || math.IsInf(discount, 0) {
+		return QuotaRoundChecked(value.InexactFloat64() * discount)
 	}
-	return QuotaFromDecimalChecked(amount)
+	return QuotaFromDecimalChecked(value.Mul(decimal.NewFromFloat(discount)))
+}
+
+// QuotaDiscountDecimalStrict 在预扣边界拒绝饱和结果，避免异常额度进入资金扣减。
+func QuotaDiscountDecimalStrict(value decimal.Decimal, discount float64) (int, error) {
+	if math.IsNaN(discount) || math.IsInf(discount, 0) {
+		return QuotaRoundStrict(value.InexactFloat64() * discount)
+	}
+	return QuotaFromDecimalStrict(value.Mul(decimal.NewFromFloat(discount)))
 }
 
 // QuotaFromDecimal converts a computed quota decimal to int with saturation.
