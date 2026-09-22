@@ -34,6 +34,7 @@ import {
   getDynamicDisplayGroupRatio,
   getDynamicPriceUnitLabelKey,
   getDynamicPricingSummary,
+  isDynamicPricingModel,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
@@ -77,9 +78,7 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
   const modelIcon = modelIconKey ? getLobeIcon(modelIconKey, 28) : null
   const initial = props.model.model_name?.charAt(0).toUpperCase() || '?'
   const isUnconfiguredTaskUsage = isUnconfiguredTaskUsageModel(props.model)
-  const isDynamicPricing =
-    props.model.billing_mode === 'tiered_expr' &&
-    Boolean(props.model.billing_expr)
+  const isDynamicPricing = isDynamicPricingModel(props.model)
   const discountMultiplier = getUserModelDiscountMultiplier(props.model)
   const hasDiscount = hasUserModelDiscount(props.model)
   const billingTime = useBillingTime(props.model.billing_expr)

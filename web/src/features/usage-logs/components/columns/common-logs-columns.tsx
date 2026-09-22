@@ -48,6 +48,7 @@ import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { taskUsageUnitLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
+import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -69,6 +70,7 @@ import {
   isDisplayableLogType,
   isTimingLogType,
   getLogTypeConfig,
+  isPerCallBilling,
 } from '../../lib/utils'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
@@ -313,14 +315,14 @@ function buildTypeDetailSegments(
       if (hasAnyCacheTokens(other)) {
         const cacheEntries = [
           other.cache_ratio != null && other.cache_ratio !== 1
-              ? formatPriceCompact(
-                  inputPriceUSD * other.cache_ratio * discountFactor
-                )
+            ? formatPriceCompact(
+                inputPriceUSD * other.cache_ratio * discountFactor
+              )
             : null,
           other.cache_creation_ratio != null && other.cache_creation_ratio !== 1
-              ? formatPriceCompact(
-                  inputPriceUSD * other.cache_creation_ratio * discountFactor
-                )
+            ? formatPriceCompact(
+                inputPriceUSD * other.cache_creation_ratio * discountFactor
+              )
             : null,
           other.cache_creation_ratio_1h != null &&
           other.cache_creation_ratio_1h !== 0

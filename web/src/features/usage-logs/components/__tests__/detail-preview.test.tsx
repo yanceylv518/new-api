@@ -28,6 +28,7 @@ import { I18nextProvider } from 'react-i18next'
 import { afterAll, afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import en from '@/i18n/locales/en.json'
+import { useAuthStore } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -86,6 +87,22 @@ function DetailPreview(props: { other: LogOtherData; isAdmin: boolean }) {
   if (!cell) throw new Error('The log must have a content column')
   return flexRender(cell.column.columnDef.cell, cell.getContext())
 }
+
+function pricingQueryKey() {
+  const { user, session } = useAuthStore.getState().auth
+  return [
+    'pricing',
+    user?.id ?? 'anonymous',
+    session?.sid ?? 'anonymous',
+  ] as const
+}
+
+function setPricingData(
+  queryClient: QueryClient,
+  data: { data: unknown[]; vendors: unknown[] }
+) {
+  queryClient.setQueryData(pricingQueryKey(), data)
+}
 const plugin = {
   key: 'incho',
   name: 'Incho',
@@ -107,7 +124,7 @@ beforeEach(async () => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   client.setQueryData(['status'], {}, { updatedAt: Date.now() + 60_000 })
   client.setQueryData(
-    ['pricing'],
+    pricingQueryKey(),
     { data: [], vendors: [] },
     { updatedAt: Date.now() + 60_000 }
   )
@@ -244,7 +261,7 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
+    setPricingData(client, {
       data: [
         {
           model_name: 'wan2.5-i2v-preview',
@@ -273,7 +290,7 @@ test.each([
 )
 
 test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
+  setPricingData(client, {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -318,7 +335,7 @@ test('settlement charge preview uses the settlement surcharge label', () => {
 
 // 历史结算日志缺少 is_task，仍须以任务表达式显示记录的档位及单价。
 test('task settlement without is_task shows historical task pricing', () => {
-  client.setQueryData(['pricing'], {
+  setPricingData(client, {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -341,7 +358,7 @@ test('task settlement without is_task shows historical task pricing', () => {
 })
 
 test('task log prices select the executing provider’s schema', () => {
-  client.setQueryData(['pricing'], {
+  setPricingData(client, {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -380,7 +397,7 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s shows an explicit unavailable summary',
   (scenario) => {
     if (scenario !== 'missing schema') {
-      client.setQueryData(['pricing'], {
+      setPricingData(client, {
         data: [
           {
             model_name: 'wan2.5-i2v-preview',
