@@ -130,12 +130,14 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 		`{"code":"operation_failed","message":"rejected"}`,
 		`{"ResponseMetadata":{"Error":{"Code":"Forbidden","Message":"rejected"}}}`,
 		`{"success":false,"message":"rejected"}`,
+		`{"error":{"code":"upstream_failure","message":"rejected","type":"server_error"}}`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			t.Cleanup(server.Close)
 			client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
 			require.NoError(t, err)
+			assert.ErrorContains(t, client.CreateSeedanceAssetGroup(t.Context(), "group", "LivenessFace", &struct{}{}), "rejected")
 			assert.ErrorContains(t, client.DeleteSeedanceAsset(t.Context(), "asset"), "rejected")
 			assert.ErrorContains(t, client.DeleteSeedanceAssetGroup(t.Context(), "group"), "rejected")
 			assert.ErrorContains(t, client.UpdateSeedanceAssetGroup(t.Context(), "group", "renamed", &struct{}{}), "rejected")
@@ -152,6 +154,46 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 	assert.NoError(t, client.DeleteSeedanceAssetGroup(t.Context(), "group"))
 	_, _, err = client.GetSeedanceAsset(t.Context(), "asset")
 	assert.ErrorIs(t, err, ErrSeedanceAssetNotFound)
+}
+
+// 非 2xx 响应也必须保留上游正文，不能只返回无上下文的状态码。
+func TestSeedanceAssetClientPreservesHTTPErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"code":"upstream_failure","message":"LivenessFace is unavailable","type":"server_error"}}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	err = client.CreateSeedanceAssetGroup(t.Context(), "group", "LivenessFace", &struct{}{})
+	assert.ErrorContains(t, err, "LivenessFace is unavailable")
+}
+
+// 创建素材组的类型必须进入上游请求，空值则保持上游默认行为。
+func TestCreateSeedanceAssetGroupForwardsGroupType(t *testing.T) {
+	var received map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = map[string]string{}
+		if err := common.DecodeJson(r.Body, &received); err != nil {
+			t.Errorf("decode CreateAssetGroup request: %v", err)
+		}
+		_, _ = io.WriteString(w, `{"Result":{"Id":"group-created"}}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	var response struct {
+		Result struct {
+			ID string `json:"Id"`
+		} `json:"Result"`
+	}
+	require.NoError(t, client.CreateSeedanceAssetGroup(t.Context(), "group", "LivenessFace", &response))
+	assert.Equal(t, "group", received["Name"])
+	assert.Equal(t, "LivenessFace", received["GroupType"])
+	assert.Equal(t, "group-created", response.Result.ID)
+
+	require.NoError(t, client.CreateSeedanceAssetGroup(t.Context(), "group", "", &response))
+	assert.NotContains(t, received, "GroupType")
 }
 
 type seedanceDeadlineTransport struct {

@@ -101,10 +101,18 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 			require.NoError(t, db.Delete(&tokens[6]).Error)
 			var calls atomic.Int32
 			var assetSequence atomic.Int32
+			var createdGroupType string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				assert.Equal(t, "Bearer fixtureupstream", r.Header.Get("Authorization"))
 				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Query().Get("Action") == "CreateAssetGroup" {
+					var body struct {
+						GroupType string `json:"GroupType"`
+					}
+					assert.NoError(t, common.DecodeJson(r.Body, &body))
+					createdGroupType = body.GroupType
+				}
 				if r.URL.Query().Get("Action") == "CreateAsset" {
 					_, _ = fmt.Fprintf(w, `{"Result":{"Id":"asset-api-%d"}}`, assetSequence.Add(1))
 					return
@@ -133,8 +141,9 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				assert.Equal(t, 401, request(key, "GET", "/asset-groups", "").Code)
 			}
 			assert.Equal(t, 403, request("assetkeyip", "GET", "/asset-groups", "").Code)
-			created := request("assetkeytwo", "POST", "/asset-groups", `{"name":"API素材组","model":"doubao-seedance-2-0-fast-260128","user_id":85002}`)
+			created := request("assetkeytwo", "POST", "/asset-groups", `{"name":"API素材组","model":"doubao-seedance-2-0-fast-260128","GroupType":"LivenessFace","user_id":85002}`)
 			require.Contains(t, created.Body.String(), `"success":true`)
+			assert.Equal(t, "LivenessFace", createdGroupType)
 			var group model.SeedanceAssetGroup
 			require.NoError(t, db.First(&group).Error)
 			assert.Equal(t, users[0].Id, group.UserID)

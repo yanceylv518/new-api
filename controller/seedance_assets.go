@@ -17,10 +17,17 @@ import (
 	"gorm.io/gorm"
 )
 
-type seedanceAssetGroupRequest struct {
+type seedanceAssetGroupCreateRequest struct {
 	Name string `json:"name" binding:"required,max=64"`
 	// 仅在建组时选择上游，已有素材的归属仍由认证用户和组绑定决定。
 	Model string `json:"model" binding:"max=191"`
+	// GroupType 按上游字段原样透传，不在网关内枚举或推断取值。
+	GroupType string `json:"GroupType"`
+}
+
+// 素材组更新只修改名称，避免把仅创建时的 GroupType 误用于重命名。
+type seedanceAssetGroupUpdateRequest struct {
+	Name string `json:"name" binding:"required,max=64"`
 }
 
 const seedanceAssetGroupCleanupWorkerSize = 4
@@ -64,7 +71,7 @@ func cleanupSeedanceAssetGroupAssets(ctx context.Context, assets []model.Seedanc
 
 // UpdateSeedanceAssetGroup 更新当前用户自己的素材组名称。
 func UpdateSeedanceAssetGroup(c *gin.Context) {
-	var req seedanceAssetGroupRequest
+	var req seedanceAssetGroupUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorI18n(c, "invalid_params")
 		return
@@ -274,7 +281,7 @@ func ListSeedanceAssetGroups(c *gin.Context) {
 
 // CreateSeedanceAssetGroup 创建上游素材组并保存本地授权映射。
 func CreateSeedanceAssetGroup(c *gin.Context) {
-	var req seedanceAssetGroupRequest
+	var req seedanceAssetGroupCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorI18n(c, "invalid_params")
 		return
@@ -308,7 +315,7 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 			ID string `json:"Id"`
 		} `json:"Result"`
 	}
-	if err := client.CreateSeedanceAssetGroup(c.Request.Context(), req.Name, &result); err != nil {
+	if err := client.CreateSeedanceAssetGroup(c.Request.Context(), req.Name, req.GroupType, &result); err != nil {
 		common.ApiError(c, err)
 		return
 	}

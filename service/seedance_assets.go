@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image/jpeg"
@@ -45,6 +44,8 @@ const (
 	seedanceAssetImageMaxDimension       = 6000
 	seedanceAssetJPEGQuality             = 95
 	seedanceAssetRequestTimeout          = 30 * time.Second
+	seedanceAssetResponseBodyLimit       = 1 << 20
+	seedanceAssetErrorPreviewLimit       = 4096
 )
 
 // privateAssetOSSStorageFactory 为素材流程提供统一的存储客户端创建入口。
@@ -601,24 +602,27 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		return err
 	}
 	defer resp.Body.Close()
-	var raw json.RawMessage
-	decodeErr := common.DecodeJson(io.LimitReader(resp.Body, 1<<20), &raw)
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, seedanceAssetResponseBodyLimit+1))
+	if readErr != nil {
+		return readErr
+	}
+	if len(raw) > seedanceAssetResponseBodyLimit {
+		return fmt.Errorf("seedance asset API response body exceeds %d bytes", seedanceAssetResponseBodyLimit)
+	}
 	var envelope seedanceAssetResponse
+	decodeErr := common.Unmarshal(raw, &envelope)
 	if decodeErr == nil {
-		decodeErr = common.Unmarshal(raw, &envelope)
-		if decodeErr == nil {
-			if err := envelope.businessError(); err != nil {
-				// 上游可能回显凭证，保持资源不存在语义但过滤实际账号密钥。
-				message := strings.ReplaceAll(err.Error(), client.apiKey, "[redacted]")
-				if errors.Is(err, ErrSeedanceAssetNotFound) {
-					return fmt.Errorf("%w: %s", ErrSeedanceAssetNotFound, message)
-				}
-				return errors.New(message)
+		if err := envelope.businessError(); err != nil {
+			// 上游可能回显凭证，保持资源不存在语义但过滤实际账号密钥。
+			message := strings.ReplaceAll(err.Error(), client.apiKey, "[redacted]")
+			if errors.Is(err, ErrSeedanceAssetNotFound) {
+				return fmt.Errorf("%w: %s", ErrSeedanceAssetNotFound, message)
 			}
+			return errors.New(message)
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("seedance asset API returned status %d", resp.StatusCode)
+		return seedanceAssetHTTPError(resp.StatusCode, raw, client.apiKey)
 	}
 	if decodeErr != nil {
 		return decodeErr
@@ -627,14 +631,12 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 }
 
 type seedanceAssetResponse struct {
-	Code             string `json:"code"`
-	Message          string `json:"message"`
-	Success          *bool  `json:"success"`
+	Code             string              `json:"code"`
+	Message          string              `json:"message"`
+	Success          *bool               `json:"success"`
+	Error            *seedanceAssetError `json:"error"`
 	ResponseMetadata struct {
-		Error *struct {
-			Code    string `json:"Code"`
-			Message string `json:"Message"`
-		} `json:"Error"`
+		Error *seedanceAssetError `json:"Error"`
 	} `json:"ResponseMetadata"`
 	Result struct {
 		ID     string `json:"Id"`
@@ -642,6 +644,13 @@ type seedanceAssetResponse struct {
 		URL    string `json:"URL"`
 	} `json:"Result"`
 	Data *seedanceAssetResponseData `json:"data"`
+}
+
+// seedanceAssetError 统一接收书言兼容接口常见的嵌套错误结构。
+type seedanceAssetError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Type    string `json:"type"`
 }
 
 type seedanceAssetContent struct {
@@ -696,8 +705,11 @@ func (response seedanceAssetResponse) previewURL() string {
 	return ""
 }
 
-// seedanceAssetBusinessError 提取 HTTP 200 响应中的业务失败，保留上游可操作的错误信息。
+// seedanceAssetBusinessError 提取不同 HTTP 状态下的业务失败，保留上游可操作的错误信息。
 func (response seedanceAssetResponse) businessError() error {
+	if response.Error != nil {
+		return newSeedanceAssetBusinessError(response.Error.Code, response.Error.Message)
+	}
 	if response.ResponseMetadata.Error != nil {
 		response.Code, response.Message = response.ResponseMetadata.Error.Code, response.ResponseMetadata.Error.Message
 	}
@@ -707,19 +719,37 @@ func (response seedanceAssetResponse) businessError() error {
 			return nil
 		}
 	}
-	message := strings.TrimSpace(response.Message)
+	return newSeedanceAssetBusinessError(response.Code, response.Message)
+}
+
+// newSeedanceAssetBusinessError 将上游错误码映射为本地可识别的错误，同时保留原始消息。
+func newSeedanceAssetBusinessError(code, message string) error {
+	message = strings.TrimSpace(message)
 	if message == "" {
-		message = strings.TrimSpace(response.Code)
+		message = strings.TrimSpace(code)
 	}
 	if message == "" {
 		message = "upstream rejected operation"
 	}
 	err := fmt.Errorf("seedance asset API request failed: %s", message)
-	switch strings.ToLower(strings.TrimSpace(response.Code)) {
+	switch strings.ToLower(strings.TrimSpace(code)) {
 	case "assetnotfound", "assetgroupnotfound", "resourcenotfound", "resourcenotfound.asset", "resourcenotfound.assetgroup", "not_found":
 		return errors.Join(ErrSeedanceAssetNotFound, err)
 	}
 	return err
+}
+
+// seedanceAssetHTTPError 为未识别的非 2xx 响应保留有限正文，并过滤渠道凭证。
+func seedanceAssetHTTPError(status int, body []byte, apiKey string) error {
+	message := strings.TrimSpace(string(body))
+	message = strings.ReplaceAll(message, apiKey, "[redacted]")
+	if len(message) > seedanceAssetErrorPreviewLimit {
+		message = message[:seedanceAssetErrorPreviewLimit] + "..."
+	}
+	if message == "" {
+		return fmt.Errorf("seedance asset API returned status %d", status)
+	}
+	return fmt.Errorf("seedance asset API returned status %d: %s", status, message)
 }
 
 // ValidateSeedanceAssetSourceURL 在用户输入边界验证地址；OSS 签名地址由受信任存储配置生成。
@@ -744,9 +774,14 @@ func (client *SeedanceAssetClient) CreateSeedanceAsset(ctx context.Context, grou
 	return response.Result.ID, err
 }
 
-// CreateSeedanceAssetGroup 创建上游素材组并返回组 ID。
-func (client *SeedanceAssetClient) CreateSeedanceAssetGroup(ctx context.Context, name string, response any) error {
-	return client.call(ctx, "CreateAssetGroup", map[string]string{"Name": name}, response)
+// CreateSeedanceAssetGroup 创建上游素材组并返回组 ID；GroupType 由上游决定是否支持。
+func (client *SeedanceAssetClient) CreateSeedanceAssetGroup(ctx context.Context, name, groupType string, response any) error {
+	request := map[string]string{"Name": name}
+	// GroupType 不做本地枚举校验，避免把上游新增或渠道自定义类型拦截在网关内。
+	if groupType != "" {
+		request["GroupType"] = groupType
+	}
+	return client.call(ctx, "CreateAssetGroup", request, response)
 }
 
 // GetSeedanceAsset 查询上游素材审核状态及审核通过后的临时预览地址。

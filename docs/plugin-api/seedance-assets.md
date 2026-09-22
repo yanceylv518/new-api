@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | GET | `/asset-groups` | 当前用户的组，支持筛选与可选分页 |
 | GET | `/asset-groups/:id` | 当前用户的单个组，本地数字 ID |
-| POST | `/asset-groups` | JSON：`name`、`model` |
+| POST | `/asset-groups` | JSON：`name`、`model`；可选 `GroupType` |
 | PUT | `/asset-groups/:id` | JSON：`name` |
 | DELETE | `/asset-groups/:id` | 删除组及其素材 |
 | GET | `/assets` | `group_id`、`p`、`page_size`、`search`、`asset_type`、`status` |
@@ -55,7 +55,9 @@
 ### 查询参数
 
 以下能力由网关查询本地授权映射提供，不是书言 Action 接口的原样透传。
-当前书言素材组为 AIGC，不包含火山直连的 H5 真人认证流程。
+创建素材组时可选传入官方字段 `GroupType`。网关按原值透传给书言的
+`CreateAssetGroup`，不枚举、不改写，也不在本地模拟真人认证；具体类型是否可用由上游决定。
+上游拒绝时，响应中的上游错误信息会作为接口失败原因返回。
 
 | 参数 | 素材列表 | 素材组列表 |
 | --- | --- | --- |
@@ -111,7 +113,7 @@ curl --get "$BASE_URL/v1/seedance/assets" \
 curl "$BASE_URL/v1/seedance/asset-groups" \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"视频素材","model":"doubao-seedance-2-0-fast-260128"}'
+  -d '{"name":"视频素材","model":"doubao-seedance-2-0-fast-260128","GroupType":"LivenessFace"}'
 
 curl "$BASE_URL/v1/seedance/assets/upload" \
   -H "Authorization: Bearer $API_KEY" \
