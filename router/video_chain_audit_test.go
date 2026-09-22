@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -80,6 +81,19 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 				modelName, route, expression = "doubao-seedance-2-0-fast-260128", "/doubao/api/v3/contents/generations/tasks", `tier("audit",u("tokens")/1000000)`
 				finalQuota = 500
 			}
+			discountBPSForUser := func(userID int) int {
+				switch userID % 3 {
+				case 0:
+					return 5000
+				case 1:
+					return 7500
+				default:
+					return 10000
+				}
+			}
+			discountedQuotaForUser := func(userID int) int {
+				return common.QuotaRound(float64(finalQuota) * float64(discountBPSForUser(userID)) / 10000)
+			}
 			modes, _ := common.Marshal(map[string]string{modelName: "tiered_expr"})
 			expressions, _ := common.Marshal(map[string]string{modelName: expression})
 			require.NoError(t, model.UpdateOptionsBulk(map[string]string{"billing_setting.billing_mode": string(modes), "billing_setting.billing_expr": string(expressions)}))
@@ -117,6 +131,10 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 				id := index + 1
 				require.NoError(t, db.Create(&model.User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Group: "default", Quota: initial, Status: common.UserStatusEnabled}).Error)
 				require.NoError(t, db.Create(&model.Token{Id: id, UserId: id, Key: fmt.Sprintf("auditvideokey%036d", id), RemainQuota: initial, Status: common.TokenStatusEnabled, ExpiredTime: -1, Group: "default"}).Error)
+				if discountBPS := discountBPSForUser(id); discountBPS < 10000 {
+					_, err := model.ReplaceUserModelPricing(id, map[string]int{modelName: discountBPS}, 1)
+					require.NoError(t, err)
+				}
 			}
 			outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{plugin}, productionPluginRouteHandlers)
 			outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
@@ -195,7 +213,9 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 			require.Len(t, tasks, 400)
 			for _, task := range tasks {
 				require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
-				require.Equal(t, finalQuota, task.Quota)
+				expectedQuota := discountedQuotaForUser(task.UserId)
+				require.Equal(t, expectedQuota, task.Quota)
+				require.Equal(t, types.NewDiscountAmounts(finalQuota, expectedQuota), task.PrivateData.DiscountAmounts)
 			}
 			// 使用真实查询路由验证任务可读性、跨用户隔离和冻结凭证不进入公共响应。
 			queryRoute := route + "/" + tasks[0].TaskID
@@ -225,12 +245,14 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 			require.NoError(t, db.Find(&users).Error)
 			require.NoError(t, db.Find(&tokens).Error)
 			for _, user := range users {
-				assert.EqualValues(t, initial-2*finalQuota, user.Quota)
-				assert.EqualValues(t, 2*finalQuota, user.UsedQuota)
+				expectedQuota := 2 * discountedQuotaForUser(user.Id)
+				assert.EqualValues(t, initial-expectedQuota, user.Quota)
+				assert.EqualValues(t, expectedQuota, user.UsedQuota)
 			}
 			for _, token := range tokens {
-				assert.Equal(t, initial-2*finalQuota, token.RemainQuota)
-				assert.Equal(t, 2*finalQuota, token.UsedQuota)
+				expectedQuota := 2 * discountedQuotaForUser(token.UserId)
+				assert.Equal(t, initial-expectedQuota, token.RemainQuota)
+				assert.Equal(t, expectedQuota, token.UsedQuota)
 			}
 			var logs []model.Log
 			require.NoError(t, db.Find(&logs).Error)
@@ -242,7 +264,11 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 					signed += entry.Quota
 				}
 			}
-			assert.Equal(t, 400*finalQuota, signed)
+			expectedSigned := 0
+			for userID := 1; userID <= 200; userID++ {
+				expectedSigned += 2 * discountedQuotaForUser(userID)
+			}
+			assert.Equal(t, expectedSigned, signed)
 			t.Logf("HTTP_CHAIN plugin=%s users=200 workers=64 tasks=400 logs=%d final_quota=%d", key, len(logs), signed)
 		})
 	}
