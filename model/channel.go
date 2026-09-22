@@ -287,6 +287,41 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
+// GetEnabledKeyByFingerprint returns the exact enabled account key previously
+// bound to a private Seedance asset. It never advances the channel polling
+// cursor, so asset affinity does not change normal multi-key scheduling.
+func (channel *Channel) GetEnabledKeyByFingerprint(fingerprint string) (string, int, *types.NewAPIError) {
+	fingerprint = strings.TrimSpace(fingerprint)
+	unavailable := func() *types.NewAPIError {
+		return types.NewError(errors.New("bound channel key is unavailable"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+	}
+	if fingerprint == "" {
+		return "", 0, unavailable()
+	}
+	fingerprintOf := func(key string) string {
+		return fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+	}
+	if !channel.ChannelInfo.IsMultiKey {
+		if channel.Key != "" && fingerprintOf(channel.Key) == fingerprint {
+			return channel.Key, 0, nil
+		}
+		return "", 0, unavailable()
+	}
+	lock := GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	defer lock.Unlock()
+	for index, key := range channel.GetKeys() {
+		if fingerprintOf(key) != fingerprint {
+			continue
+		}
+		if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+			return "", 0, unavailable()
+		}
+		return key, index, nil
+	}
+	return "", 0, unavailable()
+}
+
 func (channel *Channel) SaveChannelInfo() error {
 	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
 }

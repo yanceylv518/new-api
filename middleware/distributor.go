@@ -45,8 +45,22 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		if shouldSelectChannel {
+			if err := applySeedanceAssetAffinity(c); err != nil {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, err.Error(), types.ErrorCode("private_asset_unavailable"))
+				return
+			}
+		}
 		if pin, found, overridden := constraints.ResolvedPin(); found {
+			if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && pin.ChannelId != assetChannelID {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset is bound to a different upstream channel", types.ErrorCode("private_asset_channel_conflict"))
+				return
+			}
 			for _, lost := range overridden {
+				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && lost.ChannelId != assetChannelID && (lost.Source == taskdto.PinSourceToken || lost.Source == taskdto.PinSourceOriginTask) {
+					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset conflicts with the request channel binding", types.ErrorCode("private_asset_channel_conflict"))
+					return
+				}
 				logger.LogWarn(c, fmt.Sprintf(
 					"channel pin overridden: winning_source=%s winning_channel_id=%d overridden_source=%s overridden_channel_id=%d",
 					pin.Source, pin.ChannelId, lost.Source, lost.ChannelId,
@@ -72,6 +86,10 @@ func Distribute() func(c *gin.Context) {
 			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
+				}
+				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && channel.Id == assetChannelID {
+					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset account does not serve the requested model", types.ErrorCode("private_asset_model_unavailable"))
+					return
 				}
 				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelRequest.Model}), types.ErrorCode(kind))
 				return
@@ -190,12 +208,25 @@ func Distribute() func(c *gin.Context) {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
+				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && channel.Id == assetChannelID {
+					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset account does not serve the requested model", types.ErrorCode("private_asset_model_unavailable"))
+					return
+				}
 				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, noAvailableChannelMessage(c, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), modelRequest.Model), types.ErrorCodeModelNotFound)
 				return
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if channel != nil {
+			if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+				statusCode := setupErr.StatusCode
+				if statusCode < http.StatusBadRequest {
+					statusCode = http.StatusServiceUnavailable
+				}
+				abortWithOpenAiMessage(c, statusCode, setupErr.Error(), setupErr.GetErrorCode())
+				return
+			}
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
@@ -674,7 +705,15 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	fingerprint := common.GetContextKeyString(c, constant.ContextKeySeedanceAssetKeyFingerprint)
+	var key string
+	var index int
+	var newAPIError *types.NewAPIError
+	if fingerprint != "" {
+		key, index, newAPIError = channel.GetEnabledKeyByFingerprint(fingerprint)
+	} else {
+		key, index, newAPIError = channel.GetNextEnabledKey()
+	}
 	if newAPIError != nil {
 		return newAPIError
 	}

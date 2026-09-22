@@ -91,6 +91,72 @@ type SeedanceAsset struct {
 	UpdatedAt         time.Time            `json:"updated_at"`
 }
 
+const MaxSeedanceAssetAffinityReferences = 32
+
+// SeedanceAssetBinding identifies the upstream account that owns one or more
+// local asset records. An empty fingerprint cannot safely select an account
+// key and is rejected instead of falling back to a random key.
+type SeedanceAssetBinding struct {
+	ChannelID      int
+	KeyFingerprint string
+}
+
+// FindSeedanceAssetBinding verifies that all referenced assets belong to the
+// current user and one upstream account before a generation request is routed.
+func FindSeedanceAssetBinding(ctx context.Context, userID int, assetIDs []string) (*SeedanceAssetBinding, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if userID <= 0 || len(assetIDs) == 0 || len(assetIDs) > MaxSeedanceAssetAffinityReferences {
+		return nil, errors.New("invalid private asset reference list")
+	}
+	uniqueIDs := make([]string, 0, len(assetIDs))
+	seen := make(map[string]struct{}, len(assetIDs))
+	for _, assetID := range assetIDs {
+		assetID = strings.TrimSpace(assetID)
+		if assetID == "" || len(assetID) > 128 {
+			return nil, errors.New("invalid private asset reference")
+		}
+		if _, exists := seen[assetID]; exists {
+			continue
+		}
+		seen[assetID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, assetID)
+	}
+	if len(uniqueIDs) == 0 {
+		return nil, errors.New("invalid private asset reference list")
+	}
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	var assets []SeedanceAsset
+	if err := DB.WithContext(ctx).
+		Where("user_id = ? AND asset_id IN ?", userID, uniqueIDs).
+		Where("LOWER(status) <> ?", "deleting").
+		Find(&assets).Error; err != nil {
+		return nil, err
+	}
+	if len(assets) != len(uniqueIDs) {
+		return nil, errors.New("private asset is unavailable")
+	}
+	binding := &SeedanceAssetBinding{
+		ChannelID:      assets[0].ChannelID,
+		KeyFingerprint: strings.TrimSpace(assets[0].KeyFingerprint),
+	}
+	if binding.ChannelID <= 0 {
+		return nil, errors.New("private asset account is unavailable")
+	}
+	if binding.KeyFingerprint == "" {
+		return nil, errors.New("private asset account binding is unavailable")
+	}
+	for _, asset := range assets[1:] {
+		if asset.ChannelID != binding.ChannelID || strings.TrimSpace(asset.KeyFingerprint) != binding.KeyFingerprint {
+			return nil, errors.New("private assets belong to different upstream accounts")
+		}
+	}
+	return binding, nil
+}
+
 // CreateSeedanceAssetInGroup 与分组删除共享数据库锁，仅允许仍可用的分组接收最终素材。
 // 外部上传不持有锁，失败由调用方补偿；锁只覆盖状态校验与本地落库。
 func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error {

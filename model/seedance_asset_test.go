@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -114,6 +115,46 @@ func TestSeedanceAssetGroupNameIsUniquePerUser(t *testing.T) {
 
 	differentUser := &SeedanceAssetGroup{UserID: 8, ChannelID: 1, GroupID: "group-3", Name: first.Name}
 	require.NoError(t, db.Create(differentUser).Error)
+}
+
+// TestFindSeedanceAssetBindingKeepsOneUpstreamAccount 验证多素材请求不会跨账号拼接。
+func TestFindSeedanceAssetBindingKeepsOneUpstreamAccount(t *testing.T) {
+	previousDB := DB
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&SeedanceAsset{}))
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	require.NoError(t, db.Create(&[]SeedanceAsset{
+		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-a", Name: "a", AssetType: "Image", Status: "Active", KeyFingerprint: "account-a"},
+		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-b", Name: "b", AssetType: "Image", Status: "Processing", KeyFingerprint: "account-a"},
+		{UserID: 7, ChannelID: 12, GroupID: "group-b", AssetID: "asset-c", Name: "c", AssetType: "Image", Status: "Active", KeyFingerprint: "account-b"},
+		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-unbound", Name: "unbound", AssetType: "Image", Status: "Active"},
+		{UserID: 8, ChannelID: 11, GroupID: "group-other", AssetID: "asset-other", Name: "other", AssetType: "Image", Status: "Active", KeyFingerprint: "account-a"},
+	}).Error)
+
+	binding, err := FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-b", "asset-a"})
+	require.NoError(t, err)
+	require.Equal(t, &SeedanceAssetBinding{ChannelID: 11, KeyFingerprint: "account-a"}, binding)
+
+	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-a", "asset-c"})
+	require.EqualError(t, err, "private assets belong to different upstream accounts")
+	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-other"})
+	require.EqualError(t, err, "private asset is unavailable")
+	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-unbound"})
+	require.EqualError(t, err, "private asset account binding is unavailable")
+
+	require.NoError(t, db.Model(&SeedanceAsset{}).Where("asset_id = ?", "asset-a").Update("status", "Deleting").Error)
+	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-a"})
+	require.EqualError(t, err, "private asset is unavailable")
 }
 
 // 同一补偿目标重复入队时只保留一条记录，避免故障恢复后重复调用外部删除接口。

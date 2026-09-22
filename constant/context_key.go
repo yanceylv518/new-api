@@ -39,6 +39,10 @@ const (
 	ContextKeyChannelIsMultiKey        ContextKey = "channel_is_multi_key"
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
+	// ContextKeySeedanceAssetChannelId and ContextKeySeedanceAssetKeyFingerprint
+	// keep a private asset request on the account that owns its upstream asset.
+	ContextKeySeedanceAssetChannelId      ContextKey = "seedance_asset_channel_id"
+	ContextKeySeedanceAssetKeyFingerprint ContextKey = "seedance_asset_key_fingerprint"
 
 	ContextKeyAutoGroup           ContextKey = "auto_group"
 	ContextKeyAutoGroupIndex      ContextKey = "auto_group_index"
