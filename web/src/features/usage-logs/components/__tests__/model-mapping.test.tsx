@@ -22,7 +22,7 @@ import {
   getCoreRowModel,
   useReactTable,
 } from '@tanstack/react-table'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test } from 'vitest'
 
@@ -71,7 +71,15 @@ function ModelPreview(props: { isAdmin: boolean; mobile: boolean }) {
     getCoreRowModel: getCoreRowModel(),
   })
   if (props.mobile) {
-    return <UsageLogsMobileList table={table} logCategory='common' />
+    return (
+      <UsageLogsProvider>
+        <UsageLogsMobileList
+          table={table}
+          isAdmin={props.isAdmin}
+          logCategory='common'
+        />
+      </UsageLogsProvider>
+    )
   }
   const cell = table.getRowModel().rows[0].getAllCells()[0]
   return <>{flexRender(cell.column.columnDef.cell, cell.getContext())}</>
@@ -87,16 +95,34 @@ describe('model mapping visibility', () => {
   // 两种列表均保留请求模型，普通用户不能看到上游模型映射。
   test.each([false, true])(
     'hides mapping for regular users in mobile=%s',
-    (mobile) => {
+    async (mobile) => {
       const user = userEvent.setup()
       const view = render(<ModelPreview isAdmin={false} mobile={mobile} />)
       expect(screen.getByText('public-model')).toBeInTheDocument()
-      expect(screen.queryByRole('button')).toBeNull()
-      expect(screen.queryByText('private-upstream')).toBeNull()
+      if (mobile) {
+        const modelButton = screen.getByRole('button', {
+          name: 'Model: public-model',
+        })
+        await user.click(modelButton)
+        expect(
+          await screen.findByRole('dialog', { name: 'Model' })
+        ).toBeVisible()
+        expect(screen.queryByText('private-upstream')).toBeNull()
+        await user.keyboard('{Escape}')
+        await waitFor(() =>
+          expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+        )
+      } else {
+        expect(screen.queryByRole('button')).toBeNull()
+      }
 
       view.rerender(<ModelPreview isAdmin mobile={mobile} />)
       const mappingButton = screen.getByRole('button')
-      expect(mappingButton).toHaveAttribute('aria-expanded', 'false')
+      if (!mobile) {
+        expect(mappingButton).toHaveAttribute('aria-expanded', 'false')
+      } else {
+        expect(mappingButton).toHaveAttribute('aria-haspopup', 'dialog')
+      }
       return user.click(mappingButton).then(async () => {
         expect(await screen.findByText('private-upstream')).toBeInTheDocument()
       })

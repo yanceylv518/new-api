@@ -78,6 +78,7 @@ function Fixture(props: {
         table={table}
         logCategory='common'
         isLoading={props.loading}
+        isAdmin={props.admin ?? true}
       />
     </>
   )
