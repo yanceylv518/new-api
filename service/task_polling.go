@@ -695,10 +695,15 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
 			beforeValue := decimal.NewFromFloat(result.ActualQuotaBeforeGroup).
 				Mul(decimal.NewFromFloat(bc.TieredSnapshot.GroupRatio))
+			var beforeClamp *common.QuotaClamp
+			before, beforeClamp = common.QuotaFromDecimalChecked(beforeValue)
 			var clamp *common.QuotaClamp
 			after, clamp = common.QuotaDiscountDecimalChecked(beforeValue, price.UserModelDiscountMultiplier())
 			if result.Clamp == nil {
-				result.Clamp = clamp
+				result.Clamp = beforeClamp
+				if result.Clamp == nil {
+					result.Clamp = clamp
+				}
 			}
 			if before > 0 && after == 0 {
 				after = 1

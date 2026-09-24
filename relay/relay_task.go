@@ -293,8 +293,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 		groupRatioInfo := helper.HandleGroupRatio(c, info)
 		quota, clamp := common.QuotaRoundChecked(cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
-		noteTaskQuotaClamp(info, clamp)
 		original := quota
+		originalClamp := clamp
 		priceData = types.PriceData{GroupRatioInfo: groupRatioInfo}
 		// 任务表达式已返回美元费用；不采用文本的每百万换算。
 		// 渠道映射仅选择上游计价配置；折扣始终匹配用户请求的公开计费身份。
@@ -304,10 +304,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			beforeValue := decimal.NewFromFloat(cost).
 				Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
 				Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+			original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
 			quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, priceData.UserModelDiscountMultiplier())
 			if original > 0 && quota == 0 {
 				quota = 1
 			}
+		}
+		noteTaskQuotaClamp(info, originalClamp)
+		if clamp != originalClamp {
 			noteTaskQuotaClamp(info, clamp)
 		}
 		priceData.Quota, priceData.QuotaToPreConsume = quota, quota

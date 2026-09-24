@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -146,6 +147,61 @@ func TestQuotaDiscountUsesUnifiedRounding(t *testing.T) {
 	quota, clamp = QuotaDiscountChecked(29, 0.95, true)
 	assert.Equal(t, 27, quota)
 	assert.Nil(t, clamp)
+}
+
+func TestQuotaDiscountAmountSnapshotsUseOneDecimalBasis(t *testing.T) {
+	taskCost := 0.00000029
+	beforeValue := decimal.NewFromFloat(taskCost).
+		Mul(decimal.NewFromFloat(QuotaPerUnit)).
+		Mul(decimal.NewFromInt(100))
+	legacyBefore, _ := QuotaRoundChecked(taskCost * QuotaPerUnit * 100)
+	before, beforeClamp := QuotaFromDecimalChecked(beforeValue)
+	after, afterClamp := QuotaDiscountDecimalChecked(beforeValue, 0.9)
+
+	assert.Equal(t, 14, legacyBefore, "binary float multiplication lands below the half-quota boundary")
+	assert.Equal(t, 15, before)
+	assert.Equal(t, 13, after)
+	assert.Nil(t, beforeClamp)
+	assert.Nil(t, afterClamp)
+}
+
+func BenchmarkUserModelDiscountTaskQuotaRounding(b *testing.B) {
+	const (
+		cost       = 0.00000029
+		groupRatio = 100.0
+		discount   = 0.9
+	)
+	quotaPerUnit := QuotaPerUnit
+	b.Run("legacy", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			total := 0
+			for pb.Next() {
+				before, _ := QuotaRoundChecked(cost * quotaPerUnit * groupRatio)
+				discountValue := decimal.NewFromFloat(cost).
+					Mul(decimal.NewFromFloat(quotaPerUnit)).
+					Mul(decimal.NewFromFloat(groupRatio))
+				after, _ := QuotaDiscountDecimalChecked(discountValue, discount)
+				total += before + after
+			}
+			runtime.KeepAlive(total)
+		})
+	})
+	b.Run("shared_decimal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			total := 0
+			for pb.Next() {
+				beforeValue := decimal.NewFromFloat(cost).
+					Mul(decimal.NewFromFloat(quotaPerUnit)).
+					Mul(decimal.NewFromFloat(groupRatio))
+				before, _ := QuotaFromDecimalChecked(beforeValue)
+				after, _ := QuotaDiscountDecimalChecked(beforeValue, discount)
+				total += before + after
+			}
+			runtime.KeepAlive(total)
+		})
+	})
 }
 
 func TestWalletQuotaFromDecimalStrict(t *testing.T) {

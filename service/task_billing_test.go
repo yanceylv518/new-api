@@ -1586,6 +1586,34 @@ func TestSettle_TieredSuccessStillRecomputes(t *testing.T) {
 	assert.Equal(t, map[string]any{"seconds": float64(8), "clips": float64(2)}, facts)
 }
 
+func TestSettle_TieredDiscountUsesOneDecimalBasisForAmounts(t *testing.T) {
+	truncate(t)
+	const userID = 41
+	seedUser(t, userID, 10_000)
+	expression := `tier("final", u("amount"))`
+	task := makeTask(userID, 0, 200, 0, BillingSourceWallet, 0)
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.BillingContext.OtherRatios = map[string]float64{
+		types.UserModelDiscountRatioKey: 0.9,
+	}
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString:       expression,
+		ExprHash:         billingexpr.ExprHashString(expression),
+		GroupRatio:       100,
+		QuotaPerUnit:     common.QuotaPerUnit,
+		ExprVersion:      billingexpr.ExprVersion(expression),
+		TaskUsageBilling: true,
+		UsageFacts:       map[string]any{"amount": 0.00000029},
+	}
+	persistTaskForBillingTest(t, task)
+
+	require.True(t, settleTaskBillingOnComplete(context.Background(), &mockAdaptor{}, task, &relaycommon.TaskInfo{
+		Status: model.TaskStatusSuccess,
+	}))
+	assert.Equal(t, 13, task.Quota)
+	assert.Equal(t, types.NewDiscountAmounts(15, 13), task.PrivateData.DiscountAmounts)
+}
+
 func TestSettle_TieredUsageFactsMergeCompletionOverSubmission(t *testing.T) {
 	tests := []struct {
 		name            string
