@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { File, Film, Image, Music2 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import type { SeedanceAsset } from '../api'
@@ -33,6 +33,8 @@ export function AssetPreview(props: {
 }) {
   const { t } = useTranslation()
   const recoveryAttempted = useRef(false)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
   const assetType = props.asset.asset_type.toLowerCase()
   const previewURL = props.asset.preview_url?.trim() ?? ''
   const [retainedPreview, setRetainedPreview] = useState(() => ({
@@ -40,6 +42,10 @@ export function AssetPreview(props: {
     url: previewURL,
   }))
   const [failedPreview, setFailedPreview] = useState<{
+    assetId: number
+    url: string
+  } | null>(null)
+  const [loadedMedia, setLoadedMedia] = useState<{
     assetId: number
     url: string
   } | null>(null)
@@ -54,6 +60,42 @@ export function AssetPreview(props: {
   const displayedPreviewURL = displayedPreview.url
   const hasPreview =
     Boolean(displayedPreviewURL) && displayedPreviewURL !== failedPreviewURL
+  const mediaIsLoaded =
+    loadedMedia?.assetId === props.asset.id &&
+    loadedMedia.url === displayedPreviewURL
+  const shouldLoadMedia =
+    mediaIsLoaded || typeof IntersectionObserver === 'undefined'
+
+  useEffect(() => {
+    if (
+      !hasPreview ||
+      (assetType !== 'video' && assetType !== 'audio') ||
+      shouldLoadMedia
+    ) {
+      return
+    }
+    const media = assetType === 'video' ? videoRef.current : audioRef.current
+    if (!media) return
+
+    let observer: IntersectionObserver | null = null
+    observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setLoadedMedia({ assetId: props.asset.id, url: displayedPreviewURL })
+          observer?.disconnect()
+        }
+      },
+      { rootMargin: '200px' }
+    )
+    observer.observe(media)
+    return () => observer?.disconnect()
+  }, [
+    assetType,
+    displayedPreviewURL,
+    hasPreview,
+    props.asset.id,
+    shouldLoadMedia,
+  ])
 
   // 媒体确认可用后再记住地址；后续签名轮换不会改变已渲染元素的 src。
   const retainLoadedPreview = () => {
@@ -92,12 +134,13 @@ export function AssetPreview(props: {
   if (hasPreview && assetType === 'video') {
     return (
       <video
-        src={displayedPreviewURL}
+        ref={videoRef}
+        src={shouldLoadMedia ? displayedPreviewURL : undefined}
         className={props.className}
         controls
         muted
         playsInline
-        preload='metadata'
+        preload={shouldLoadMedia ? 'metadata' : 'none'}
         onLoadedMetadata={retainLoadedPreview}
         onError={handlePreviewError}
       />
@@ -108,10 +151,11 @@ export function AssetPreview(props: {
     return (
       <div className='flex h-full w-full items-center justify-center px-4'>
         <audio
-          src={displayedPreviewURL}
+          ref={audioRef}
+          src={shouldLoadMedia ? displayedPreviewURL : undefined}
           className='w-full'
           controls
-          preload='metadata'
+          preload={shouldLoadMedia ? 'metadata' : 'none'}
           onLoadedMetadata={retainLoadedPreview}
           onError={handlePreviewError}
         />

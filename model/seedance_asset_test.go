@@ -12,6 +12,78 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestSeedanceAssetListSummaryTracksUpdatesAndBackfillsExistingRows(t *testing.T) {
+	previousDB := DB
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAsset{}, &SeedanceAssetSchemaMigration{}))
+	require.NoError(t, db.Exec("CREATE INDEX idx_seedance_asset_poll_due ON seedance_assets (status, next_poll_at, poll_lease_until, id)").Error)
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	assetCount := int64(0)
+	group := &SeedanceAssetGroup{UserID: 1, ChannelID: 2, GroupID: "group-1", Name: "mock", AssetCount: &assetCount}
+	require.NoError(t, db.Create(group).Error)
+	asset := &SeedanceAsset{
+		UserID: 1, ChannelID: 2, GroupID: "group-1", AssetID: "asset-1",
+		Name: "cover.png", AssetType: "Image", Status: "pRoCeSsInG",
+	}
+	require.NoError(t, CreateSeedanceAssetInGroup(context.Background(), asset))
+	require.NoError(t, db.First(group, group.ID).Error)
+	require.NotNil(t, group.AssetCount)
+	require.EqualValues(t, 1, *group.AssetCount)
+	require.NotNil(t, asset.StatusKey)
+	require.Equal(t, "processing", *asset.StatusKey)
+	require.NotNil(t, asset.PendingStatus)
+	require.True(t, *asset.PendingStatus)
+
+	legacyAsset := &SeedanceAsset{
+		UserID: 1, ChannelID: 2, GroupID: "group-1", AssetID: "asset-2",
+		Name: "legacy.png", AssetType: "Image", Status: "pEnDiNg",
+	}
+	require.NoError(t, db.Create(legacyAsset).Error)
+	require.NoError(t, db.Model(legacyAsset).UpdateColumn("status_key", nil).Error)
+	require.NoError(t, db.Model(legacyAsset).UpdateColumn("pending_status", nil).Error)
+
+	require.NoError(t, migrateSeedanceAssetListPerformance(db))
+	require.False(t, db.Migrator().HasIndex(&SeedanceAsset{}, "idx_seedance_asset_poll_due"))
+	require.NoError(t, db.First(legacyAsset, legacyAsset.ID).Error)
+	require.NotNil(t, legacyAsset.StatusKey)
+	require.Equal(t, "pending", *legacyAsset.StatusKey)
+	require.NotNil(t, legacyAsset.PendingStatus)
+	require.True(t, *legacyAsset.PendingStatus)
+	require.NoError(t, db.First(group, group.ID).Error)
+	require.NotNil(t, group.AssetCount)
+	require.EqualValues(t, 2, *group.AssetCount)
+
+	updated, err := UpdateSeedanceAssetIfUnchanged(asset.ID, asset.UpdatedAt, map[string]any{"status": "Active"})
+	require.NoError(t, err)
+	require.True(t, updated)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	require.NotNil(t, asset.StatusKey)
+	require.Equal(t, "active", *asset.StatusKey)
+	require.NotNil(t, asset.PendingStatus)
+	require.False(t, *asset.PendingStatus)
+
+	require.NoError(t, migrateSeedanceAssetListPerformance(db))
+	require.NoError(t, DeleteSeedanceAssetWithCount(context.Background(), 1, legacyAsset.ID, "pEnDiNg"))
+	require.NoError(t, db.First(group, group.ID).Error)
+	require.EqualValues(t, 1, *group.AssetCount)
+	require.NoError(t, DeleteSeedanceAssetWithCount(context.Background(), 1, legacyAsset.ID, "pEnDiNg"))
+	require.NoError(t, db.First(group, group.ID).Error)
+	require.EqualValues(t, 1, *group.AssetCount)
+	var migrationCount int64
+	require.NoError(t, db.Model(&SeedanceAssetSchemaMigration{}).Where("name = ? AND completed = ?", "seedance_asset_list_performance_v1", true).Count(&migrationCount).Error)
+	require.EqualValues(t, 1, migrationCount)
+}
+
 // TestSeedanceAssetPollingClaimRejectsStaleReaders 验证后台轮询租约和版本条件能够阻止旧读取结果覆盖新状态。
 func TestSeedanceAssetPollingClaimRejectsStaleReaders(t *testing.T) {
 	previousDB := DB
@@ -117,13 +189,13 @@ func TestSeedanceAssetGroupNameIsUniquePerUser(t *testing.T) {
 	require.NoError(t, db.Create(differentUser).Error)
 }
 
-// TestFindSeedanceAssetBindingKeepsOneUpstreamAccount 验证多素材请求不会跨账号拼接。
-func TestFindSeedanceAssetBindingKeepsOneUpstreamAccount(t *testing.T) {
+// TestSeedanceAssetReplicaIsScopedToAccount 验证不同目标凭证各有独立映射，创建租约可去重并恢复过期任务。
+func TestSeedanceAssetReplicaIsScopedToAccount(t *testing.T) {
 	previousDB := DB
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&SeedanceAsset{}))
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}))
 	DB = db
 	t.Cleanup(func() {
 		DB = previousDB
@@ -133,28 +205,72 @@ func TestFindSeedanceAssetBindingKeepsOneUpstreamAccount(t *testing.T) {
 		}
 	})
 
-	require.NoError(t, db.Create(&[]SeedanceAsset{
-		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-a", Name: "a", AssetType: "Image", Status: "Active", KeyFingerprint: "account-a"},
-		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-b", Name: "b", AssetType: "Image", Status: "Processing", KeyFingerprint: "account-a"},
-		{UserID: 7, ChannelID: 12, GroupID: "group-b", AssetID: "asset-c", Name: "c", AssetType: "Image", Status: "Active", KeyFingerprint: "account-b"},
-		{UserID: 7, ChannelID: 11, GroupID: "group-a", AssetID: "asset-unbound", Name: "unbound", AssetType: "Image", Status: "Active"},
-		{UserID: 8, ChannelID: 11, GroupID: "group-other", AssetID: "asset-other", Name: "other", AssetType: "Image", Status: "Active", KeyFingerprint: "account-a"},
-	}).Error)
+	group := &SeedanceAssetGroup{UserID: 7, ChannelID: 11, GroupID: "source-group", Name: "Videos", Status: "Active", KeyFingerprint: "source-key", AccountFingerprint: "source-account"}
+	require.NoError(t, db.Create(group).Error)
+	asset := &SeedanceAsset{UserID: 7, ChannelID: 11, GroupID: group.GroupID, AssetID: "source-asset", Name: "clip.mp4", AssetType: "Video", Status: "Active", KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint}
+	require.NoError(t, CreateSeedanceAssetInGroup(context.Background(), asset))
 
-	binding, err := FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-b", "asset-a"})
+	assets, err := FindSeedanceAssetsForUser(context.Background(), 7, []string{asset.AssetID})
 	require.NoError(t, err)
-	require.Equal(t, &SeedanceAssetBinding{ChannelID: 11, KeyFingerprint: "account-a"}, binding)
+	require.Len(t, assets, 1)
+	_, err = FindSeedanceAssetsForUser(context.Background(), 8, []string{asset.AssetID})
+	require.ErrorIs(t, err, ErrSeedanceAssetUnavailable)
 
-	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-a", "asset-c"})
-	require.EqualError(t, err, "private assets belong to different upstream accounts")
-	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-other"})
-	require.EqualError(t, err, "private asset is unavailable")
-	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-unbound"})
-	require.EqualError(t, err, "private asset account binding is unavailable")
+	now := time.Now().Unix()
+	leaseUntil := now + 90
+	groupReplica, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 21, "account-a", "key-a", group.Name, now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	duplicateGroupClaim, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 21, "account-a", "key-a", group.Name, now, leaseUntil)
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.Equal(t, groupReplica.ID, duplicateGroupClaim.ID)
 
-	require.NoError(t, db.Model(&SeedanceAsset{}).Where("asset_id = ?", "asset-a").Update("status", "Deleting").Error)
-	_, err = FindSeedanceAssetBinding(context.Background(), 7, []string{"asset-a"})
-	require.EqualError(t, err, "private asset is unavailable")
+	completed, err := CompleteSeedanceAssetGroupReplica(context.Background(), groupReplica.ID, leaseUntil, "remote-group-a", group.Name)
+	require.NoError(t, err)
+	require.True(t, completed)
+	readyGroup, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 21, "account-a", "key-a", group.Name, now, leaseUntil)
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.Equal(t, "remote-group-a", readyGroup.UpstreamGroupID)
+
+	replica, claimed, err := ClaimSeedanceAssetReplica(context.Background(), asset, group.ID, 21, "account-a", "key-a", now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	completed, err = CompleteSeedanceAssetReplica(context.Background(), replica.ID, leaseUntil, "remote-group-a", "remote-asset-a", now)
+	require.NoError(t, err)
+	require.True(t, completed)
+
+	var saved SeedanceAssetReplica
+	require.NoError(t, db.First(&saved, replica.ID).Error)
+	require.Equal(t, "Processing", saved.Status)
+	due, err := ListDueSeedanceAssetReplicas(now, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	claimed, err = ClaimSeedanceAssetReplicaForPolling(saved.ID, saved.UpdatedAt, now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	updated, err := UpdateSeedanceAssetReplicaPollState(saved.ID, leaseUntil, map[string]any{"status": "Active", "poll_lease_until": int64(0), "next_poll_at": int64(0)})
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	otherAccount, claimed, err := ClaimSeedanceAssetReplica(context.Background(), asset, group.ID, 22, "account-b", "key-b", now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NotEqual(t, replica.ID, otherAccount.ID)
+	otherGroup, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 22, "account-b", "key-b", group.Name, now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NotEqual(t, groupReplica.ID, otherGroup.ID)
+
+	recovered, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 23, "account-c", "key-c", group.Name, now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	staleLease := leaseUntil + 1
+	recoveredAgain, claimed, err := ClaimSeedanceAssetGroupReplica(context.Background(), 7, group.ID, 23, "account-c", "key-c", group.Name, staleLease, staleLease+90)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, recovered.ID, recoveredAgain.ID)
 }
 
 // 同一补偿目标重复入队时只保留一条记录，避免故障恢复后重复调用外部删除接口。

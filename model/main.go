@@ -374,12 +374,18 @@ func migrateDB() error {
 		&SystemTaskLock{},
 		// 素材与授权映射随主库迁移，复用现有顺序迁移入口。
 		&SeedanceAssetGroup{},
+		&SeedanceAssetGroupReplica{},
 		&SeedanceAsset{},
+		&SeedanceAssetSchemaMigration{},
+		&SeedanceAssetReplica{},
 		&SeedanceAssetCleanupJob{},
 		&CasbinRule{},
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := migrateSeedanceAssetListPerformance(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

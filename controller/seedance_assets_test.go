@@ -73,7 +73,11 @@ func setupSeedanceControllerRegression(t *testing.T, upstream http.HandlerFunc) 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetCleanupJob{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.Channel{Type: constant.ChannelTypeDoubaoVideo},
+		&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{},
+		&model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{},
+	))
 	model.DB = db
 	t.Cleanup(func() { model.DB = previousDB; _ = sqlDB.Close() })
 	server := httptest.NewServer(upstream)
@@ -193,21 +197,31 @@ func TestSeedanceControllerRejectsForeignOwnership(t *testing.T) {
 	require.NoError(t, db.First(asset, asset.ID).Error)
 }
 
-// HTTP 成功不代表业务成功，失败的写操作不能丢失授权映射或更新本地名称。
+// 同步写操作必须返回上游业务错误；异步删除则保留记录并调度失败重试。
 func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 	for _, operation := range []struct {
 		name, method string
 		handler      gin.HandlerFunc
+		deferred     bool
 	}{
-		{"delete asset", http.MethodDelete, DeleteSeedanceAsset},
-		{"delete group", http.MethodDelete, DeleteSeedanceAssetGroup},
-		{"rename group", http.MethodPut, UpdateSeedanceAssetGroup},
+		{"delete asset", http.MethodDelete, DeleteSeedanceAsset, true},
+		{"delete group", http.MethodDelete, DeleteSeedanceAssetGroup, false},
+		{"rename group", http.MethodPut, UpdateSeedanceAssetGroup, false},
 	} {
 		t.Run(operation.name, func(t *testing.T) {
 			db, group, asset := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(`{"code":"operation_failed","message":"rejected"}`))
 			})
 			payload := invokeSeedanceRegression(t, operation.handler, operation.method, "/", "1", `{"name":"After"}`)
+			if operation.deferred {
+				require.True(t, payload.Success, payload.Message)
+				summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+				require.NoError(t, err)
+				assert.Equal(t, 1, summary.RetryScheduled)
+				require.NoError(t, db.First(asset, asset.ID).Error)
+				assert.Equal(t, "Deleting", asset.Status)
+				return
+			}
 			assert.False(t, payload.Success)
 			assert.Contains(t, payload.Message, "rejected")
 			require.NoError(t, db.First(group, group.ID).Error)
@@ -215,6 +229,72 @@ func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 			assert.Equal(t, "Before", group.Name)
 		})
 	}
+}
+
+func TestSeedanceDeleteGroupKeepsLibraryAvailableWhenSourceChannelIsDisabled(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	db, group, asset := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", group.ChannelID).
+		Update("status", common.ChannelStatusManuallyDisabled).Error)
+
+	payload := invokeSeedanceRegression(t, DeleteSeedanceAssetGroup, http.MethodDelete, "/", fmt.Sprint(group.ID), "")
+	assert.False(t, payload.Success)
+	require.NoError(t, db.First(group, group.ID).Error)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, "Active", group.Status)
+	assert.Equal(t, "Processing", asset.Status)
+	assert.Zero(t, upstreamCalls.Load())
+}
+
+func TestSeedanceGroupManagementUsesMatchingEnabledChannelAlias(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	db, group, asset := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.URL.Query().Get("Action") == "GetAsset" {
+			_, _ = w.Write([]byte(`{"Result":{"Status":"Active"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	var source model.Channel
+	require.NoError(t, db.First(&source, group.ChannelID).Error)
+	sourceClient, err := service.NewSeedanceAssetClient(&source)
+	require.NoError(t, err)
+	group.KeyFingerprint = sourceClient.KeyFingerprint
+	group.AccountFingerprint = sourceClient.AccountFingerprint
+	asset.KeyFingerprint = sourceClient.KeyFingerprint
+	asset.AccountFingerprint = sourceClient.AccountFingerprint
+	require.NoError(t, db.Save(group).Error)
+	require.NoError(t, db.Save(asset).Error)
+
+	alias := source
+	alias.Id = 2
+	alias.Status = common.ChannelStatusEnabled
+	require.NoError(t, db.Create(&alias).Error)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", source.Id).
+		Update("status", common.ChannelStatusManuallyDisabled).Error)
+
+	refreshed := invokeSeedanceRegression(t, RefreshSeedanceAsset, http.MethodPost, "/", fmt.Sprint(asset.ID), "")
+	require.True(t, refreshed.Success, refreshed.Message)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, "Active", asset.Status)
+
+	updated := invokeSeedanceRegression(t, UpdateSeedanceAssetGroup, http.MethodPut, "/", fmt.Sprint(group.ID), `{"name":"After"}`)
+	require.True(t, updated.Success, updated.Message)
+	require.NoError(t, db.First(group, group.ID).Error)
+	assert.Equal(t, "After", group.Name)
+
+	deleted := invokeSeedanceRegression(t, DeleteSeedanceAssetGroup, http.MethodDelete, "/", fmt.Sprint(group.ID), "")
+	require.True(t, deleted.Success, deleted.Message)
+	assert.EqualValues(t, 3, upstreamCalls.Load())
+	var remaining int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("id = ?", group.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
+	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
 }
 
 func TestSeedanceRefreshReturnsPersistedStatus(t *testing.T) {
@@ -260,15 +340,23 @@ func TestSeedanceDeleteResumesAfterLocalFailure(t *testing.T) {
 	const callback = "review:delete-failure"
 	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(callback, func(tx *gorm.DB) { tx.AddError(errors.New("local deletion failed")) }))
 	payload := invokeSeedanceRegression(t, DeleteSeedanceAsset, http.MethodDelete, "/", fmt.Sprint(asset.ID), "")
-	assert.False(t, payload.Success)
+	require.True(t, payload.Success, payload.Message)
+	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.RetryScheduled)
 	require.NoError(t, db.Callback().Delete().Remove(callback))
 	require.NoError(t, db.First(asset, asset.ID).Error)
-	assert.Positive(t, asset.UpstreamDeletedAt)
 	assert.Equal(t, "Deleting", asset.Status)
+	cleanupJob := service.NewSeedanceAssetDeleteCleanupJob(asset)
+	require.NoError(t, db.Where("dedup_key = ?", cleanupJob.DedupKey).First(&cleanupJob).Error)
+	assert.Positive(t, cleanupJob.UpstreamDoneAt)
 	payload = invokeSeedanceRegression(t, DeleteSeedanceAsset, http.MethodDelete, "/", fmt.Sprint(asset.ID), "")
-	assert.True(t, payload.Success, payload.Message)
-	_, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.True(t, payload.Success, payload.Message)
+	require.NoError(t, db.Where("dedup_key = ?", cleanupJob.DedupKey).First(&cleanupJob).Error)
+	assert.Positive(t, cleanupJob.UpstreamDoneAt)
+	summary, err = service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
 	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
 	assert.EqualValues(t, 1, calls.Load())
 }
 
@@ -303,6 +391,14 @@ func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
 	require.Len(t, remaining, 2)
 	assert.Equal(t, "Deleting", remaining[0].Status)
 	assert.Equal(t, "Deleting", remaining[1].Status)
+	require.NotNil(t, remaining[0].StatusKey)
+	require.NotNil(t, remaining[1].StatusKey)
+	require.NotNil(t, remaining[0].PendingStatus)
+	require.NotNil(t, remaining[1].PendingStatus)
+	assert.Equal(t, "deleting", *remaining[0].StatusKey)
+	assert.Equal(t, "deleting", *remaining[1].StatusKey)
+	assert.True(t, *remaining[0].PendingStatus)
+	assert.True(t, *remaining[1].PendingStatus)
 
 	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
 	require.NoError(t, err)
@@ -315,11 +411,17 @@ func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
 	require.NoError(t, db.Where("id IN ?", []uint{first.ID, second.ID}).Find(&remaining).Error)
 	require.Len(t, remaining, 1)
 	assert.Equal(t, "Deleting", remaining[0].Status)
+	require.NotNil(t, remaining[0].StatusKey)
+	require.NotNil(t, remaining[0].PendingStatus)
+	assert.Equal(t, "deleting", *remaining[0].StatusKey)
+	assert.True(t, *remaining[0].PendingStatus)
 }
 
 // 覆盖第 201 条素材、跨页搜索、用户隔离和筛选下的后台轮询提示。
 func TestSeedancePaginationSearchesBeyondFirstTwoHundredAssets(t *testing.T) {
 	db, group, initial := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) })
+	initial.Status = "pRoCeSsInG"
+	require.NoError(t, db.Save(initial).Error)
 	require.NoError(t, db.Model(initial).Update("name", "old%file").Error)
 	rows := make([]model.SeedanceAsset, 201)
 	for index := range rows {
@@ -327,6 +429,8 @@ func TestSeedancePaginationSearchesBeyondFirstTwoHundredAssets(t *testing.T) {
 	}
 	rows[200].UserID = 10
 	require.NoError(t, db.Create(&rows).Error)
+	groupAssetCount := int64(201)
+	require.NoError(t, db.Model(group).UpdateColumn("asset_count", groupAssetCount).Error)
 	for _, scenario := range []struct {
 		query              string
 		total, count, page int
@@ -352,7 +456,7 @@ func TestUpdateSeedanceAssetGroupDoesNotDeleteStoredAssets(t *testing.T) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}))
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = previousDB

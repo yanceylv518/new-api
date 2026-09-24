@@ -40,6 +40,11 @@ type seedanceAssetPollResult struct {
 	err            error
 }
 
+type seedanceAssetPollJob struct {
+	asset   *model.SeedanceAsset
+	replica *model.SeedanceAssetReplica
+}
+
 // SeedanceAssetPollSchedule 根据状态和已有次数计算下一次轮询时间，终态素材直接停止调度。
 func SeedanceAssetPollSchedule(status string, previousAttempts int, now int64) (int, int64) {
 	normalizedStatus := normalizeSeedanceAssetStatus(status)
@@ -82,34 +87,49 @@ func RunSeedanceAssetPollingOnce(ctx context.Context, report func(processed, tot
 	if err != nil {
 		return SeedanceAssetPollSummary{}, err
 	}
-	summary := SeedanceAssetPollSummary{Candidates: len(assets)}
-	if report != nil {
-		report(0, len(assets))
+	replicas, err := model.ListDueSeedanceAssetReplicas(common.GetTimestamp(), seedanceAssetPollBatchSize)
+	if err != nil {
+		return SeedanceAssetPollSummary{}, err
 	}
-	if len(assets) == 0 {
+	jobsList := make([]seedanceAssetPollJob, 0, len(assets)+len(replicas))
+	for _, asset := range assets {
+		jobsList = append(jobsList, seedanceAssetPollJob{asset: asset})
+	}
+	for _, replica := range replicas {
+		jobsList = append(jobsList, seedanceAssetPollJob{replica: replica})
+	}
+	summary := SeedanceAssetPollSummary{Candidates: len(jobsList)}
+	if report != nil {
+		report(0, len(jobsList))
+	}
+	if len(jobsList) == 0 {
 		return summary, nil
 	}
 
-	jobs := make(chan *model.SeedanceAsset, len(assets))
-	results := make(chan seedanceAssetPollResult, len(assets))
-	for _, asset := range assets {
-		jobs <- asset
+	jobs := make(chan seedanceAssetPollJob, len(jobsList))
+	results := make(chan seedanceAssetPollResult, len(jobsList))
+	for _, job := range jobsList {
+		jobs <- job
 	}
 	close(jobs)
 
 	workerSize := seedanceAssetPollWorkerSize
-	if workerSize > len(assets) {
-		workerSize = len(assets)
+	if workerSize > len(jobsList) {
+		workerSize = len(jobsList)
 	}
 	var workers sync.WaitGroup
 	workers.Add(workerSize)
 	for worker := 0; worker < workerSize; worker++ {
 		go func() {
 			defer workers.Done()
-			for asset := range jobs {
+			for job := range jobs {
 				result := seedanceAssetPollResult{skipped: true}
 				if ctx.Err() == nil {
-					result = pollSeedanceAsset(ctx, asset)
+					if job.asset != nil {
+						result = pollSeedanceAsset(ctx, job.asset)
+					} else if job.replica != nil {
+						result = pollSeedanceAssetReplica(ctx, job.replica)
+					}
 				}
 				results <- result
 			}
@@ -138,10 +158,73 @@ func RunSeedanceAssetPollingOnce(ctx context.Context, report func(processed, tot
 			logger.LogWarn(ctx, fmt.Sprintf("Seedance asset polling failed: %v", result.err))
 		}
 		if report != nil {
-			report(processed, len(assets))
+			report(processed, len(jobsList))
 		}
 	}
 	return summary, ctx.Err()
+}
+
+// pollSeedanceAssetReplica 用与原素材相同的租约协议同步目标账号副本。
+func pollSeedanceAssetReplica(ctx context.Context, replica *model.SeedanceAssetReplica) seedanceAssetPollResult {
+	now := common.GetTimestamp()
+	leaseUntil := now + int64(seedanceAssetPollLease/time.Second)
+	claimed, err := model.ClaimSeedanceAssetReplicaForPolling(replica.ID, replica.UpdatedAt, now, leaseUntil)
+	if err != nil {
+		return seedanceAssetPollResult{err: err}
+	}
+	if !claimed {
+		return seedanceAssetPollResult{skipped: true}
+	}
+	result := seedanceAssetPollResult{claimed: true}
+	client, err := ResolveSeedanceAssetClient(ctx, replica.ChannelID, replica.KeyFingerprint, replica.AccountFingerprint)
+	if err != nil {
+		return scheduleSeedanceAssetReplicaRetry(result, replica, leaseUntil, err)
+	}
+	status, previewURL, err := client.GetSeedanceAsset(ctx, replica.UpstreamAssetID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return result
+		}
+		return scheduleSeedanceAssetReplicaRetry(result, replica, leaseUntil, err)
+	}
+	if ctx.Err() != nil {
+		return result
+	}
+	attempts, nextPollAt := SeedanceAssetPollSchedule(status, replica.PollAttempts, common.GetTimestamp())
+	updates := map[string]any{
+		"status": status, "poll_attempts": attempts, "next_poll_at": nextPollAt,
+		"poll_lease_until": int64(0), "last_error": "",
+	}
+	if previewURL != "" {
+		updates["preview_url"] = previewURL
+	}
+	updated, err := model.UpdateSeedanceAssetReplicaPollState(replica.ID, leaseUntil, updates)
+	if err != nil {
+		return seedanceAssetPollResult{claimed: true, err: err}
+	}
+	if !updated {
+		return seedanceAssetPollResult{claimed: true, skipped: true}
+	}
+	return seedanceAssetPollResult{claimed: true, updated: true}
+}
+
+func scheduleSeedanceAssetReplicaRetry(result seedanceAssetPollResult, replica *model.SeedanceAssetReplica, leaseUntil int64, pollErr error) seedanceAssetPollResult {
+	attempts, nextPollAt := SeedanceAssetPollSchedule(replica.Status, replica.PollAttempts, common.GetTimestamp())
+	updated, err := model.UpdateSeedanceAssetReplicaPollState(replica.ID, leaseUntil, map[string]any{
+		"poll_attempts": attempts, "next_poll_at": nextPollAt,
+		"poll_lease_until": int64(0), "last_error": truncateSeedanceAssetMappingError(pollErr.Error()),
+	})
+	if err != nil {
+		result.err = errors.Join(pollErr, fmt.Errorf("retry schedule update failed: %w", err))
+		return result
+	}
+	if !updated {
+		result.skipped = true
+		return result
+	}
+	result.retryScheduled = true
+	result.err = pollErr
+	return result
 }
 
 // pollSeedanceAsset 抢占单个素材后查询上游，并用租约条件提交结果。
@@ -156,11 +239,7 @@ func pollSeedanceAsset(ctx context.Context, asset *model.SeedanceAsset) seedance
 		return seedanceAssetPollResult{skipped: true}
 	}
 	result := seedanceAssetPollResult{claimed: true}
-	channel, err := model.GetChannelById(asset.ChannelID, true)
-	if err != nil {
-		return scheduleSeedanceAssetRetry(result, asset, leaseUntil, err)
-	}
-	client, err := NewSeedanceAssetClient(channel, asset.KeyFingerprint)
+	client, err := ResolveSeedanceAssetClient(ctx, asset.ChannelID, asset.KeyFingerprint, asset.AccountFingerprint)
 	if err != nil {
 		return scheduleSeedanceAssetRetry(result, asset, leaseUntil, err)
 	}

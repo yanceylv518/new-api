@@ -31,6 +31,22 @@ type ModelRequest struct {
 	Group string `json:"group,omitempty"`
 }
 
+const seedanceAssetMappingRetryAfterSeconds = "5"
+
+func newSeedanceAssetMappingError(c *gin.Context, err error) *types.NewAPIError {
+	statusCode := http.StatusBadGateway
+	code := types.ErrorCode("private_asset_mapping_failed")
+	if errors.Is(err, service.ErrSeedanceAssetMappingPending) {
+		statusCode = http.StatusConflict
+		code = types.ErrorCode("private_asset_mapping_pending")
+		c.Header("Retry-After", seedanceAssetMappingRetryAfterSeconds)
+	} else if errors.Is(err, ErrInvalidSeedanceAssetRequest) || errors.Is(err, model.ErrSeedanceAssetUnavailable) {
+		statusCode = http.StatusBadRequest
+		code = types.ErrorCode("private_asset_invalid")
+	}
+	return types.NewError(err, code, types.ErrOptionWithStatusCode(statusCode), types.ErrOptionWithSkipRetry())
+}
+
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		var channel *model.Channel
@@ -45,22 +61,8 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		if shouldSelectChannel {
-			if err := applySeedanceAssetAffinity(c); err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, err.Error(), types.ErrorCode("private_asset_unavailable"))
-				return
-			}
-		}
 		if pin, found, overridden := constraints.ResolvedPin(); found {
-			if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && pin.ChannelId != assetChannelID {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset is bound to a different upstream channel", types.ErrorCode("private_asset_channel_conflict"))
-				return
-			}
 			for _, lost := range overridden {
-				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && lost.ChannelId != assetChannelID && (lost.Source == taskdto.PinSourceToken || lost.Source == taskdto.PinSourceOriginTask) {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset conflicts with the request channel binding", types.ErrorCode("private_asset_channel_conflict"))
-					return
-				}
 				logger.LogWarn(c, fmt.Sprintf(
 					"channel pin overridden: winning_source=%s winning_channel_id=%d overridden_source=%s overridden_channel_id=%d",
 					pin.Source, pin.ChannelId, lost.Source, lost.ChannelId,
@@ -87,33 +89,15 @@ func Distribute() func(c *gin.Context) {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
-				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && channel.Id == assetChannelID {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset account does not serve the requested model", types.ErrorCode("private_asset_model_unavailable"))
-					return
-				}
 				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelRequest.Model}), types.ErrorCode(kind))
 				return
 			}
 		} else {
 			// Select a channel for the user
 			// check token model mapping
-			modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
-			if modelLimitEnable {
-				s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
-				if !ok {
-					// token model limit is empty, all models are not allowed
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
-					return
-				}
-				var tokenModelLimit map[string]bool
-				tokenModelLimit, ok = s.(map[string]bool)
-				if !ok {
-					tokenModelLimit = map[string]bool{}
-				}
-				if !tokenModelLimitAllows(tokenModelLimit, modelRequest.Model) {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelRequest.Model}))
-					return
-				}
+			if message := tokenModelLimitDenial(c, modelRequest.Model); message != "" {
+				abortWithOpenAiMessage(c, http.StatusForbidden, message)
+				return
 			}
 
 			if shouldSelectChannel {
@@ -207,10 +191,6 @@ func Distribute() func(c *gin.Context) {
 			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
-				}
-				if assetChannelID := common.GetContextKeyInt(c, constant.ContextKeySeedanceAssetChannelId); assetChannelID > 0 && channel.Id == assetChannelID {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, "private asset account does not serve the requested model", types.ErrorCode("private_asset_model_unavailable"))
-					return
 				}
 				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, noAvailableChannelMessage(c, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), modelRequest.Model), types.ErrorCodeModelNotFound)
 				return
@@ -620,6 +600,24 @@ func tokenModelLimitAllows(limit map[string]bool, model string) bool {
 	return limit[ratio_setting.RoutingMatchModelName(model)]
 }
 
+func tokenModelLimitDenial(c *gin.Context, modelName string) string {
+	if !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+		return ""
+	}
+	value, exists := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
+	if !exists {
+		return i18n.T(c, i18n.MsgDistributorTokenNoModelAccess)
+	}
+	limit, ok := value.(map[string]bool)
+	if !ok {
+		limit = map[string]bool{}
+	}
+	if !tokenModelLimitAllows(limit, modelName) {
+		return i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelName})
+	}
+	return ""
+}
+
 // 修复 #4834: GET /v1/video/generations/:task_id && /v1/video/:task_id 此前不解析 model，
 // 当 token 启用「可用模型限制」时，下游 modelLimitEnable 校验会因
 // modelRequest.Model 为空而误报 "This token has no access to model"。
@@ -705,15 +703,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	fingerprint := common.GetContextKeyString(c, constant.ContextKeySeedanceAssetKeyFingerprint)
-	var key string
-	var index int
-	var newAPIError *types.NewAPIError
-	if fingerprint != "" {
-		key, index, newAPIError = channel.GetEnabledKeyByFingerprint(fingerprint)
-	} else {
-		key, index, newAPIError = channel.GetNextEnabledKey()
-	}
+	key, index, newAPIError := channel.GetNextEnabledKey()
 	if newAPIError != nil {
 		return newAPIError
 	}
@@ -748,6 +738,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		c.Set("api_version", channel.Other)
 	case constant.ChannelTypeCoze:
 		c.Set("bot_id", channel.Other)
+	}
+	if err := prepareSeedanceAssetRequest(c, channel, key); err != nil {
+		return newSeedanceAssetMappingError(c, err)
 	}
 	return nil
 }

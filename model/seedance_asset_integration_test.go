@@ -45,18 +45,18 @@ func TestSeedanceAssetDatabaseLifecycle(t *testing.T) {
 			previousDB := DB
 			DB = db
 			t.Cleanup(func() {
-				assert.NoError(t, db.Migrator().DropTable(&SeedanceAsset{}, &SeedanceAssetGroup{}))
+				assert.NoError(t, db.Migrator().DropTable(&SeedanceAssetCleanupJob{}, &SeedanceAssetReplica{}, &SeedanceAsset{}, &SeedanceAssetGroupReplica{}, &SeedanceAssetGroup{}))
 				DB = previousDB
 				assert.NoError(t, connection.Close())
 			})
 			// 基线没有素材表；首次创建后插入真实记录，再重复迁移确认数据与约束保留。
-			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAsset{}, &SeedanceAssetCleanupJob{}))
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}, &SeedanceAssetCleanupJob{}))
 			group := SeedanceAssetGroup{UserID: 11, ChannelID: 7, GroupID: "group-owned", Name: "素材组", KeyFingerprint: "bound-account"}
 			require.NoError(t, db.Create(&group).Error)
 			asset := SeedanceAsset{UserID: group.UserID, ChannelID: group.ChannelID, GroupID: group.GroupID, AssetID: "asset-owned", Name: "视频", AssetType: "Video", Status: "Processing", KeyFingerprint: group.KeyFingerprint, ObjectKey: "private-assets/video.mp4", Storage: SeedanceAssetStorage{Region: "cn-hangzhou", Bucket: "fixture-bucket", Endpoint: "https://oss-cn-hangzhou.aliyuncs.com"}}
 			require.NoError(t, CreateSeedanceAssetInGroup(context.Background(), &asset))
-			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAsset{}, &SeedanceAssetCleanupJob{}))
-			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAsset{}))
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}, &SeedanceAssetCleanupJob{}))
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}))
 			var stored SeedanceAsset
 			require.NoError(t, db.First(&stored, asset.ID).Error)
 			assert.Equal(t, asset.Storage, stored.Storage)

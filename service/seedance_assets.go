@@ -23,12 +23,13 @@ import (
 
 // SeedanceAssetClient 调用兼容火山方舟的 Seedance 素材 Action 接口。
 type SeedanceAssetClient struct {
-	ChannelID      int
-	baseURL        string
-	apiKey         string
-	path           string
-	proxy          string
-	KeyFingerprint string
+	ChannelID          int
+	baseURL            string
+	apiKey             string
+	path               string
+	proxy              string
+	KeyFingerprint     string
+	AccountFingerprint string
 }
 
 var seedanceAssetHTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -503,6 +504,15 @@ func SeedanceAssetOSSPreviewURL(ctx context.Context, objectKey string, location 
 	return storage.PrivateAssetPreviewURL(ctx, objectKey)
 }
 
+// SeedanceAssetOSSUpstreamURL 为跨账号素材导入生成新的短期 OSS 读取地址。
+func SeedanceAssetOSSUpstreamURL(ctx context.Context, objectKey string, location ...model.SeedanceAssetStorage) (string, error) {
+	storage, err := privateAssetOSSStorageFactory(location...)
+	if err != nil {
+		return "", err
+	}
+	return storage.PrivateAssetUpstreamURL(ctx, objectKey)
+}
+
 // NewSeedanceAssetClient 使用渠道账号调用素材 Action，不依赖视频生成的 Go 适配器。
 func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*SeedanceAssetClient, error) {
 	if channel == nil || channel.Status != common.ChannelStatusEnabled {
@@ -545,6 +555,87 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 	if strings.TrimSpace(key) == "" {
 		return nil, fmt.Errorf("bound Seedance account is unavailable")
 	}
+	baseURL, assetPath := seedanceAssetEndpoint(channel)
+	keyFingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	return &SeedanceAssetClient{
+		ChannelID:          channel.Id,
+		baseURL:            baseURL,
+		apiKey:             key,
+		path:               assetPath,
+		proxy:              channel.GetSetting().Proxy,
+		KeyFingerprint:     keyFingerprint,
+		AccountFingerprint: seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint),
+	}, nil
+}
+
+// NewSeedanceAssetClientForSelectedKey 保持素材管理请求与本次模型请求使用同一把渠道密钥。
+func NewSeedanceAssetClientForSelectedKey(channel *model.Channel, key string) (*SeedanceAssetClient, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, errors.New("selected Seedance channel key is unavailable")
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	return NewSeedanceAssetClient(channel, fingerprint)
+}
+
+// ResolveSeedanceAssetClient 使用仍启用且指向同一上游账号的渠道恢复旧素材绑定。
+func ResolveSeedanceAssetClient(ctx context.Context, channelID int, keyFingerprint, accountFingerprint string) (*SeedanceAssetClient, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if model.DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+
+	expectedAccountFingerprint := strings.TrimSpace(accountFingerprint)
+	var originalChannel model.Channel
+	originalChannelErr := model.DB.WithContext(ctx).First(&originalChannel, "id = ?", channelID).Error
+	if originalChannelErr == nil {
+		if expectedAccountFingerprint == "" {
+			expectedAccountFingerprint = SeedanceAssetAccountFingerprint(&originalChannel, keyFingerprint)
+		}
+		if client, err := NewSeedanceAssetClient(&originalChannel, keyFingerprint); err == nil &&
+			(expectedAccountFingerprint == "" || client.AccountFingerprint == expectedAccountFingerprint) {
+			return client, nil
+		}
+	}
+	if expectedAccountFingerprint == "" {
+		return nil, errors.New("bound Seedance account is unavailable")
+	}
+
+	const batchSize = 100
+	lastID := 0
+	for {
+		var channels []*model.Channel
+		if err := model.DB.WithContext(ctx).
+			Where("id > ? AND status = ? AND type IN ?", lastID, common.ChannelStatusEnabled,
+				[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin}).
+			Order("id asc").Limit(batchSize).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+		for _, channel := range channels {
+			lastID = channel.Id
+			client, err := NewSeedanceAssetClient(channel, keyFingerprint)
+			if err == nil && client.AccountFingerprint == expectedAccountFingerprint {
+				return client, nil
+			}
+		}
+		if len(channels) < batchSize {
+			break
+		}
+	}
+	return nil, errors.New("no enabled Seedance channel matches the bound account")
+}
+
+// SeedanceAssetAccountFingerprint 生成不包含密钥明文、可跨同账号渠道复用的命名空间。
+func SeedanceAssetAccountFingerprint(channel *model.Channel, keyFingerprint string) string {
+	if channel == nil || strings.TrimSpace(keyFingerprint) == "" {
+		return ""
+	}
+	baseURL, assetPath := seedanceAssetEndpoint(channel)
+	return seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint)
+}
+
+func seedanceAssetEndpoint(channel *model.Channel) (string, string) {
 	path := os.Getenv("SEEDANCE_ASSET_API_PATH")
 	if path == "" {
 		path = "/seedance"
@@ -554,14 +645,11 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 	if strings.HasSuffix(baseURL, assetPath) {
 		baseURL = strings.TrimSuffix(baseURL, assetPath)
 	}
-	return &SeedanceAssetClient{
-		ChannelID:      channel.Id,
-		baseURL:        baseURL,
-		apiKey:         key,
-		path:           assetPath,
-		proxy:          channel.GetSetting().Proxy,
-		KeyFingerprint: fmt.Sprintf("%x", sha256.Sum256([]byte(key))),
-	}, nil
+	return baseURL, assetPath
+}
+
+func seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(baseURL+"\x00"+assetPath+"\x00"+keyFingerprint)))
 }
 
 func (client *SeedanceAssetClient) call(ctx context.Context, action string, request any, response any) error {
@@ -835,6 +923,11 @@ func isSeedanceAssetChannel(channel *model.Channel) bool {
 	default:
 		return false
 	}
+}
+
+// SupportsSeedanceAssets 判断渠道是否实现 Seedance 素材 Action 接口。
+func SupportsSeedanceAssets(channel *model.Channel) bool {
+	return isSeedanceAssetChannel(channel)
 }
 
 // FindSeedanceAssetChannel 按主键游标扫描启用渠道，避免前 100 条无效配置遮蔽可用账号。

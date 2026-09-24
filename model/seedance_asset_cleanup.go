@@ -15,6 +15,7 @@ const (
 	SeedanceAssetCleanupKindUpstreamGroup = "upstream_group"
 	SeedanceAssetCleanupKindOSSObject     = "oss_object"
 	SeedanceAssetCleanupKindAssetDelete   = "asset_delete"
+	SeedanceAssetCleanupKindReplicaDelete = "asset_replica_delete"
 
 	SeedanceAssetCleanupStatusPending   = "pending"
 	SeedanceAssetCleanupStatusCompleted = "completed"
@@ -27,6 +28,7 @@ type SeedanceAssetCleanupJob struct {
 	Kind           string               `gorm:"size:32;not null;index"`
 	UserID         int                  `gorm:"index"`
 	LocalAssetID   uint                 `gorm:"index"`
+	LocalMappingID uint                 `gorm:"index"`
 	ChannelID      int                  `gorm:"index"`
 	KeyFingerprint string               `gorm:"size:64"`
 	UpstreamID     string               `gorm:"size:128"`
@@ -90,7 +92,7 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for index := range jobs {
 			job := &jobs[index]
-			if job.Kind != SeedanceAssetCleanupKindAssetDelete || job.UserID == 0 || job.LocalAssetID == 0 || strings.TrimSpace(job.DedupKey) == "" {
+			if (job.Kind != SeedanceAssetCleanupKindAssetDelete && job.Kind != SeedanceAssetCleanupKindReplicaDelete) || job.UserID == 0 || job.LocalAssetID == 0 || strings.TrimSpace(job.DedupKey) == "" {
 				return errors.New("invalid Seedance asset deletion job")
 			}
 			var asset SeedanceAsset
@@ -99,7 +101,16 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 			}
 			// 已进入删除状态的素材允许幂等重新入队，避免 MySQL 将无值变化更新报告为零行。
 			if asset.Status != "Deleting" || asset.PollLeaseUntil != 0 {
-				if err := tx.Model(&asset).Updates(map[string]any{"status": "Deleting", "poll_lease_until": 0}).Error; err != nil {
+				if err := tx.Model(&asset).Updates(map[string]any{
+					"status": "Deleting", "status_key": SeedanceAssetStatusIndexKey("Deleting"), "pending_status": true,
+					"poll_lease_until": 0,
+				}).Error; err != nil {
+					return err
+				}
+			}
+			if job.Kind == SeedanceAssetCleanupKindReplicaDelete {
+				var replica SeedanceAssetReplica
+				if err := tx.Where("id = ? AND user_id = ? AND local_asset_id = ?", job.LocalMappingID, job.UserID, job.LocalAssetID).First(&replica).Error; err != nil {
 					return err
 				}
 			}
@@ -125,11 +136,14 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 					}
 				} else if existing.LeaseUntil <= common.GetTimestamp() {
 					// 用户再次点击删除时立即唤醒已退避任务；有效租约中的 worker 不被抢占。
-					if err := tx.Model(&existing).Updates(map[string]any{
-						"next_attempt_at":  common.GetTimestamp(),
-						"lease_until":      0,
-						"upstream_done_at": job.UpstreamDoneAt,
-					}).Error; err != nil {
+					updates := map[string]any{
+						"next_attempt_at": common.GetTimestamp(),
+						"lease_until":     0,
+					}
+					if job.UpstreamDoneAt > 0 {
+						updates["upstream_done_at"] = job.UpstreamDoneAt
+					}
+					if err := tx.Model(&existing).Updates(updates).Error; err != nil {
 						return err
 					}
 				}

@@ -23,12 +23,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,7 +44,11 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 type fakePrivateAssetOSSClient struct {
@@ -87,6 +95,54 @@ func TestFindSeedanceAssetChannelSupportsPluginBeyondFirstPage(t *testing.T) {
 	volcengine.Type = constant.ChannelTypeVolcEngine
 	_, err = NewSeedanceAssetClient(&volcengine)
 	assert.Error(t, err)
+}
+
+func TestPollingResolvesDisabledSourceChannelToMatchingEnabledAlias(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAsset{}))
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB; assert.NoError(t, sqlDB.Close()) })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"Result":{"Status":"Active"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	baseURL, key := upstream.URL, "same-upstream-key"
+	source := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: key, Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
+	sourceClient, err := NewSeedanceAssetClient(source)
+	require.NoError(t, err)
+	source.Status = common.ChannelStatusManuallyDisabled
+	alias := *source
+	alias.Id = 2
+	alias.Status = common.ChannelStatusEnabled
+	require.NoError(t, db.Create(source).Error)
+	require.NoError(t, db.Create(&alias).Error)
+
+	asset := &model.SeedanceAsset{
+		UserID: 7, ChannelID: source.Id, GroupID: "group", AssetID: "asset", Name: "portrait.jpg",
+		AssetType: "Image", Status: "Processing", KeyFingerprint: sourceClient.KeyFingerprint,
+		AccountFingerprint: sourceClient.AccountFingerprint,
+	}
+	require.NoError(t, db.Create(asset).Error)
+	client, err := ResolveSeedanceAssetClient(context.Background(), source.Id, asset.KeyFingerprint, asset.AccountFingerprint)
+	require.NoError(t, err)
+	assert.Equal(t, alias.Id, client.ChannelID)
+
+	result := pollSeedanceAsset(context.Background(), asset)
+	require.NoError(t, result.err)
+	assert.True(t, result.claimed)
+	assert.True(t, result.updated)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, "Active", asset.Status)
+
+	assert.NoError(t, db.Model(&model.Channel{}).Where("id = ?", alias.Id).Update("key", "different-account-key").Error)
+	_, err = ResolveSeedanceAssetClient(context.Background(), source.Id, asset.KeyFingerprint, asset.AccountFingerprint)
+	assert.Error(t, err, "a channel with a different account credential must not be used as an alias")
 }
 
 // 地址检查只使用字面 IP，确保拒绝私网和非 HTTP 地址且不依赖外部 DNS。
@@ -476,7 +532,7 @@ func TestRunSeedanceAssetPollingOnceUpdatesTerminalAsset(t *testing.T) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAsset{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{Type: constant.ChannelTypeDoubaoVideo}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}))
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = previousDB
@@ -632,4 +688,609 @@ func TestStoreSeedanceAssetUploadNormalizesProgressiveJPEG(t *testing.T) {
 	require.Equal(t, 8, decoded.Bounds().Dx())
 	require.Equal(t, 8, decoded.Bounds().Dy())
 	require.Equal(t, int64(len(client.putBody)), upload.Size)
+}
+
+func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&model.SystemTask{},
+		&model.SeedanceAssetGroup{},
+		&model.SeedanceAssetGroupReplica{},
+		&model.SeedanceAsset{},
+		&model.SeedanceAssetReplica{},
+	))
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	fetchSettings := system_setting.GetFetchSetting()
+	previousFetchSettings := *fetchSettings
+	*fetchSettings = system_setting.FetchSetting{}
+	t.Cleanup(func() { *fetchSettings = previousFetchSettings })
+	useFakePrivateAssetOSSStorage(t)
+
+	group := &model.SeedanceAssetGroup{
+		UserID: 7, ChannelID: 11, GroupID: "source-group", Name: "Originals", GroupType: "LivenessFace",
+		Status: "Active", KeyFingerprint: "source-key", AccountFingerprint: "source-account",
+	}
+	require.NoError(t, db.Create(group).Error)
+	asset := &model.SeedanceAsset{
+		UserID: group.UserID, ChannelID: group.ChannelID, GroupID: group.GroupID, AssetID: "source-asset",
+		Name: "portrait.jpg", AssetType: "Image", Status: "Active", ObjectKey: "private-assets/users/7/portrait.jpg",
+		Storage:        model.SeedanceAssetStorage{Region: "cn-hangzhou", Endpoint: "https://oss-cn-hangzhou.aliyuncs.com", Bucket: "private-assets"},
+		KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint,
+	}
+	require.NoError(t, model.CreateSeedanceAssetInGroup(t.Context(), asset))
+
+	var actions []string
+	var groupTypes []string
+	var sourceURLs []string
+	assetPolls := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload map[string]string
+		if err := common.DecodeJson(request.Body, &payload); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		action := request.URL.Query().Get("Action")
+		apiKey := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		actions = append(actions, apiKey+":"+action)
+		writer.Header().Set("Content-Type", "application/json")
+		switch action {
+		case "CreateAssetGroup":
+			groupTypes = append(groupTypes, payload["GroupType"])
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"remote-group-%s"}}`, apiKey)
+		case "CreateAsset":
+			sourceURLs = append(sourceURLs, payload["URL"])
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"remote-asset-%s"}}`, apiKey)
+		case "GetAsset":
+			assetPolls[apiKey]++
+			status := "Active"
+			if apiKey == "key-a" && assetPolls[apiKey] == 1 {
+				status = "Processing"
+			}
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"%s","Status":"%s"}}`, payload["Id"], status)
+		default:
+			http.Error(writer, "unexpected Action", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	newClient := func(id int, key string) *SeedanceAssetClient {
+		channel := &model.Channel{Id: id, Type: constant.ChannelTypeDoubaoVideo, Key: key, Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
+		client, clientErr := NewSeedanceAssetClientForSelectedKey(channel, key)
+		require.NoError(t, clientErr)
+		return client
+	}
+	clientA := newClient(21, "key-a")
+	_, err = MapSeedanceAssetsToAccount(t.Context(), 8, clientA, []string{asset.AssetID})
+	require.ErrorIs(t, err, model.ErrSeedanceAssetUnavailable)
+	assert.Empty(t, actions, "an asset owned by another user must never reach the upstream")
+
+	_, err = MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientA, []string{asset.AssetID})
+	require.ErrorIs(t, err, ErrSeedanceAssetMappingPending)
+
+	var replica model.SeedanceAssetReplica
+	require.NoError(t, db.Where("local_asset_id = ?", asset.ID).First(&replica).Error)
+	require.Equal(t, model.SeedanceAssetReplicaReady, replica.ProvisionStatus)
+	require.Equal(t, "Processing", replica.Status)
+	require.NoError(t, db.Model(&replica).Update("next_poll_at", int64(0)).Error)
+
+	mapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientA, []string{asset.AssetID})
+	require.NoError(t, err)
+	require.Equal(t, "remote-asset-key-a", mapping[asset.AssetID])
+	_, err = MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientA, []string{asset.AssetID})
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"key-a:CreateAssetGroup", "key-a:CreateAsset", "key-a:GetAsset", "key-a:GetAsset",
+	}, actions)
+
+	clientAAlias := newClient(23, "key-a")
+	aliasMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientAAlias, []string{asset.AssetID})
+	require.NoError(t, err)
+	assert.Equal(t, mapping, aliasMapping)
+	var groupReplica model.SeedanceAssetGroupReplica
+	require.NoError(t, db.Where("local_group_id = ? AND account_fingerprint = ?", group.ID, clientA.AccountFingerprint).First(&groupReplica).Error)
+	assert.Equal(t, clientAAlias.ChannelID, groupReplica.ChannelID)
+	require.NoError(t, db.Where("local_asset_id = ? AND account_fingerprint = ?", asset.ID, clientA.AccountFingerprint).First(&replica).Error)
+	assert.Equal(t, clientAAlias.ChannelID, replica.ChannelID)
+	assert.Equal(t, 4, len(actions), "reusing an account alias must not import the asset again")
+
+	clientB := newClient(22, "key-b")
+	otherMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientB, []string{asset.AssetID})
+	require.NoError(t, err)
+	require.Equal(t, "remote-asset-key-b", otherMapping[asset.AssetID])
+	require.Equal(t, []string{"LivenessFace", "LivenessFace"}, groupTypes)
+	require.Len(t, sourceURLs, 2)
+	assert.Equal(t, "https://signed.example/"+asset.ObjectKey, sourceURLs[0])
+	assert.Equal(t, sourceURLs[0], sourceURLs[1])
+
+	primaryClient := newClient(31, "primary-key")
+	primaryGroup := &model.SeedanceAssetGroup{
+		UserID: 8, ChannelID: 30, GroupID: "primary-group", Name: "Primary",
+		Status: "Active", KeyFingerprint: primaryClient.KeyFingerprint,
+		AccountFingerprint: primaryClient.AccountFingerprint,
+	}
+	require.NoError(t, db.Create(primaryGroup).Error)
+	primaryAsset := &model.SeedanceAsset{
+		UserID: primaryGroup.UserID, ChannelID: primaryGroup.ChannelID,
+		GroupID: primaryGroup.GroupID, AssetID: "primary-asset", Name: "primary.png",
+		AssetType: "Image", Status: "Active", SourceURL: "https://8.8.8.8/primary.png",
+		KeyFingerprint: primaryGroup.KeyFingerprint, AccountFingerprint: primaryGroup.AccountFingerprint,
+	}
+	require.NoError(t, model.CreateSeedanceAssetInGroup(t.Context(), primaryAsset))
+	primaryAlias := newClient(32, "primary-key")
+	primaryMapping, err := MapSeedanceAssetsToAccount(t.Context(), primaryGroup.UserID, primaryAlias, []string{primaryAsset.AssetID})
+	require.NoError(t, err)
+	assert.Equal(t, primaryAsset.AssetID, primaryMapping[primaryAsset.AssetID])
+	require.NoError(t, db.First(primaryGroup, primaryGroup.ID).Error)
+	require.NoError(t, db.First(primaryAsset, primaryAsset.ID).Error)
+	assert.Equal(t, primaryAlias.ChannelID, primaryGroup.ChannelID)
+	assert.Equal(t, primaryAlias.ChannelID, primaryAsset.ChannelID)
+	assert.Equal(t, primaryAlias.AccountFingerprint, primaryAsset.AccountFingerprint)
+
+	var groupReplicaCount, assetReplicaCount int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroupReplica{}).Count(&groupReplicaCount).Error)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&assetReplicaCount).Error)
+	assert.EqualValues(t, 2, groupReplicaCount)
+	assert.EqualValues(t, 2, assetReplicaCount)
+}
+
+func TestMapSeedanceAssetsToSelectedAccountHandlesMultipleAssetsInOneRequest(t *testing.T) {
+	previousDB := model.DB
+	databaseEngine := "sqlite"
+	maxConnections := 1
+	var dialector gorm.Dialector
+	mysqlDSN := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_MYSQL_DSN")
+	postgresDSN := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_POSTGRES_DSN")
+	if mysqlDSN != "" && postgresDSN != "" {
+		t.Fatal("set only one SEEDANCE_ASSET_LOAD_TEST database DSN at a time")
+	}
+	if mysqlDSN != "" {
+		databaseEngine = "mysql"
+		maxConnections = 16
+		dialector = mysql.Open(mysqlDSN)
+	} else if postgresDSN != "" {
+		databaseEngine = "postgres"
+		maxConnections = 16
+		dialector = postgres.Open(postgresDSN)
+	} else {
+		dialector = sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_")))
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{
+		NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("sam%d_", time.Now().UnixNano())},
+	})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(maxConnections)
+	sqlDB.SetMaxIdleConns(maxConnections)
+	require.NoError(t, db.AutoMigrate(
+		&model.SystemTask{},
+		&model.SeedanceAssetCleanupJob{},
+		&model.SeedanceAssetGroup{},
+		&model.SeedanceAssetGroupReplica{},
+		&model.SeedanceAsset{},
+		&model.SeedanceAssetReplica{},
+	))
+	var systemTaskQueries atomic.Int64
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("seedance_asset_mapping_count_system_task_queries", func(tx *gorm.DB) {
+		if strings.HasSuffix(tx.Statement.Table, "_system_tasks") {
+			systemTaskQueries.Add(1)
+		}
+	}))
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		assert.NoError(t, db.Migrator().DropTable(
+			&model.SeedanceAssetReplica{}, &model.SeedanceAsset{},
+			&model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetGroup{},
+			&model.SeedanceAssetCleanupJob{}, &model.SystemTask{},
+		))
+		_ = sqlDB.Close()
+	})
+
+	fetchSettings := system_setting.GetFetchSetting()
+	previousFetchSettings := *fetchSettings
+	*fetchSettings = system_setting.FetchSetting{}
+	t.Cleanup(func() { *fetchSettings = previousFetchSettings })
+
+	var ossClientBuilds atomic.Int64
+	ossClient := &fakePrivateAssetOSSClient{}
+	previousFactory := privateAssetOSSStorageFactory
+	privateAssetOSSStorageFactory = func(...model.SeedanceAssetStorage) (*PrivateAssetOSSStorage, error) {
+		ossClientBuilds.Add(1)
+		return &PrivateAssetOSSStorage{
+			client:   ossClient,
+			bucket:   "test-private-assets",
+			prefix:   "private-assets/",
+			location: model.SeedanceAssetStorage{Region: "test-region", Endpoint: "https://oss.example.com", Bucket: "test-private-assets"},
+		}, nil
+	}
+	t.Cleanup(func() { privateAssetOSSStorageFactory = previousFactory })
+
+	group := &model.SeedanceAssetGroup{
+		UserID: 41, ChannelID: 42, GroupID: "multi-source-group", Name: "Multi asset request",
+		Status: "Active", KeyFingerprint: "source-key", AccountFingerprint: "source-account",
+	}
+	require.NoError(t, db.Create(group).Error)
+	secondGroup := &model.SeedanceAssetGroup{
+		UserID: group.UserID, ChannelID: group.ChannelID, GroupID: "second-source-group", Name: "Second group",
+		Status: "Active", KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint,
+	}
+	require.NoError(t, db.Create(secondGroup).Error)
+	groups := []*model.SeedanceAssetGroup{group, secondGroup}
+	assets := make([]model.SeedanceAsset, 4)
+	assetIDs := make([]string, 0, len(assets)+1)
+	for index := range assets {
+		assetGroup := groups[index%len(groups)]
+		assets[index] = model.SeedanceAsset{
+			UserID: group.UserID, ChannelID: group.ChannelID, GroupID: assetGroup.GroupID,
+			AssetID: fmt.Sprintf("multi-source-asset-%d", index), Name: fmt.Sprintf("asset-%d.jpg", index),
+			AssetType: "Image", Status: "Active", ObjectKey: fmt.Sprintf("private-assets/users/41/asset-%d.jpg", index),
+			Storage:        model.SeedanceAssetStorage{Region: "test-region", Endpoint: "https://oss.example.com", Bucket: "test-private-assets"},
+			KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint,
+		}
+		require.NoError(t, model.CreateSeedanceAssetInGroup(t.Context(), &assets[index]))
+		assetIDs = append(assetIDs, assets[index].AssetID)
+	}
+	assetIDs = append(assetIDs, assets[0].AssetID)
+
+	var groupCreates, assetCreates, assetGets atomic.Int64
+	var activeHTTPRequests, peakHTTPRequests atomic.Int64
+	allAssetCreatesStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		active := activeHTTPRequests.Add(1)
+		for peak := peakHTTPRequests.Load(); active > peak && !peakHTTPRequests.CompareAndSwap(peak, active); peak = peakHTTPRequests.Load() {
+		}
+		defer activeHTTPRequests.Add(-1)
+		var payload map[string]string
+		if err := common.DecodeJson(request.Body, &payload); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("Action") {
+		case "CreateAssetGroup":
+			groupID := groupCreates.Add(1)
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"multi-remote-group-%d"}}`, groupID)
+		case "CreateAsset":
+			assetID := assetCreates.Add(1)
+			if !strings.HasPrefix(payload["GroupId"], "multi-remote-group-") {
+				http.Error(writer, "asset was assigned to an unexpected group", http.StatusBadRequest)
+				return
+			}
+			if assetID == int64(len(assets)) {
+				close(allAssetCreatesStarted)
+			}
+			select {
+			case <-allAssetCreatesStarted:
+			case <-request.Context().Done():
+				return
+			}
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"multi-remote-asset-%d"}}`, assetID)
+		case "GetAsset":
+			assetGets.Add(1)
+			status := "Active"
+			if request.Header.Get("Authorization") == "Bearer multi-key-pending" {
+				status = "Processing"
+			}
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":%q,"Status":%q}}`, payload["Id"], status)
+		case "DeleteAsset":
+			_, _ = writer.Write([]byte(`{"Result":{}}`))
+		default:
+			http.Error(writer, "unexpected Action", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	channel := &model.Channel{Id: 43, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key", Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
+	client, err := NewSeedanceAssetClientForSelectedKey(channel, channel.Key)
+	require.NoError(t, err)
+
+	startedAt := time.Now()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	mapping, err := MapSeedanceAssetsToAccount(ctx, group.UserID, client, assetIDs)
+	require.NoError(t, err)
+	firstRequestDuration := time.Since(startedAt)
+	require.Len(t, mapping, len(assets))
+	uniqueMappings := make(map[string]struct{}, len(assets))
+	for _, asset := range assets {
+		upstreamID := mapping[asset.AssetID]
+		assert.True(t, strings.HasPrefix(upstreamID, "multi-remote-asset-"))
+		uniqueMappings[upstreamID] = struct{}{}
+	}
+	assert.Len(t, uniqueMappings, len(assets))
+	assert.EqualValues(t, len(groups), groupCreates.Load())
+	assert.EqualValues(t, len(assets), assetCreates.Load())
+	assert.EqualValues(t, len(assets), assetGets.Load())
+	assert.EqualValues(t, seedanceAssetMappingWorkerSize, peakHTTPRequests.Load(), "a multi-asset request should run up to its bounded worker count")
+	assert.EqualValues(t, 1, ossClientBuilds.Load(), "one OSS client should be reused for assets in the same storage location")
+
+	reusedMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, client, assetIDs)
+	require.NoError(t, err)
+	assert.Equal(t, mapping, reusedMapping)
+	assert.EqualValues(t, len(groups), groupCreates.Load())
+	assert.EqualValues(t, len(assets), assetCreates.Load())
+	assert.EqualValues(t, len(assets), assetGets.Load())
+	assert.EqualValues(t, 1, ossClientBuilds.Load())
+	assert.Zero(t, systemTaskQueries.Load())
+
+	pendingChannel := &model.Channel{Id: 44, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key-pending", Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
+	pendingClient, err := NewSeedanceAssetClientForSelectedKey(pendingChannel, pendingChannel.Key)
+	require.NoError(t, err)
+	_, err = MapSeedanceAssetsToAccount(ctx, group.UserID, pendingClient, assetIDs)
+	require.ErrorIs(t, err, ErrSeedanceAssetMappingPending)
+	assert.EqualValues(t, len(groups)*2, groupCreates.Load())
+	assert.EqualValues(t, len(assets)*2, assetCreates.Load())
+	assert.EqualValues(t, len(assets)*2, assetGets.Load())
+	assert.EqualValues(t, 2, ossClientBuilds.Load())
+	assert.EqualValues(t, 1, systemTaskQueries.Load(), "one batch should make one active-task lookup when polling is needed")
+
+	var groupReplicaCount, assetReplicaCount, activePollTasks int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroupReplica{}).Count(&groupReplicaCount).Error)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&assetReplicaCount).Error)
+	require.NoError(t, db.Model(&model.SystemTask{}).Where("type = ? AND status = ?", model.SystemTaskTypeSeedanceAssetPoll, model.SystemTaskStatusPending).Count(&activePollTasks).Error)
+	assert.EqualValues(t, len(groups)*2, groupReplicaCount)
+	assert.EqualValues(t, len(assets)*2, assetReplicaCount)
+	assert.EqualValues(t, 1, activePollTasks)
+	t.Logf("multi-asset request: db=%s assets=%d unique_assets=%d upstream group/create/status=%d/%d/%d peak_upstream=%d OSS client constructions=%d first_request=%s",
+		databaseEngine, len(assetIDs), len(assets), groupCreates.Load(), assetCreates.Load(), assetGets.Load(), peakHTTPRequests.Load(), ossClientBuilds.Load(), firstRequestDuration)
+}
+
+func TestSeedanceAssetReplicaBurstIsStableUnderConcurrentLoad(t *testing.T) {
+	const (
+		userCount   = 200
+		concurrency = 64
+	)
+	databaseEngine := "sqlite"
+	maxConnections := 1
+	var dialector gorm.Dialector
+	mysqlDSN := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_MYSQL_DSN")
+	postgresDSN := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_POSTGRES_DSN")
+	if mysqlDSN != "" && postgresDSN != "" {
+		t.Fatal("set only one SEEDANCE_ASSET_LOAD_TEST database DSN at a time")
+	}
+	if mysqlDSN != "" {
+		databaseEngine = "mysql"
+		maxConnections = concurrency
+		dialector = mysql.Open(mysqlDSN)
+	} else if postgresDSN != "" {
+		databaseEngine = "postgres"
+		maxConnections = concurrency
+		dialector = postgres.Open(postgresDSN)
+	} else {
+		dialector = sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_")))
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{
+		Logger:         gormlogger.Default.LogMode(gormlogger.Silent),
+		NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("sa%d_", time.Now().UnixNano())},
+	})
+	require.NoError(t, err)
+	databaseVersion := ""
+	if databaseEngine != "sqlite" {
+		require.NoError(t, db.Raw("SELECT version()").Scan(&databaseVersion).Error)
+	}
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(maxConnections)
+	sqlDB.SetMaxIdleConns(maxConnections)
+	require.NoError(t, db.AutoMigrate(
+		&model.SystemTask{},
+		&model.SeedanceAssetGroup{},
+		&model.SeedanceAssetGroupReplica{},
+		&model.SeedanceAsset{},
+		&model.SeedanceAssetReplica{},
+	))
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		assert.NoError(t, db.Migrator().DropTable(
+			&model.SeedanceAssetReplica{}, &model.SeedanceAsset{},
+			&model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetGroup{}, &model.SystemTask{},
+		))
+		assert.NoError(t, sqlDB.Close())
+	})
+	fetchSettings := system_setting.GetFetchSetting()
+	previousFetchSettings := *fetchSettings
+	*fetchSettings = system_setting.FetchSetting{}
+	t.Cleanup(func() { *fetchSettings = previousFetchSettings })
+	useFakePrivateAssetOSSStorage(t)
+
+	assetIDs := make([]string, userCount)
+	for index := range userCount {
+		userID := index + 1
+		groupID := fmt.Sprintf("source-group-%03d", index)
+		group := &model.SeedanceAssetGroup{
+			UserID: userID, ChannelID: 1, GroupID: groupID, Name: fmt.Sprintf("User %03d", index),
+			Status: "Active", KeyFingerprint: fmt.Sprintf("source-key-%03d", index),
+			AccountFingerprint: fmt.Sprintf("source-account-%03d", index),
+		}
+		require.NoError(t, db.Create(group).Error)
+		assetIDs[index] = fmt.Sprintf("source-asset-%03d", index)
+		asset := &model.SeedanceAsset{
+			UserID: userID, ChannelID: group.ChannelID, GroupID: group.GroupID,
+			AssetID: assetIDs[index], Name: fmt.Sprintf("asset-%03d.jpg", index),
+			AssetType: "Image", Status: "Active", ObjectKey: fmt.Sprintf("private-assets/users/%d/source.jpg", userID),
+			Storage:        model.SeedanceAssetStorage{Region: "test-region", Endpoint: "https://oss.example.com", Bucket: "test-private-assets"},
+			KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint,
+		}
+		require.NoError(t, model.CreateSeedanceAssetInGroup(t.Context(), asset))
+	}
+
+	var groupCreates, assetCreates, assetGets, invalidRequests atomic.Int64
+	var activeHTTPRequests, peakHTTPRequests atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		active := activeHTTPRequests.Add(1)
+		for peak := peakHTTPRequests.Load(); active > peak && !peakHTTPRequests.CompareAndSwap(peak, active); peak = peakHTTPRequests.Load() {
+		}
+		defer activeHTTPRequests.Add(-1)
+		var payload map[string]string
+		if err := common.DecodeJson(request.Body, &payload); err != nil {
+			invalidRequests.Add(1)
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		apiKey := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("Action") {
+		case "CreateAssetGroup":
+			groupCreates.Add(1)
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"remote-group-%s"}}`, apiKey)
+		case "CreateAsset":
+			assetCreates.Add(1)
+			if !strings.HasPrefix(payload["URL"], "https://signed.example/") {
+				invalidRequests.Add(1)
+			}
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":"remote-asset-%s"}}`, apiKey)
+		case "GetAsset":
+			assetGets.Add(1)
+			_, _ = fmt.Fprintf(writer, `{"Result":{"Id":%q,"Status":"Active"}}`, payload["Id"])
+		default:
+			invalidRequests.Add(1)
+			http.Error(writer, "unexpected action", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	clients := make([]*SeedanceAssetClient, userCount)
+	for index := range userCount {
+		key := fmt.Sprintf("load-key-%03d", index)
+		channel := &model.Channel{
+			Id: index + 100, Type: constant.ChannelTypeDoubaoVideo, Key: key,
+			Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL,
+		}
+		clients[index], err = NewSeedanceAssetClientForSelectedKey(channel, key)
+		require.NoError(t, err)
+	}
+
+	var maximumWorkers atomic.Int64
+	runBatch := func(count int, work func(int) (string, error)) ([]string, []error, time.Duration) {
+		results := make([]string, count)
+		errorsByIndex := make([]error, count)
+		start := make(chan struct{})
+		semaphore := make(chan struct{}, concurrency)
+		var workers sync.WaitGroup
+		var activeWorkers, peakWorkers atomic.Int64
+		workers.Add(count)
+		startedAt := time.Now()
+		for index := range count {
+			go func(index int) {
+				defer workers.Done()
+				semaphore <- struct{}{}
+				<-start
+				active := activeWorkers.Add(1)
+				for peak := peakWorkers.Load(); active > peak && !peakWorkers.CompareAndSwap(peak, active); peak = peakWorkers.Load() {
+				}
+				results[index], errorsByIndex[index] = work(index)
+				activeWorkers.Add(-1)
+				<-semaphore
+			}(index)
+		}
+		close(start)
+		workers.Wait()
+		for peak := peakWorkers.Load(); peak > maximumWorkers.Load() && !maximumWorkers.CompareAndSwap(maximumWorkers.Load(), peak); peak = peakWorkers.Load() {
+		}
+		return results, errorsByIndex, time.Since(startedAt)
+	}
+	mapAsset := func(userIndex, clientIndex int) (string, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		mapping, err := MapSeedanceAssetsToAccount(ctx, userIndex+1, clients[clientIndex], []string{assetIDs[userIndex]})
+		if err != nil {
+			return "", err
+		}
+		return mapping[assetIDs[userIndex]], nil
+	}
+
+	initialResults, initialErrors, initialDuration := runBatch(userCount, func(int) (string, error) {
+		return mapAsset(0, 0)
+	})
+	pendingRetries := 0
+	for index, err := range initialErrors {
+		if errors.Is(err, ErrSeedanceAssetMappingPending) {
+			pendingRetries++
+			continue
+		}
+		require.NoError(t, err, "same-account concurrent first use %d", index)
+		assert.Equal(t, "remote-asset-load-key-000", initialResults[index])
+	}
+	_, retryErrors, retryDuration := runBatch(pendingRetries, func(int) (string, error) {
+		return mapAsset(0, 0)
+	})
+	for index, err := range retryErrors {
+		require.NoError(t, err, "same-account retry %d", index)
+	}
+
+	firstUseResults, firstUseErrors, firstUseDuration := runBatch(userCount-1, func(index int) (string, error) {
+		return mapAsset(index+1, index+1)
+	})
+	for index, err := range firstUseErrors {
+		require.NoError(t, err, "independent-account first use %d", index)
+		assert.Equal(t, fmt.Sprintf("remote-asset-load-key-%03d", index+1), firstUseResults[index])
+	}
+	reuseResults, reuseErrors, reuseDuration := runBatch(userCount, func(index int) (string, error) {
+		return mapAsset(index, index)
+	})
+	for index, err := range reuseErrors {
+		require.NoError(t, err, "mapping reuse %d", index)
+		assert.Equal(t, fmt.Sprintf("remote-asset-load-key-%03d", index), reuseResults[index])
+	}
+
+	var groupReplicaCount, assetReplicaCount int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroupReplica{}).Count(&groupReplicaCount).Error)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&assetReplicaCount).Error)
+	assert.EqualValues(t, userCount, groupReplicaCount)
+	assert.EqualValues(t, userCount, assetReplicaCount)
+	assert.EqualValues(t, userCount, groupCreates.Load())
+	assert.EqualValues(t, userCount, assetCreates.Load())
+	assert.EqualValues(t, userCount, assetGets.Load())
+	assert.Zero(t, invalidRequests.Load())
+	assert.LessOrEqual(t, maximumWorkers.Load(), int64(concurrency))
+
+	var localGroups []model.SeedanceAssetGroup
+	var localAssets []model.SeedanceAsset
+	var groupReplicas []model.SeedanceAssetGroupReplica
+	var assetReplicas []model.SeedanceAssetReplica
+	require.NoError(t, db.Order("user_id asc").Find(&localGroups).Error)
+	require.NoError(t, db.Order("user_id asc").Find(&localAssets).Error)
+	require.NoError(t, db.Order("user_id asc").Find(&groupReplicas).Error)
+	require.NoError(t, db.Order("user_id asc").Find(&assetReplicas).Error)
+	for index := range userCount {
+		userID := index + 1
+		assert.Equal(t, userID, localGroups[index].UserID)
+		assert.Equal(t, userID, localAssets[index].UserID)
+		assert.Equal(t, userID, groupReplicas[index].UserID)
+		assert.Equal(t, localGroups[index].ID, groupReplicas[index].LocalGroupID)
+		assert.Equal(t, clients[index].AccountFingerprint, groupReplicas[index].AccountFingerprint)
+		assert.Equal(t, model.SeedanceAssetReplicaReady, groupReplicas[index].Status)
+		assert.Equal(t, fmt.Sprintf("remote-group-load-key-%03d", index), groupReplicas[index].UpstreamGroupID)
+		assert.Equal(t, userID, assetReplicas[index].UserID)
+		assert.Equal(t, localAssets[index].ID, assetReplicas[index].LocalAssetID)
+		assert.Equal(t, localGroups[index].ID, assetReplicas[index].LocalGroupID)
+		assert.Equal(t, clients[index].AccountFingerprint, assetReplicas[index].AccountFingerprint)
+		assert.Equal(t, model.SeedanceAssetReplicaReady, assetReplicas[index].ProvisionStatus)
+		assert.Equal(t, "Active", assetReplicas[index].Status)
+		assert.Equal(t, fmt.Sprintf("remote-asset-load-key-%03d", index), assetReplicas[index].UpstreamAssetID)
+	}
+
+	requestsPerSecond := func(requests int, duration time.Duration) float64 {
+		if duration <= 0 {
+			return 0
+		}
+		return float64(requests) / duration.Seconds()
+	}
+	t.Logf("replica load: db=%s version=%s users/accounts=%d concurrency=%d peak_workers=%d peak_upstream=%d pending_first_use=%d recovered=%d in %.1fms; same-account=%.1f req/s, distinct-account=%.1f req/s, reuse=%.1f req/s; upstream group/asset/status calls=%d/%d/%d",
+		databaseEngine, databaseVersion, userCount, concurrency, maximumWorkers.Load(), peakHTTPRequests.Load(), pendingRetries,
+		pendingRetries, float64(retryDuration.Microseconds())/1000,
+		requestsPerSecond(userCount, initialDuration), requestsPerSecond(userCount-1, firstUseDuration), requestsPerSecond(userCount, reuseDuration),
+		groupCreates.Load(), assetCreates.Load(), assetGets.Load())
 }

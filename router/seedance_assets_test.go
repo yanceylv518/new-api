@@ -81,7 +81,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				common.IsMasterNode = previousMaster
 				assert.NoError(t, connection.Close())
 			})
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
 			users := []model.User{{Id: 85001, Username: "assetsowner", AffCode: "assetsowner", Group: "default", Status: common.UserStatusEnabled}, {Id: 85002, Username: "assetsother", AffCode: "assetsother", Group: "default", Status: common.UserStatusEnabled}}
 			// 不同引擎使用不同用户，避免进程级限流跨测试累计。
 			for i := range users {
