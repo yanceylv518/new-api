@@ -54,6 +54,21 @@ export interface AuditFilters {
   username?: string
   request_id?: string
 }
+
+export function getDefaultAuditTimeRange(): Pick<
+  AuditFilters,
+  'start_timestamp' | 'end_timestamp'
+> {
+  const now = new Date()
+  const start = new Date(now)
+  start.setHours(0, 0, 0, 0)
+
+  return {
+    start_timestamp: Math.floor(start.getTime() / 1000),
+    end_timestamp: Math.floor(now.getTime() / 1000),
+  }
+}
+
 export async function getAuditLogs(
   scope: 'all' | 'self',
   params: AuditFilters

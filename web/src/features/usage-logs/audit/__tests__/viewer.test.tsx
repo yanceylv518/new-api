@@ -269,7 +269,7 @@ it('uses the shared log toolbar and opens details in a keyboard-accessible dialo
     },
   })
   renderViewer()
-  expect(screen.getByRole('button', { name: 'Date Range' })).toBeVisible()
+  expect(screen.getByRole('button', { name: /00:00/ })).toBeVisible()
   expect(screen.getByRole('button', { name: 'Search' })).toBeVisible()
   expect(
     await screen.findByRole('button', { name: 'Go to next page' })
@@ -445,7 +445,7 @@ it('filters own access history by result, generation and time and resets paginat
   await user.click(
     await screen.findByRole('option', { name: 'Historical tokens' })
   )
-  await user.click(screen.getByRole('button', { name: 'Date Range' }))
+  await user.click(screen.getByRole('button', { name: /00:00/ }))
   fireEvent.change(screen.getByLabelText('Start Time'), {
     target: { value: '2026-09-01T12:00' },
   })

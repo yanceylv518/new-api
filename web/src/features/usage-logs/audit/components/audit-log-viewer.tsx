@@ -27,7 +27,12 @@ import { Button } from '@/components/ui/button'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getAuditLogs, type AuditFilters, type AuditLog } from '../api'
+import {
+  getAuditLogs,
+  getDefaultAuditTimeRange,
+  type AuditFilters,
+  type AuditLog,
+} from '../api'
 import { useAuditLogColumns } from './audit-log-columns'
 import { AuditLogFilterBar } from './audit-log-filter-bar'
 
@@ -41,7 +46,11 @@ export function AuditLogViewer(props: {
 }) {
   const { t } = useTranslation()
   const userId = useAuthStore((state) => state.auth.user?.id)
-  const [filters, setFilters] = useState<AuditFilters>({ p: 1, page_size: 20 })
+  const [filters, setFilters] = useState<AuditFilters>(() => ({
+    p: 1,
+    page_size: 20,
+    ...getDefaultAuditTimeRange(),
+  }))
   const [tokenScope, setTokenScope] = useState('all')
   const params = { ...filters }
   if (props.accessOnly) params.category = 'access_token'
@@ -141,7 +150,11 @@ export function AuditLogViewer(props: {
               }}
               onReset={() => {
                 setTokenScope('all')
-                setFilters({ p: 1, page_size: filters.page_size })
+                setFilters({
+                  p: 1,
+                  page_size: filters.page_size,
+                  ...getDefaultAuditTimeRange(),
+                })
               }}
             />
             {invalidRange && (
