@@ -193,6 +193,34 @@ it('keeps plugin price columns ordered in overview and group tables', () => {
   }
 })
 
+it('shows only the model overview without the removed performance and API tabs', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={model}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+
+  expect(screen.getByText('Pricing')).toBeVisible()
+  expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+  expect(screen.queryByText('Performance')).not.toBeInTheDocument()
+  expect(screen.queryByText('API')).not.toBeInTheDocument()
+})
+
 it('shows nested task conditions in pricing cards and details', () => {
   vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
   const client = new QueryClient({
