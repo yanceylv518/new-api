@@ -47,7 +47,6 @@ export function Pricing() {
     vendors,
     groupRatio,
     usableGroup,
-    endpointMap,
     autoGroups,
     isLoading,
     priceRate,
@@ -269,12 +268,6 @@ export function Pricing() {
               model={selectedModel}
               groupRatio={groupRatio || {}}
               usableGroup={usableGroup || {}}
-              endpointMap={
-                (endpointMap as Record<
-                  string,
-                  { path?: string; method?: string }
-                >) || {}
-              }
               autoGroups={autoGroups || []}
               priceRate={priceRate ?? 1}
               usdExchangeRate={usdExchangeRate ?? 1}

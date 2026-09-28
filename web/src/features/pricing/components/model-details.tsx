@@ -21,10 +21,8 @@ import { useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import {
   ArrowLeft,
   CalendarClock,
-  Code2,
   FileText,
   HeartPulse,
-  Info,
   Layers,
   Maximize2,
   Sparkles,
@@ -47,7 +45,6 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getPerfMetrics } from '@/features/performance-metrics/api'
 import {
   formatLatency,
@@ -93,8 +90,6 @@ import type {
 import { DiscountedPrice } from './discounted-price'
 import { DynamicPricingBreakdown } from './dynamic-pricing-breakdown'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
-import { ModelDetailsApi } from './model-details-api'
-import { ModelDetailsPerformance } from './model-details-performance'
 import { UserPricingBadge } from './user-pricing-badge'
 
 // ----------------------------------------------------------------------------
@@ -1398,23 +1393,10 @@ function GroupPricingSection(props: {
   )
 }
 
-const TAB_VALUES = ['overview', 'performance', 'api'] as const
-type TabValue = (typeof TAB_VALUES)[number]
-
-const TAB_META: Record<
-  TabValue,
-  { icon: React.ComponentType<{ className?: string }>; labelKey: string }
-> = {
-  overview: { icon: Info, labelKey: 'Overview' },
-  performance: { icon: HeartPulse, labelKey: 'Performance' },
-  api: { icon: Code2, labelKey: 'API' },
-}
-
 export interface ModelDetailsContentProps {
   model: PricingModel
   groupRatio: Record<string, number>
   usableGroup: Record<string, { desc: string; ratio: number }>
-  endpointMap: Record<string, { path?: string; method?: string }>
   autoGroups: string[]
   priceRate: number
   usdExchangeRate: number
@@ -1434,68 +1416,39 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
     <div className='@container/details space-y-4'>
       <ModelHeader model={props.model} />
 
-      <Tabs defaultValue='overview' className='gap-4'>
-        <TabsList className='bg-muted/60 grid w-full grid-cols-3 gap-1 rounded-lg p-1 group-data-horizontal/tabs:h-auto'>
-          {TAB_VALUES.map((value) => {
-            const Icon = TAB_META[value].icon
-            return (
-              <TabsTrigger
-                key={value}
-                value={value}
-                className='h-8 min-w-0 gap-1.5 rounded-md px-3 text-xs sm:text-sm'
-              >
-                <Icon className='size-3.5' />
-                <span className='truncate'>{t(TAB_META[value].labelKey)}</span>
-              </TabsTrigger>
-            )
-          })}
-        </TabsList>
+      <div className='space-y-6'>
+        <OverviewSummaryGrid model={props.model} />
 
-        <TabsContent value='overview' className='space-y-6 outline-none'>
-          <OverviewSummaryGrid model={props.model} />
-
-          <section className='bg-card/60 space-y-5 rounded-xl border p-4 shadow-sm'>
-            <SectionTitle>{t('Pricing')}</SectionTitle>
-            <PriceSection
-              model={props.model}
-              priceRate={props.priceRate}
-              usdExchangeRate={props.usdExchangeRate}
-              tokenUnit={props.tokenUnit}
-              showRechargePrice={showRechargePrice}
-            />
-            {isDynamic && (
-              <DynamicPricingBreakdown
-                priceMultiplier={getUserModelDiscountMultiplier(props.model)}
-                billingExpr={props.model.billing_expr}
-                usageSchema={props.model.billing_usage_schema}
-              />
-            )}
-            <GroupPricingSection
-              model={props.model}
-              groupRatio={props.groupRatio}
-              usableGroup={props.usableGroup}
-              autoGroups={props.autoGroups}
-              priceRate={props.priceRate}
-              usdExchangeRate={props.usdExchangeRate}
-              tokenUnit={props.tokenUnit}
-              showRechargePrice={showRechargePrice}
-            />
-          </section>
-
-          <ModelBackendDetailsSection model={props.model} />
-        </TabsContent>
-
-        <TabsContent value='performance' className='outline-none'>
-          <ModelDetailsPerformance model={props.model} />
-        </TabsContent>
-
-        <TabsContent value='api' className='outline-none'>
-          <ModelDetailsApi
+        <section className='bg-card/60 space-y-5 rounded-xl border p-4 shadow-sm'>
+          <SectionTitle>{t('Pricing')}</SectionTitle>
+          <PriceSection
             model={props.model}
-            endpointMap={props.endpointMap}
+            priceRate={props.priceRate}
+            usdExchangeRate={props.usdExchangeRate}
+            tokenUnit={props.tokenUnit}
+            showRechargePrice={showRechargePrice}
           />
-        </TabsContent>
-      </Tabs>
+          {isDynamic && (
+            <DynamicPricingBreakdown
+              priceMultiplier={getUserModelDiscountMultiplier(props.model)}
+              billingExpr={props.model.billing_expr}
+              usageSchema={props.model.billing_usage_schema}
+            />
+          )}
+          <GroupPricingSection
+            model={props.model}
+            groupRatio={props.groupRatio}
+            usableGroup={props.usableGroup}
+            autoGroups={props.autoGroups}
+            priceRate={props.priceRate}
+            usdExchangeRate={props.usdExchangeRate}
+            tokenUnit={props.tokenUnit}
+            showRechargePrice={showRechargePrice}
+          />
+        </section>
+
+        <ModelBackendDetailsSection model={props.model} />
+      </div>
     </div>
   )
 }
@@ -1543,7 +1496,6 @@ export function ModelDetails() {
     models,
     groupRatio,
     usableGroup,
-    endpointMap,
     autoGroups,
     isLoading,
     priceRate,
@@ -1627,12 +1579,6 @@ export function ModelDetails() {
           usdExchangeRate={usdExchangeRate ?? 1}
           tokenUnit={tokenUnit}
           showRechargePrice={search.rechargePrice ?? false}
-          endpointMap={
-            (endpointMap as Record<
-              string,
-              { path?: string; method?: string }
-            >) || {}
-          }
         />
       </div>
     </PublicLayout>

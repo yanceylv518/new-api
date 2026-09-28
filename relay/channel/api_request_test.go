@@ -1,15 +1,69 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDoRequestCapturesPreferredUpstreamRequestID(t *testing.T) {
+	service.InitHttpClient()
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name       string
+		setPrimary bool
+		primary    string
+		fallback   string
+		want       string
+	}{
+		{name: "fallback", fallback: "provider-request", want: "provider-request"},
+		{name: "preferred", setPrimary: true, primary: "oneapi-request", fallback: "provider-request", want: "oneapi-request"},
+		{name: "empty primary", setPrimary: true, fallback: "provider-request", want: "provider-request"},
+		{name: "missing", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if test.setPrimary {
+					w.Header().Set(common.RequestIdKey, test.primary)
+				}
+				if test.fallback != "" {
+					w.Header().Set("X-Request-Id", test.fallback)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewReader([]byte("request")))
+			req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewReader([]byte("request")))
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+			resp, err := doRequest(ctx, req, info)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, test.want, ctx.GetString(common.UpstreamRequestIdKey))
+		})
+	}
+}
+
+func TestCopiedUpstreamHeadersPreserveRequestIDPriority(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	require.True(t, service.ShouldCopyUpstreamHeader(ctx, "x-request-id", []string{"provider-request"}))
+	require.Equal(t, "provider-request", ctx.GetString(common.UpstreamRequestIdKey))
+	require.False(t, service.ShouldCopyUpstreamHeader(ctx, "x-oneapi-request-id", []string{"oneapi-request"}))
+	require.Equal(t, "oneapi-request", ctx.GetString(common.UpstreamRequestIdKey))
+	require.True(t, service.ShouldCopyUpstreamHeader(ctx, "X-REQUEST-ID", []string{"later-provider-request"}))
+	require.Equal(t, "oneapi-request", ctx.GetString(common.UpstreamRequestIdKey))
+}
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	recorder := httptest.NewRecorder()

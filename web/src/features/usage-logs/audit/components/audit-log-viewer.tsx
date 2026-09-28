@@ -24,6 +24,7 @@ import { useTranslation } from 'react-i18next'
 import { DataTablePage, useDataTable } from '@/components/data-table'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { dateToUnixTimestamp, getEndOfDay, getStartOfDay } from '@/lib/time'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getAuditLogs, type AuditFilters, type AuditLog } from '../api'
@@ -31,6 +32,16 @@ import { useAuditLogColumns } from './audit-log-columns'
 import { AuditLogFilterBar } from './audit-log-filter-bar'
 
 const EMPTY_LOGS: AuditLog[] = []
+
+function getTodayAuditFilters(pageSize: number): AuditFilters {
+  const today = new Date()
+  return {
+    p: 1,
+    page_size: pageSize,
+    start_timestamp: dateToUnixTimestamp(getStartOfDay(today)),
+    end_timestamp: dateToUnixTimestamp(getEndOfDay(today)),
+  }
+}
 
 export function AuditLogViewer(props: {
   scope: 'all' | 'self'
@@ -40,7 +51,9 @@ export function AuditLogViewer(props: {
 }) {
   const { t } = useTranslation()
   const userId = useAuthStore((state) => state.auth.user?.id)
-  const [filters, setFilters] = useState<AuditFilters>({ p: 1, page_size: 20 })
+  const [filters, setFilters] = useState<AuditFilters>(() =>
+    props.accessOnly ? { p: 1, page_size: 20 } : getTodayAuditFilters(20)
+  )
   const [tokenScope, setTokenScope] = useState('all')
   const params = { ...filters }
   if (props.accessOnly) params.category = 'access_token'
@@ -139,7 +152,11 @@ export function AuditLogViewer(props: {
               }}
               onReset={() => {
                 setTokenScope('all')
-                setFilters({ p: 1, page_size: filters.page_size })
+                setFilters(
+                  props.accessOnly
+                    ? { p: 1, page_size: filters.page_size }
+                    : getTodayAuditFilters(filters.page_size)
+                )
               }}
             />
             {invalidRange && (

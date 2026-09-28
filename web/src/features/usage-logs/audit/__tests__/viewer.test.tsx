@@ -403,6 +403,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   useAuthStore.getState().auth.reset()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
@@ -421,6 +422,55 @@ function renderViewer(scope: 'all' | 'self' = 'self') {
     </QueryClientProvider>
   )
 }
+
+it('defaults audit logs to today and restores today after resetting filters', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date(2026, 8, 7, 12, 30))
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [], total: 0 } },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AuditLogViewer scope='self' />
+    </QueryClientProvider>
+  )
+  const today = {
+    start_timestamp: Math.floor(new Date(2026, 8, 7, 0, 0, 0).getTime() / 1000),
+    end_timestamp: Math.floor(
+      new Date(2026, 8, 7, 23, 59, 59).getTime() / 1000
+    ),
+  }
+  await waitFor(() =>
+    expect(get).toHaveBeenCalledWith('/api/audit/self', {
+      params: expect.objectContaining(today),
+    })
+  )
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', {
+      name: '2026-09-07 00:00 ~ 2026-09-07 23:59',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: '7 Days' }))
+  await waitFor(() =>
+    expect(get).toHaveBeenLastCalledWith('/api/audit/self', {
+      params: expect.objectContaining({
+        start_timestamp: Math.floor(
+          new Date(2026, 8, 1, 0, 0, 0).getTime() / 1000
+        ),
+      }),
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Reset' }))
+  await waitFor(() =>
+    expect(get).toHaveBeenLastCalledWith('/api/audit/self', {
+      params: expect.objectContaining(today),
+    })
+  )
+})
 
 it('filters own access history by result, generation and time and resets pagination', async () => {
   const get = vi.spyOn(api, 'get').mockResolvedValue({
