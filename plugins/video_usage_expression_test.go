@@ -140,7 +140,11 @@ func TestDoubaoVisualExpressionUsage(t *testing.T) {
 	for _, modelName := range plugin.Meta.Models {
 		schema, _ := plugin.Meta.UsageForModel(modelName)
 		for _, resolution := range schema["resolution"].Enum {
-			for _, video := range []bool{false, true} {
+			videoInputs := []bool{false}
+			if _, supported := schema["video_input"]; supported {
+				videoInputs = append(videoInputs, true)
+			}
+			for _, video := range videoInputs {
 				t.Run(fmt.Sprintf("%s/%s/video=%t", modelName, resolution, video), func(t *testing.T) {
 					expression := fmt.Sprintf(`u("resolution") == %q && u("video_input") == "video" ? tier("reference", u("tokens") * 20 / 1000000) : tier("plain", u("tokens") * 40 / 1000000)`, resolution)
 					content := []any{map[string]any{"type": "text", "text": "a lighthouse in fog"}}

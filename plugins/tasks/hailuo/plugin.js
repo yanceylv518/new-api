@@ -99,7 +99,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.3.7",
+  version: "1.3.8",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -157,6 +157,18 @@ export const meta = {
             resolution: "2K",
             input_images: 0,
             input_video_seconds: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            operation: "generation",
+          },
+        },
+        {
+          label: "H3 generation 2K 5s · 15s input video",
+          facts: {
+            seconds: 5,
+            resolution: "2K",
+            input_images: 0,
+            input_video_seconds: 15,
             prompt_tokens: 0,
             completion_tokens: 0,
             operation: "generation",
@@ -1466,7 +1478,7 @@ protocols.openai_video = {
         try {
           parsed = JSON.parse(req.metadata);
         } catch (e) {
-          throw new Error("metadata must be a JSON object string");
+          throw new Error("metadata must be a JSON object string", { cause: e });
         }
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("metadata must be a JSON object string");
         req.metadata = parsed;

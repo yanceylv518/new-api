@@ -38,7 +38,7 @@ import {
   isDisplayableLogType,
   isTimingLogType,
 } from '../lib/utils'
-import { ModelBadge } from './model-badge'
+import { ModelBadge, ResponseModelDetails } from './model-badge'
 import { StreamTpsCell, TimingMetricsCell } from './timing-metrics-cell'
 import { useUsageLogsContext } from './usage-logs-provider'
 
@@ -72,6 +72,7 @@ export function CommonLogMobileCard<TData>(props: {
   const timing = isTimingLogType(log.type)
   const model = formatModelName(log)
   const visibleActualModel = props.isAdmin ? model.actualModel : undefined
+  const visibleResponseModel = props.isAdmin ? model.responseModel : undefined
   const config = getLogTypeConfig(log.type)
   const group = log.group || other?.group || ''
   const groupRatio =
@@ -151,6 +152,7 @@ export function CommonLogMobileCard<TData>(props: {
             <ModelBadge
               modelName={model.name}
               actualModel={visibleActualModel}
+              responseModel={visibleResponseModel}
               wrapText
               onInspect={() => setSelectedField('model')}
             />
@@ -195,6 +197,7 @@ export function CommonLogMobileCard<TData>(props: {
                   className='min-h-5 max-w-full min-w-0 justify-end'
                   isStream={log.is_stream}
                   isTask={other?.is_task === true}
+                  isSyncTask={other?.task_sync === true}
                   tokensPerSecond={
                     log.use_time > 0 && log.completion_tokens > 0
                       ? log.completion_tokens / log.use_time
@@ -351,15 +354,20 @@ export function CommonLogMobileCard<TData>(props: {
             <p className='bg-muted rounded-lg p-4 text-base [overflow-wrap:anywhere] whitespace-pre-wrap'>
               {activeField.value}
             </p>
-            {selectedField === 'model' && visibleActualModel && (
-              <div className='space-y-2'>
-                <p className='text-muted-foreground'>{t('Actual Model')}</p>
-                <p className='text-base [overflow-wrap:anywhere]'>
-                  {visibleActualModel}
-                </p>
-                <CopyButton value={visibleActualModel} />
-              </div>
+            {selectedField === 'model' && visibleResponseModel && (
+              <ResponseModelDetails observation={visibleResponseModel} />
             )}
+            {selectedField === 'model' &&
+              !visibleResponseModel &&
+              visibleActualModel && (
+                <div className='space-y-2'>
+                  <p className='text-muted-foreground'>{t('Actual Model')}</p>
+                  <p className='text-base [overflow-wrap:anywhere]'>
+                    {visibleActualModel}
+                  </p>
+                  <CopyButton value={visibleActualModel} />
+                </div>
+              )}
             {selectedField === 'channel' && channelCell && (
               <div>
                 {flexRender(

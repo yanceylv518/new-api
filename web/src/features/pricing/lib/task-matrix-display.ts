@@ -19,9 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import type { BillingUsageSchema } from '../types'
 import {
   parseTaskTiersFromExpr,
+  splitBillingExprAndRequestRules,
   type ParsedTaskTier,
   type TaskTierCondition,
 } from './billing-expr'
+import { readConditionalTaskPricing } from './billing-expression/task-display'
 import {
   getTaskEnumFields,
   taskMatrixRowLabel,
@@ -67,7 +69,12 @@ export function getTaskPricingDisplayTiers(
   const tiers = parseTaskTiersFromExpr(expression || '', schema, true)
   // 条件字段不能按独立枚举展开，否则会重新展示不存在的操作/分辨率组合。
   if (schema && Object.values(schema).some((field) => field.when)) {
-    return getTaskMatrixDisplayTiers(expression, schema) ?? tiers
+    const matrix = getTaskMatrixDisplayTiers(expression, schema)
+    if (matrix) return matrix
+  }
+  if (tiers.length === 0 && expression && schema) {
+    const { billingExpr } = splitBillingExprAndRequestRules(expression)
+    return readConditionalTaskPricing(billingExpr, schema) ?? []
   }
   const fallback = tiers.at(-1)
   if (!schema || tiers.length < 2 || !fallback) return tiers

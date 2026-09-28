@@ -22,7 +22,7 @@ import {
   getCoreRowModel,
   useReactTable,
 } from '@tanstack/react-table'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test } from 'vitest'
 
@@ -103,15 +103,10 @@ describe('model mapping visibility', () => {
         const modelButton = screen.getByRole('button', {
           name: 'Model: public-model',
         })
+        expect(modelButton).not.toHaveAttribute('aria-haspopup', 'dialog')
         await user.click(modelButton)
-        expect(
-          await screen.findByRole('dialog', { name: 'Model' })
-        ).toBeVisible()
+        expect(screen.queryByRole('dialog')).toBeNull()
         expect(screen.queryByText('private-upstream')).toBeNull()
-        await user.keyboard('{Escape}')
-        await waitFor(() =>
-          expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-        )
       } else {
         expect(screen.queryByRole('button')).toBeNull()
       }

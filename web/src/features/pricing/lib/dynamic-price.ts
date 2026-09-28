@@ -28,7 +28,6 @@ import type {
 import {
   BILLING_PRICING_VARS,
   getCurrentTimePricingTiers,
-  parseTaskTiersFromExpr,
   parseTiersFromExpr,
   splitBillingExprAndRequestRules,
   tryParseRequestRuleExpr,
@@ -271,14 +270,7 @@ export function getDynamicPricingTiers(
     model.billing_expr || ''
   )
   if (isTaskUsagePricingModel(model)) {
-    if (
-      Object.values(model.billing_usage_schema ?? {}).some(
-        (field) => field.when
-      )
-    ) {
-      return getTaskPricingDisplayTiers(billingExpr, model.billing_usage_schema)
-    }
-    return parseTaskTiersFromExpr(billingExpr, model.billing_usage_schema, true)
+    return getTaskPricingDisplayTiers(billingExpr, model.billing_usage_schema)
   }
   return parseTiersFromExpr(billingExpr)
 }

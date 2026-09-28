@@ -101,7 +101,7 @@ const model: PricingModel = {
 const clients: QueryClient[] = []
 
 // 概览和分组表会合并不同操作的费用项，合并后仍须遵循插件的完整列顺序。
-it('orders task prices consistently in overview and group pricing tables', () => {
+it('keeps plugin price columns ordered in overview and group tables', () => {
   vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -153,16 +153,17 @@ it('orders task prices consistently in overview and group pricing tables', () =>
       when: [{ field: 'operation', values: ['generation'] }],
     },
   }
+  const h3Model: PricingModel = {
+    ...model,
+    model_name: 'MiniMax-H3',
+    billing_usage_schema: schema,
+    billing_expr:
+      'u("operation") == "generation" ? tier("video", u("seconds") * 0.5 + u("input_images") * 0.2 + u("input_video_seconds") * 0.1 + 1) : tier("ir", u("prompt_tokens") * 23 / 1000000 + u("completion_tokens") * 5.8 / 1000000)',
+  }
   render(
     <QueryClientProvider client={client}>
       <ModelDetailsContent
-        model={{
-          ...model,
-          model_name: 'MiniMax-H3',
-          billing_usage_schema: schema,
-          billing_expr:
-            'u("operation") == "generation" ? tier("video", u("seconds") * 0.5 + u("input_images") * 0.2 + u("input_video_seconds") * 0.1 + 1) : tier("ir", u("prompt_tokens") * 23 / 1000000 + u("completion_tokens") * 5.8 / 1000000)',
-        }}
+        model={h3Model}
         groupRatio={{ default: 1 }}
         usableGroup={{ default: { desc: '', ratio: 1 } }}
         endpointMap={{}}
@@ -190,6 +191,69 @@ it('orders task prices consistently in overview and group pricing tables', () =>
       expect(headings[index]).toHaveTextContent(label)
     )
   }
+})
+
+it('shows nested task conditions in pricing cards and details', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const nestedModel: PricingModel = {
+    ...model,
+    billing_expr:
+      'tier("standard", u("seconds") * (hour("Asia/Shanghai") >= 18 && hour("Asia/Shanghai") < 22 ? (u("resolution") == "4K" ? 0.12 : 0.072) : (u("resolution") == "4K" ? 0.15 : 0.09)))',
+    billing_usage_schema: {
+      seconds: { type: 'number', unit: 'second' },
+      resolution: { enum: ['768P', '4K'] },
+    },
+  }
+  render(
+    <QueryClientProvider client={client}>
+      <ModelCard model={nestedModel} onClick={vi.fn()} />
+      <ModelPriceCell model={nestedModel} />
+      <ModelDetailsContent
+        model={nestedModel}
+        groupRatio={{ default: 2 }}
+        usableGroup={{ default: { desc: '', ratio: 2 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+      <DynamicPricingBreakdown
+        billingExpr={nestedModel.billing_expr}
+        usageSchema={nestedModel.billing_usage_schema}
+        matchedTierLabel='standard'
+        usageFacts={{ seconds: 10, resolution: '4K' }}
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    screen.queryByText('Special billing expression')
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getAllByText(/resolution: 4K · 18:00–22:00 \(Asia\/Shanghai\)/)
+      .length
+  ).toBeGreaterThan(0)
+  expect(
+    screen.getAllByText(/resolution: 768P · Outside these times:/).length
+  ).toBeGreaterThan(0)
+  expect(screen.getByText('$0.072 – $0.15')).toBeVisible()
+  expect(screen.getAllByText('$0.24').length).toBeGreaterThan(0)
+  expect(screen.queryByText('Matched')).not.toBeInTheDocument()
+})
+
+it('explains missing task metadata while retaining the original expression', () => {
+  const expression = 'tier("base", u("seconds") * 0.09)'
+  render(<DynamicPricingBreakdown billingExpr={expression} />)
+  expect(
+    screen.getByText(
+      'Task usage metadata is unavailable. Pricing details cannot be displayed.'
+    )
+  ).toBeVisible()
+  expect(screen.getByText(expression)).toBeVisible()
 })
 
 it('falls back for omitted count labels and preserves canonical units for other quantities', () => {

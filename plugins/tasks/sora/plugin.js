@@ -7,11 +7,13 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.0.3",
+  version: "1.1.0",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
   fetchMode: "per_task",
+  // A New API gateway serves /v1/videos as a host protocol, so no URL changes.
+  upstreams: ["vendor", "new_api"],
   usageSchema: {
     // Requested video duration in seconds.
     seconds: {
@@ -291,7 +293,7 @@ protocols.openai_video = {
       try {
         parsed = JSON.parse(req.metadata);
       } catch (e) {
-        throw new Error("metadata must be a JSON object string");
+        throw new Error("metadata must be a JSON object string", { cause: e });
       }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("metadata must be a JSON object string");
       req.metadata = parsed;

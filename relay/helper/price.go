@@ -2,10 +2,10 @@ package helper
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -38,11 +38,6 @@ func modelPriceNotConfiguredError(modelName string, userId int) error {
 
 // https://docs.claude.com/en/docs/build-with-claude/prompt-caching#1-hour-cache-duration
 const claudeCacheCreation1hMultiplier = 6 / 3.75
-
-// defaultTieredPreConsumeMaxTokens is the fallback completion-token estimate
-// used for tiered expression pre-consume when the client omits max_tokens, so
-// the pre-consumed quota still reflects a plausible output cost in paid groups.
-const defaultTieredPreConsumeMaxTokens = 8192
 
 // addUserModelDiscount 将匹配到的用户规则冻结到 PriceData，供后续所有计费阶段复用。
 func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.PriceData) {
@@ -99,7 +94,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 	// Check if this model uses tiered_expr billing
 	if billing_setting.GetBillingMode(billingModelName) == billing_setting.BillingModeTieredExpr {
-		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, meta, groupRatioInfo)
+		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, groupRatioInfo)
 	}
 
 	var preConsumedQuota int
@@ -114,10 +109,11 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	var audioCompletionRatio float64
 	var freeModel bool
 	if !usePrice {
-		preConsumedTokens := common.Max(promptTokens, common.PreConsumedQuota)
-		if meta.MaxTokens != 0 {
-			preConsumedTokens += meta.MaxTokens
+		preConsumeMultiplier, err := operation_setting.InputPreConsumeMultiplier()
+		if err != nil {
+			return hosttypes.PriceData{}, err
 		}
+		preConsumedTokens := float64(promptTokens) * preConsumeMultiplier
 		var success bool
 		var matchName string
 		modelRatio, success, matchName = ratio_setting.GetModelRatio(billingModelName)
@@ -143,15 +139,13 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		if discountBPS := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(billingModelName)); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
 			discountRatio = float64(discountBPS) / 10000
 		}
-		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio
-		preConsumeValue := float64(preConsumedTokens) * ratio
+		beforeValue := decimal.NewFromFloat(preConsumedTokens).
+			Mul(decimal.NewFromFloat(modelRatio)).
+			Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+		preConsumeValue := preConsumedTokens * modelRatio * groupRatioInfo.GroupRatio * discountRatio
 		var quota int
-		var err error
 		if discountRatio != 1 {
 			// 有用户折扣时，所有倍率先用十进制相乘，再统一按半远离零规则取整。
-			beforeValue := decimal.NewFromInt(int64(preConsumedTokens)).
-				Mul(decimal.NewFromFloat(modelRatio)).
-				Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
 			quota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
 		} else {
 			// 无用户折扣时保留原有预扣取整行为，避免改变旧版本账单。
@@ -166,7 +160,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 		preConsumedQuota = quota
 		if _, image := info.Request.(*dto.ImageRequest); image {
-			info.ImageQuotaBeforeGroup = float64(preConsumedTokens) * modelRatio
+			info.ImageQuotaBeforeGroup = preConsumedTokens * modelRatio
 		}
 	} else {
 		if meta.ImagePriceRatio != 0 {
@@ -222,24 +216,12 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 	}
 	if request, image := info.Request.(*dto.ImageRequest); image {
-		channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
-		count, err := request.ImageCount(channelType == constant.ChannelTypeAli)
+		count, err := request.ImageCount(false)
 		if err != nil {
 			return hosttypes.PriceData{}, err
 		}
-		if usePrice || channelType == constant.ChannelTypeAli {
+		if usePrice {
 			priceData.AddOtherRatio("n", float64(count))
-		}
-		if channelType == constant.ChannelTypeAli && request.BillingParameters != nil && request.BillingParameters.PromptExtend != nil && *request.BillingParameters.PromptExtend {
-			// Resolve only routing identity; do not initialize ChannelMeta on the
-			// real request, which also distinguishes the first channel attempt.
-			mapped := &relaycommon.RelayInfo{OriginModelName: info.OriginModelName, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: info.OriginModelName}}
-			if err := ModelMappedHelper(c, mapped, nil); err != nil {
-				return hosttypes.PriceData{}, err
-			}
-			if strings.Contains(mapped.UpstreamModelName, "z-image") {
-				priceData.AddOtherRatio("prompt_extend", common.ZImagePromptExtendMultiplier)
-			}
 		}
 		if !usePrice {
 			quota, err := common.QuotaFromFloatStrict(priceData.ApplyOtherRatiosToFloat(info.ImageQuotaBeforeGroup * groupRatioInfo.GroupRatio))
@@ -377,7 +359,7 @@ func HasPriceOrRatioEntry(name string) bool {
 	return model.HasPriceOrRatioEntry(name)
 }
 
-func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, meta *types.TokenCountMeta, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
+func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
 	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
 	if !ok {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
@@ -387,9 +369,9 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 		return hosttypes.PriceData{}, fmt.Errorf("fixed pricing is not supported for Realtime requests")
 	}
 
-	estimatedCompletionTokens := meta.MaxTokens
-	if estimatedCompletionTokens == 0 && groupRatioInfo.GroupRatio != 0 {
-		estimatedCompletionTokens = defaultTieredPreConsumeMaxTokens
+	preConsumeMultiplier, err := operation_setting.InputPreConsumeMultiplier()
+	if err != nil {
+		return hosttypes.PriceData{}, err
 	}
 
 	requestInput, err := ResolveIncomingBillingExprRequestInput(c, info)
@@ -405,7 +387,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 
 	rawCost, trace, err := billingexpr.RunExprByHashWithRequest(exprStr, exprHash, billingexpr.TokenParams{
 		P:   float64(promptTokens),
-		C:   float64(estimatedCompletionTokens),
+		C:   0,
 		Len: float64(promptTokens),
 	}, requestInput)
 	if err != nil {
@@ -416,14 +398,22 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
 	priceData := hosttypes.PriceData{GroupRatioInfo: groupRatioInfo}
 	addUserModelDiscount(info, &priceData)
-	preConsumeValue := quotaBeforeGroup * groupRatioInfo.GroupRatio * priceData.UserModelDiscountMultiplier()
 	discountRatio := priceData.UserModelDiscountMultiplier()
+	// RC40 的输入预扣系数只放大可变用量；按次表达式仍预留完整固定费用。
+	if trace.BillingUnit != billingexpr.BillingUnitRequest {
+		quotaBeforeGroup *= preConsumeMultiplier
+	}
+	if math.IsNaN(quotaBeforeGroup) || math.IsInf(quotaBeforeGroup, 0) {
+		_, err := billingexpr.QuotaRoundStrict(quotaBeforeGroup)
+		return hosttypes.PriceData{}, err
+	}
+	beforeValue := decimal.NewFromFloat(quotaBeforeGroup).Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
+	preConsumeValue := quotaBeforeGroup * groupRatioInfo.GroupRatio * discountRatio
 	var preConsumedQuota int
 	var originalEstimate int
 	var originalClamp *common.QuotaClamp
 	if discountRatio != 1 {
 		// 阶梯计费的折前、折后预扣都从同一份十进制基础额度计算。
-		beforeValue := decimal.NewFromFloat(quotaBeforeGroup).Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio))
 		preConsumedQuota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
 		originalEstimate, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
 	} else {
@@ -457,7 +447,8 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 		ExprHash:                  exprHash,
 		GroupRatio:                groupRatioInfo.GroupRatio,
 		EstimatedPromptTokens:     promptTokens,
-		EstimatedCompletionTokens: estimatedCompletionTokens,
+		EstimatedCompletionTokens: 0,
+		PreConsumeMultiplier:      preConsumeMultiplier,
 		EstimatedQuotaBeforeGroup: quotaBeforeGroup,
 		EstimatedQuotaAfterGroup:  preConsumedQuota,
 		EstimatedTier:             trace.MatchedTier,
