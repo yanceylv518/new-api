@@ -24,6 +24,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  ShieldCheck,
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -37,25 +38,42 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import type { SeedanceAssetGroup } from '../api'
 import { seedanceAssetLayoutClasses } from '../layout'
+import {
+  getSeedanceAssetGroupCategory,
+  type SeedanceAssetGroupCategory,
+} from '../types'
 
 // 分组侧栏负责选择当前工作区，并把重命名、删除放在每个分组的局部菜单中。
 export function AssetGroupSidebar(props: {
   groups: SeedanceAssetGroup[]
+  groupCategory: SeedanceAssetGroupCategory
   selectedId: string
   isLoading: boolean
   isError: boolean
   isCreating: boolean
   onRetry: () => void
+  onGroupCategoryChange: (category: SeedanceAssetGroupCategory) => void
   onSelect: (group: SeedanceAssetGroup) => void
   onCreate: (name: string) => Promise<boolean>
+  onCreateVerified: () => void
   onEdit: (group: SeedanceAssetGroup) => void
   onDelete: (group: SeedanceAssetGroup) => void
 }) {
   const { t } = useTranslation()
   const [newGroupName, setNewGroupName] = useState('')
+  const aigcGroups = props.groups.filter(
+    (group) => getSeedanceAssetGroupCategory(group.group_type) === 'AIGC'
+  )
+  const humanGroups = props.groups.filter(
+    (group) =>
+      getSeedanceAssetGroupCategory(group.group_type) === 'LivenessFace'
+  )
+  const visibleGroups =
+    props.groupCategory === 'LivenessFace' ? humanGroups : aigcGroups
 
   const submitNewGroup = async () => {
     const name = newGroupName.trim()
@@ -80,33 +98,69 @@ export function AssetGroupSidebar(props: {
         </span>
       </div>
 
-      <div className='flex items-center gap-2'>
-        <Input
-          aria-label={t('New group name')}
-          placeholder={t('New group name')}
-          maxLength={64}
-          value={newGroupName}
-          onChange={(event) => setNewGroupName(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault()
-              void submitNewGroup()
-            }
-          }}
-          className='min-w-0'
-        />
+      <Tabs
+        value={props.groupCategory}
+        onValueChange={(value) => {
+          if (value === 'AIGC' || value === 'LivenessFace') {
+            props.onGroupCategoryChange(value)
+          }
+        }}
+      >
+        <TabsList className='grid w-full grid-cols-2'>
+          <TabsTrigger value='AIGC'>
+            {t('AIGC')}
+            <span className='text-muted-foreground text-xs tabular-nums'>
+              {aigcGroups.length}
+            </span>
+          </TabsTrigger>
+          <TabsTrigger value='LivenessFace'>
+            {t('Human verification')}
+            <span className='text-muted-foreground text-xs tabular-nums'>
+              {humanGroups.length}
+            </span>
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      {props.groupCategory === 'AIGC' ? (
+        <div className='flex items-center gap-2'>
+          <Input
+            aria-label={t('New group name')}
+            placeholder={t('New group name')}
+            maxLength={64}
+            value={newGroupName}
+            onChange={(event) => setNewGroupName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                void submitNewGroup()
+              }
+            }}
+            className='min-w-0'
+          />
+          <Button
+            type='button'
+            size='icon'
+            variant='outline'
+            title={t('Create group')}
+            aria-label={t('Create group')}
+            disabled={!newGroupName.trim() || props.isCreating}
+            onClick={submitNewGroup}
+          >
+            {props.isCreating ? <Loader2 className='animate-spin' /> : <Plus />}
+          </Button>
+        </div>
+      ) : (
         <Button
           type='button'
-          size='icon'
           variant='outline'
-          title={t('Create group')}
-          aria-label={t('Create group')}
-          disabled={!newGroupName.trim() || props.isCreating}
-          onClick={submitNewGroup}
+          className='w-full justify-start'
+          onClick={props.onCreateVerified}
         >
-          {props.isCreating ? <Loader2 className='animate-spin' /> : <Plus />}
+          <ShieldCheck />
+          {t('Create verified human group')}
         </Button>
-      </div>
+      )}
 
       <div className={seedanceAssetLayoutClasses.groupSidebarBody}>
         {props.isLoading ? (
@@ -126,7 +180,7 @@ export function AssetGroupSidebar(props: {
             </Button>
           </div>
         ) : null}
-        {!props.isLoading && !props.isError && props.groups.length === 0 ? (
+        {!props.isLoading && !props.isError && visibleGroups.length === 0 ? (
           <div className='text-muted-foreground flex min-h-0 w-full flex-1 flex-col items-center justify-center gap-3 px-4 text-center'>
             <span className='bg-muted flex size-11 items-center justify-center rounded-full'>
               <FolderOpen className='size-5' aria-hidden='true' />
@@ -136,9 +190,9 @@ export function AssetGroupSidebar(props: {
             </p>
           </div>
         ) : null}
-        {!props.isLoading && !props.isError && props.groups.length > 0 ? (
+        {!props.isLoading && !props.isError && visibleGroups.length > 0 ? (
           <nav className={seedanceAssetLayoutClasses.groupSidebarScroll}>
-            {props.groups.map((group) => {
+            {visibleGroups.map((group) => {
               const selected = group.group_id === props.selectedId
               return (
                 <div

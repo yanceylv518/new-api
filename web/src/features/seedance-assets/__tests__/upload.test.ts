@@ -24,6 +24,7 @@ import {
   SEEDANCE_ASSET_MAX_BYTES,
   getSeedanceAssetType,
   validateSeedanceAssetFile,
+  validateSeedancePortraitFile,
 } from '../lib/upload'
 
 describe('Seedance asset upload validation', () => {
@@ -66,6 +67,39 @@ describe('Seedance asset upload validation', () => {
       valid: false,
       errorKey: 'File exceeds {{limit}}',
       limit: '50.0 MB',
+    })
+  })
+
+  test('accepts the verified portrait formats and rejects other images', () => {
+    for (const extension of ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic']) {
+      assert.deepEqual(
+        validateSeedancePortraitFile(
+          new File(['image'], `portrait.${extension}`, {
+            type: extension === 'heic' ? 'image/heic' : `image/${extension}`,
+          })
+        ),
+        { valid: true, assetType: 'Image' }
+      )
+    }
+    assert.deepEqual(
+      validateSeedancePortraitFile(
+        new File(['image'], 'portrait.bmp', { type: 'image/bmp' })
+      ),
+      { valid: false, errorKey: 'Unsupported file type' }
+    )
+  })
+
+  test('enforces the same 30 MB image limit for verified portraits', () => {
+    const oversized = {
+      name: 'portrait.jpg',
+      type: 'image/jpeg',
+      size: SEEDANCE_ASSET_MAX_BYTES.Image + 1,
+    } as File
+
+    assert.deepEqual(validateSeedancePortraitFile(oversized), {
+      valid: false,
+      errorKey: 'File exceeds {{limit}}',
+      limit: '30.0 MB',
     })
   })
 })

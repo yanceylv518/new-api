@@ -3,14 +3,48 @@ package model
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
+
+func TestSeedanceAssetValidationSessionSchemaMatrix(t *testing.T) {
+	engines := []struct {
+		name string
+		dsn  string
+		open func(string) gorm.Dialector
+	}{
+		{name: "sqlite", dsn: fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_")), open: sqlite.Open},
+		{name: "mysql", dsn: os.Getenv("SEEDANCE_TEST_MYSQL_DSN"), open: mysql.Open},
+		{name: "postgres", dsn: os.Getenv("SEEDANCE_TEST_POSTGRES_DSN"), open: postgres.Open},
+	}
+	for _, engine := range engines {
+		engine := engine
+		t.Run(engine.name, func(t *testing.T) {
+			if engine.dsn == "" {
+				t.Skip("database DSN is unset")
+			}
+			db, err := gorm.Open(engine.open(engine.dsn), &gorm.Config{})
+			require.NoError(t, err)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			connection.SetMaxOpenConns(1)
+			t.Cleanup(func() { _ = connection.Close() })
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetValidationSession{}))
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetValidationSession{}))
+			require.True(t, db.Migrator().HasTable(&SeedanceAssetValidationSession{}))
+			require.True(t, db.Migrator().HasColumn(&SeedanceAssetValidationSession{}, "project_name"))
+			require.True(t, db.Migrator().HasColumn(&SeedanceAssetValidationSession{}, "byted_token_hash"))
+		})
+	}
+}
 
 func TestSeedanceAssetListSummaryTracksUpdatesAndBackfillsExistingRows(t *testing.T) {
 	previousDB := DB
@@ -187,6 +221,78 @@ func TestSeedanceAssetGroupNameIsUniquePerUser(t *testing.T) {
 
 	differentUser := &SeedanceAssetGroup{UserID: 8, ChannelID: 1, GroupID: "group-3", Name: first.Name}
 	require.NoError(t, db.Create(differentUser).Error)
+}
+
+// TestSeedanceAssetValidationSessionPublishesOneGroup 验证认证结果只能发布一次真人素材组，
+// 并且并发轮询通过租约被去重。
+func TestSeedanceAssetValidationSessionPublishesOneGroup(t *testing.T) {
+	previousDB := DB
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetValidationSession{}))
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+		_ = sqlDB.Close()
+	})
+	for index := range 2 {
+		creating := &SeedanceAssetValidationSession{
+			UserID:             9,
+			ChannelID:          2,
+			KeyFingerprint:     "key-fingerprint",
+			AccountFingerprint: "account-fingerprint",
+			Name:               "创建中素材组",
+			CallbackStateHash:  fmt.Sprintf("callback-state-%d", index),
+			Status:             SeedanceAssetValidationStatusCreating,
+			ExpiresAt:          time.Now().Add(time.Hour).Unix(),
+		}
+		require.NoError(t, db.Create(creating).Error)
+	}
+
+	tokenHash := "token-hash"
+	session := &SeedanceAssetValidationSession{
+		UserID:               9,
+		ChannelID:            2,
+		KeyFingerprint:       "key-fingerprint",
+		AccountFingerprint:   "account-fingerprint",
+		Name:                 "真人组",
+		Description:          "经过认证的人物肖像",
+		Tags:                 "演员, 已认证",
+		BytedTokenHash:       &tokenHash,
+		BytedTokenCiphertext: "ciphertext",
+		Status:               SeedanceAssetValidationStatusPending,
+		ExpiresAt:            time.Now().Add(time.Hour).Unix(),
+	}
+	require.NoError(t, db.Create(session).Error)
+	now := time.Now().Unix()
+	leaseUntil := now + 30
+	claimed, err := ClaimSeedanceAssetValidationSession(session.ID, session.UserID, now, leaseUntil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	claimed, err = ClaimSeedanceAssetValidationSession(session.ID, session.UserID, now, leaseUntil)
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	group, err := CompleteSeedanceAssetValidationSession(context.Background(), session.ID, session.UserID, leaseUntil, now, "upstream-group")
+	require.NoError(t, err)
+	require.Equal(t, "LivenessFace", group.GroupType)
+	require.Equal(t, "upstream-group", group.GroupID)
+	require.Equal(t, "经过认证的人物肖像", group.Description)
+	require.Equal(t, "演员, 已认证", group.Tags)
+
+	groupAgain, err := CompleteSeedanceAssetValidationSession(context.Background(), session.ID, session.UserID, leaseUntil, now, "upstream-group")
+	require.NoError(t, err)
+	require.Equal(t, group.ID, groupAgain.ID)
+
+	var saved SeedanceAssetValidationSession
+	require.NoError(t, db.First(&saved, session.ID).Error)
+	require.Equal(t, SeedanceAssetValidationStatusSucceeded, saved.Status)
+	require.Empty(t, saved.BytedTokenCiphertext)
+	require.Equal(t, group.ID, saved.LocalGroupID)
 }
 
 // TestSeedanceAssetReplicaIsScopedToAccount 验证不同目标凭证各有独立映射，创建租约可去重并恢复过期任务。

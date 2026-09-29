@@ -17,6 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 export type SeedanceAssetViewMode = 'grid' | 'list'
+export type SeedanceAssetGroupCategory = 'AIGC' | 'LivenessFace'
+
+// 旧素材组没有 group_type，继续按普通 AIGC 组显示。
+export function getSeedanceAssetGroupCategory(
+  groupType?: string
+): SeedanceAssetGroupCategory {
+  return groupType === 'LivenessFace' ? 'LivenessFace' : 'AIGC'
+}
+
 export type SeedanceAssetTypeFilter = 'all' | 'Image' | 'Video' | 'Audio'
 export type SeedanceAssetStatusFilter =
   | 'all'

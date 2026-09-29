@@ -64,6 +64,306 @@ func TestSeedanceAssetPreviewURLPreservesSourceAfterTerminal(t *testing.T) {
 	require.Equal(t, asset.SourceURL, previewURL)
 }
 
+func TestSeedanceAssetValidationSessionCreatesAndPublishesLocalGroup(t *testing.T) {
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	previousServerAddress := system_setting.ServerAddress
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("Action") {
+		case "CreateVisualValidateSession":
+			_, _ = w.Write([]byte(`{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`))
+		case "GetVisualValidateResult":
+			_, _ = w.Write([]byte(`{"Result":{"GroupId":"group-liveness"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"Result":{"Status":"Active"}}`))
+		}
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		system_setting.ServerAddress = previousServerAddress
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "validation-controller-test-secret"
+	t.Setenv("CRYPTO_SECRET", "validation-controller-test-secret")
+	system_setting.ServerAddress = "http://localhost:3000"
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+
+	createWriter := httptest.NewRecorder()
+	createContext, _ := gin.CreateTestContext(createWriter)
+	createContext.Set("id", 9)
+	createContext.Request = httptest.NewRequest(http.MethodPost, "/api/user/seedance/validation-sessions", strings.NewReader(`{"name":"真人素材组","description":"审核通过后可用","tags":"演员, 已认证"}`))
+	createContext.Request.Header.Set("Content-Type", "application/json")
+	CreateSeedanceAssetValidationSession(createContext)
+	require.Equal(t, http.StatusAccepted, createWriter.Code)
+	var created struct {
+		Success bool
+		Data    service.SeedanceAssetValidationSessionView
+	}
+	require.NoError(t, common.Unmarshal(createWriter.Body.Bytes(), &created))
+	require.True(t, created.Success)
+	require.Equal(t, model.SeedanceAssetValidationStatusPending, created.Data.Status)
+	assert.Equal(t, "真人素材组", created.Data.Name)
+	assert.Equal(t, "审核通过后可用", created.Data.Description)
+	assert.Equal(t, "演员, 已认证", created.Data.Tags)
+
+	getWriter := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getWriter)
+	getContext.Set("id", 9)
+	getContext.Params = gin.Params{{Key: "id", Value: fmt.Sprint(created.Data.ID)}}
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/seedance/validation-sessions/1", nil)
+	GetSeedanceAssetValidationSession(getContext)
+	require.Equal(t, http.StatusOK, getWriter.Code)
+	var refreshed struct {
+		Success bool
+		Data    service.SeedanceAssetValidationSessionView
+	}
+	require.NoError(t, common.Unmarshal(getWriter.Body.Bytes(), &refreshed))
+	require.True(t, refreshed.Success)
+	require.Equal(t, model.SeedanceAssetValidationStatusSucceeded, refreshed.Data.Status)
+	require.Equal(t, "group-liveness", refreshed.Data.GroupID)
+	var group model.SeedanceAssetGroup
+	require.NoError(t, db.Where("user_id = ?", 9).First(&group).Error)
+	assert.Equal(t, "LivenessFace", group.GroupType)
+	assert.Equal(t, "审核通过后可用", group.Description)
+	assert.Equal(t, "演员, 已认证", group.Tags)
+}
+
+func TestSeedanceAssetValidationFallsBackWhenActionIsUnsupported(t *testing.T) {
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	previousServerAddress := system_setting.ServerAddress
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var unsupportedCalls, successfulCalls atomic.Int32
+	unsupportedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		unsupportedCalls.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"unsupported_action","message":"visual validation is not supported"}}`))
+	}))
+	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		successfulCalls.Add(1)
+		if r.URL.Query().Get("Action") != "CreateVisualValidateSession" {
+			t.Fatalf("unexpected action %q", r.URL.Query().Get("Action"))
+		}
+		_, _ = w.Write([]byte(`{"Result":{"BytedToken":"fallback-token","H5Link":"https://example.com/fallback"}}`))
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		system_setting.ServerAddress = previousServerAddress
+		unsupportedServer.Close()
+		successServer.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "validation-fallback-test-secret"
+	t.Setenv("CRYPTO_SECRET", "validation-fallback-test-secret")
+	system_setting.ServerAddress = "http://localhost:3000"
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	firstURL, secondURL := unsupportedServer.URL, successServer.URL
+	require.NoError(t, db.Create([]*model.Channel{
+		{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &firstURL, Status: common.ChannelStatusEnabled},
+		{Id: 2, Type: constant.ChannelTypeDoubaoVideo, Key: "supported-key", BaseURL: &secondURL, Status: common.ChannelStatusEnabled},
+	}).Error)
+
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+	c.Set("id", 9)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/seedance/validation-sessions", strings.NewReader(`{"name":"fallback真人组"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	CreateSeedanceAssetValidationSession(c)
+
+	require.Equal(t, http.StatusAccepted, writer.Code, writer.Body.String())
+	assert.EqualValues(t, 1, unsupportedCalls.Load())
+	assert.EqualValues(t, 1, successfulCalls.Load())
+	var session model.SeedanceAssetValidationSession
+	require.NoError(t, db.First(&session).Error)
+	assert.Equal(t, 2, session.ChannelID)
+	assert.Equal(t, model.SeedanceAssetValidationStatusPending, session.Status)
+}
+
+func TestCreateSeedanceAssetGroupRejectsGroupTypeOverride(t *testing.T) {
+	for _, groupType := range []string{"", "AIGC", "LivenessFace"} {
+		t.Run(groupType, func(t *testing.T) {
+			writer := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(writer)
+			c.Set("id", 9)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/user/seedance/asset-groups",
+				strings.NewReader(fmt.Sprintf(`{"name":"test","GroupType":%q}`, groupType)))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			CreateSeedanceAssetGroup(c)
+
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			require.NoError(t, common.Unmarshal(writer.Body.Bytes(), &response))
+			assert.False(t, response.Success)
+			assert.NotEmpty(t, response.Message)
+		})
+	}
+}
+
+func TestCreateSeedanceAssetGroupCreatesAIGCType(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var upstreamRequest map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := common.DecodeJson(r.Body, &upstreamRequest); err != nil {
+			t.Errorf("decode CreateAssetGroup request: %v", err)
+			return
+		}
+		_, _ = w.Write([]byte(`{"Result":{"Id":"group-aigc"}}`))
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}))
+	channel := &model.Channel{
+		Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key",
+		BaseURL: &server.URL, Status: common.ChannelStatusEnabled,
+	}
+	require.NoError(t, db.Create(channel).Error)
+
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+	c.Set("id", 9)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/seedance/asset-groups",
+		strings.NewReader(`{"name":"AIGC references"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	CreateSeedanceAssetGroup(c)
+
+	require.Equal(t, http.StatusOK, writer.Code, writer.Body.String())
+	assert.Equal(t, map[string]string{"Name": "AIGC references", "GroupType": "AIGC"}, upstreamRequest)
+	var group model.SeedanceAssetGroup
+	require.NoError(t, db.Where("group_id = ?", "group-aigc").First(&group).Error)
+	assert.Equal(t, "AIGC", group.GroupType)
+}
+
+func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var received []map[string]string
+	validationResultCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		received = append(received, body)
+		switch r.URL.Query().Get("Action") {
+		case "CreateVisualValidateSession":
+			_, _ = w.Write([]byte(`{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`))
+		case "GetVisualValidateResult":
+			validationResultCalls++
+			if validationResultCalls == 1 {
+				_, _ = w.Write([]byte(`{"Result":{}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"Result":{"GroupId":"group-liveness"}}`))
+		default:
+			t.Fatalf("unexpected action %q", r.URL.Query().Get("Action"))
+		}
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "validation-official-contract-test-secret"
+	t.Setenv("CRYPTO_SECRET", "validation-official-contract-test-secret")
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+
+	request := func(userID int, query, body string) *httptest.ResponseRecorder {
+		writer := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(writer)
+		c.Set("id", userID)
+		c.Request = httptest.NewRequest(http.MethodPost, "/doubao/v2/assets?"+query, strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		SeedanceAssetV2Action(c)
+		return writer
+	}
+
+	missingCallback := request(9, "Action=CreateVisualValidateSession&Version=2024-01-01", `{}`)
+	assert.Equal(t, http.StatusBadRequest, missingCallback.Code)
+	assert.Empty(t, received)
+
+	missingVersion := request(9, "Action=CreateVisualValidateSession", `{"CallbackURL":"https://example.com/callback"}`)
+	assert.Equal(t, http.StatusBadRequest, missingVersion.Code)
+	assert.Empty(t, received)
+
+	created := request(9, "Action=CreateVisualValidateSession&Version=2024-01-01", `{"CallbackURL":"https://example.com/callback","ProjectName":"project-a"}`)
+	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
+	var createdBody struct {
+		Result struct {
+			BytedToken string `json:"BytedToken"`
+			H5Link     string `json:"H5Link"`
+		} `json:"Result"`
+	}
+	require.NoError(t, common.Unmarshal(created.Body.Bytes(), &createdBody))
+	require.Equal(t, "validation-token", createdBody.Result.BytedToken)
+	require.Equal(t, "https://example.com/validate", createdBody.Result.H5Link)
+	require.Len(t, received, 1)
+	assert.Equal(t, map[string]string{"CallbackURL": "https://example.com/callback", "ProjectName": "project-a"}, received[0])
+
+	pending := request(9, "Action=GetVisualValidateResult&Version=2024-01-01", `{"BytedToken":"validation-token","ProjectName":"project-a"}`)
+	assert.Equal(t, http.StatusBadGateway, pending.Code)
+	var pendingBody struct {
+		ResponseMetadata struct {
+			Error struct {
+				Code string `json:"Code"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	require.NoError(t, common.Unmarshal(pending.Body.Bytes(), &pendingBody))
+	assert.Equal(t, "UpstreamError", pendingBody.ResponseMetadata.Error.Code)
+	require.Len(t, received, 2)
+
+	result := request(9, "Action=GetVisualValidateResult&Version=2024-01-01", `{"BytedToken":"validation-token","ProjectName":"project-a"}`)
+	require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+	var resultBody struct {
+		Result struct {
+			GroupID string `json:"GroupId"`
+		} `json:"Result"`
+	}
+	require.NoError(t, common.Unmarshal(result.Body.Bytes(), &resultBody))
+	assert.Equal(t, "group-liveness", resultBody.Result.GroupID)
+	require.Len(t, received, 3)
+	assert.Equal(t, map[string]string{"BytedToken": "validation-token", "ProjectName": "project-a"}, received[2])
+
+	outsider := request(10, "Action=GetVisualValidateResult&Version=2024-01-01", `{"BytedToken":"validation-token"}`)
+	assert.Equal(t, http.StatusNotFound, outsider.Code)
+	assert.Len(t, received, 3)
+}
+
 // 每个回归用独立内存库与回环上游，避免碰触实际账号、文件或数据库。
 func setupSeedanceControllerRegression(t *testing.T, upstream http.HandlerFunc) (*gorm.DB, *model.SeedanceAssetGroup, *model.SeedanceAsset) {
 	t.Helper()
@@ -205,7 +505,7 @@ func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 		deferred     bool
 	}{
 		{"delete asset", http.MethodDelete, DeleteSeedanceAsset, true},
-		{"delete group", http.MethodDelete, DeleteSeedanceAssetGroup, false},
+		{"delete group", http.MethodDelete, DeleteSeedanceAssetGroup, true},
 		{"rename group", http.MethodPut, UpdateSeedanceAssetGroup, false},
 	} {
 		t.Run(operation.name, func(t *testing.T) {
@@ -218,8 +518,13 @@ func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 				summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
 				require.NoError(t, err)
 				assert.Equal(t, 1, summary.RetryScheduled)
-				require.NoError(t, db.First(asset, asset.ID).Error)
-				assert.Equal(t, "Deleting", asset.Status)
+				if operation.name == "delete asset" {
+					require.NoError(t, db.First(asset, asset.ID).Error)
+					assert.Equal(t, "Deleting", asset.Status)
+				} else {
+					require.NoError(t, db.First(group, group.ID).Error)
+					assert.Equal(t, "Deleting", group.Status)
+				}
 				return
 			}
 			assert.False(t, payload.Success)
@@ -231,7 +536,7 @@ func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 	}
 }
 
-func TestSeedanceDeleteGroupKeepsLibraryAvailableWhenSourceChannelIsDisabled(t *testing.T) {
+func TestSeedanceDeleteGroupQueuesWhenSourceChannelIsDisabled(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	db, group, asset := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -241,12 +546,46 @@ func TestSeedanceDeleteGroupKeepsLibraryAvailableWhenSourceChannelIsDisabled(t *
 		Update("status", common.ChannelStatusManuallyDisabled).Error)
 
 	payload := invokeSeedanceRegression(t, DeleteSeedanceAssetGroup, http.MethodDelete, "/", fmt.Sprint(group.ID), "")
-	assert.False(t, payload.Success)
+	assert.True(t, payload.Success, payload.Message)
 	require.NoError(t, db.First(group, group.ID).Error)
 	require.NoError(t, db.First(asset, asset.ID).Error)
-	assert.Equal(t, "Active", group.Status)
-	assert.Equal(t, "Processing", asset.Status)
+	assert.Equal(t, "Deleting", group.Status)
+	assert.Equal(t, "Deleting", asset.Status)
+	var jobs int64
+	require.NoError(t, db.Model(&model.SeedanceAssetCleanupJob{}).Count(&jobs).Error)
+	assert.EqualValues(t, 1, jobs)
 	assert.Zero(t, upstreamCalls.Load())
+}
+
+// 已经卡在 Deleting 的历史素材组再次发起删除时，必须补建清理任务并最终移除本地记录。
+func TestSeedanceDeletingGroupCanResumeCleanup(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	db, group, asset := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("Action") == "DeleteAssetGroup" {
+			upstreamCalls.Add(1)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	require.NoError(t, db.Model(group).Update("status", "Deleting").Error)
+	require.NoError(t, db.Model(asset).Updates(map[string]any{
+		"status": "Deleting", "status_key": "deleting", "pending_status": true,
+	}).Error)
+
+	payload := invokeSeedanceRegression(t, DeleteSeedanceAssetGroup, http.MethodDelete, "/", fmt.Sprint(group.ID), "")
+	require.True(t, payload.Success, payload.Message)
+	var jobs int64
+	require.NoError(t, db.Model(&model.SeedanceAssetCleanupJob{}).Count(&jobs).Error)
+	assert.EqualValues(t, 1, jobs)
+
+	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
+	assert.EqualValues(t, 1, upstreamCalls.Load())
+	var remaining int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("id = ?", group.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
+	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
 }
 
 func TestSeedanceGroupManagementUsesMatchingEnabledChannelAlias(t *testing.T) {
@@ -289,6 +628,9 @@ func TestSeedanceGroupManagementUsesMatchingEnabledChannelAlias(t *testing.T) {
 
 	deleted := invokeSeedanceRegression(t, DeleteSeedanceAssetGroup, http.MethodDelete, "/", fmt.Sprint(group.ID), "")
 	require.True(t, deleted.Success, deleted.Message)
+	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
 	assert.EqualValues(t, 3, upstreamCalls.Load())
 	var remaining int64
 	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("id = ?", group.ID).Count(&remaining).Error)
@@ -327,6 +669,9 @@ func TestSeedanceCreateCannotOutliveDeletedGroup(t *testing.T) {
 	})
 	payload := invokeSeedanceRegression(t, CreateSeedanceAsset, http.MethodPost, "/", "", `{"group_id":"group-test","source_url":"https://8.8.8.8/file.png","asset_type":"Image","name":"late"}`)
 	assert.False(t, payload.Success)
+	summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
 	var count int64
 	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("group_id = ?", group.GroupID).Count(&count).Error)
 	assert.Zero(t, count)
@@ -451,7 +796,7 @@ func TestSeedancePaginationSearchesBeyondFirstTwoHundredAssets(t *testing.T) {
 	}
 }
 
-func TestUpdateSeedanceAssetGroupDoesNotDeleteStoredAssets(t *testing.T) {
+func TestUpdateSeedanceAssetGroupUpdatesMetadataWithoutDeletingStoredAssets(t *testing.T) {
 	previousDB := model.DB
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -488,7 +833,7 @@ func TestUpdateSeedanceAssetGroupDoesNotDeleteStoredAssets(t *testing.T) {
 	requestContext, _ := gin.CreateTestContext(response)
 	requestContext.Set("id", 9)
 	requestContext.Params = gin.Params{{Key: "id", Value: fmt.Sprint(group.ID)}}
-	requestContext.Request = httptest.NewRequest(http.MethodPut, "/api/user/seedance/asset-groups/1", strings.NewReader(`{"name":"After"}`))
+	requestContext.Request = httptest.NewRequest(http.MethodPut, "/api/user/seedance/asset-groups/1", strings.NewReader(`{"name":"After","description":"Character portrait","tags":"actor, verified"}`))
 	requestContext.Request.Header.Set("Content-Type", "application/json")
 
 	UpdateSeedanceAssetGroup(requestContext)
@@ -500,6 +845,8 @@ func TestUpdateSeedanceAssetGroupDoesNotDeleteStoredAssets(t *testing.T) {
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
 	assert.True(t, payload.Success)
 	assert.Equal(t, "After", payload.Data.Name)
+	assert.Equal(t, "Character portrait", payload.Data.Description)
+	assert.Equal(t, "actor, verified", payload.Data.Tags)
 	assert.Equal(t, "UpdateAssetGroup", upstreamAction)
 	var storedAssetCount int64
 	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).Count(&storedAssetCount).Error)

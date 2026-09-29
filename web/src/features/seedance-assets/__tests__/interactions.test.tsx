@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
   act,
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -40,6 +41,8 @@ import { SeedanceAssets } from '../index'
 const originalAdapter = api.defaults.adapter
 const clients: QueryClient[] = []
 afterEach(() => {
+  cleanup()
+  document.body.style.removeProperty('overflow')
   api.defaults.adapter = originalAdapter
   for (const client of clients) client.clear()
   clients.length = 0
@@ -146,6 +149,262 @@ test('creates, renames, and deletes a group through the library controls', async
   expect(screen.getByRole('button', { name: 'Upload assets' })).toBeDisabled()
 })
 
+test('keeps AIGC and human-verified groups in separate sidebar tabs', async () => {
+  api.defaults.adapter = async (config) => ({
+    data: {
+      success: true,
+      data: config.url?.endsWith('asset-groups')
+        ? [
+            {
+              id: 1,
+              group_id: 'group-aigc',
+              name: 'AIGC references',
+              group_type: 'AIGC',
+            },
+            {
+              id: 2,
+              group_id: 'group-human',
+              name: 'Verified references',
+              group_type: 'LivenessFace',
+            },
+            { id: 3, group_id: 'group-legacy', name: 'Legacy references' },
+          ]
+        : [],
+      total: 0,
+      page: 1,
+      page_size: 24,
+      has_pending: false,
+    },
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    config,
+  })
+  renderLibrary()
+
+  await screen.findByRole('button', { name: 'AIGC references' })
+  expect(
+    screen.getByRole('button', { name: 'Legacy references' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Verified references' })
+  ).not.toBeInTheDocument()
+
+  await userEvent.click(screen.getByRole('tab', { name: /Human verification/ }))
+  expect(
+    await screen.findByRole('button', { name: 'Verified references' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'AIGC references' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Legacy references' })
+  ).not.toBeInTheDocument()
+})
+
+test('completes verified human group setup and uploads its portrait for review', async () => {
+  let sessionPolls = 0
+  let validationRequest: Record<string, string> | null = null
+  let uploadedGroupId = ''
+  const uploadedAsset = {
+    ...firstAsset,
+    id: 12,
+    asset_id: 'portrait-asset',
+    group_id: 'group-human',
+    name: 'portrait.jpg',
+    status: 'Processing',
+  }
+  const verifiedGroup = {
+    id: 22,
+    group_id: 'group-human',
+    name: 'Verified person',
+    description: 'Approved portrait',
+    tags: 'actor, verified',
+    group_type: 'LivenessFace',
+  }
+  api.defaults.adapter = async (config) => {
+    if (config.url?.includes('/validation-sessions')) {
+      if (config.method === 'post') {
+        validationRequest = JSON.parse(String(config.data))
+        return {
+          data: {
+            success: true,
+            data: {
+              id: 11,
+              status: 'Pending',
+              name: 'Verified person',
+              description: 'Approved portrait',
+              tags: 'actor, verified',
+              launch_url: 'https://verify.example/session-11',
+              expires_at: Math.floor(Date.now() / 1000) + 1800,
+              created_at: 1,
+              updated_at: 1,
+            },
+          },
+          status: 202,
+          statusText: 'Accepted',
+          headers: {},
+          config,
+        }
+      }
+      sessionPolls += 1
+      return {
+        data: {
+          success: true,
+          data: {
+            id: 11,
+            status: sessionPolls > 1 ? 'Succeeded' : 'Pending',
+            name: 'Verified person',
+            description: 'Approved portrait',
+            tags: 'actor, verified',
+            launch_url: 'https://verify.example/session-11',
+            group_id: 'group-human',
+            local_group_id: 22,
+            expires_at: Math.floor(Date.now() / 1000) + 1800,
+            created_at: 1,
+            updated_at: 2,
+          },
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      }
+    }
+    if (config.url?.endsWith('/assets/upload')) {
+      const form = config.data as FormData
+      uploadedGroupId = String(form.get('group_id'))
+      return {
+        data: { success: true, data: uploadedAsset },
+        status: 202,
+        statusText: 'Accepted',
+        headers: {},
+        config,
+      }
+    }
+    if (config.url?.endsWith('asset-groups')) {
+      return {
+        data: {
+          success: true,
+          data: sessionPolls > 1 ? [verifiedGroup] : [],
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: uploadedGroupId ? [uploadedAsset] : [],
+        total: uploadedGroupId ? 1 : 0,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  renderLibrary()
+  await screen.findByText('No asset groups yet')
+  await userEvent.click(screen.getByRole('tab', { name: /Human verification/ }))
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Create verified human group' })
+  )
+  const dialog = await screen.findByRole('dialog')
+  await userEvent.type(
+    within(dialog).getByRole('textbox', { name: 'Group name' }),
+    'Verified person'
+  )
+  await userEvent.type(
+    within(dialog).getByRole('textbox', { name: 'Description' }),
+    'Approved portrait'
+  )
+  await userEvent.type(
+    within(dialog).getByRole('textbox', { name: 'Tags' }),
+    'actor, verified'
+  )
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Start verification' })
+  )
+  expect(
+    await within(dialog).findByRole('img', { name: 'Verification QR code' })
+  ).toBeVisible()
+  expect(validationRequest).toEqual({
+    name: 'Verified person',
+    description: 'Approved portrait',
+    tags: 'actor, verified',
+  })
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Check status' })
+  )
+  await within(dialog).findByText('Step 2 of 2: Upload portrait')
+  const portrait = new File(['portrait'], 'portrait.jpg', {
+    type: 'image/jpeg',
+  })
+  await userEvent.upload(
+    within(dialog).getByLabelText('Portrait image'),
+    portrait
+  )
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Upload and start review' })
+  )
+  expect(
+    await screen.findByRole('button', { name: 'Verified person' })
+  ).toBeVisible()
+  expect(await screen.findByRole('img', { name: 'portrait.jpg' })).toBeVisible()
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  expect(uploadedGroupId).toBe('group-human')
+  expect(localStorage.getItem('seedance-assets-human-session:7')).toBeNull()
+})
+
+test('restores an unfinished verification session after the page reloads', async () => {
+  localStorage.setItem('seedance-assets-human-session:7', '11')
+  api.defaults.adapter = async (config) => ({
+    data: {
+      success: true,
+      message: '',
+      data: config.url?.includes('/validation-sessions/')
+        ? {
+            id: 11,
+            status: 'Pending',
+            name: 'Restored person',
+            description: '',
+            tags: '',
+            launch_url: 'https://verify.example/session-11',
+            expires_at: Math.floor(Date.now() / 1000) + 1800,
+            created_at: 1,
+            updated_at: 1,
+          }
+        : [],
+      total: 0,
+      page: 1,
+      page_size: 24,
+      has_pending: false,
+    },
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    config,
+  })
+  renderLibrary()
+
+  const resume = await screen.findByRole('button', {
+    name: 'Continue verification',
+  })
+  await userEvent.click(resume)
+  expect(
+    await screen.findByRole('img', { name: 'Verification QR code' })
+  ).toBeVisible()
+  expect(screen.getByText('Restored person')).toBeVisible()
+})
+
 test('refreshes only the selected asset and keeps sibling preview URLs stable', async () => {
   const requests: string[] = []
   api.defaults.adapter = async (config) => {
@@ -178,7 +437,9 @@ test('refreshes only the selected asset and keeps sibling preview URLs stable', 
   }
   renderLibrary()
   const image = await screen.findByRole('img', { name: 'cover.png' })
+  const siblingImage = await screen.findByRole('img', { name: 'second.png' })
   fireEvent.load(image)
+  fireEvent.load(siblingImage)
   const card = image.closest('[data-slot="card"]')
   expect(card).not.toBeNull()
   if (!card) throw new Error('Missing asset card')
@@ -186,15 +447,47 @@ test('refreshes only the selected asset and keeps sibling preview URLs stable', 
     within(card as HTMLElement).getByRole('button', { name: 'Refresh' })
   )
   await waitFor(() =>
-    expect(requests).toContain('/api/user/seedance/assets/1/refresh')
+    expect(requests.join(', ')).toContain('/api/user/seedance/assets/1/refresh')
   )
   expect(image).toHaveAttribute('src', firstAsset.preview_url)
-  expect(screen.getByRole('img', { name: 'second.png' })).toHaveAttribute(
-    'src',
-    secondAsset.preview_url
-  )
+  expect(
+    await screen.findByRole('img', { name: 'second.png' })
+  ).toHaveAttribute('src', secondAsset.preview_url)
   expect(requests.filter((url) => url.endsWith('/assets'))).toHaveLength(1)
   expect(requests.some((url) => url.endsWith('/2/refresh'))).toBe(false)
+})
+
+test('opens an image preview modal without replacing the library thumbnail', async () => {
+  api.defaults.adapter = async (config) => {
+    const data = config.url?.endsWith('asset-groups')
+      ? {
+          success: true,
+          data: [{ id: 1, group_id: 'group-1', name: 'References' }],
+        }
+      : {
+          success: true,
+          data: [firstAsset],
+          total: 1,
+          page: 1,
+          page_size: 24,
+          has_pending: false,
+        }
+    return { data, status: 200, statusText: 'OK', headers: {}, config }
+  }
+  renderLibrary()
+  const thumbnail = await screen.findByRole('img', { name: 'cover.png' })
+  fireEvent.load(thumbnail)
+
+  await userEvent.click(screen.getByRole('button', { name: 'Preview' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(
+    within(dialog).getByRole('img', { name: 'cover.png' })
+  ).toHaveAttribute('src', firstAsset.preview_url)
+  expect(screen.getByRole('img', { name: 'cover.png' })).toBeInTheDocument()
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
 })
 
 test('selects the visible assets and deletes them with one batch request', async () => {
@@ -468,9 +761,9 @@ test('keeps an active upload visible when switching asset groups', async () => {
   expect(queue).toHaveTextContent('0%')
 
   view.rerender(renderPanel('group-2', 'Generated'))
-  expect(screen.getByRole('region', { name: 'Upload queue' })).toHaveTextContent(
-    'References'
-  )
+  expect(
+    screen.getByRole('region', { name: 'Upload queue' })
+  ).toHaveTextContent('References')
 
   await act(async () => {
     if (resolveUpload && activeResponse) resolveUpload(activeResponse)

@@ -38,6 +38,8 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'API URL',
   'API2GPT',
   'AccessKey / SecretAccessKey',
+  'AccessKey ID',
+  'AccessKey Secret',
   'AZURE_OPENAI_ENDPOINT *',
   'Baidu V2',
   'CC Switch',
@@ -82,10 +84,13 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'QuantumNous',
   'Quota:',
   'Replicate',
+  'Responses WebSocket',
   'SiliconFlow',
   'Stripe',
   'Submodel',
   'SunoAPI',
+  'H3-Context-IR',
+  'SGLang',
   'Telegram',
   'Tencent',
   'TTFT P50',
@@ -105,6 +110,8 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'Worker URL',
   'Xinference',
   'Xunfei',
+  'vLLM',
+  'Zhipu GLM',
   'Zhipu V4',
   '"default": "us-central1", "claude-3-5-sonnet-20240620": "europe-west1"',
   'edit_this',
@@ -231,8 +238,9 @@ function isLikelyUntranslated({ locale, baseValue, value }) {
   if (locale === 'ru') return true
 
   // For fr/vi: still useful but noisier; keep it conservative.
-  if (locale === 'fr' || locale === 'vi')
+  if (locale === 'fr' || locale === 'vi') {
     return /\b(the|and|or|to|with|please)\b/i.test(s)
+  }
 
   return false
 }

@@ -12,14 +12,16 @@ import (
 
 // SeedanceAssetGroup 保存用户在火山方舟 Seedance 素材库中的本地授权映射。
 type SeedanceAssetGroup struct {
-	ID         uint    `gorm:"primaryKey" json:"id"`
-	UserID     int     `gorm:"index;not null;index:idx_seedance_asset_group_user_group,priority:1;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:1" json:"user_id"`
-	ChannelID  int     `gorm:"index;not null" json:"channel_id"`
-	GroupID    string  `gorm:"size:128;not null;index:idx_seedance_asset_group_user_group,priority:2" json:"group_id"`
-	AssetCount *int64  `gorm:"column:asset_count" json:"-"`
-	Name       string  `gorm:"size:64;not null" json:"name"`
-	GroupType  string  `gorm:"size:128" json:"group_type,omitempty"`
-	NameKey    *string `gorm:"size:64;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:2" json:"-"`
+	ID          uint    `gorm:"primaryKey" json:"id"`
+	UserID      int     `gorm:"index;not null;index:idx_seedance_asset_group_user_group,priority:1;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:1" json:"user_id"`
+	ChannelID   int     `gorm:"index;not null" json:"channel_id"`
+	GroupID     string  `gorm:"size:128;not null;index:idx_seedance_asset_group_user_group,priority:2" json:"group_id"`
+	AssetCount  *int64  `gorm:"column:asset_count" json:"-"`
+	Name        string  `gorm:"size:64;not null" json:"name"`
+	Description string  `gorm:"type:text" json:"description,omitempty"`
+	Tags        string  `gorm:"size:512" json:"tags,omitempty"`
+	GroupType   string  `gorm:"size:128" json:"group_type,omitempty"`
+	NameKey     *string `gorm:"size:64;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:2" json:"-"`
 	// 删除状态先持久化，阻止在途上传在分组清理后重新入库。
 	Status             string    `gorm:"size:16;not null;default:Active" json:"status"`
 	UpstreamDeletedAt  int64     `gorm:"not null;default:0" json:"-"`

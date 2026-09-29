@@ -32,6 +32,16 @@ import (
 // 测试专用 CA 只在显式 fallback 模式启用，仍执行证书验证，不修改系统信任库。
 var seedanceTestRootsOnce sync.Once
 
+func TestSeedanceAssetValidationActionUsesDoubaoNamespace(t *testing.T) {
+	router := gin.New()
+	setSeedanceAssetValidationActionRoute(router)
+
+	routes := router.Routes()
+	require.Len(t, routes, 1)
+	assert.Equal(t, http.MethodPost, routes[0].Method)
+	assert.Equal(t, "/doubao/v2/assets", routes[0].Path)
+}
+
 // TestSeedanceAssetAPIKeysSharedLibrary 通过真实 TokenAuth 和生产路由验证用户级
 // 共享、跨用户隔离、失效凭证及建组模型权限；仅替换付费上游，不调用真实云服务。
 func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
@@ -81,7 +91,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				common.IsMasterNode = previousMaster
 				assert.NoError(t, connection.Close())
 			})
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
 			users := []model.User{{Id: 85001, Username: "assetsowner", AffCode: "assetsowner", Group: "default", Status: common.UserStatusEnabled}, {Id: 85002, Username: "assetsother", AffCode: "assetsother", Group: "default", Status: common.UserStatusEnabled}}
 			// 不同引擎使用不同用户，避免进程级限流跨测试累计。
 			for i := range users {
@@ -141,9 +151,9 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				assert.Equal(t, 401, request(key, "GET", "/asset-groups", "").Code)
 			}
 			assert.Equal(t, 403, request("assetkeyip", "GET", "/asset-groups", "").Code)
-			created := request("assetkeytwo", "POST", "/asset-groups", `{"name":"API素材组","model":"doubao-seedance-2-0-fast-260128","GroupType":"LivenessFace","user_id":85002}`)
+			created := request("assetkeytwo", "POST", "/asset-groups", `{"name":"API素材组","model":"doubao-seedance-2-0-fast-260128","user_id":85002}`)
 			require.Contains(t, created.Body.String(), `"success":true`)
-			assert.Equal(t, "LivenessFace", createdGroupType)
+			assert.Equal(t, "AIGC", createdGroupType)
 			var group model.SeedanceAssetGroup
 			require.NoError(t, db.First(&group).Error)
 			assert.Equal(t, users[0].Id, group.UserID)

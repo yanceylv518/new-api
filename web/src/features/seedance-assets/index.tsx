@@ -28,15 +28,18 @@ import {
   useDataTableViewMode,
 } from '@/components/data-table/hooks/use-data-table-view-mode'
 import { Main } from '@/components/layout'
+import { Button } from '@/components/ui/button'
 import { useDebounce } from '@/hooks/use-debounce'
 import { handleServerError } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
   createSeedanceAssetGroup,
+  createSeedanceAssetValidationSession,
   batchDeleteSeedanceAssets,
   deleteSeedanceAsset,
   deleteSeedanceAssetGroup,
+  getSeedanceAssetValidationSession,
   listSeedanceAssetGroups,
   listSeedanceAssets,
   refreshSeedanceAsset,
@@ -52,12 +55,15 @@ import {
 import { AssetGroupSidebar } from './components/asset-group-sidebar'
 import { AssetLibraryView } from './components/asset-library-view'
 import { AssetUploadPanel } from './components/asset-upload-panel'
+import { CreateHumanValidationDialog } from './components/create-human-validation-dialog'
 import { seedanceAssetLayoutClasses } from './layout'
 import { updateSeedanceAssetInList } from './lib/cache'
-import type {
-  SeedanceAssetStatusFilter,
-  SeedanceAssetTypeFilter,
-  SeedanceAssetViewMode,
+import {
+  getSeedanceAssetGroupCategory,
+  type SeedanceAssetGroupCategory,
+  type SeedanceAssetStatusFilter,
+  type SeedanceAssetTypeFilter,
+  type SeedanceAssetViewMode,
 } from './types'
 
 const SEEDANCE_ASSETS_VIEW_MODE_KEY = 'seedance-assets-view-mode'
@@ -68,6 +74,11 @@ export function SeedanceAssets() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const userId = useAuthStore((state) => state.auth.user?.id)
+  const validationSessionStorageKey = userId
+    ? `seedance-assets-human-session:${userId}`
+    : ''
+  const [groupCategory, setGroupCategory] =
+    useState<SeedanceAssetGroupCategory>('AIGC')
   const [selectedGroupId, setSelectedGroupId] = useState('')
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebounce(search, 300)
@@ -76,6 +87,11 @@ export function SeedanceAssets() {
   const [statusFilter, setStatusFilter] =
     useState<SeedanceAssetStatusFilter>('all')
   const [editGroup, setEditGroup] = useState<SeedanceAssetGroup | null>(null)
+  const [createValidationDialogOpen, setCreateValidationDialogOpen] =
+    useState(false)
+  const [validationSessionId, setValidationSessionId] = useState<number | null>(
+    null
+  )
   const [deleteGroup, setDeleteGroup] = useState<SeedanceAssetGroup | null>(
     null
   )
@@ -89,6 +105,23 @@ export function SeedanceAssets() {
     defaultMode: DATA_TABLE_VIEW_MODES.CARD,
   })
 
+  useEffect(() => {
+    if (!validationSessionStorageKey) {
+      setValidationSessionId(null)
+      return
+    }
+    try {
+      const storedId = Number(
+        window.localStorage.getItem(validationSessionStorageKey)
+      )
+      setValidationSessionId(
+        Number.isSafeInteger(storedId) && storedId > 0 ? storedId : null
+      )
+    } catch {
+      setValidationSessionId(null)
+    }
+  }, [validationSessionStorageKey])
+
   const groups = useQuery({
     queryKey: ['seedance-asset-groups', userId],
     queryFn: ({ signal }) => listSeedanceAssetGroups(signal),
@@ -97,9 +130,28 @@ export function SeedanceAssets() {
         ? 5000
         : false,
   })
+  const validationSession = useQuery({
+    queryKey: [
+      'seedance-asset-validation-session',
+      userId,
+      validationSessionId,
+    ],
+    queryFn: () =>
+      getSeedanceAssetValidationSession(validationSessionId as number),
+    enabled: validationSessionId !== null,
+    refetchInterval: (query) => {
+      if (!createValidationDialogOpen) return false
+      const status = query.state.data?.data.status
+      return status === 'Creating' || status === 'Pending' ? 5000 : false
+    },
+  })
+  const allGroups = groups.data?.data ?? []
+  const visibleGroups = allGroups.filter(
+    (group) => getSeedanceAssetGroupCategory(group.group_type) === groupCategory
+  )
   const selectedGroup =
-    groups.data?.data.find((group) => group.group_id === selectedGroupId) ??
-    groups.data?.data[0]
+    visibleGroups.find((group) => group.group_id === selectedGroupId) ??
+    visibleGroups[0]
   const selectedId = selectedGroup?.group_id ?? ''
   const canUpload = Boolean(selectedId) && selectedGroup?.status !== 'Deleting'
   const filters = {
@@ -155,6 +207,7 @@ export function SeedanceAssets() {
   const createGroupMutation = useMutation({
     mutationFn: createSeedanceAssetGroup,
     onSuccess: (response) => {
+      setGroupCategory('AIGC')
       setSelectedGroupId(response.data.group_id)
       setPage(1)
       void invalidate()
@@ -163,9 +216,35 @@ export function SeedanceAssets() {
     // mutation 的后续参数是业务变量和上下文，不能传给错误处理器作为提示文案。
     onError: (error) => handleServerError(error),
   })
+  const createValidationMutation = useMutation({
+    mutationFn: (details: {
+      name: string
+      description: string
+      tags: string
+    }) => createSeedanceAssetValidationSession(details),
+    onSuccess: (response) => {
+      setValidationSessionId(response.data.id)
+      if (validationSessionStorageKey) {
+        try {
+          window.localStorage.setItem(
+            validationSessionStorageKey,
+            String(response.data.id)
+          )
+        } catch {
+          // 服务端仍保存会话状态，本页内可继续完成流程。
+        }
+      }
+      toast.success(t('Verification session created'))
+    },
+    onError: (error) => handleServerError(error),
+  })
   const updateGroupMutation = useMutation({
-    mutationFn: (payload: { id: number; name: string }) =>
-      updateSeedanceAssetGroup(payload.id, payload.name),
+    mutationFn: (payload: {
+      id: number
+      name: string
+      description: string
+      tags: string
+    }) => updateSeedanceAssetGroup(payload.id, payload),
     onSuccess: (response) => {
       setSelectedGroupId(response.data.group_id)
       setEditGroup(null)
@@ -257,6 +336,28 @@ export function SeedanceAssets() {
     },
   })
 
+  const validationStatus = validationSession.data?.data.status
+  useEffect(() => {
+    if (validationStatus === 'Succeeded') {
+      setGroupCategory('LivenessFace')
+      if (validationSession.data?.data.group_id) {
+        setSelectedGroupId(validationSession.data.data.group_id)
+      }
+      void queryClient.invalidateQueries({
+        queryKey: ['seedance-asset-groups', userId],
+      })
+      toast.success(
+        t('Identity verified. Upload a matching portrait to finish setup.')
+      )
+    }
+  }, [
+    queryClient,
+    t,
+    userId,
+    validationSession.data?.data.group_id,
+    validationStatus,
+  ])
+
   const allAssets = assets.data?.data ?? EMPTY_SEEDANCE_ASSETS
   // 服务端在完整素材集合上执行搜索和筛选，页面只渲染当前页。
   const rows = allAssets
@@ -265,6 +366,64 @@ export function SeedanceAssets() {
     storedViewMode === 'card' ? 'grid' : 'list'
   const setViewMode = (mode: SeedanceAssetViewMode) => {
     setStoredViewMode(mode === 'grid' ? 'card' : 'table')
+  }
+  const resumableSession = validationSession.data?.data
+  let resumeMessage = t('Character setup is unfinished')
+  let resumeAction = t('Continue verification')
+  if (resumableSession?.status === 'Succeeded') {
+    resumeMessage = t('Portrait upload is still needed')
+    resumeAction = t('Continue portrait upload')
+  } else if (
+    resumableSession?.status === 'Failed' ||
+    resumableSession?.status === 'Expired'
+  ) {
+    resumeAction = t('Review verification status')
+  }
+
+  const finishHumanPortraitUpload = async (asset: SeedanceAsset) => {
+    setGroupCategory('LivenessFace')
+    setSelectedGroupId(asset.group_id)
+    setPage(1)
+    clearAssetSelection()
+    await invalidate()
+    if (validationSessionStorageKey) {
+      try {
+        window.localStorage.removeItem(validationSessionStorageKey)
+      } catch {
+        // 会话已完成，存储异常不应阻止素材展示。
+      }
+    }
+    setValidationSessionId(null)
+    setCreateValidationDialogOpen(false)
+    toast.success(t('Portrait uploaded for review'))
+  }
+
+  const clearValidationSession = () => {
+    if (validationSessionStorageKey) {
+      try {
+        window.localStorage.removeItem(validationSessionStorageKey)
+      } catch {
+        // 存储不可用时仍清除页面内的会话状态。
+      }
+    }
+    setValidationSessionId(null)
+    queryClient.removeQueries({
+      queryKey: ['seedance-asset-validation-session', userId],
+    })
+    createValidationMutation.reset()
+  }
+
+  const handleGroupCategoryChange = (category: SeedanceAssetGroupCategory) => {
+    setGroupCategory(category)
+    const nextGroup = allGroups.find(
+      (group) => getSeedanceAssetGroupCategory(group.group_type) === category
+    )
+    setSelectedGroupId(nextGroup?.group_id ?? '')
+    setSearch('')
+    setTypeFilter('all')
+    setStatusFilter('all')
+    setPage(1)
+    clearAssetSelection()
   }
 
   return (
@@ -287,16 +446,40 @@ export function SeedanceAssets() {
           <span className='text-muted-foreground text-xs'>Seedance</span>
         </header>
 
+        {!createValidationDialogOpen && resumableSession ? (
+          <div
+            role='status'
+            className='flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3 sm:px-6'
+          >
+            <div className='min-w-0'>
+              <p className='text-sm font-medium'>{resumeMessage}</p>
+              <p className='text-muted-foreground truncate text-xs'>
+                {resumableSession.name}
+              </p>
+            </div>
+            <Button
+              type='button'
+              variant='outline'
+              onClick={() => setCreateValidationDialogOpen(true)}
+            >
+              {resumeAction}
+            </Button>
+          </div>
+        ) : null}
+
         <div className={seedanceAssetLayoutClasses.content}>
           <AssetGroupSidebar
-            groups={groups.data?.data ?? []}
+            groups={allGroups}
+            groupCategory={groupCategory}
             selectedId={selectedId}
             isLoading={groups.isPending}
             isError={groups.isError}
             isCreating={createGroupMutation.isPending}
             onRetry={() => void groups.refetch()}
+            onGroupCategoryChange={handleGroupCategoryChange}
             onSelect={(group) => {
               clearAssetSelection()
+              setGroupCategory(getSeedanceAssetGroupCategory(group.group_type))
               setSelectedGroupId(group.group_id)
               setSearch('')
               setTypeFilter('all')
@@ -310,6 +493,9 @@ export function SeedanceAssets() {
               } catch {
                 return false
               }
+            }}
+            onCreateVerified={() => {
+              setCreateValidationDialogOpen(true)
             }}
             onEdit={setEditGroup}
             onDelete={setDeleteGroup}
@@ -414,6 +600,19 @@ export function SeedanceAssets() {
         </div>
       </div>
 
+      <CreateHumanValidationDialog
+        open={createValidationDialogOpen}
+        isPending={createValidationMutation.isPending}
+        isChecking={validationSession.isFetching}
+        session={validationSession.data?.data ?? null}
+        onOpenChange={(open) => {
+          setCreateValidationDialogOpen(open)
+        }}
+        onSubmit={(details) => createValidationMutation.mutate(details)}
+        onCheckStatus={() => void validationSession.refetch()}
+        onStartOver={clearValidationSession}
+        onPortraitUploaded={finishHumanPortraitUpload}
+      />
       <EditAssetGroupDialog
         group={editGroup}
         open={Boolean(editGroup)}
@@ -421,9 +620,9 @@ export function SeedanceAssets() {
         onOpenChange={(open) => {
           if (!open) setEditGroup(null)
         }}
-        onSubmit={(name) => {
+        onSubmit={(details) => {
           if (editGroup) {
-            updateGroupMutation.mutate({ id: editGroup.id, name })
+            updateGroupMutation.mutate({ id: editGroup.id, ...details })
           }
         }}
       />

@@ -98,6 +98,21 @@ func NewSeedanceAssetDeleteCleanupJobs(asset *model.SeedanceAsset, replicas []mo
 	return jobs
 }
 
+// NewSeedanceAssetGroupDeleteCleanupJob 为素材组删除生成稳定的去重任务。
+func NewSeedanceAssetGroupDeleteCleanupJob(group *model.SeedanceAssetGroup) model.SeedanceAssetCleanupJob {
+	if group == nil {
+		return model.SeedanceAssetCleanupJob{}
+	}
+	return model.SeedanceAssetCleanupJob{
+		Kind:          model.SeedanceAssetCleanupKindGroupDelete,
+		UserID:        group.UserID,
+		LocalGroupID:  group.ID,
+		DedupKey:      model.SeedanceAssetGroupDeletionDedupKey(group.UserID, group.ID),
+		Status:        model.SeedanceAssetCleanupStatusPending,
+		NextAttemptAt: common.GetTimestamp(),
+	}
+}
+
 // queueSeedanceAssetUpstreamCleanup 记录上游资源清理失败，客户端恢复后由后台任务继续处理。
 func queueSeedanceAssetUpstreamCleanup(kind string, client *SeedanceAssetClient, upstreamID string) error {
 	if client == nil || strings.TrimSpace(upstreamID) == "" {
@@ -267,6 +282,127 @@ func processSeedanceAssetCleanupJob(ctx context.Context, job *model.SeedanceAsse
 	return result
 }
 
+// executeSeedanceAssetGroupCleanup 删除素材组的所有上游副本，再清理本地素材和 OSS。
+// 每个阶段都把完成状态写回数据库，失败重试时只会继续处理未完成的资源。
+func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAssetCleanupJob) error {
+	var group model.SeedanceAssetGroup
+	if err := model.DB.WithContext(ctx).
+		Where("id = ? AND user_id = ?", job.LocalGroupID, job.UserID).
+		First(&group).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	if group.Status != "Deleting" {
+		return errors.New("Seedance asset group is not marked for deletion")
+	}
+
+	if group.UpstreamDeletedAt == 0 && strings.TrimSpace(group.GroupID) != "" {
+		client, err := ResolveSeedanceAssetClient(ctx, group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
+		if err != nil {
+			return err
+		}
+		if err := client.DeleteSeedanceAssetGroup(ctx, group.GroupID); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroup{}).
+			Where("id = ? AND user_id = ? AND status = ? AND upstream_deleted_at = 0", group.ID, group.UserID, "Deleting").
+			Update("upstream_deleted_at", common.GetTimestamp()).Error; err != nil {
+			return err
+		}
+	}
+
+	replicas, err := model.FindSeedanceAssetGroupReplicas(ctx, group.UserID, group.ID)
+	if err != nil {
+		return err
+	}
+	for index := range replicas {
+		replica := &replicas[index]
+		if strings.TrimSpace(replica.UpstreamGroupID) == "" || replica.UpstreamDeletedAt != 0 {
+			continue
+		}
+		client, err := ResolveSeedanceAssetClient(ctx, replica.ChannelID, replica.KeyFingerprint, replica.AccountFingerprint)
+		if err != nil {
+			return err
+		}
+		if err := client.DeleteSeedanceAssetGroup(ctx, replica.UpstreamGroupID); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroupReplica{}).
+			Where("id = ? AND user_id = ? AND local_group_id = ? AND upstream_deleted_at = 0", replica.ID, replica.UserID, replica.LocalGroupID).
+			Update("upstream_deleted_at", common.GetTimestamp()).Error; err != nil {
+			return err
+		}
+	}
+
+	if err := cleanupSeedanceAssetGroupLocalAssets(ctx, group.UserID, group.GroupID); err != nil {
+		return err
+	}
+	return model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ? AND local_group_id = ? AND status = ?", group.UserID, group.ID, "Deleting").
+			Delete(&model.SeedanceAssetGroupReplica{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("user_id = ? AND id = ? AND status = ?", group.UserID, group.ID, "Deleting").
+			Delete(&model.SeedanceAssetGroup{}).Error
+	})
+}
+
+// cleanupSeedanceAssetGroupLocalAssets 删除组内 OSS 对象和本地素材映射。
+func cleanupSeedanceAssetGroupLocalAssets(ctx context.Context, userID int, groupID string) error {
+	for {
+		var assets []model.SeedanceAsset
+		if err := model.DB.WithContext(ctx).
+			Where("user_id = ? AND group_id = ?", userID, groupID).
+			Order("id asc").Limit(seedanceAssetCleanupBatchSize).Find(&assets).Error; err != nil {
+			return err
+		}
+		if len(assets) == 0 {
+			return nil
+		}
+
+		jobs := make(chan *model.SeedanceAsset, len(assets))
+		results := make(chan error, len(assets))
+		for index := range assets {
+			jobs <- &assets[index]
+		}
+		close(jobs)
+		workerSize := min(seedanceAssetCleanupWorkerSize, len(assets))
+		var workers sync.WaitGroup
+		workers.Add(workerSize)
+		for range workerSize {
+			go func() {
+				defer workers.Done()
+				for asset := range jobs {
+					if err := RemoveSeedanceAssetObject(ctx, asset.ObjectKey, asset.Storage); err != nil {
+						results <- err
+						continue
+					}
+					if err := model.DB.WithContext(ctx).
+						Where("user_id = ? AND local_asset_id = ?", asset.UserID, asset.ID).
+						Delete(&model.SeedanceAssetReplica{}).Error; err != nil {
+						results <- err
+						continue
+					}
+					results <- model.DeleteSeedanceAssetWithCount(ctx, asset.UserID, asset.ID, "Deleting")
+				}
+			}()
+		}
+		workers.Wait()
+		close(results)
+		var firstErr error
+		for err := range results {
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if firstErr != nil {
+			return firstErr
+		}
+	}
+}
+
 // executeSeedanceAssetCleanup 执行单个清理目标；每次外部操作都有独立的有界超时。
 func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCleanupJob) error {
 	if job == nil {
@@ -276,6 +412,8 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 	defer cancel()
 
 	switch job.Kind {
+	case model.SeedanceAssetCleanupKindGroupDelete:
+		return executeSeedanceAssetGroupCleanup(operationCtx, job)
 	case model.SeedanceAssetCleanupKindUpstreamAsset, model.SeedanceAssetCleanupKindUpstreamGroup, model.SeedanceAssetCleanupKindAssetDelete, model.SeedanceAssetCleanupKindReplicaDelete:
 		needsUpstreamDelete := strings.TrimSpace(job.UpstreamID) != "" &&
 			((job.Kind != model.SeedanceAssetCleanupKindAssetDelete && job.Kind != model.SeedanceAssetCleanupKindReplicaDelete) || job.UpstreamDoneAt == 0)

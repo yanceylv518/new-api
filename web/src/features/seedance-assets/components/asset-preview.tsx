@@ -20,6 +20,8 @@ import { File, Film, Image, Music2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { Dialog } from '@/components/dialog'
+
 import type { SeedanceAsset } from '../api'
 import { retainSeedanceAssetPreview } from '../lib/preview'
 import { getSeedanceAssetTypeLabel } from '../lib/upload'
@@ -176,5 +178,37 @@ export function AssetPreview(props: {
         {t(getSeedanceAssetTypeLabel(props.asset.asset_type))}
       </span>
     </div>
+  )
+}
+
+export function AssetPreviewDialog(props: {
+  asset: SeedanceAsset | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onUnavailable?: () => void
+}) {
+  const { t } = useTranslation()
+  const asset = props.asset
+
+  return (
+    <Dialog
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      title={t('Preview')}
+      description={asset?.name || asset?.asset_id}
+      contentClassName='bg-background/95 w-[calc(100%-1rem)] max-w-5xl p-3 sm:p-5'
+      bodyClassName='p-0'
+      bodyWrapperClassName='overflow-hidden'
+    >
+      {asset ? (
+        <div className='bg-muted/40 flex max-h-[78dvh] min-h-56 items-center justify-center overflow-hidden rounded-lg p-2 sm:p-4'>
+          <AssetPreview
+            asset={asset}
+            className='max-h-[72dvh] max-w-full object-contain'
+            onUnavailable={props.onUnavailable}
+          />
+        </div>
+      ) : null}
+    </Dialog>
   )
 }

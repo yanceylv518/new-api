@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { RefreshCw, Trash2 } from 'lucide-react'
+import { Maximize2, RefreshCw, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
@@ -36,12 +36,51 @@ type AssetItemProps = {
   mode: 'grid' | 'list'
   onRefresh: (asset: SeedanceAsset) => void
   onDelete: (asset: SeedanceAsset) => void
+  onPreview: (asset: SeedanceAsset) => void
   onSelectionChange: (asset: SeedanceAsset, selected: boolean) => void
   selected: boolean
   selectionDisabled?: boolean
   isBatchDeleting?: boolean
   isRefreshing?: boolean
   isDeleting?: boolean
+}
+
+function AssetPreviewSurface(props: {
+  asset: SeedanceAsset
+  className: string
+  showAudioControls?: boolean
+  onRefresh: () => void
+  onPreview: () => void
+}) {
+  const { t } = useTranslation()
+  const canPreview =
+    props.asset.asset_type.toLowerCase() === 'image' &&
+    Boolean(props.asset.preview_url?.trim())
+  const preview = (
+    <AssetPreview
+      asset={props.asset}
+      className={props.className}
+      showAudioControls={props.showAudioControls}
+      onUnavailable={props.onRefresh}
+    />
+  )
+
+  if (!canPreview) return preview
+
+  return (
+    <button
+      type='button'
+      className='group/preview relative block h-full w-full cursor-zoom-in overflow-hidden'
+      title={t('Preview')}
+      aria-label={t('Preview')}
+      onClick={props.onPreview}
+    >
+      {preview}
+      <span className='bg-background/80 text-foreground pointer-events-none absolute right-2 bottom-2 flex size-7 items-center justify-center rounded-md opacity-0 shadow-sm transition-opacity group-hover/preview:opacity-100'>
+        <Maximize2 className='size-4' aria-hidden='true' />
+      </span>
+    </button>
+  )
 }
 
 // 操作按钮在列表和卡片视图共用，避免不同视图产生不一致的行为。
@@ -76,9 +115,7 @@ function AssetActions(props: AssetItemProps) {
         title={t('Delete')}
         aria-label={t('Delete')}
         disabled={
-          props.isDeleting ||
-          props.isRefreshing ||
-          props.isBatchDeleting
+          props.isDeleting || props.isRefreshing || props.isBatchDeleting
         }
         onClick={() => props.onDelete(props.asset)}
       >
@@ -113,11 +150,12 @@ export function AssetItem(props: AssetItemProps) {
           })}
         />
         <div className='bg-muted flex aspect-video size-16 shrink-0 items-center justify-center overflow-hidden rounded-lg sm:size-20'>
-          <AssetPreview
+          <AssetPreviewSurface
             asset={props.asset}
             className='h-full w-full object-cover'
             showAudioControls={false}
-            onUnavailable={() => props.onRefresh(props.asset)}
+            onRefresh={() => props.onRefresh(props.asset)}
+            onPreview={() => props.onPreview(props.asset)}
           />
         </div>
         <div className='min-w-0 flex-1'>
@@ -166,11 +204,12 @@ export function AssetItem(props: AssetItemProps) {
         })}
       />
       <div className='bg-muted aspect-video w-full overflow-hidden'>
-        <AssetPreview
+        <AssetPreviewSurface
           asset={props.asset}
           className='h-full w-full object-cover'
           showAudioControls
-          onUnavailable={() => props.onRefresh(props.asset)}
+          onRefresh={() => props.onRefresh(props.asset)}
+          onPreview={() => props.onPreview(props.asset)}
         />
       </div>
       <CardContent className='min-w-0 space-y-3 p-4'>

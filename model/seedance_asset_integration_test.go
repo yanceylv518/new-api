@@ -86,6 +86,20 @@ func TestSeedanceAssetDatabaseLifecycle(t *testing.T) {
 			assert.Equal(t, "Active", stored.Status)
 			// 删除意图落库后，在途上传不能再产生孤儿记录。
 			require.NoError(t, db.Model(&group).Update("status", "Deleting").Error)
+			deletionJob := SeedanceAssetCleanupJob{
+				Kind:          SeedanceAssetCleanupKindGroupDelete,
+				UserID:        group.UserID,
+				LocalGroupID:  group.ID,
+				DedupKey:      "seedance-group-delete-integration",
+				Status:        SeedanceAssetCleanupStatusPending,
+				NextAttemptAt: time.Now().Unix(),
+			}
+			require.NoError(t, QueueSeedanceAssetGroupDeletion(context.Background(), deletionJob))
+			require.NoError(t, QueueSeedanceAssetGroupDeletion(context.Background(), deletionJob))
+			var deletionJobs []SeedanceAssetCleanupJob
+			require.NoError(t, db.Where("dedup_key = ?", deletionJob.DedupKey).Find(&deletionJobs).Error)
+			require.Len(t, deletionJobs, 1)
+			assert.Equal(t, SeedanceAssetCleanupKindGroupDelete, deletionJobs[0].Kind)
 			late := asset
 			late.ID, late.AssetID = 0, "late-asset"
 			assert.Error(t, CreateSeedanceAssetInGroup(context.Background(), &late))

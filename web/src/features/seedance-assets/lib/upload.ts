@@ -17,6 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 export const SEEDANCE_ASSET_ACCEPT = 'image/*,video/*,audio/*'
+export const SEEDANCE_PORTRAIT_ACCEPT =
+  '.jpg,.jpeg,.png,.webp,.gif,.heic,image/jpeg,image/png,image/webp,image/gif,image/heic'
 
 export const SEEDANCE_ASSET_MAX_BYTES = {
   Image: 30 * 1024 * 1024,
@@ -50,6 +52,15 @@ const extensionTypeMap: Record<string, SeedanceAssetType> = {
   webm: 'Video',
   webp: 'Image',
 }
+
+const portraitExtensions = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'heic',
+])
 
 export type SeedanceAssetFileValidation =
   | { valid: true; assetType: SeedanceAssetType }
@@ -94,6 +105,19 @@ export function validateSeedanceAssetFile(
     }
   }
   return { valid: true, assetType }
+}
+
+export function validateSeedancePortraitFile(
+  file: File
+): SeedanceAssetFileValidation {
+  const extension = file.name.toLowerCase().split('.').pop() ?? ''
+  if (
+    !portraitExtensions.has(extension) ||
+    getSeedanceAssetType(file) !== 'Image'
+  ) {
+    return { valid: false, errorKey: 'Unsupported file type' }
+  }
+  return validateSeedanceAssetFile(file)
 }
 
 export function formatSeedanceFileSize(bytes: number): string {

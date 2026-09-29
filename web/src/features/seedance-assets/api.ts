@@ -1,3 +1,4 @@
+import type { AxiosProgressEvent } from 'axios'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -17,7 +18,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { t } from 'i18next'
-import type { AxiosProgressEvent } from 'axios'
 
 import { api } from '@/lib/api'
 
@@ -35,7 +35,24 @@ export type SeedanceAssetGroup = {
   id: number
   group_id: string
   name: string
+  description?: string
+  tags?: string
   status?: string
+  group_type?: string
+}
+export type SeedanceAssetValidationSession = {
+  id: number
+  status: string
+  name: string
+  description?: string
+  tags?: string
+  launch_url?: string
+  expires_at: number
+  group_id?: string
+  local_group_id?: number
+  last_error?: string
+  created_at: number
+  updated_at: number
 }
 export type SeedanceAsset = {
   id: number
@@ -102,12 +119,43 @@ export async function createSeedanceAssetGroup(name: string) {
     ).data
   )
 }
-export async function updateSeedanceAssetGroup(id: number, name: string) {
+export async function createSeedanceAssetValidationSession(payload: {
+  name: string
+  description: string
+  tags: string
+}) {
+  return checked(
+    (
+      await api.post<SeedanceAssetResponse<SeedanceAssetValidationSession>>(
+        '/api/user/seedance/validation-sessions',
+        payload
+      )
+    ).data
+  )
+}
+export async function getSeedanceAssetValidationSession(id: number) {
+  return checked(
+    (
+      await api.get<SeedanceAssetResponse<SeedanceAssetValidationSession>>(
+        `/api/user/seedance/validation-sessions/${id}`,
+        {
+          disableDuplicate: true,
+          timeout: 35000,
+          headers: { 'Cache-Control': 'no-cache, no-store' },
+        }
+      )
+    ).data
+  )
+}
+export async function updateSeedanceAssetGroup(
+  id: number,
+  payload: { name: string; description?: string; tags?: string }
+) {
   return checked(
     (
       await api.put<SeedanceAssetResponse<SeedanceAssetGroup>>(
         `/api/user/seedance/asset-groups/${id}`,
-        { name }
+        payload
       )
     ).data
   )

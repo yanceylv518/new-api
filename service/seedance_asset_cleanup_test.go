@@ -67,6 +67,59 @@ func TestRunSeedanceAssetCleanupOnceDeletesRemoteAndLocal(t *testing.T) {
 	assert.ErrorIs(t, db.First(&storedJob, job.ID).Error, gorm.ErrRecordNotFound)
 }
 
+// 素材组清理必须在上游确认后删除本地组、素材和清理任务。
+func TestRunSeedanceAssetGroupCleanupOnceDeletesRemoteAndLocal(t *testing.T) {
+	previousDB := model.DB
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}))
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	var deleteGroupCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("Action") == "DeleteAssetGroup" {
+			deleteGroupCalls.Add(1)
+			_, _ = writer.Write([]byte(`{"code":"NotFound.20260929104047407D4D891C847F1BBB31","message":"resource does not exist"}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+	channel := &model.Channel{Id: 803, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+	group := &model.SeedanceAssetGroup{UserID: 9, ChannelID: channel.Id, GroupID: "group-delete", Name: "Delete me", Status: "Deleting"}
+	require.NoError(t, db.Create(group).Error)
+	replica := &model.SeedanceAssetGroupReplica{
+		ID: 99, UserID: group.UserID, LocalGroupID: group.ID, ChannelID: channel.Id,
+		UpstreamGroupID: "replica-group-delete", GroupName: group.Name, Status: "Deleting",
+	}
+	require.NoError(t, db.Create(replica).Error)
+	asset := &model.SeedanceAsset{UserID: 9, ChannelID: channel.Id, GroupID: group.GroupID, AssetID: "asset-delete", Name: "cover.png", AssetType: "Image", Status: "Deleting"}
+	require.NoError(t, db.Create(asset).Error)
+	job := NewSeedanceAssetGroupDeleteCleanupJob(group)
+
+	summary, err := RunSeedanceAssetCleanupOnce(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
+	assert.EqualValues(t, 2, deleteGroupCalls.Load())
+	var remaining int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("id = ?", group.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
+	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
+	require.NoError(t, db.Model(&model.SeedanceAssetGroupReplica{}).Where("id = ?", replica.ID).Count(&remaining).Error)
+	assert.Zero(t, remaining)
+	assert.ErrorIs(t, db.Where("dedup_key = ?", job.DedupKey).First(&model.SeedanceAssetCleanupJob{}).Error, gorm.ErrRecordNotFound)
+}
+
 // 外部清理失败必须保留任务、推进退避时间和原始错误，不能把失败伪装成已完成。
 func TestRunSeedanceAssetCleanupOnceReschedulesFailure(t *testing.T) {
 	previousDB := model.DB

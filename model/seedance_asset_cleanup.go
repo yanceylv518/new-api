@@ -3,11 +3,13 @@ package model
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -16,6 +18,7 @@ const (
 	SeedanceAssetCleanupKindOSSObject     = "oss_object"
 	SeedanceAssetCleanupKindAssetDelete   = "asset_delete"
 	SeedanceAssetCleanupKindReplicaDelete = "asset_replica_delete"
+	SeedanceAssetCleanupKindGroupDelete   = "asset_group_delete"
 
 	SeedanceAssetCleanupStatusPending   = "pending"
 	SeedanceAssetCleanupStatusCompleted = "completed"
@@ -27,6 +30,7 @@ type SeedanceAssetCleanupJob struct {
 	ID             uint                 `gorm:"primaryKey;index:idx_seedance_asset_cleanup_due,priority:4"`
 	Kind           string               `gorm:"size:32;not null;index"`
 	UserID         int                  `gorm:"index"`
+	LocalGroupID   uint                 `gorm:"index"`
 	LocalAssetID   uint                 `gorm:"index"`
 	LocalMappingID uint                 `gorm:"index"`
 	ChannelID      int                  `gorm:"index"`
@@ -159,9 +163,124 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 	})
 }
 
+// QueueSeedanceAssetGroupDeletion 原子标记素材组及其素材，并建立可重试的组删除任务。
+// 组删除涉及多个上游账号和 OSS，不能只依赖当前 HTTP 请求完成。
+func QueueSeedanceAssetGroupDeletion(ctx context.Context, job SeedanceAssetCleanupJob) error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	if job.Kind != SeedanceAssetCleanupKindGroupDelete || job.UserID <= 0 || job.LocalGroupID == 0 || strings.TrimSpace(job.DedupKey) == "" {
+		return errors.New("invalid Seedance asset group deletion job")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := common.GetTimestamp()
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var group SeedanceAssetGroup
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", job.LocalGroupID, job.UserID).First(&group).Error; err != nil {
+			return err
+		}
+		if group.Status != "Deleting" {
+			if err := tx.Model(&group).Update("status", "Deleting").Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&SeedanceAsset{}).
+			Where("user_id = ? AND group_id = ?", group.UserID, group.GroupID).
+			Updates(map[string]any{
+				"status": "Deleting", "status_key": SeedanceAssetStatusIndexKey("Deleting"), "pending_status": true,
+				"poll_lease_until": 0,
+			}).Error; err != nil {
+			return err
+		}
+
+		if job.Status == "" {
+			job.Status = SeedanceAssetCleanupStatusPending
+		}
+		if job.NextAttemptAt == 0 {
+			job.NextAttemptAt = now
+		}
+		var existing SeedanceAssetCleanupJob
+		lookup := tx.Where("dedup_key = ?", job.DedupKey).First(&existing)
+		switch {
+		case lookup.Error == nil:
+			updates := map[string]any{"next_attempt_at": now}
+			if existing.Status == SeedanceAssetCleanupStatusCompleted {
+				updates["status"] = SeedanceAssetCleanupStatusPending
+				updates["attempts"] = 0
+				updates["last_error"] = ""
+			}
+			if existing.LeaseUntil <= now {
+				updates["lease_until"] = int64(0)
+			}
+			return tx.Model(&existing).Updates(updates).Error
+		case errors.Is(lookup.Error, gorm.ErrRecordNotFound):
+			return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&job).Error
+		default:
+			return lookup.Error
+		}
+	})
+}
+
+// SeedanceAssetGroupDeletionDedupKey 为素材组删除任务生成稳定的去重键。
+func SeedanceAssetGroupDeletionDedupKey(userID int, localGroupID uint) string {
+	return fmt.Sprintf("%s:%d:%d", SeedanceAssetCleanupKindGroupDelete, userID, localGroupID)
+}
+
+// EnsureSeedanceAssetGroupDeletionJobs 为历史遗留的 Deleting 素材组自动补建清理任务。
+func EnsureSeedanceAssetGroupDeletionJobs(ctx context.Context, limit int) error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !DB.Migrator().HasTable(&SeedanceAssetGroup{}) {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	var groups []SeedanceAssetGroup
+	if err := DB.WithContext(ctx).Where("status = ?", "Deleting").Order("id asc").Limit(limit).Find(&groups).Error; err != nil {
+		return err
+	}
+	var jobs []SeedanceAssetCleanupJob
+	if err := DB.WithContext(ctx).Where("kind = ? AND local_group_id > 0", SeedanceAssetCleanupKindGroupDelete).Find(&jobs).Error; err != nil {
+		return err
+	}
+	existing := make(map[string]struct{}, len(jobs))
+	for _, job := range jobs {
+		existing[fmt.Sprintf("%d:%d", job.UserID, job.LocalGroupID)] = struct{}{}
+	}
+	for index := range groups {
+		group := &groups[index]
+		if _, exists := existing[fmt.Sprintf("%d:%d", group.UserID, group.ID)]; exists {
+			continue
+		}
+		job := SeedanceAssetCleanupJob{
+			Kind:          SeedanceAssetCleanupKindGroupDelete,
+			UserID:        group.UserID,
+			LocalGroupID:  group.ID,
+			DedupKey:      SeedanceAssetGroupDeletionDedupKey(group.UserID, group.ID),
+			Status:        SeedanceAssetCleanupStatusPending,
+			NextAttemptAt: common.GetTimestamp(),
+		}
+		if err := QueueSeedanceAssetGroupDeletion(ctx, job); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
 // HasDueSeedanceAssetCleanupJobs 判断是否存在可执行的补偿任务。
 func HasDueSeedanceAssetCleanupJobs(now int64) bool {
 	if DB == nil {
+		return false
+	}
+	if err := EnsureSeedanceAssetGroupDeletionJobs(context.Background(), 50); err != nil {
+		common.SysError("failed to backfill Seedance asset group cleanup jobs: " + err.Error())
 		return false
 	}
 	var marker struct {
@@ -179,6 +298,9 @@ func HasDueSeedanceAssetCleanupJobs(now int64) bool {
 func ListDueSeedanceAssetCleanupJobs(now int64, limit int) ([]*SeedanceAssetCleanupJob, error) {
 	if DB == nil {
 		return nil, errors.New("database is not initialized")
+	}
+	if err := EnsureSeedanceAssetGroupDeletionJobs(context.Background(), 50); err != nil {
+		return nil, err
 	}
 	if limit <= 0 {
 		limit = 1

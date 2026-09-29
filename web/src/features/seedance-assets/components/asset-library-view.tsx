@@ -28,6 +28,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { DataTableViewModeToggle } from '@/components/data-table'
@@ -53,6 +54,7 @@ import type {
   SeedanceAssetViewMode,
 } from '../types'
 import { AssetItem } from './asset-item'
+import { AssetPreviewDialog } from './asset-preview'
 
 // 素材库把素材组和操作合并为固定头部，素材集合独立滚动。
 export function AssetLibraryView(props: {
@@ -90,6 +92,7 @@ export function AssetLibraryView(props: {
   deletingId?: number
 }) {
   const { t } = useTranslation()
+  const [previewAsset, setPreviewAsset] = useState<SeedanceAsset | null>(null)
   const totalPages = Math.max(1, Math.ceil(props.total / props.pageSize))
   const selectedCount = props.selectedIds.size
   const allRowsSelected =
@@ -228,7 +231,7 @@ export function AssetLibraryView(props: {
         <div className='flex items-center justify-between gap-3 py-4'>
           <div className='flex min-w-0 flex-wrap items-center gap-3'>
             {props.rows.length > 0 ? (
-              <label className='flex items-center gap-2 text-xs'>
+              <label className='ml-1 flex items-center gap-2 text-xs'>
                 <Checkbox
                   checked={allRowsSelected}
                   indeterminate={someRowsSelected && !allRowsSelected}
@@ -331,6 +334,7 @@ export function AssetLibraryView(props: {
                 mode='grid'
                 onRefresh={props.onRefresh}
                 onDelete={props.onDelete}
+                onPreview={setPreviewAsset}
                 onSelectionChange={props.onSelectionChange}
                 selected={props.selectedIds.has(asset.id)}
                 selectionDisabled={props.isBatchDeleting || props.isFetching}
@@ -353,6 +357,7 @@ export function AssetLibraryView(props: {
                 mode='list'
                 onRefresh={props.onRefresh}
                 onDelete={props.onDelete}
+                onPreview={setPreviewAsset}
                 onSelectionChange={props.onSelectionChange}
                 selected={props.selectedIds.has(asset.id)}
                 selectionDisabled={props.isBatchDeleting || props.isFetching}
@@ -400,6 +405,16 @@ export function AssetLibraryView(props: {
           </div>
         </nav>
       ) : null}
+      <AssetPreviewDialog
+        asset={previewAsset}
+        open={previewAsset !== null}
+        onOpenChange={(open) => {
+          if (!open) setPreviewAsset(null)
+        }}
+        onUnavailable={() => {
+          if (previewAsset) props.onRefresh(previewAsset)
+        }}
+      />
     </section>
   )
 }

@@ -47,6 +47,7 @@ const (
 	seedanceAssetRequestTimeout          = 30 * time.Second
 	seedanceAssetResponseBodyLimit       = 1 << 20
 	seedanceAssetErrorPreviewLimit       = 4096
+	seedanceAssetNativeActionPath        = "/v2/assets"
 )
 
 // privateAssetOSSStorageFactory 为素材流程提供统一的存储客户端创建入口。
@@ -403,7 +404,10 @@ func detectSeedanceAssetContentType(reader io.ReadSeeker, filename string) (stri
 	}
 	contentType := http.DetectContentType(header[:read])
 	if contentType == "application/octet-stream" {
-		if extensionType := mime.TypeByExtension(filepath.Ext(filename)); extensionType != "" {
+		extension := strings.ToLower(filepath.Ext(filename))
+		if extension == ".heic" || extension == ".heif" {
+			contentType = "image/heic"
+		} else if extensionType := mime.TypeByExtension(extension); extensionType != "" {
 			contentType = extensionType
 		}
 	}
@@ -636,16 +640,13 @@ func SeedanceAssetAccountFingerprint(channel *model.Channel, keyFingerprint stri
 }
 
 func seedanceAssetEndpoint(channel *model.Channel) (string, string) {
-	path := os.Getenv("SEEDANCE_ASSET_API_PATH")
-	if path == "" {
-		path = "/seedance"
-	}
 	baseURL := strings.TrimRight(channel.GetBaseURL(), "/")
-	assetPath := "/" + strings.Trim(path, "/")
-	if strings.HasSuffix(baseURL, assetPath) {
-		baseURL = strings.TrimSuffix(baseURL, assetPath)
+	parsed, err := url.Parse(baseURL)
+	// ShuYan 的素材 Action 挂在 /seedance 本身，其他上游按 /v2/assets 调用。
+	if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/seedance") {
+		return baseURL, ""
 	}
-	return baseURL, assetPath
+	return baseURL, seedanceAssetNativeActionPath
 }
 
 func seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint string) string {
@@ -653,18 +654,37 @@ func seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint string) 
 }
 
 func (client *SeedanceAssetClient) call(ctx context.Context, action string, request any, response any) error {
+	return client.callAtPath(ctx, client.path, action, request, response)
+}
+
+func (client *SeedanceAssetClient) callAtPath(ctx context.Context, path, action string, request any, response any) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	// 请求级截止时间覆盖直连、代理、响应头及响应体读取，不依赖通用 Relay 超时。
 	ctx, cancel := context.WithTimeout(ctx, seedanceAssetRequestTimeout)
 	defer cancel()
-	requestURL := fmt.Sprintf("%s%s?Action=%s&Version=2024-01-01", client.baseURL, client.path, action)
+	requestURL := client.baseURL
+	var err error
+	if path != "" {
+		requestURL, err = url.JoinPath(client.baseURL, strings.TrimLeft(path, "/"))
+		if err != nil {
+			return err
+		}
+	}
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		return err
+	}
+	query := parsedURL.Query()
+	query.Set("Action", action)
+	query.Set("Version", "2024-01-01")
+	parsedURL.RawQuery = query.Encode()
 	body, err := common.Marshal(request)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parsedURL.String(), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -713,7 +733,7 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		return seedanceAssetHTTPError(resp.StatusCode, raw, client.apiKey)
 	}
 	if decodeErr != nil {
-		return decodeErr
+		return seedanceAssetInvalidJSONError(resp.StatusCode, resp.Header.Get("Content-Type"), raw, client.apiKey, decodeErr)
 	}
 	return common.Unmarshal(raw, response)
 }
@@ -727,14 +747,17 @@ type seedanceAssetResponse struct {
 		Error *seedanceAssetError `json:"Error"`
 	} `json:"ResponseMetadata"`
 	Result struct {
-		ID     string `json:"Id"`
-		Status string `json:"Status"`
-		URL    string `json:"URL"`
+		ID         string `json:"Id"`
+		Status     string `json:"Status"`
+		URL        string `json:"URL"`
+		BytedToken string `json:"BytedToken"`
+		H5Link     string `json:"H5Link"`
+		GroupID    string `json:"GroupId"`
 	} `json:"Result"`
 	Data *seedanceAssetResponseData `json:"data"`
 }
 
-// seedanceAssetError 统一接收书言兼容接口常见的嵌套错误结构。
+// seedanceAssetError 统一接收官方及兼容代理常见的嵌套错误结构。
 type seedanceAssetError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -840,6 +863,28 @@ func seedanceAssetHTTPError(status int, body []byte, apiKey string) error {
 	return fmt.Errorf("seedance asset API returned status %d: %s", status, message)
 }
 
+func seedanceAssetInvalidJSONError(status int, contentType string, body []byte, apiKey string, decodeErr error) error {
+	message := strings.TrimSpace(string(body))
+	message = strings.ReplaceAll(message, apiKey, "[redacted]")
+	if len(message) > seedanceAssetErrorPreviewLimit {
+		message = message[:seedanceAssetErrorPreviewLimit] + "..."
+	}
+	if message == "" {
+		message = "<empty response>"
+	}
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		contentType = "unknown content type"
+	}
+	return fmt.Errorf(
+		"seedance asset API returned invalid JSON (status %d, content-type %s): %s: %w",
+		status,
+		contentType,
+		message,
+		decodeErr,
+	)
+}
+
 // ValidateSeedanceAssetSourceURL 在用户输入边界验证地址；OSS 签名地址由受信任存储配置生成。
 func ValidateSeedanceAssetSourceURL(sourceURL string) error {
 	parsed, err := url.Parse(sourceURL)
@@ -893,7 +938,7 @@ func (client *SeedanceAssetClient) GetSeedanceAsset(ctx context.Context, assetID
 // DeleteSeedanceAsset 删除上游素材。
 func (client *SeedanceAssetClient) DeleteSeedanceAsset(ctx context.Context, assetID string) error {
 	err := client.call(ctx, "DeleteAsset", map[string]string{"Id": assetID}, &struct{}{})
-	if errors.Is(err, ErrSeedanceAssetNotFound) {
+	if isSeedanceAssetDeleteNotFoundError(err) {
 		return nil
 	}
 	return err
@@ -902,10 +947,35 @@ func (client *SeedanceAssetClient) DeleteSeedanceAsset(ctx context.Context, asse
 // DeleteSeedanceAssetGroup 删除上游素材组。
 func (client *SeedanceAssetClient) DeleteSeedanceAssetGroup(ctx context.Context, groupID string) error {
 	err := client.call(ctx, "DeleteAssetGroup", map[string]string{"Id": groupID}, &struct{}{})
-	if errors.Is(err, ErrSeedanceAssetNotFound) {
+	if isSeedanceAssetDeleteNotFoundError(err) {
 		return nil
 	}
 	return err
+}
+
+// isSeedanceAssetDeleteNotFoundError 仅为删除操作识别上游的幂等“不存在”。
+// 部分代理返回 NotFound.<request-id> 或只返回“resource does not exist”，不能依赖固定错误码；
+// 查询接口仍保留原始错误，避免把认证会话或其他读取失败误判为已完成。
+func isSeedanceAssetDeleteNotFoundError(err error) bool {
+	if err == nil || errors.Is(err, ErrSeedanceAssetNotFound) {
+		return err != nil
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"notfound.",
+		"assetnotfound",
+		"assetgroupnotfound",
+		"resourcenotfound",
+		"resource does not exist",
+		"resource not found",
+		"asset group not found",
+		"asset not found",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateSeedanceAssetGroup 更新上游素材组名称。
@@ -930,7 +1000,48 @@ func SupportsSeedanceAssets(channel *model.Channel) bool {
 	return isSeedanceAssetChannel(channel)
 }
 
-// FindSeedanceAssetChannel 按主键游标扫描启用渠道，避免前 100 条无效配置遮蔽可用账号。
+// FindSeedanceAssetChannels 按主键游标扫描启用渠道，避免前 100 条无效配置遮蔽可用账号。
+func FindSeedanceAssetChannels() ([]*model.Channel, error) {
+	const batchSize = 100
+	lastID := 0
+	result := make([]*model.Channel, 0)
+	for {
+		var channels []*model.Channel
+		err := model.DB.Where("id > ? AND status = ? AND type IN ?", lastID, common.ChannelStatusEnabled,
+			[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin}).
+			Order("id asc").Limit(batchSize).Find(&channels).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, channel := range channels {
+			lastID = channel.Id
+			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
+				continue
+			}
+			// 只检查可用密钥，不提前推进轮询索引；实际账号选择由客户端完成。
+			for index, key := range channel.GetKeys() {
+				if strings.TrimSpace(key) == "" {
+					continue
+				}
+				if channel.ChannelInfo.IsMultiKey {
+					if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+						continue
+					}
+				}
+				result = append(result, channel)
+				break
+			}
+		}
+		if len(channels) < batchSize {
+			if len(result) == 0 {
+				return nil, fmt.Errorf("no enabled Seedance channel available")
+			}
+			return result, nil
+		}
+	}
+}
+
+// FindSeedanceAssetChannel 按主键游标扫描并在找到首个可用渠道后立即返回，保持普通素材管理的旧成本。
 func FindSeedanceAssetChannel() (*model.Channel, error) {
 	const batchSize = 100
 	lastID := 0
@@ -947,7 +1058,6 @@ func FindSeedanceAssetChannel() (*model.Channel, error) {
 			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
 				continue
 			}
-			// 只检查可用密钥，不提前推进轮询索引；实际账号选择由客户端完成。
 			for index, key := range channel.GetKeys() {
 				if strings.TrimSpace(key) == "" {
 					continue

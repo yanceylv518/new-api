@@ -1,7 +1,7 @@
 # 私域素材库 API Key 接口
 
 使用 `Authorization: Bearer sk-...` 调用 `/v1/seedance`。这是网关提供的用户级
-素材管理 API，不是书言 `/seedance?Action=...` 的原样透传接口。
+素材管理 API，不是上游厂商 Action 接口的原样透传。
 后台 `/api/user/seedance` 接口继续使用后台凭证；两者读取相同的用户数据。
 
 ## 归属、权限与计费
@@ -19,7 +19,7 @@
 - 生成请求引用 `asset://<AssetId>` 时，网关先按常规规则完成令牌、分组、模型和渠道
   选择，再按最终选中的渠道密钥解析当前用户的本地素材，并将上游请求中的媒体引用
   替换为该账号对应的素材 ID。素材不会改变渠道选择，也不能绕过令牌的渠道权限。
-- 若目标账号尚无素材组，网关会在该账号创建同名组并透传原 `GroupType`；若尚无素材
+- 若目标账号尚无素材组，网关会在该账号创建同名、同类型的组；若尚无素材
   副本，则从 OSS 原件生成新的短期签名地址并导入。目标账号的组、素材 ID 和审核状态
   独立保存；后续调用复用映射。一个请求可以引用来自不同原始账号或素材组的素材。
 - 目标账号的组或素材仍在创建/审核时，生成请求返回 HTTP 409 和错误码
@@ -42,9 +42,11 @@
 | --- | --- | --- |
 | GET | `/asset-groups` | 当前用户的组，支持筛选与可选分页 |
 | GET | `/asset-groups/:id` | 当前用户的单个组，本地数字 ID |
-| POST | `/asset-groups` | JSON：`name`、`model`；可选 `GroupType` |
-| PUT | `/asset-groups/:id` | JSON：`name` |
+| POST | `/asset-groups` | JSON：`name`、`model` |
+| PUT | `/asset-groups/:id` | JSON：`name`；可选本地备注 `description`、`tags` |
 | DELETE | `/asset-groups/:id` | 删除组及其素材 |
+| POST | `/validation-sessions` | JSON：`name`、`description`、`tags`；创建真人认证会话并返回 H5 地址和本地会话编号 |
+| GET | `/validation-sessions/:id` | 查询真人认证会话并同步认证结果 |
 | GET | `/assets` | `group_id`、`p`、`page_size`、`search`、`asset_type`、`status` |
 | GET | `/assets/:id` | 当前用户的单个素材，本地数字 ID |
 | POST | `/assets` | JSON：`group_id`、`source_url`、`asset_type`、`name` |
@@ -68,9 +70,14 @@
 
 ### 查询参数
 
-以下能力由网关查询本地授权映射提供，不是书言 Action 接口的原样透传。
-创建素材组时可选传入官方字段 `GroupType`。网关按原值透传给书言的
-`CreateAssetGroup`，不枚举、不改写，也不在本地模拟真人认证；具体类型是否可用由上游决定。
+以下能力由网关查询本地授权映射提供，不是上游 Action 接口的原样透传。
+普通建组接口固定创建 `AIGC` 组，不接受 `GroupType` 覆盖参数；显式传入该字段会返回
+参数错误。`LivenessFace` 真人组必须完成真人认证会话，认证结果返回的 `GroupId` 会在
+网关内自动落成本地素材组，不能通过普通建组请求创建。
+真人认证会话有效期为 30 分钟，会按当前请求的模型、分组、令牌限制和渠道约束生成候选渠道，令牌在主库内
+以密文保存，网页和自定义 `/v1/seedance` 接口只返回本地会话状态，不返回 `BytedToken`。
+如果候选渠道明确返回认证 Action 不支持、未实现或 Action 不存在，网关会在同一个本地会话
+内回退到下一个候选渠道；鉴权失败、参数错误、网络超时和其他上游业务错误不会盲目换渠道。
 上游拒绝时，响应中的上游错误信息会作为接口失败原因返回。
 
 | 参数 | 素材列表 | 素材组列表 |
@@ -127,7 +134,7 @@ curl --get "$BASE_URL/v1/seedance/assets" \
 curl "$BASE_URL/v1/seedance/asset-groups" \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"视频素材","model":"doubao-seedance-2-0-fast-260128","GroupType":"LivenessFace"}'
+  -d '{"name":"视频素材","model":"doubao-seedance-2-0-fast-260128"}'
 
 curl "$BASE_URL/v1/seedance/assets/upload" \
   -H "Authorization: Bearer $API_KEY" \
@@ -140,6 +147,57 @@ curl "$BASE_URL/v1/seedance/assets?group_id=$GROUP_ID&p=1&page_size=24" \
 curl "$BASE_URL/v1/seedance/assets/$LOCAL_ASSET_ID/refresh" \
   -X POST -H "Authorization: Bearer $API_KEY"
 ```
+
+### 真人认证素材组
+
+创建会话时 `model` 可选；API Key 调用建议明确传入模型，以便沿用令牌的模型、分组和
+渠道约束。未传 `callback_url` 时，网关使用系统设置中的 `TaskPublicAddress`，否则回退
+到 `ServerAddress`，生成一次性能力地址作为上游回跳地址。
+
+```bash
+curl "$BASE_URL/v1/seedance/validation-sessions" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"真人素材组","description":"用于已认证人物肖像","tags":"演员, 已认证","model":"doubao-seedance-2-0-fast-260128"}'
+
+curl "$BASE_URL/v1/seedance/validation-sessions/$SESSION_ID" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+第一次响应中的 `data.launch_url` 是认证页面地址。认证完成后继续查询本地会话；只有
+`status` 为 `Succeeded` 且返回 `group_id` 后，才上传对应真人的肖像并等待上游审核。组名、说明和标签会保存在本地组信息中。认证未完成、
+上游暂时不可查询或渠道正在切换时，会话保持 `Pending` 并保存有限错误摘要，不会把未认证
+素材组显示为可用。会话有效期为 24 小时，过期后需要重新创建。
+认证会话依赖固定的 `CRYPTO_SECRET`；未设置时使用固定的 `SESSION_SECRET`。至少配置其中一个并在实例重启及多节点间保持不变，否则会话令牌无法解密，认证回调也无法关联原会话。
+
+网关同时提供官方 Action 兼容入口：
+
+```bash
+curl "$BASE_URL/doubao/v2/assets?Action=CreateVisualValidateSession&Version=2024-01-01" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"CallbackURL":"https://example.com/validation/callback","ProjectName":"default"}'
+
+curl "$BASE_URL/doubao/v2/assets?Action=GetVisualValidateResult&Version=2024-01-01" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"BytedToken":"<创建会话返回的令牌>","ProjectName":"default"}'
+```
+
+官方创建接口要求 `CallbackURL`，`ProjectName` 可选；查询接口的 `ProjectName` 也可选，
+网关会优先使用创建会话时保存的项目。官方入口返回与上游一致的 `ResponseMetadata` 和
+`Result` 外形；`BytedToken` 只会在官方创建接口响应中返回，查询时必须属于当前 API Key
+用户创建的会话，不能跨用户复用。
+
+插件 Action 兼容入口位于 `/doubao/v2/assets`，与 Doubao 插件路由保持同一命名空间。
+若渠道 BaseURL 的路径以 `/seedance` 结尾，上游素材 Action 直接向 BaseURL 本身发送，Action 与
+Version 放在查询参数中；其他渠道 BaseURL 使用官方 `/v2/assets` 路径。网关不会自动添加
+`/seedance`，由管理员配置渠道 BaseURL 决定上游命名空间。
+真人认证会话
+必须由实际支持 `CreateVisualValidateSession` 和 `GetVisualValidateResult` 的上游账号处理；
+候选渠道中只有部分支持时，会按上述规则自动回退到支持的渠道。
+普通建组接口固定创建 `AIGC` 组，真人组只能由认证会话成功后创建；如果目标上游账号
+不允许重建真人组，素材映射会返回上游错误，不会把真人组降级为 `AIGC` 组。
 
 同用户换用另一把 API Key 查询时，可直接得到相同的组和素材。通常每 5 秒读取
 列表中的状态即可；后台负责上游审核轮询，不需要反复调用单个素材刷新接口。

@@ -24,6 +24,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 
 import type { SeedanceAssetGroup } from '../api'
 
@@ -33,20 +34,40 @@ export function EditAssetGroupDialog(props: {
   open: boolean
   isPending: boolean
   onOpenChange: (open: boolean) => void
-  onSubmit: (name: string) => void
+  onSubmit: (details: {
+    name: string
+    description: string
+    tags: string
+  }) => void
 }) {
   const { t } = useTranslation()
   const [draft, setDraft] = useState<{
     groupId: number | null
     name: string
-  }>({ groupId: null, name: '' })
+    description: string
+    tags: string
+  }>({ groupId: null, name: '', description: '', tags: '' })
   const groupId = props.group?.id ?? null
-  const name =
-    draft.groupId === groupId ? draft.name : (props.group?.name ?? '')
+  const currentDraft =
+    draft.groupId === groupId
+      ? draft
+      : {
+          groupId,
+          name: props.group?.name ?? '',
+          description: props.group?.description ?? '',
+          tags: props.group?.tags ?? '',
+        }
+  const name = currentDraft.name
   const trimmedName = name.trim()
+  const submit = () =>
+    props.onSubmit({
+      name: trimmedName,
+      description: currentDraft.description.trim(),
+      tags: currentDraft.tags.trim(),
+    })
 
   const handleOpenChange = (open: boolean) => {
-    if (!open) setDraft({ groupId: null, name: '' })
+    if (!open) setDraft({ groupId: null, name: '', description: '', tags: '' })
     props.onOpenChange(open)
   }
 
@@ -70,7 +91,7 @@ export function EditAssetGroupDialog(props: {
           </Button>
           <Button
             type='button'
-            onClick={() => props.onSubmit(trimmedName)}
+            onClick={submit}
             disabled={!trimmedName || props.isPending}
           >
             {props.isPending ? <Loader2 className='animate-spin' /> : null}
@@ -85,13 +106,36 @@ export function EditAssetGroupDialog(props: {
           autoFocus
           maxLength={64}
           value={name}
-          onChange={(event) => setDraft({ groupId, name: event.target.value })}
+          onChange={(event) =>
+            setDraft({ ...currentDraft, name: event.target.value })
+          }
           onKeyDown={(event) => {
             if (event.key === 'Enter' && trimmedName && !props.isPending) {
               event.preventDefault()
-              props.onSubmit(trimmedName)
+              submit()
             }
           }}
+        />
+      </label>
+      <label className='flex flex-col gap-2 text-sm font-medium'>
+        {t('Description')}
+        <Textarea
+          maxLength={1024}
+          value={currentDraft.description}
+          onChange={(event) =>
+            setDraft({ ...currentDraft, description: event.target.value })
+          }
+        />
+      </label>
+      <label className='flex flex-col gap-2 text-sm font-medium'>
+        {t('Tags')}
+        <Input
+          maxLength={512}
+          placeholder={t('Use commas to separate tags')}
+          value={currentDraft.tags}
+          onChange={(event) =>
+            setDraft({ ...currentDraft, tags: event.target.value })
+          }
         />
       </label>
     </Dialog>

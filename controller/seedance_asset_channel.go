@@ -11,6 +11,76 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// selectSeedanceAssetValidationChannels returns ordered candidates for the official validation Action.
+// The service layer only falls back after the selected upstream explicitly lacks the Action.
+func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]*model.Channel, error) {
+	modelLimitsEnabled := c.GetBool("token_model_limit_enabled")
+	allowed := map[string]bool{}
+	if modelLimitsEnabled {
+		limits, ok := c.Get("token_model_limit")
+		var valid bool
+		allowed, valid = limits.(map[string]bool)
+		if !ok || !valid {
+			return nil, errors.New("API key model limits are invalid")
+		}
+	}
+	constraints := service.GetChannelConstraints(c)
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
+	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if group == "" {
+		group = c.GetString("group")
+	}
+	if group == "" {
+		group = c.GetString("user_group")
+	}
+	if group == "" {
+		group = "default"
+	}
+	groups := []string{group}
+	if group == "auto" {
+		groups = service.GetRequestAutoGroups(c, c.GetString("user_group"))
+	}
+	channels, err := service.FindSeedanceAssetChannels()
+	if err != nil {
+		return nil, err
+	}
+	if c.GetInt("token_id") == 0 && modelName == "" {
+		return channels, nil
+	}
+	pin, pinned, _ := constraints.ResolvedPin()
+	filtered := make([]*model.Channel, 0, len(channels))
+	for _, channel := range channels {
+		if pinned && channel.Id != pin.ChannelId {
+			continue
+		}
+		for _, candidateModel := range channel.GetModels() {
+			if modelName != "" && candidateModel != modelName {
+				continue
+			}
+			if modelLimitsEnabled && !allowed[candidateModel] {
+				continue
+			}
+			for _, candidateGroup := range groups {
+				if candidateGroup == "" || candidateGroup == "auto" {
+					continue
+				}
+				if ok, _ := model.ChannelSatisfiesFilters(channel, candidateModel, constraints.Filters); ok &&
+					model.IsChannelEnabledForGroupModel(candidateGroup, candidateModel, channel.Id) {
+					filtered = append(filtered, channel)
+					break
+				}
+			}
+			if len(filtered) > 0 && filtered[len(filtered)-1].Id == channel.Id {
+				break
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, errors.New("no available Seedance asset channel is allowed for this API key")
+	}
+	return filtered, nil
+}
+
 // selectSeedanceAssetGroupChannel 在建组时按模型选择上游；已有组始终沿用持久化
 // 绑定。API Key 的资源读取按用户共享，但建组不能绕过模型或分组访问限制。
 func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.Channel, error) {

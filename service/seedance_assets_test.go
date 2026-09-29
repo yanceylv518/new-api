@@ -59,6 +59,12 @@ type fakePrivateAssetOSSClient struct {
 	deleteErr  error
 }
 
+func TestDetectSeedanceAssetContentTypeSupportsHEICExtensionFallback(t *testing.T) {
+	contentType, err := detectSeedanceAssetContentType(bytes.NewReader([]byte{0, 1, 2, 3}), "portrait.heic")
+	require.NoError(t, err)
+	assert.Equal(t, "image/heic", contentType)
+}
+
 // 渠道选择必须越过满页的非 Doubao 插件，并跳过所有密钥禁用的账号。
 func TestFindSeedanceAssetChannelSupportsPluginBeyondFirstPage(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -210,6 +216,18 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 	assert.NoError(t, client.DeleteSeedanceAssetGroup(t.Context(), "group"))
 	_, _, err = client.GetSeedanceAsset(t.Context(), "asset")
 	assert.ErrorIs(t, err, ErrSeedanceAssetNotFound)
+
+	notFoundServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"code":"NotFound.20260929104047407D4D891C847F1BBB31","message":"resource does not exist"}`)
+	}))
+	t.Cleanup(notFoundServer.Close)
+	notFoundClient, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &notFoundServer.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	assert.NoError(t, notFoundClient.DeleteSeedanceAsset(t.Context(), "asset"))
+	assert.NoError(t, notFoundClient.DeleteSeedanceAssetGroup(t.Context(), "group"))
+	_, _, err = notFoundClient.GetSeedanceAsset(t.Context(), "asset")
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, ErrSeedanceAssetNotFound)
 }
 
 // 非 2xx 响应也必须保留上游正文，不能只返回无上下文的状态码。
@@ -225,10 +243,26 @@ func TestSeedanceAssetClientPreservesHTTPErrorBody(t *testing.T) {
 	assert.ErrorContains(t, err, "LivenessFace is unavailable")
 }
 
+func TestSeedanceAssetClientReportsNonJSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, "<!doctype html><html>not api</html>")
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	err = client.CreateSeedanceAssetGroup(t.Context(), "group", "", &struct{}{})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "invalid JSON")
+	assert.ErrorContains(t, err, "content-type text/html")
+	assert.ErrorContains(t, err, "not api")
+}
+
 // 创建素材组的类型必须进入上游请求，空值则保持上游默认行为。
 func TestCreateSeedanceAssetGroupForwardsGroupType(t *testing.T) {
 	var received map[string]string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v2/assets", r.URL.Path)
 		received = map[string]string{}
 		if err := common.DecodeJson(r.Body, &received); err != nil {
 			t.Errorf("decode CreateAssetGroup request: %v", err)
@@ -250,6 +284,320 @@ func TestCreateSeedanceAssetGroupForwardsGroupType(t *testing.T) {
 
 	require.NoError(t, client.CreateSeedanceAssetGroup(t.Context(), "group", "", &response))
 	assert.NotContains(t, received, "GroupType")
+}
+
+// TestSeedanceAssetValidationActionsUseOfficialPayloads verifies the two official
+// action names and preserves the upstream BytedToken/H5Link/GroupId fields.
+func TestSeedanceAssetValidationActionsUseOfficialPayloads(t *testing.T) {
+	var actions []string
+	expectedPath := "/seedance"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, expectedPath, r.URL.Path)
+		action := r.URL.Query().Get("Action")
+		actions = append(actions, action)
+		assert.Equal(t, "2024-01-01", r.URL.Query().Get("Version"))
+		var body map[string]string
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		switch action {
+		case "CreateVisualValidateSession":
+			assert.Equal(t, "https://example.com/callback", body["CallbackURL"])
+			assert.Equal(t, "project-a", body["ProjectName"])
+			_, _ = io.WriteString(w, `{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`)
+		case "GetVisualValidateResult":
+			assert.Equal(t, "validation-token", body["BytedToken"])
+			assert.Equal(t, "project-a", body["ProjectName"])
+			_, _ = io.WriteString(w, `{"Result":{"GroupId":"group-liveness"}}`)
+		default:
+			t.Fatalf("unexpected action %q", action)
+		}
+	}))
+	t.Cleanup(server.Close)
+	baseURL := server.URL + "/seedance"
+	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	created, err := client.CreateSeedanceAssetValidationSession(t.Context(), "https://example.com/callback", "project-a")
+	require.NoError(t, err)
+	assert.Equal(t, "validation-token", created.BytedToken)
+	assert.Equal(t, "https://example.com/validate", created.H5Link)
+	groupID, err := client.GetSeedanceAssetValidationResult(t.Context(), created.BytedToken, "project-a")
+	require.NoError(t, err)
+	assert.Equal(t, "group-liveness", groupID)
+
+	expectedPath = "/v2/assets"
+	rootURL := server.URL
+	rootClient, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &rootURL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	require.NoError(t, err)
+	_, err = rootClient.CreateSeedanceAssetValidationSession(t.Context(), "https://example.com/callback", "project-a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"CreateVisualValidateSession", "GetVisualValidateResult", "CreateVisualValidateSession"}, actions)
+}
+
+func TestSeedanceValidationFallsBackToSupportedChannelAndKeepsEarlyNotFoundPending(t *testing.T) {
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var unsupportedCalls, resultCalls atomic.Int32
+	unsupportedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("Action") != "CreateVisualValidateSession" {
+			t.Errorf("unsupported channel received unexpected action %q", r.URL.Query().Get("Action"))
+		}
+		unsupportedCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"code":"unsupported_action","message":"unsupported action"}`)
+	}))
+	selectedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("Action") {
+		case "CreateVisualValidateSession":
+			_, _ = io.WriteString(w, `{"Result":{"BytedToken":"fallback-token","H5Link":"https://example.com/validate"}}`)
+		case "GetVisualValidateResult":
+			resultCalls.Add(1)
+			if resultCalls.Load() == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"NotFound.20260929104047407D4D891C847F1BBB31","Message":"The specified token Visual Face token is not found."}}}`)
+				return
+			}
+			if resultCalls.Load() == 2 {
+				_, _ = io.WriteString(w, `{"Result":{}}`)
+				return
+			}
+			if resultCalls.Load() == 3 {
+				_, _ = io.WriteString(w, `{"code":"Forbidden","message":"rejected fallback-token"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"Result":{"GroupId":"group-liveness"}}`)
+		default:
+			t.Errorf("unexpected action %q", r.URL.Query().Get("Action"))
+		}
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		unsupportedServer.Close()
+		selectedServer.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "validation-channel-fallback-test-secret"
+	t.Setenv("CRYPTO_SECRET", "validation-channel-fallback-test-secret")
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	unsupportedURL, selectedURL := unsupportedServer.URL, selectedServer.URL
+	require.NoError(t, db.Create([]*model.Channel{
+		{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &unsupportedURL, Status: common.ChannelStatusEnabled},
+		{Id: 12, Type: constant.ChannelTypeDoubaoVideo, Key: "selected-key", BaseURL: &selectedURL, Status: common.ChannelStatusEnabled},
+	}).Error)
+
+	started, err := StartSeedanceAssetValidationSessionWithFallback(t.Context(), 9,
+		[]*model.Channel{
+			{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &unsupportedURL, Status: common.ChannelStatusEnabled},
+			{Id: 12, Type: constant.ChannelTypeDoubaoVideo, Key: "selected-key", BaseURL: &selectedURL, Status: common.ChannelStatusEnabled},
+		}, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
+	require.NoError(t, err)
+	var session model.SeedanceAssetValidationSession
+	require.NoError(t, db.First(&session, started.Session.ID).Error)
+	require.Equal(t, 12, session.ChannelID)
+	assert.EqualValues(t, 1, unsupportedCalls.Load())
+
+	for attempt := int32(1); attempt <= 2; attempt++ {
+		pending, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, started.Session.ID)
+		require.NoError(t, err)
+		assert.Equal(t, model.SeedanceAssetValidationStatusPending, pending.Status)
+		assert.Empty(t, pending.LastError)
+		assert.Equal(t, int(attempt), pending.PollAttempts)
+	}
+	pollError, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, started.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusPending, pollError.Status)
+	assert.Contains(t, pollError.LastError, "[redacted]")
+	assert.NotContains(t, pollError.LastError, "fallback-token")
+
+	completed, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, started.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusSucceeded, completed.Status)
+	assert.Equal(t, "group-liveness", completed.UpstreamGroupID)
+	assert.Empty(t, completed.LastError)
+	assert.EqualValues(t, 4, resultCalls.Load())
+	assert.EqualValues(t, 1, unsupportedCalls.Load())
+}
+
+func TestSeedanceValidationSecretSurvivesProcessSecretChanges(t *testing.T) {
+	previousCryptoSecret := common.CryptoSecret
+	t.Cleanup(func() { common.CryptoSecret = previousCryptoSecret })
+
+	for _, testCase := range []struct {
+		name          string
+		cryptoSecret  string
+		sessionSecret string
+	}{
+		{name: "crypto secret", cryptoSecret: "stable-crypto-secret", sessionSecret: "unused-session-secret"},
+		{name: "session secret fallback", sessionSecret: "stable-session-secret"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("CRYPTO_SECRET", testCase.cryptoSecret)
+			t.Setenv("SESSION_SECRET", testCase.sessionSecret)
+			common.CryptoSecret = "first-process-secret"
+
+			ciphertext, err := encryptSeedanceAssetValidationToken("upstream-token")
+			require.NoError(t, err)
+			tokenHash, err := seedanceAssetValidationTokenHash("upstream-token")
+			require.NoError(t, err)
+			state, stateHash, err := newSeedanceAssetValidationState()
+			require.NoError(t, err)
+
+			common.CryptoSecret = "restarted-process-secret"
+			plaintext, err := decryptSeedanceAssetValidationToken(ciphertext)
+			require.NoError(t, err)
+			assert.Equal(t, "upstream-token", plaintext)
+			actualTokenHash, err := seedanceAssetValidationTokenHash("upstream-token")
+			require.NoError(t, err)
+			assert.Equal(t, tokenHash, actualTokenHash)
+			actualStateHash, err := HashSeedanceAssetValidationState(state)
+			require.NoError(t, err)
+			assert.Equal(t, stateHash, actualStateHash)
+		})
+	}
+}
+
+func TestSeedanceValidationRejectsMissingPersistentSecretBeforeUpstreamCall(t *testing.T) {
+	t.Setenv("CRYPTO_SECRET", "")
+	t.Setenv("SESSION_SECRET", "")
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var upstreamCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		_, _ = io.WriteString(w, `{"Result":{"BytedToken":"token","H5Link":"https://example.com/validate"}}`)
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "ephemeral-process-secret"
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetValidationSession{}))
+	baseURL := server.URL
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+
+	_, err = StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
+	require.ErrorContains(t, err, "CRYPTO_SECRET or SESSION_SECRET is required")
+	assert.Zero(t, upstreamCalls.Load())
+	var sessions int64
+	require.NoError(t, db.Model(&model.SeedanceAssetValidationSession{}).Count(&sessions).Error)
+	assert.Zero(t, sessions)
+}
+
+func TestSeedanceValidationKeepsCiphertextWhenConfiguredSecretIsUnavailable(t *testing.T) {
+	t.Setenv("CRYPTO_SECRET", "retryable-validation-secret")
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var resultCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("Action") {
+		case "CreateVisualValidateSession":
+			_, _ = io.WriteString(w, `{"Result":{"BytedToken":"retry-token","H5Link":"https://example.com/validate"}}`)
+		case "GetVisualValidateResult":
+			resultCalls.Add(1)
+			_, _ = io.WriteString(w, `{"Result":{"GroupId":"retry-group"}}`)
+		default:
+			t.Errorf("unexpected action %q", r.URL.Query().Get("Action"))
+		}
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "retryable-validation-secret"
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	baseURL := server.URL
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+	started, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
+	require.NoError(t, err)
+
+	t.Setenv("CRYPTO_SECRET", "")
+	t.Setenv("SESSION_SECRET", "")
+	common.CryptoSecret = "new-ephemeral-process-secret"
+	pending, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, started.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusPending, pending.Status)
+	assert.Contains(t, pending.LastError, "CRYPTO_SECRET or SESSION_SECRET is required")
+	assert.NotEmpty(t, pending.BytedTokenCiphertext)
+	assert.Zero(t, resultCalls.Load())
+
+	t.Setenv("CRYPTO_SECRET", "retryable-validation-secret")
+	completed, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, started.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusSucceeded, completed.Status)
+	assert.Equal(t, "retry-group", completed.UpstreamGroupID)
+	assert.Empty(t, completed.LastError)
+	assert.EqualValues(t, 1, resultCalls.Load())
+}
+
+func TestSeedanceValidationCleansUpUpstreamGroupWhenLocalPublishConflicts(t *testing.T) {
+	previousDB := model.DB
+	previousCryptoSecret := common.CryptoSecret
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	var deleteCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("Action") {
+		case "CreateVisualValidateSession":
+			_, _ = io.WriteString(w, `{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`)
+		case "GetVisualValidateResult":
+			_, _ = io.WriteString(w, `{"Result":{"GroupId":"upstream-liveness"}}`)
+		case "DeleteAssetGroup":
+			deleteCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected action %q", r.URL.Query().Get("Action"))
+		}
+	}))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.CryptoSecret = previousCryptoSecret
+		server.Close()
+		_ = sqlDB.Close()
+	})
+	model.DB = db
+	common.CryptoSecret = "validation-cleanup-test-secret"
+	t.Setenv("CRYPTO_SECRET", "validation-cleanup-test-secret")
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}))
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+
+	start, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "重复名称"}, "", "https://example.com/callback")
+	require.NoError(t, err)
+	conflictingGroup := &model.SeedanceAssetGroup{UserID: 9, ChannelID: 1, GroupID: "existing-group", Name: "重复名称"}
+	require.NoError(t, db.Create(conflictingGroup).Error)
+
+	_, err = RefreshSeedanceAssetValidationSession(t.Context(), 9, start.Session.ID)
+	assert.ErrorIs(t, err, model.ErrSeedanceAssetValidationNameExists)
+	assert.EqualValues(t, 1, deleteCalls.Load())
+	var session model.SeedanceAssetValidationSession
+	require.NoError(t, db.First(&session, start.Session.ID).Error)
+	assert.Equal(t, model.SeedanceAssetValidationStatusFailed, session.Status)
+	assert.Empty(t, session.BytedTokenCiphertext)
 }
 
 type seedanceDeadlineTransport struct {
