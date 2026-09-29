@@ -24,7 +24,6 @@ import {
   BadgeListCell,
   DataTableColumnHeader,
 } from '@/components/data-table'
-import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge } from '@/components/status-badge'
 import { getLobeIcon } from '@/lib/lobe-icon'
 
@@ -59,7 +58,6 @@ export interface PricingColumnsOptions {
   priceRate?: number
   usdExchangeRate?: number
   showRechargePrice?: boolean
-  selectedGroup?: string
 }
 
 export function usePricingColumns(
@@ -71,7 +69,6 @@ export function usePricingColumns(
     priceRate = 1,
     usdExchangeRate = 1,
     showRechargePrice = false,
-    selectedGroup,
   } = options
 
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
@@ -128,10 +125,7 @@ export function usePricingColumns(
           showRechargePrice,
           priceRate,
           usdExchangeRate,
-          groupRatioMultiplier: getDynamicDisplayGroupRatio(
-            model,
-            selectedGroup
-          ),
+          groupRatioMultiplier: getDynamicDisplayGroupRatio(model),
           discountMultiplier,
         })
         const baseDynamicSummary =
@@ -141,10 +135,7 @@ export function usePricingColumns(
                 showRechargePrice,
                 priceRate,
                 usdExchangeRate,
-                groupRatioMultiplier: getDynamicDisplayGroupRatio(
-                  model,
-                  selectedGroup
-                ),
+                groupRatioMultiplier: getDynamicDisplayGroupRatio(model),
               })
             : null
 
@@ -237,7 +228,7 @@ export function usePricingColumns(
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              selectedGroup,
+              undefined,
               discountMultiplier
             )
           )
@@ -249,7 +240,7 @@ export function usePricingColumns(
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              selectedGroup,
+              undefined,
               discountMultiplier
             )
           )
@@ -260,8 +251,7 @@ export function usePricingColumns(
               tokenUnit,
               showRechargePrice,
               priceRate,
-              usdExchangeRate,
-              selectedGroup
+              usdExchangeRate
             )
           )
           const baseOutputPrice = stripTrailingZeros(
@@ -271,8 +261,7 @@ export function usePricingColumns(
               tokenUnit,
               showRechargePrice,
               priceRate,
-              usdExchangeRate,
-              selectedGroup
+              usdExchangeRate
             )
           )
 
@@ -304,7 +293,7 @@ export function usePricingColumns(
             showRechargePrice,
             priceRate,
             usdExchangeRate,
-            selectedGroup,
+            undefined,
             discountMultiplier
           )
         )
@@ -313,8 +302,7 @@ export function usePricingColumns(
             model,
             showRechargePrice,
             priceRate,
-            usdExchangeRate,
-            selectedGroup
+            usdExchangeRate
           )
         )
 
@@ -349,10 +337,7 @@ export function usePricingColumns(
           showRechargePrice,
           priceRate,
           usdExchangeRate,
-          groupRatioMultiplier: getDynamicDisplayGroupRatio(
-            model,
-            selectedGroup
-          ),
+          groupRatioMultiplier: getDynamicDisplayGroupRatio(model),
           discountMultiplier,
         })
         const baseDynamicSummary =
@@ -362,10 +347,7 @@ export function usePricingColumns(
                 showRechargePrice,
                 priceRate,
                 usdExchangeRate,
-                groupRatioMultiplier: getDynamicDisplayGroupRatio(
-                  model,
-                  selectedGroup
-                ),
+                groupRatioMultiplier: getDynamicDisplayGroupRatio(model),
               })
             : null
 
@@ -422,7 +404,7 @@ export function usePricingColumns(
             showRechargePrice,
             priceRate,
             usdExchangeRate,
-            selectedGroup,
+            undefined,
             discountMultiplier
           )
         )
@@ -433,8 +415,7 @@ export function usePricingColumns(
             tokenUnit,
             showRechargePrice,
             priceRate,
-            usdExchangeRate,
-            selectedGroup
+            usdExchangeRate
           )
         )
 
@@ -526,25 +507,6 @@ export function usePricingColumns(
                 copyable={false}
               />
             ))}
-          />
-        )
-      },
-      size: 130,
-      enableSorting: false,
-    },
-
-    // Enable Groups column
-    {
-      accessorKey: 'enable_groups',
-      header: t('Groups'),
-      cell: ({ row }) => {
-        const groups = row.original.enable_groups || []
-        return (
-          <BadgeListCell
-            items={groups.map((group) => (
-              <GroupBadge key={group} group={group} size='sm' />
-            ))}
-            tooltipClassName='max-w-[280px] p-2'
           />
         )
       },

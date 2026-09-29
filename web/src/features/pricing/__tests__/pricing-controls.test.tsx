@@ -36,7 +36,6 @@ function toolbarProps(): PricingToolbarProps {
     quotaTypeFilter: 'all',
     endpointTypeFilter: 'all',
     vendorFilter: 'all',
-    groupFilter: 'all',
     tagFilter: 'all',
     onSortChange: vi.fn(),
     onTokenUnitChange: vi.fn(),
@@ -45,11 +44,8 @@ function toolbarProps(): PricingToolbarProps {
     onQuotaTypeChange: vi.fn(),
     onEndpointTypeChange: vi.fn(),
     onVendorChange: vi.fn(),
-    onGroupChange: vi.fn(),
     onTagChange: vi.fn(),
     vendors: [],
-    groups: ['default', 'premium'],
-    groupRatios: { default: 1, premium: 3 },
     tags: [],
     models: [],
     hasActiveFilters: false,
@@ -117,27 +113,19 @@ describe('pricing controls', () => {
     expect(props.onSortChange).toHaveBeenCalledWith('price-low')
   })
 
-  it('opens mobile filters from the left, selects a group, and restores focus on close', async () => {
-    const props = toolbarProps()
+  it('opens mobile filters without group controls and restores focus on close', async () => {
+    const props = {
+      ...toolbarProps(),
+      hasActiveFilters: true,
+      activeFilterCount: 1,
+    }
     const user = userEvent.setup()
-    const { rerender } = render(<PricingToolbar {...props} />)
-    await user.click(screen.getByRole('button', { name: 'Filter' }))
+    render(<PricingToolbar {...props} />)
+    await user.click(screen.getByRole('button', { name: /^Filter/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Filter' })
     expect(dialog).toHaveAttribute('data-side', 'left')
-    expect(within(dialog).getByRole('button', { name: 'Reset' })).toBeDisabled()
-    await user.click(within(dialog).getByRole('button', { name: /premium/ }))
-    expect(props.onGroupChange).toHaveBeenCalledWith('premium')
-    rerender(
-      <PricingToolbar
-        {...props}
-        groupFilter='premium'
-        hasActiveFilters
-        activeFilterCount={1}
-      />
-    )
-    expect(
-      within(dialog).getByRole('button', { name: /premium/ })
-    ).toHaveAttribute('aria-pressed', 'true')
+    expect(within(dialog).getByRole('button', { name: 'Reset' })).toBeEnabled()
+    expect(within(dialog).queryByText('Groups')).not.toBeInTheDocument()
     await user.click(within(dialog).getByRole('button', { name: 'Reset' }))
     expect(props.onClearFilters).toHaveBeenCalledOnce()
     await user.keyboard('{Escape}')

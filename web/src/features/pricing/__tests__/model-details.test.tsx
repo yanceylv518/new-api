@@ -38,9 +38,6 @@ describe('model details overview', () => {
       <QueryClientProvider client={queryClient}>
         <ModelDetailsContent
           model={model}
-          groupRatio={{ default: 1 }}
-          usableGroup={{ default: { desc: 'Default group', ratio: 1 } }}
-          autoGroups={[]}
           priceRate={1}
           usdExchangeRate={1}
           tokenUnit='M'
@@ -51,5 +48,8 @@ describe('model details overview', () => {
     expect(screen.queryByRole('tab')).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'test-model' })).toBeVisible()
     expect(screen.getByRole('heading', { name: 'Pricing' })).toBeVisible()
+    expect(screen.queryByText('Groups')).not.toBeInTheDocument()
+    expect(screen.queryByText('Pricing by Group')).not.toBeInTheDocument()
+    expect(screen.queryByText('Auto Group Chain')).not.toBeInTheDocument()
   })
 })

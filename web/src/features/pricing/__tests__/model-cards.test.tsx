@@ -113,7 +113,7 @@ describe('model cards', () => {
     expect(screen.getByRole('button', { name: 'Details' })).toBeEnabled()
   })
 
-  it('keeps group, endpoint and tag overflow counts with their own metadata', () => {
+  it('hides groups while preserving endpoint and tag metadata', () => {
     const groups = ['default-with-a-long-group-name', 'premium', 'internal']
     const endpoints = ['openai-response', 'openai', 'claude', 'gemini', 'jina']
     const tags = [
@@ -135,17 +135,12 @@ describe('model cards', () => {
       />
     )
 
-    const groupField = screen.getByText('Groups').parentElement
     const endpointField = screen.getByText('Endpoints').parentElement
-    if (!groupField || !endpointField) {
-      throw new Error('Expected labeled group and endpoint fields')
+    if (!endpointField) {
+      throw new Error('Expected labeled endpoint field')
     }
     const tagField = screen.getByRole('group', { name: 'Tags' })
-    expect(within(groupField).getByText(groups[0])).toBeVisible()
-    expect(within(groupField).getByText('+2')).toHaveAttribute(
-      'title',
-      groups.slice(1).join(', ')
-    )
+    expect(screen.queryByText('Groups')).not.toBeInTheDocument()
     expect(
       within(endpointField).getByText('openai-response, openai')
     ).toHaveAttribute('title', endpoints.join(', '))
@@ -161,7 +156,7 @@ describe('model cards', () => {
     ).toBeVisible()
   })
 
-  it('omits metadata fields when the model has no groups, endpoints or tags', () => {
+  it('omits endpoint and tag metadata when the model has none', () => {
     render(
       <ModelCard
         model={pricingModel({ enable_groups: [] })}
@@ -199,11 +194,10 @@ describe('model cards', () => {
     }
   )
 
-  it('keeps group and recharge pricing correct when changing the token unit, including a free cache price', () => {
+  it('keeps recharge pricing correct when changing the token unit, including a free cache price', () => {
     const props = {
-      model: pricingModel({ cache_ratio: 0 }),
+      model: pricingModel({ cache_ratio: 0, enable_groups: ['premium'] }),
       onClick: vi.fn(),
-      selectedGroup: 'premium',
       showRechargePrice: true,
       priceRate: 3,
       usdExchangeRate: 6,
@@ -230,12 +224,15 @@ describe('model cards', () => {
     )
   })
 
-  it('shows a per-request price with the selected group and recharge multiplier without a token unit', () => {
+  it('shows a per-request price with the model ratio and recharge multiplier without a token unit', () => {
     render(
       <ModelCard
-        model={pricingModel({ quota_type: 1, model_price: 0.4 })}
+        model={pricingModel({
+          quota_type: 1,
+          model_price: 0.4,
+          enable_groups: ['premium'],
+        })}
         onClick={vi.fn()}
-        selectedGroup='premium'
         showRechargePrice
         priceRate={3}
         usdExchangeRate={6}
@@ -254,10 +251,10 @@ describe('model cards', () => {
         model={pricingModel({
           billing_mode: 'tiered_expr',
           billing_expr: 'tier("base", p * 3 + c * 15)',
+          enable_groups: ['premium'],
         })}
         onClick={vi.fn()}
         tokenUnit='K'
-        selectedGroup='premium'
         showRechargePrice
         priceRate={3}
         usdExchangeRate={6}
