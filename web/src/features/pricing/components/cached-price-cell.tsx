@@ -24,7 +24,6 @@ import { useSystemConfigStore } from '@/stores/system-config-store'
 import { DEFAULT_TOKEN_UNIT } from '../constants'
 import { useBillingTime } from '../hooks/use-billing-time'
 import {
-  getDynamicDisplayGroupRatio,
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
@@ -48,7 +47,6 @@ export function CachedPriceCell(props: {
     priceRate = 1,
     usdExchangeRate = 1,
     showRechargePrice = false,
-    selectedGroup,
   } = props.options
 
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
@@ -67,7 +65,7 @@ export function CachedPriceCell(props: {
         priceRate,
         usdExchangeRate,
         discountMultiplier,
-        groupRatioMultiplier: getDynamicDisplayGroupRatio(model, selectedGroup),
+        groupRatioMultiplier: 1,
       }),
     // Currency is read indirectly by the price formatter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -77,7 +75,6 @@ export function CachedPriceCell(props: {
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      selectedGroup,
       billingTime,
       currency,
       discountMultiplier,
@@ -92,20 +89,18 @@ export function CachedPriceCell(props: {
             showRechargePrice,
             priceRate,
             usdExchangeRate,
-            groupRatioMultiplier: getDynamicDisplayGroupRatio(
-              model,
-              selectedGroup
-            ),
+            groupRatioMultiplier: 1,
             discountMultiplier: 1,
           })
         : null,
+    // Currency is read indirectly by the price formatter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       model,
       tokenUnit,
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      selectedGroup,
       billingTime,
       hasDiscount,
       currency,
@@ -181,7 +176,7 @@ export function CachedPriceCell(props: {
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      selectedGroup,
+      undefined,
       discountMultiplier,
       false
     )
@@ -194,7 +189,7 @@ export function CachedPriceCell(props: {
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      selectedGroup,
+      undefined,
       false
     )
   )

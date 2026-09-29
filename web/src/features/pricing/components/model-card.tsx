@@ -31,7 +31,6 @@ import { DEFAULT_TOKEN_UNIT } from '../constants'
 import { useBillingTime } from '../hooks/use-billing-time'
 import {
   getCardExamplePrice,
-  getDynamicDisplayGroupRatio,
   getDynamicPriceUnitLabelKey,
   getDynamicPricingSummary,
   isDynamicPricingModel,
@@ -59,7 +58,6 @@ export interface ModelCardProps {
   usdExchangeRate?: number
   tokenUnit?: TokenUnit
   showRechargePrice?: boolean
-  selectedGroup?: string
   perf?: ModelPerfBadgeData
 }
 
@@ -72,7 +70,6 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
   const isTokenBased = isTokenBasedModel(props.model)
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
   const tags = parseTags(props.model.tags)
-  const groups = props.model.enable_groups || []
   const endpoints = props.model.supported_endpoint_types || []
   const modelIconKey = props.model.icon || props.model.vendor_icon
   const modelIcon = modelIconKey ? getLobeIcon(modelIconKey, 28) : null
@@ -91,14 +88,9 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
       showRechargePrice,
       priceRate,
       usdExchangeRate,
-      groupRatioMultiplier: getDynamicDisplayGroupRatio(
-        props.model,
-        props.selectedGroup
-      ),
+      groupRatioMultiplier: 1,
     }),
     [
-      props.model,
-      props.selectedGroup,
       billingTime,
       discountMultiplier,
       tokenUnit,
@@ -270,7 +262,7 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              props.selectedGroup
+              undefined
             )}
             effective={formatPrice(
               props.model,
@@ -279,7 +271,7 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              props.selectedGroup,
+              undefined,
               discountMultiplier
             )}
           />
@@ -301,14 +293,14 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              props.selectedGroup
+              undefined
             )}
             effective={formatRequestPrice(
               props.model,
               showRechargePrice,
               priceRate,
               usdExchangeRate,
-              props.selectedGroup,
+              undefined,
               discountMultiplier
             )}
           />
@@ -400,33 +392,8 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
             {priceSummary}
           </div>
         </div>
-        {(groups.length > 0 || endpoints.length > 0) && (
-          <dl
-            className={cn(
-              'grid min-w-0 grid-cols-2 gap-3 text-xs',
-              (groups.length === 0 || endpoints.length === 0) && 'grid-cols-1'
-            )}
-          >
-            {groups.length > 0 && (
-              <div className='flex min-w-0 items-baseline gap-1.5'>
-                <dt className='text-muted-foreground shrink-0'>
-                  {t('Groups')}
-                </dt>
-                <dd className='flex min-w-0 items-baseline gap-1'>
-                  <span className='truncate' title={groups.join(', ')}>
-                    {groups[0]}
-                  </span>
-                  {groups.length > 1 && (
-                    <span
-                      className='text-muted-foreground shrink-0'
-                      title={groups.slice(1).join(', ')}
-                    >
-                      +{groups.length - 1}
-                    </span>
-                  )}
-                </dd>
-              </div>
-            )}
+        {endpoints.length > 0 && (
+          <dl className='grid min-w-0 grid-cols-1 gap-3 text-xs'>
             {endpoints.length > 0 && (
               <div className='flex min-w-0 items-baseline gap-1.5'>
                 <dt className='text-muted-foreground shrink-0'>

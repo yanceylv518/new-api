@@ -25,7 +25,6 @@ import { useSystemConfigStore } from '@/stores/system-config-store'
 import { DEFAULT_TOKEN_UNIT } from '../constants'
 import { useBillingTime } from '../hooks/use-billing-time'
 import {
-  getDynamicDisplayGroupRatio,
   getDynamicPriceUnitLabelKey,
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
@@ -45,7 +44,6 @@ export type ModelPriceCellOptions = {
   priceRate?: number
   usdExchangeRate?: number
   showRechargePrice?: boolean
-  selectedGroup?: string
 }
 
 export function ModelPriceCell(props: {
@@ -73,10 +71,7 @@ export function ModelPriceCell(props: {
         tokenUnit,
         discountMultiplier,
         showCurrencySymbol: false,
-        groupRatioMultiplier: getDynamicDisplayGroupRatio(
-          props.model,
-          options.selectedGroup
-        ),
+        groupRatioMultiplier: 1,
       }),
     // Currency is read indirectly by the price formatter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -86,7 +81,6 @@ export function ModelPriceCell(props: {
       options.priceRate,
       options.usdExchangeRate,
       options.showRechargePrice,
-      options.selectedGroup,
       billingTime,
       discountMultiplier,
       currency,
@@ -102,20 +96,18 @@ export function ModelPriceCell(props: {
             now: billingTime === undefined ? undefined : new Date(billingTime),
             tokenUnit,
             showCurrencySymbol: false,
-            groupRatioMultiplier: getDynamicDisplayGroupRatio(
-              props.model,
-              options.selectedGroup
-            ),
+            groupRatioMultiplier: 1,
             discountMultiplier: 1,
           })
         : null,
+    // Currency is read indirectly by the price formatter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       props.model,
       tokenUnit,
       options.priceRate,
       options.usdExchangeRate,
       options.showRechargePrice,
-      options.selectedGroup,
       billingTime,
       hasDiscount,
       currency,
@@ -181,9 +173,8 @@ export function ModelPriceCell(props: {
               <DiscountedPrice
                 discounted={hasDiscount}
                 original={
-                  baseDynamic?.entries.find(
-                    (item) => item.key === entry.key
-                  )?.formattedRange ??
+                  baseDynamic?.entries.find((item) => item.key === entry.key)
+                    ?.formattedRange ??
                   baseDynamic?.entries.find((item) => item.key === entry.key)
                     ?.formatted
                 }
@@ -254,7 +245,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 false
               )}
               effective={formatPrice(
@@ -264,7 +255,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 discountMultiplier,
                 false
               )}
@@ -283,7 +274,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 false
               )}
               effective={formatPrice(
@@ -293,7 +284,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 discountMultiplier,
                 false
               )}
@@ -313,7 +304,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 false
               )}
               effective={formatRequestPrice(
@@ -321,7 +312,7 @@ export function ModelPriceCell(props: {
                 options.showRechargePrice,
                 options.priceRate,
                 options.usdExchangeRate,
-                options.selectedGroup,
+                undefined,
                 discountMultiplier,
                 false
               )}
@@ -348,9 +339,7 @@ export function ModelPriceCell(props: {
             >
               {metric.label}
             </span>
-            <span
-              className='min-w-0 font-mono text-sm break-words whitespace-normal tabular-nums'
-            >
+            <span className='min-w-0 font-mono text-sm break-words whitespace-normal tabular-nums'>
               {metric.value}
             </span>
           </span>
