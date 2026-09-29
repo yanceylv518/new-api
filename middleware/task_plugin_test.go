@@ -60,6 +60,7 @@ export const meta = {
 export const native = {
 decodeJob: function(ctx) {
   if (ctx.path !== "/vendor/jobs/video" || ctx.method !== "POST") throw new Error("bad path");
+  if (ctx.action !== "static-action") throw new Error("bad action");
   if (ctx.params.category !== "video") throw new Error("bad params");
   if (ctx.query.tag.length !== 2 || ctx.query.tag[0] !== "first" || ctx.query.tag[1] !== "second") throw new Error("bad query");
   if (ctx.body.kind !== "json" || !Array.isArray(ctx.body.value) || ctx.body.value[0] !== "prompt") throw new Error("bad body");

@@ -36,6 +36,7 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		{"POST", "/doubao/api/v3/contents/generations/tasks", "doubao", jsplugin.RouteTypeSubmit, "", "taskCreated"},
 		{"GET", "/doubao/api/v3/contents/generations/tasks/:task_id", "doubao", jsplugin.RouteTypeQuery, "", "taskStatus"},
 		{"POST", "/doubao/api/v3/images/generations", "doubao", jsplugin.RouteTypeSubmit, "", "imageCreated"},
+		{"POST", "/ali/api/v1/services/aigc/image2video/face-detect", "alibaba", jsplugin.RouteTypeSubmit, "", "faceDetectCreated"},
 	}
 	for _, expected := range routes {
 		t.Run(expected.method+" "+expected.path, func(t *testing.T) {
@@ -112,6 +113,10 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			assert.Equal(t, []string{"stream", "sync", "background"}, responsesClaim.Supports)
 			for _, model := range plugin.Meta.Models {
 				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/responses", model)
+				if key == "alibaba" && model == "wan2.2-s2v-detect" {
+					assert.False(t, claimed, model)
+					continue
+				}
 				require.True(t, claimed, model)
 				assert.Same(t, plugin, binding.Plugin)
 			}
@@ -168,7 +173,7 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
 	require.NotNil(t, generation)
-	for _, key := range []string{"hailuo", "google", "vidu", "vertex-ai"} {
+	for _, key := range []string{"hailuo", "google", "vertex-ai"} {
 		plugin, found := generation.Get(key)
 		require.True(t, found, key)
 		assert.False(t, plugin.Meta.SupportsUpstream(jsplugin.UpstreamKindNewAPI), "%s has no native routes and must not be bindable to a New API channel", key)
@@ -206,6 +211,16 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 			gatewaySubmit:    "/ali/api/v1/services/aigc/video-generation/video-synthesis",
 			vendorQuery:      "/api/v1/tasks/tid",
 			gatewayQuery:     "/ali/api/v1/tasks/tid",
+		},
+		{
+			key:              "vidu",
+			driver:           map[string]any{"action": "text_to_video", "model": "viduq2", "upstreamModel": "viduq2", "requestBody": map[string]any{"model": "viduq2", "prompt": "a cat"}},
+			vendorKey:        "vendor-key",
+			vendorAuthPrefix: "Bearer vendor-key",
+			vendorSubmit:     "/ent/v2/text2video",
+			gatewaySubmit:    "/vidu/ent/v2/text2video",
+			vendorQuery:      "/ent/v2/tasks?task_ids=tid",
+			gatewayQuery:     "/vidu/ent/v2/tasks?task_ids=tid",
 		},
 		{
 			key:                "kling",

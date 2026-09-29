@@ -159,12 +159,15 @@ API Key 上传和管理私域素材请参见[私域素材库 API](seedance-asset
 
 | 模型 | 当前插件声明的可用分辨率 |
 | --- | --- |
+| `doubao-seedance-2-0-260128` | `480p`、`720p`、`1080p`、`4k` |
+| `doubao-seedance-2-5-260628` | `480p`、`720p`、`1080p` |
 | `doubao-seedance-2-0-fast-260128` | `480p`、`720p` |
 | `doubao-seedance-2-0-mini-260615` | `480p`、`720p` |
-| 其他已声明模型 | `480p`、`720p`、`1080p`、`4k`，最终以渠道和上游限制为准 |
+| `doubao-seedance-1-0-pro-250528`、`doubao-seedance-1-0-lite-t2v`、`doubao-seedance-1-0-lite-i2v`、`doubao-seedance-1-5-pro-251215` | `480p`、`720p`、`1080p` |
 
-Fast 和 Mini 模型不接受 `1080p`、`4k` 或等价的高分辨率尺寸。未传分辨率
-时，Fast/Mini 默认按 `720p` 估算；其他模型默认按 `1080p` 估算。
+2.5 模型不接受 `4k` 或等价的 `3840x2160` 高分辨率尺寸；Fast 和 Mini
+模型不接受 `1080p`、`4k` 或等价的高分辨率尺寸。未传分辨率时，Fast/Mini
+默认按 `720p` 估算，2.5 和其他支持 1080p 的模型默认按 `1080p` 估算。
 
 当前插件声明的模型：
 

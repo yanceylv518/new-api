@@ -35,6 +35,7 @@ func TestDoubaoResolutionProfiles(t *testing.T) {
 		{"doubao-seedance-2-0-260128", []string{"480p", "720p", "1080p", "4k"}},
 		{"doubao-seedance-2-0-fast-260128", []string{"480p", "720p"}},
 		{"doubao-seedance-2-0-mini-260615", []string{"480p", "720p"}},
+		{"doubao-seedance-2-5-260628", []string{"480p", "720p", "1080p"}},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			schema, examples := plugin.Meta.UsageForModel(tc.model)
@@ -704,6 +705,31 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 			assert.Equal(t, tc.want, alibabaObject(t, facts))
 		})
 	}
+
+	// 上游渠道映射成未知 endpoint 时，不能让 2.5 回退到包含 4K 的默认 profile。
+	t.Run("mapped 2.5 keeps the declared resolution limit", func(t *testing.T) {
+		const model25 = "doubao-seedance-2-5-260628"
+		request := map[string]any{
+			"model": model25, "prompt": "test", "seconds": float64(5),
+			"metadata": map[string]any{"resolution": "4k"},
+		}
+		ctx := map[string]any{
+			"model": model25, "upstreamModel": "provider-seedance-2-5-endpoint",
+			"requestBody": request,
+		}
+		for _, hook := range []string{"buildSubmitRequest", "extractUsage"} {
+			_, err := plugin.Engine.Call(t.Context(), hook, ctx)
+			require.Error(t, err, hook)
+			assert.Contains(t, err.Error(), model25)
+		}
+		for _, protocol := range []string{"openai_responses", "openai_video"} {
+			_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{protocol, "decodeRequest"}, map[string]any{
+				"model": model25, "upstreamModel": "provider-seedance-2-5-endpoint",
+				"body": map[string]any{"kind": "json", "value": request},
+			})
+			require.Error(t, err, protocol)
+		}
+	})
 
 	t.Run("completion overlays only resolutions the model offers", func(t *testing.T) {
 		for _, tc := range []struct {

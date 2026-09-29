@@ -5,11 +5,15 @@ const WAN_MODELS = {
   "wan3.0-video-prime": { kind: "all", resolutions: ["480P", "720P", "1080P"], defaultResolution: "1080P", maxDuration: 30 },
   "wan2.7-t2v": { kind: "t2v", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
   "wan2.7-i2v": { kind: "media", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
+  "wan2.7-r2v": { kind: "reference", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
+  "wan2.7-videoedit": { kind: "videoedit", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 10 },
   "wan2.6-t2v": { kind: "size", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
   "wan2.6-t2v-us": { kind: "size", resolutions: ["720P", "1080P"], defaultResolution: "1080P", durations: [5, 10, 15] },
   "wan2.6-i2v": { kind: "image", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
   "wan2.6-i2v-flash": { kind: "image", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 15 },
   "wan2.6-i2v-us": { kind: "image", resolutions: ["720P", "1080P"], defaultResolution: "1080P", durations: [5, 10, 15] },
+  "wan2.6-r2v": { kind: "reference_legacy", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 10 },
+  "wan2.6-r2v-flash": { kind: "reference_legacy", resolutions: ["720P", "1080P"], defaultResolution: "1080P", maxDuration: 10 },
   "wan2.5-t2v-preview": { kind: "size", resolutions: ["480P", "720P", "1080P"], defaultResolution: "1080P", durations: [5, 10] },
   "wan2.5-i2v-preview": { kind: "image", resolutions: ["480P", "720P", "1080P"], defaultResolution: "1080P", durations: [5, 10] },
   "wan2.2-t2v-plus": { kind: "size", resolutions: ["480P", "1080P"], defaultResolution: "1080P", durations: [5] },
@@ -17,10 +21,15 @@ const WAN_MODELS = {
   "wan2.2-i2v-plus": { kind: "image", resolutions: ["480P", "1080P"], defaultResolution: "1080P", durations: [5] },
   "wan2.2-kf2v-flash": { kind: "frames", resolutions: ["480P", "720P", "1080P"], defaultResolution: "720P", durations: [5] },
   "wan2.2-s2v": { kind: "speech", resolutions: ["480P", "720P"], defaultResolution: "480P" },
+  "wan2.2-animate-move": { kind: "animate", resolutions: [], defaultResolution: "", maxDuration: 30 },
+  "wan2.2-animate-mix": { kind: "animate", resolutions: [], defaultResolution: "", maxDuration: 30 },
+  "wan2.2-s2v-detect": { kind: "face_detect", resolutions: [], defaultResolution: "", maxDuration: 0 },
   "wanx2.1-t2v-plus": { kind: "size", resolutions: ["720P"], defaultResolution: "720P", durations: [5] },
   "wanx2.1-t2v-turbo": { kind: "size", resolutions: ["480P", "720P"], defaultResolution: "720P", durations: [5] },
   "wanx2.1-i2v-plus": { kind: "image", resolutions: ["720P"], defaultResolution: "720P", durations: [5] },
   "wanx2.1-i2v-turbo": { kind: "image", resolutions: ["480P", "720P"], defaultResolution: "720P", durations: [3, 4, 5] },
+  "wanx2.1-kf2v-plus": { kind: "frames", resolutions: ["720P"], defaultResolution: "720P", durations: [5] },
+  "wanx2.1-vace-plus": { kind: "vace", resolutions: ["720P"], defaultResolution: "720P", durations: [5] },
 };
 
 // HTTP contracts (SDK synchronous calls can also wrap polling):
@@ -132,6 +141,14 @@ const IMAGE_COUNT_FIELD = {
 };
 
 const WAN_IMAGE_USAGE_SCHEMA = { image_count: IMAGE_COUNT_FIELD };
+const IMAGE_DETECTION_USAGE_SCHEMA = {
+  image_count: {
+    type: "number",
+    unit: "count",
+    unitLabel: IMAGE_UNIT_LABEL,
+    description: { en: "Image detection unit price", zh: "图片检测单价" },
+  },
+};
 
 // Z-Image is priced differently when prompt rewriting is enabled.
 const Z_IMAGE_USAGE_SCHEMA = {
@@ -190,22 +207,71 @@ function wanVideoUsageSchema(resolutions, audio) {
   return schema;
 }
 
-const WAN_AUDIO_VIDEO_MODELS = ["wan2.6-i2v-flash"];
+const WAN_AUDIO_VIDEO_MODELS = ["wan2.6-i2v-flash", "wan2.6-r2v-flash"];
 // Dated snapshots share the undated model's capabilities through modelKey.
-const WAN_VIDEO_SNAPSHOTS = ["wan2.7-t2v-2026-04-25", "wan2.7-t2v-2026-06-12", "wan2.7-i2v-2026-04-25"];
+const WAN_VIDEO_SNAPSHOTS = [
+  "wan2.7-t2v-2026-04-25",
+  "wan2.7-t2v-2026-06-12",
+  "wan2.7-i2v-2026-04-25",
+  "wan2.7-r2v-2026-06-12",
+];
 const WAN_VIDEO_RESOLUTIONS = ["480P", "720P", "1080P"];
+const WAN_ANIMATE_MODELS = ["wan2.2-animate-move", "wan2.2-animate-mix"];
+const WAN_FACE_DETECT_MODELS = ["wan2.2-s2v-detect"];
+const WAN_PROTOCOL_VIDEO_MODELS = Object.keys(WAN_MODELS)
+  .filter((name) => !WAN_FACE_DETECT_MODELS.includes(name))
+  .concat(WAN_VIDEO_SNAPSHOTS);
+const ALIBABA_OPENAI_MODELS = Object.keys(IMAGE_MODELS).concat(IMAGE_MODEL_SNAPSHOTS, WAN_PROTOCOL_VIDEO_MODELS);
+
+const WAN_MODE_FIELD = {
+  enum: ["wan-std", "wan-pro"],
+  enumLabels: {
+    "wan-std": { en: "Standard mode", zh: "标准模式" },
+    "wan-pro": { en: "Professional mode", zh: "专业模式" },
+  },
+  description: { en: "Video service mode", zh: "视频服务模式" },
+};
+
+const WAN_ANIMATE_USAGE_SCHEMA = {
+  seconds: {
+    type: "number",
+    unit: "second",
+    description: { en: "Video generation unit price", zh: "视频生成单价" },
+  },
+  mode: WAN_MODE_FIELD,
+};
+
+const WAN_VACE_USAGE_SCHEMA = {
+  seconds: {
+    type: "number",
+    unit: "second",
+    description: { en: "Video generation unit price", zh: "视频生成单价" },
+  },
+};
 
 // One usage profile per distinct resolution set and audio option.
 function wanVideoUsageProfiles() {
   const profiles = [];
   for (const model of Object.keys(WAN_MODELS).concat(WAN_VIDEO_SNAPSHOTS)) {
     const key = modelKey(model);
+    if (WAN_FACE_DETECT_MODELS.includes(key)) continue;
     const resolutions = WAN_MODELS[key].resolutions;
     const audio = WAN_AUDIO_VIDEO_MODELS.includes(key);
-    const shape = resolutions.join("/") + (audio ? "+audio" : "");
+    let schema;
+    let shape;
+    if (WAN_ANIMATE_MODELS.includes(key)) {
+      schema = WAN_ANIMATE_USAGE_SCHEMA;
+      shape = "animate";
+    } else if (WAN_MODELS[key].kind === "vace") {
+      schema = WAN_VACE_USAGE_SCHEMA;
+      shape = "vace";
+    } else {
+      schema = wanVideoUsageSchema(resolutions, audio);
+      shape = resolutions.join("/") + (audio ? "+audio" : "");
+    }
     let profile = profiles.find((entry) => entry.shape === shape);
     if (!profile) {
-      profile = { shape: shape, models: [], schema: wanVideoUsageSchema(resolutions, audio) };
+      profile = { shape: shape, models: [], schema: schema };
       profiles.push(profile);
     }
     profile.models.push(model);
@@ -222,7 +288,7 @@ export const meta = {
     en: "Alibaba Cloud Bailian image and video generation (Wan, Qwen-Image, Z-Image)",
     zh: "阿里云百炼图片与视频生成（万相、千问图像、Z-Image）",
   },
-  version: "1.4.1",
+  version: "1.5.0",
   author: { name: "QuantumNous" },
   channelTypes: [17],
   // Literal metadata also supports the dashboard's static script preview.
@@ -234,11 +300,16 @@ export const meta = {
     "wan2.7-t2v-2026-06-12",
     "wan2.7-i2v",
     "wan2.7-i2v-2026-04-25",
+    "wan2.7-r2v",
+    "wan2.7-r2v-2026-06-12",
+    "wan2.7-videoedit",
     "wan2.6-t2v",
     "wan2.6-t2v-us",
     "wan2.6-i2v",
     "wan2.6-i2v-flash",
     "wan2.6-i2v-us",
+    "wan2.6-r2v",
+    "wan2.6-r2v-flash",
     "wan2.5-t2v-preview",
     "wan2.5-i2v-preview",
     "wan2.2-t2v-plus",
@@ -246,10 +317,15 @@ export const meta = {
     "wan2.2-i2v-plus",
     "wan2.2-kf2v-flash",
     "wan2.2-s2v",
+    "wan2.2-animate-move",
+    "wan2.2-animate-mix",
+    "wan2.2-s2v-detect",
     "wanx2.1-t2v-plus",
     "wanx2.1-t2v-turbo",
     "wanx2.1-i2v-plus",
     "wanx2.1-i2v-turbo",
+    "wanx2.1-kf2v-plus",
+    "wanx2.1-vace-plus",
     "wan2.7-image-pro",
     "wan2.7-image",
     "wan2.6-image",
@@ -286,6 +362,7 @@ export const meta = {
         .filter((name) => !QWEN_IMAGE3_MODELS.includes(name) && !Z_IMAGE_MODELS.includes(name)),
       schema: WAN_IMAGE_USAGE_SCHEMA,
     },
+    { models: WAN_FACE_DETECT_MODELS, schema: IMAGE_DETECTION_USAGE_SCHEMA },
     { models: Z_IMAGE_MODELS, schema: Z_IMAGE_USAGE_SCHEMA },
     { models: QWEN_IMAGE3_MODELS, schema: QWEN_IMAGE3_USAGE_SCHEMA },
   ].concat(wanVideoUsageProfiles()),
@@ -325,13 +402,22 @@ export const meta = {
       decode: "createImageTask",
       render: "taskCreated",
     },
+    {
+      method: "POST",
+      path: "/ali/api/v1/services/aigc/image2video/face-detect",
+      type: "submit",
+      models: ["wan2.2-s2v-detect"],
+      decode: "createFaceDetectTask",
+      render: "faceDetectCreated",
+      retainResult: false,
+    },
     { method: "POST", path: "/ali/api/v1/services/aigc/video-generation/video-synthesis", type: "submit", decode: "createVideoTask", render: "taskCreated" },
     { method: "POST", path: "/ali/api/v1/services/aigc/image2video/video-synthesis", type: "submit", decode: "createVideoTask", render: "taskCreated" },
     { method: "GET", path: "/ali/api/v1/tasks/:task_id", type: "query", render: "taskStatus" },
   ],
   protocols: [
-    { name: "openai_responses", supports: ["stream", "sync", "background"] },
-    { name: "openai_video", models: Object.keys(WAN_MODELS).concat(["wan2.7-t2v-2026-04-25", "wan2.7-t2v-2026-06-12", "wan2.7-i2v-2026-04-25"]) },
+    { name: "openai_responses", models: ALIBABA_OPENAI_MODELS, supports: ["stream", "sync", "background"] },
+    { name: "openai_video", models: WAN_PROTOCOL_VIDEO_MODELS },
     { name: "openai_image", models: Object.keys(IMAGE_MODELS).concat(IMAGE_MODEL_SNAPSHOTS) },
   ],
 };
@@ -340,14 +426,20 @@ function trimmed(value) {
   return String(value || "").trim();
 }
 
-function viaNewAPI(ctx) {
-  return !!(ctx.upstream && ctx.upstream.kind === "new_api");
+function httpURL(value) {
+  return /^https?:\/\//i.test(trimmed(value));
+}
+
+function viaGateway(ctx) {
+  return !!(ctx && ctx.upstream && ctx.upstream.kind === "new_api");
 }
 
 // Another New API gateway serves the DashScope wire format only on this
 // plugin's /ali native routes; DashScope itself serves the unprefixed paths.
 function apiRoot(ctx) {
-  return ctx.baseUrl + (viaNewAPI(ctx) ? "/ali" : "");
+  const base = trimmed(ctx && ctx.baseUrl).replace(/\/+$/, "");
+  if (base.toLowerCase().endsWith("/ali")) return base;
+  return base + (viaGateway(ctx) ? "/ali" : "");
 }
 
 function firstImage(req) {
@@ -389,6 +481,10 @@ function modelProfile(model) {
   const key = modelKey(model);
   if (!Object.prototype.hasOwnProperty.call(WAN_MODELS, key)) throw new Error("unsupported Wan model: " + model);
   return WAN_MODELS[key];
+}
+
+function faceDetectModel(ctx) {
+  return WAN_FACE_DETECT_MODELS.includes(modelKey(ctx.upstreamModel || ctx.model || (ctx.requestBody || {}).model));
 }
 
 function imageModel(ctx) {
@@ -751,6 +847,8 @@ function videoSize(value) {
 
 function videoAction(req) {
   const input = objectValue((req.metadata || {}).input, "metadata.input");
+  if (trimmed(input.function)) return "video_edit";
+  if (trimmed(input.video_url) || Array.isArray(input.reference_urls)) return "reference_to_video";
   for (const source of [req, input]) {
     if (
       firstImage(source) ||
@@ -764,22 +862,118 @@ function videoAction(req) {
   return "text_to_video";
 }
 
+function convertFaceDetect(ctx) {
+  const req = ctx.requestBody || {};
+  const upstreamModel = ctx.upstreamModel || req.model;
+  const metadata = objectValue(req.metadata, "metadata");
+  const input = objectValue(metadata.input, "metadata.input");
+  const image = trimmed(input.image_url || input.img_url || req.image_url || req.img_url);
+  if (!httpURL(image)) throw new Error("wan2.2-s2v-detect requires an HTTP(S) image_url");
+  return { model: upstreamModel, input: { image_url: image } };
+}
+
+function normalizeVaceInput(input, parameters) {
+  const functions = ["image_reference", "video_repainting", "video_edit", "video_extension", "video_outpainting"];
+  const operation = trimmed(input.function);
+  if (!functions.includes(operation)) throw new Error("wanx2.1-vace-plus input.function is invalid");
+  if (!trimmed(input.prompt)) throw new Error("wanx2.1-vace-plus requires input.prompt");
+
+  const referenceImages = input.ref_images_url;
+  if (referenceImages !== undefined && (!Array.isArray(referenceImages) || referenceImages.some((url) => !httpURL(url))))
+    throw new Error("ref_images_url must be an array of URLs");
+  if (operation === "image_reference") {
+    if (!Array.isArray(referenceImages) || referenceImages.length < 1 || referenceImages.length > 3)
+      throw new Error("image_reference requires 1 to 3 ref_images_url entries");
+    if (parameters.obj_or_bg !== undefined) {
+      if (!Array.isArray(parameters.obj_or_bg) || parameters.obj_or_bg.length !== referenceImages.length)
+        throw new Error("obj_or_bg must match ref_images_url length");
+      if (parameters.obj_or_bg.some((value) => value !== "obj" && value !== "bg") || parameters.obj_or_bg.filter((value) => value === "bg").length > 1)
+        throw new Error("obj_or_bg must contain obj or bg with at most one bg");
+    }
+  }
+
+  if (["video_repainting", "video_edit", "video_outpainting"].includes(operation) && !httpURL(input.video_url))
+    throw new Error(operation + " requires input.video_url");
+  for (const key of ["mask_image_url", "mask_video_url", "first_frame_url", "last_frame_url", "first_clip_url", "last_clip_url"]) {
+    if (input[key] !== undefined && !httpURL(input[key])) throw new Error(key + " must be an HTTP(S) URL");
+  }
+  if (["video_repainting", "video_edit"].includes(operation) && referenceImages && referenceImages.length > 1)
+    throw new Error(operation + " accepts at most one reference image");
+
+  if (operation === "video_repainting") {
+    if (!["posebodyface", "posebody", "depth", "scribble"].includes(parameters.control_condition))
+      throw new Error("video_repainting requires a valid control_condition");
+    if (parameters.strength !== undefined && (typeof parameters.strength !== "number" || !Number.isFinite(parameters.strength) || parameters.strength < 0 || parameters.strength > 1))
+      throw new Error("strength must be between 0 and 1");
+  }
+
+  if (operation === "video_edit") {
+    const hasMaskImage = !!trimmed(input.mask_image_url);
+    const hasMaskVideo = !!trimmed(input.mask_video_url);
+    if (!hasMaskImage && !hasMaskVideo) throw new Error("video_edit requires mask_image_url or mask_video_url");
+    if (hasMaskImage && hasMaskVideo) throw new Error("video_edit accepts one mask source");
+    if (parameters.control_condition !== undefined && !["posebodyface", "depth"].includes(parameters.control_condition))
+      throw new Error("control_condition is invalid for video_edit");
+    if (parameters.mask_type !== undefined && !["tracking", "fixed"].includes(parameters.mask_type)) throw new Error("mask_type is invalid");
+    if (parameters.expand_ratio !== undefined && (typeof parameters.expand_ratio !== "number" || !Number.isFinite(parameters.expand_ratio) || parameters.expand_ratio < 0 || parameters.expand_ratio > 1))
+      throw new Error("expand_ratio must be between 0 and 1");
+    if (parameters.expand_mode !== undefined && !["hull", "bbox", "original"].includes(parameters.expand_mode)) throw new Error("expand_mode is invalid");
+    if (input.mask_frame_id !== undefined && (!Number.isInteger(input.mask_frame_id) || input.mask_frame_id < 1)) throw new Error("mask_frame_id must be a positive integer");
+  }
+
+  if (operation === "video_extension") {
+    const hasSource = ["first_frame_url", "last_frame_url", "first_clip_url", "last_clip_url"].some((key) => trimmed(input[key]));
+    if (!hasSource) throw new Error("video_extension requires a frame or clip input");
+    if (trimmed(input.video_url) && !["posebodyface", "depth"].includes(parameters.control_condition))
+      throw new Error("video_extension with video_url requires a valid control_condition");
+  }
+
+  if (operation === "video_outpainting") {
+    for (const key of ["top_scale", "bottom_scale", "left_scale", "right_scale"]) {
+      const value = parameters[key] === undefined ? 1 : parameters[key];
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 2) throw new Error(key + " must be between 1 and 2");
+      parameters[key] = value;
+    }
+  }
+  parameters.duration = 5;
+}
+
 function convert(ctx) {
-  const req = ctx.requestBody;
+  const req = ctx.requestBody || {};
   const upstreamModel = ctx.upstreamModel || req.model;
   const profile = modelProfile(upstreamModel);
+  if (faceDetectModel(ctx)) return convertFaceDetect(ctx);
   const metadata = objectValue(req.metadata, "metadata");
   if (metadata.model !== undefined && metadata.model !== upstreamModel) throw new Error("can't change model with metadata");
   const input = {};
-  for (const key of ["prompt", "negative_prompt", "img_url", "image_url", "first_frame_url", "last_frame_url", "audio_url", "template", "media"]) {
+  for (const key of [
+    "prompt",
+    "negative_prompt",
+    "img_url",
+    "image_url",
+    "first_frame_url",
+    "last_frame_url",
+    "audio_url",
+    "template",
+    "media",
+    "reference_urls",
+    "ref_images_url",
+    "video_url",
+    "mask_image_url",
+    "mask_frame_id",
+    "mask_video_url",
+    "first_clip_url",
+    "last_clip_url",
+    "function",
+  ]) {
     if (req[key] !== undefined) input[key] = req[key];
   }
   const image = firstImage(req);
-  if (image && input.img_url === undefined) input.img_url = image;
+  if (image && input.img_url === undefined && !["reference", "videoedit", "animate", "vace"].includes(profile.kind)) input.img_url = image;
   Object.assign(input, objectValue(metadata.input, "metadata.input"));
   const nativeParameters = objectValue(metadata.parameters, "metadata.parameters");
-  const parameters = profile.kind === "speech" ? {} : { prompt_extend: true };
-  for (const key of ["resolution", "ratio", "prompt_extend", "watermark", "audio", "seed", "shot_type"]) {
+  const parameters = profile.kind === "speech" || profile.kind === "animate" ? {} : { prompt_extend: true };
+  for (const key of ["resolution", "ratio", "prompt_extend", "watermark", "audio", "seed", "shot_type", "mode", "style", "audio_setting"]) {
     if (req[key] !== undefined) parameters[key] = req[key];
   }
   Object.assign(parameters, nativeParameters);
@@ -788,6 +982,17 @@ function convert(ctx) {
   }
   if (parameters.seed != null && (!Number.isInteger(parameters.seed) || parameters.seed < (profile.kind === "all" ? -1 : 0) || parameters.seed > 2147483647))
     throw new Error("seed must be an integer between " + (profile.kind === "all" ? -1 : 0) + " and 2147483647");
+
+  if (profile.kind === "animate") {
+    const mode = parameters.mode ?? "wan-std";
+    if (mode !== "wan-std" && mode !== "wan-pro") throw new Error("mode must be wan-std or wan-pro");
+    if (!/^https?:\/\//i.test(trimmed(input.image_url)) || !/^https?:\/\//i.test(trimmed(input.video_url)))
+      throw new Error(upstreamModel + " requires HTTP(S) image_url and video_url");
+    parameters.mode = mode;
+    delete parameters.duration;
+    delete parameters.resolution;
+    delete parameters.ratio;
+  }
 
   const sizeValue = nativeParameters.size ?? req.size;
   const size = sizeValue == null || sizeValue === "" ? {} : videoSize(sizeValue);
@@ -798,44 +1003,111 @@ function convert(ctx) {
     resolution = size.resolution;
     ratio = size.ratio ?? parameters.ratio ?? "16:9";
   }
-  if (!profile.resolutions.includes(resolution)) throw new Error(upstreamModel + " resolution must be one of " + profile.resolutions.join(", "));
-  if (profile.kind === "size" || profile.kind === "t2v" || profile.kind === "all") {
+  if (profile.kind !== "animate" && profile.kind !== "reference_legacy" && profile.kind !== "vace" && !profile.resolutions.includes(resolution))
+    throw new Error(upstreamModel + " resolution must be one of " + profile.resolutions.join(", "));
+  if (profile.kind === "size" || profile.kind === "t2v" || profile.kind === "all" || profile.kind === "reference" || profile.kind === "videoedit") {
     const ratios = ["16:9", "9:16", "1:1", "4:3", "3:4"];
     if (profile.kind === "all") ratios.push("adaptive");
     if (!ratios.includes(ratio)) throw new Error(upstreamModel + " ratio must be one of " + ratios.join(", "));
   }
-  if (profile.kind === "size") {
+  if (profile.kind === "reference_legacy") {
+    if (!Array.isArray(input.reference_urls) || input.reference_urls.length < 1 || input.reference_urls.length > 5 || input.reference_urls.some((url) => !/^https?:\/\//i.test(trimmed(url))))
+      throw new Error(upstreamModel + " requires 1 to 5 HTTP(S) reference_urls");
+    const legacySize = sizeValue == null || sizeValue === "" ? LEGACY_SIZES["1080P"]["16:9"] : trimmed(sizeValue).replace(/x/i, "*");
+    if (!/^\d+\*\d+$/.test(legacySize)) {
+      const mappedSize = LEGACY_SIZES[resolution] && LEGACY_SIZES[resolution][ratio];
+      if (!mappedSize) throw new Error(upstreamModel + " requires a valid parameters.size");
+      parameters.size = mappedSize;
+    } else {
+      const parsedSize = videoSize(legacySize);
+      if (!profile.resolutions.includes(parsedSize.resolution)) throw new Error(upstreamModel + " size resolution is unsupported");
+      parameters.size = legacySize;
+    }
+    delete parameters.resolution;
+    delete parameters.ratio;
+    if (upstreamModel === "wan2.6-r2v" && parameters.audio !== undefined) throw new Error("audio is only supported by wan2.6-r2v-flash");
+    if (upstreamModel === "wan2.6-r2v-flash") parameters.audio = parameters.audio !== false;
+  } else if (profile.kind === "vace") {
+    if (sizeValue != null && sizeValue !== "") {
+      const vaceSize = videoSize(sizeValue);
+      if (vaceSize.resolution !== "720P") throw new Error("wanx2.1-vace-plus supports only 720P size");
+      parameters.size = trimmed(sizeValue).replace(/x/i, "*");
+    }
+    delete parameters.resolution;
+    delete parameters.ratio;
+  } else if (profile.kind === "size") {
     const pixelSize = LEGACY_SIZES[resolution][ratio];
     if (!pixelSize) throw new Error("unsupported ratio for " + resolution + ": " + ratio);
     parameters.size = pixelSize;
     delete parameters.resolution;
     delete parameters.ratio;
+  } else if (profile.kind === "animate") {
+    delete parameters.resolution;
+    delete parameters.size;
+    delete parameters.ratio;
   } else {
     parameters.resolution = resolution;
     delete parameters.size;
-    if (profile.kind === "t2v" || profile.kind === "all") parameters.ratio = ratio;
+    if (profile.kind === "t2v" || profile.kind === "all" || profile.kind === "reference" || profile.kind === "videoedit") parameters.ratio = ratio;
     else delete parameters.ratio; // Image-derived aspect ratios are not configurable.
   }
 
-  const rawDuration = nativeParameters.duration ?? (req.auto_duration === true ? -1 : (req.duration ?? req.seconds));
+  const rawDuration =
+    profile.kind === "videoedit"
+      ? nativeParameters.duration ?? req.duration
+      : nativeParameters.duration ?? (req.auto_duration === true ? -1 : (req.duration ?? req.seconds));
   if (rawDuration != null && ((typeof rawDuration !== "number" && typeof rawDuration !== "string") || String(rawDuration).trim() === ""))
     throw new Error("duration must be a number");
-  const duration = rawDuration == null ? 5 : Number(rawDuration);
+  const duration = rawDuration == null ? (profile.kind === "videoedit" ? 0 : 5) : Number(rawDuration);
+  const hasReferenceVideo = profile.kind === "reference" && Array.isArray(input.media) && input.media.some((media) => media && media.type === "reference_video");
   if (duration === -1 && profile.kind !== "all") throw new Error("duration -1 (smart duration) is only supported by wan3.0 models");
   if (profile.kind === "speech") {
     if (rawDuration != null && (!Number.isFinite(duration) || duration <= 0 || duration >= 20))
       throw new Error("wan2.2-s2v duration must be positive and less than 20 seconds; output follows the audio");
     delete parameters.duration;
+  } else if (profile.kind === "animate") {
+    delete parameters.duration;
+  } else if (profile.kind === "vace") {
+    if (rawDuration != null && duration !== 5) throw new Error("wanx2.1-vace-plus duration is fixed at 5 seconds");
+    parameters.duration = 5;
+  } else if (profile.kind === "videoedit") {
+    if (duration !== 0 && (!Number.isInteger(duration) || duration < 2 || duration > profile.maxDuration))
+      throw new Error("wan2.7-videoedit duration must be 0 or an integer between 2 and 10");
+    parameters.duration = duration;
   } else {
+    const maxDuration = profile.kind === "reference" && hasReferenceVideo ? 10 : profile.maxDuration;
     if (profile.durations) {
       if (!profile.durations.includes(duration)) throw new Error(upstreamModel + " duration must be one of " + profile.durations.join(", "));
-    } else if (!(profile.kind === "all" && duration === -1) && (!Number.isInteger(duration) || duration < 2 || duration > profile.maxDuration)) {
-      throw new Error(upstreamModel + " duration must be " + (profile.kind === "all" ? "-1 or " : "") + "an integer between 2 and " + profile.maxDuration);
+    } else if (!(profile.kind === "all" && duration === -1) && (!Number.isInteger(duration) || duration < 2 || duration > maxDuration)) {
+      throw new Error(upstreamModel + " duration must be " + (profile.kind === "all" ? "-1 or " : "") + "an integer between 2 and " + maxDuration);
     }
     parameters.duration = duration;
   }
 
-  if (profile.kind === "media" || profile.kind === "all") {
+  if (profile.kind === "reference") {
+    if (!Array.isArray(input.media) || input.media.length < 1 || input.media.length > 5) throw new Error("wan2.7-r2v requires 1 to 5 input.media entries");
+    const counts = {};
+    for (const media of input.media) {
+      if (!media || !["reference_image", "reference_video", "first_frame"].includes(media.type) || !trimmed(media.url)) throw new Error("invalid wan2.7-r2v input.media entry");
+      if (media.type === "reference_video" && !httpURL(media.url)) throw new Error("wan2.7-r2v reference_video requires an HTTP(S) URL");
+      counts[media.type] = (counts[media.type] || 0) + 1;
+      if (counts[media.type] > (media.type === "first_frame" ? 1 : 5)) throw new Error("too many wan2.7-r2v input.media entries");
+      if (media.reference_voice !== undefined && !httpURL(media.reference_voice)) throw new Error("reference_voice must be an HTTP(S) URL");
+    }
+    if ((counts.reference_image || 0) + (counts.reference_video || 0) > 5 || !trimmed(input.prompt))
+      throw new Error("wan2.7-r2v requires prompt and at most 5 reference media entries");
+  } else if (profile.kind === "videoedit") {
+    if (!Array.isArray(input.media) || input.media.length < 1 || input.media.length > 5) throw new Error("wan2.7-videoedit requires input.media");
+    const counts = {};
+    for (const media of input.media) {
+      if (!media || !["video", "reference_image"].includes(media.type) || !/^https?:\/\//i.test(trimmed(media.url))) throw new Error("invalid wan2.7-videoedit input.media entry");
+      counts[media.type] = (counts[media.type] || 0) + 1;
+    }
+    if (counts.video !== 1 || (counts.reference_image || 0) > 4) throw new Error("wan2.7-videoedit requires one video and at most four reference images");
+    if (parameters.audio_setting !== undefined && !["auto", "origin"].includes(parameters.audio_setting)) throw new Error("audio_setting must be auto or origin");
+  } else if (profile.kind === "vace") {
+    normalizeVaceInput(input, parameters);
+  } else if (profile.kind === "media" || profile.kind === "all") {
     if (input.media !== undefined && !Array.isArray(input.media)) throw new Error("input.media must be an array");
     if (!input.media || input.media.length === 0) {
       input.media = [];
@@ -870,6 +1142,11 @@ function convert(ctx) {
     delete input.first_frame_url;
     delete input.last_frame_url;
     delete input.audio_url;
+  } else if (profile.kind === "reference_legacy") {
+    if (!trimmed(input.prompt)) throw new Error(upstreamModel + " requires input.prompt");
+    if (parameters.shot_type !== undefined && !["single", "multi"].includes(parameters.shot_type)) throw new Error("shot_type must be single or multi");
+  } else if (profile.kind === "animate") {
+    // 动作迁移和视频换人只依赖图片、视频及服务模式，不使用通用 prompt。
   } else if (profile.kind === "frames") {
     input.first_frame_url = trimmed(input.first_frame_url) || trimmed(input.img_url);
     if (!input.first_frame_url) throw new Error(upstreamModel + " requires first_frame_url or image");
@@ -973,13 +1250,22 @@ function responsesOutputText(ctx, task) {
 }
 
 export function buildSubmitRequest(ctx) {
+  if (faceDetectModel(ctx)) {
+    return {
+      url: apiRoot(ctx) + "/api/v1/services/aigc/image2video/face-detect",
+      method: "POST",
+      headers: { Authorization: "Bearer " + ctx.apiKey, "Content-Type": "application/json" },
+      body: convertFaceDetect(ctx),
+      action: "face_detect",
+    };
+  }
   if (imageModel(ctx)) {
     const converted = convertImage(ctx);
     const headers = { Authorization: "Bearer " + ctx.apiKey, "Content-Type": "application/json" };
     if (!converted.synchronous) headers["X-DashScope-Async"] = "enable";
     // A gateway's native route aggregates the vendor stream itself and answers
     // with one JSON body, so only DashScope is asked for SSE.
-    const streaming = converted.synchronous && converted.body.parameters.enable_interleave === true && !viaNewAPI(ctx);
+    const streaming = converted.synchronous && converted.body.parameters.enable_interleave === true && !viaGateway(ctx);
     if (streaming) headers["X-DashScope-Sse"] = "enable";
     return {
       url: apiRoot(ctx) + "/api/v1/services/aigc/" + converted.service,
@@ -992,7 +1278,7 @@ export function buildSubmitRequest(ctx) {
   }
   const body = convert(ctx);
   const kind = modelProfile(body.model).kind;
-  const service = kind === "frames" || kind === "speech" ? "image2video" : "video-generation";
+  const service = kind === "frames" || kind === "speech" || kind === "animate" ? "image2video" : "video-generation";
   return {
     url: apiRoot(ctx) + "/api/v1/services/aigc/" + service + "/video-synthesis",
     method: "POST",
@@ -1056,6 +1342,15 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
 
 export function parseSubmitResponse(ctx, resp) {
   const body = resp.body || {};
+  if (faceDetectModel(ctx)) {
+    if (!body.output || typeof body.output !== "object" || typeof body.output.check_pass !== "boolean")
+      throw new Error("face detection response is invalid");
+    return {
+      taskId: ctx.publicTaskId || body.request_id || utils.uuid(),
+      taskData: body,
+      immediate: { status: "SUCCESS", progress: "100%" },
+    };
+  }
   if (body.code) throw new Error(body.code + ": " + (body.message || ""));
   if (imageModel(ctx) && convertImage(ctx).synchronous) {
     const content = imageContent(body);
@@ -1076,6 +1371,7 @@ export function parseSubmitResponse(ctx, resp) {
 }
 
 export function extractUsage(ctx) {
+  if (faceDetectModel(ctx)) return { image_count: 1 };
   if (imageModel(ctx)) {
     const converted = convertImage(ctx);
     const estimate = imageEstimate(ctx, converted);
@@ -1084,11 +1380,20 @@ export function extractUsage(ctx) {
   }
   const body = convert(ctx);
   const kind = modelProfile(body.model).kind;
+  if (kind === "animate") {
+    const facts = { seconds: 30, mode: body.parameters.mode };
+    return ctx.usagePurpose === "billing_ratios" ? { seconds: 30 } : facts;
+  }
+  if (kind === "vace") {
+    const seconds = 5;
+    return ctx.usagePurpose === "billing_ratios" ? { seconds: seconds } : { seconds: seconds };
+  }
   const hasVideo = (body.input.media || []).some(function (media) {
     return media.type === "reference_video";
   });
   let seconds = body.parameters.duration;
   if (kind === "speech") seconds = 20;
+  else if (kind === "videoedit" && seconds === 0) seconds = 10;
   else if (kind === "all" && (hasVideo || seconds === -1)) seconds = 30;
   if (ctx.usagePurpose === "billing_ratios") {
     const ratios = { seconds: seconds };
@@ -1105,6 +1410,10 @@ export function extractUsage(ctx) {
 export function extractUsageOnSubmit(ctx, body) {
   // Legacy ratio pricing uses this hook; task expressions use the same actual
   // facts through extractUsageOnComplete for both immediate and polled results.
+  if (faceDetectModel(ctx)) {
+    const count = body && body.usage && body.usage.image_count;
+    return Number.isInteger(count) && count >= 1 && count <= 1 ? { image_count: count } : {};
+  }
   if (!imageModel(ctx)) return {};
   const converted = convertImage(ctx);
   if (!converted.synchronous) return {};
@@ -1113,11 +1422,22 @@ export function extractUsageOnSubmit(ctx, body) {
 }
 
 export function extractUsageOnComplete(task, taskResult, body) {
+  if (faceDetectModel(task)) {
+    const count = body && body.usage && body.usage.image_count;
+    return count === undefined ? {} : { image_count: count };
+  }
   if (imageModel(task)) return imageUsage(task, body || {});
   const output = (body && body.output) || {};
   const usage = (body && body.usage) || {};
   const facts = {};
   const model = modelKey(task && (task.upstreamModel || task.model));
+  if (WAN_ANIMATE_MODELS.includes(model)) {
+    const seconds = usage.video_duration ?? usage.duration;
+    if (seconds != null) facts.seconds = seconds;
+    if (usage.video_ratio === "standard") facts.mode = "wan-std";
+    if (usage.video_ratio === "pro") facts.mode = "wan-pro";
+    return facts;
+  }
   if (model === "wan3.0-video" || model === "wan3.0-video-prime" || (!model && usage.input_video_duration != null)) {
     const inputSeconds = usage.input_video_duration;
     const outputSeconds = usage.output_video_duration ?? usage.duration;
@@ -1130,10 +1450,17 @@ export function extractUsageOnComplete(task, taskResult, body) {
       else facts.seconds = inputSeconds + outputSeconds;
     }
   } else {
-    const seconds = usage.duration ?? usage.output_video_duration ?? output.duration ?? output.duration_seconds;
+    const seconds = usage.duration ?? usage.output_video_duration ?? usage.video_duration ?? output.duration ?? output.duration_seconds;
     if (seconds != null) facts.seconds = seconds;
   }
-  const resolution = usage.SR ?? output.resolution;
+  let resolution = usage.SR ?? output.resolution;
+  if (resolution == null && typeof usage.video_ratio === "string") {
+    try {
+      resolution = videoSize(usage.video_ratio).resolution;
+    } catch {
+      // animate and fixed-ratio models use video_ratio for non-resolution modes.
+    }
+  }
   if (resolution != null) facts.resolution = normalizeResolution(resolution);
   if (WAN_AUDIO_VIDEO_MODELS.includes(model) && typeof usage.audio === "boolean") facts.audio = usage.audio;
   return facts;
@@ -1144,6 +1471,9 @@ export function buildQueryRequest(ctx) {
 }
 
 export function parseTaskResult(ctx, body) {
+  if (body && body.code) {
+    return { status: "FAILURE", reason: body.message || String(body.code) };
+  }
   const output = body.output || {};
   if (output.task_status === "PENDING") return { status: "QUEUED" };
   if (output.task_status === "RUNNING") return { status: "IN_PROGRESS" };
@@ -1165,7 +1495,8 @@ export function parseTaskResult(ctx, body) {
       }
       return { status: "SUCCESS", url: images[0].image };
     }
-    return { status: "SUCCESS", url: videoURL(body) };
+    const url = videoURL(body);
+    return url ? { status: "SUCCESS", url: url } : { status: "FAILURE", reason: "video task succeeded without a video URL" };
   }
   if (["FAILED", "CANCELED", "UNKNOWN"].includes(output.task_status)) {
     let reason = body.message || "";
@@ -1217,6 +1548,22 @@ export function buildContentRequest(ctx) {
 }
 
 export const native = {
+  createFaceDetectTask: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value))
+      throw new Error("JSON object required");
+    const req = ctx.body.value;
+    if (req.model !== "wan2.2-s2v-detect") throw new Error("model must be wan2.2-s2v-detect");
+    const input = objectValue(req.input, "input");
+    return {
+      kind: "submit",
+      model: req.model,
+      action: "face_detect",
+      requestBody: { model: req.model, metadata: { input: input } },
+    };
+  },
+  faceDetectCreated: function (ctx, task) {
+    return task.data || {};
+  },
   createImageTask: function (ctx) {
     if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value))
       throw new Error("JSON object required");

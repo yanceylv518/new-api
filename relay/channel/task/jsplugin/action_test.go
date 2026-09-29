@@ -90,6 +90,41 @@ export function buildTaskActionRequest(ctx) { return {url:ctx.baseUrl+"/tasks/"+
 	assert.JSONEq(t, `{"task_id":"upstream-task","action":"cancelled","status":"cancelled"}`, string(response.Body))
 }
 
+// 只读原生代理必须复用渠道凭证和 URL 校验，但不能创建任务或进入管理操作路径。
+func TestTaskAdaptorExecuteNativeRequest(t *testing.T) {
+	service.InitHttpClient()
+	var method, path, authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		path = r.URL.Path
+		authorization = r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"items":[{"id":"voice-1"}]}`)
+	}))
+	defer server.Close()
+	plugin, err := pluginruntime.NewRegistry().Register(`
+export const meta = {apiVersion:1,key:"native-proxy-test",name:"Native Proxy Test",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task"};
+export function buildSubmitRequest() { return {url:"https://example.com/submit"}; }
+export function parseSubmitResponse() { return {taskId:"task"}; }
+export function buildQueryRequest() { return {url:"https://example.com/query"}; }
+export function parseTaskResult() { return {status:"SUCCESS"}; }
+export function buildNativeRequest(ctx) { return {url:ctx.baseUrl+"/presets",method:"GET",headers:{Accept:"application/json",Authorization:"Bearer "+ctx.apiKey}}; }
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+
+	response, err := New(plugin).ExecuteNativeRequest(
+		context.Background(),
+		pluginruntime.RouteRequestContext{Path: "/vendor/presets", Method: http.MethodGet, Query: map[string][]string{}},
+		"model", "model", server.URL, "secret", 50, "",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	assert.Equal(t, http.MethodGet, method)
+	assert.Equal(t, "/presets", path)
+	assert.Equal(t, "Bearer secret", authorization)
+	assert.JSONEq(t, `{"items":[{"id":"voice-1"}]}`, string(response.Body))
+}
+
 // 官方管理接口允许 200 空响应体，宿主应把它交给插件确认而不是误判为非法 JSON。
 func TestTaskAdaptorExecuteTaskActionAllowsEmptyResponse(t *testing.T) {
 	service.InitHttpClient()

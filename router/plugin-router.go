@@ -125,6 +125,17 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, bindi
 			controller.RelayTaskPluginNativeAction,
 		}
 	}
+	if binding.Route.Type == jsplugin.RouteTypeDynamic && binding.Route.Action == "proxy" {
+		return []gin.HandlerFunc{
+			pinRoute,
+			middleware.TokenAuth(),
+			middleware.SystemPerformanceCheck(),
+			middleware.ModelRequestRateLimit(),
+			middleware.PrepareTaskPluginRoute(),
+			middleware.Distribute(),
+			controller.RelayTaskPluginNativeProxy,
+		}
+	}
 	return []gin.HandlerFunc{
 		pinRoute,
 		middleware.TokenAuth(),

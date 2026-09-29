@@ -116,6 +116,19 @@ func nativeActionTestPlugin(t *testing.T, source string) *pluginruntime.LoadedPl
 	return plugin
 }
 
+func TestTaskPluginNativeListFilterUsesRouteAction(t *testing.T) {
+	filter, err := taskPluginNativeListFilter(
+		pluginruntime.Meta{Key: "kling", ChannelTypes: []int{50}},
+		map[string][]string{},
+		map[string]any{
+			"model":   "kling-v3",
+			"actions": []any{"motion_control"},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"motion_control"}, filter.Actions)
+}
+
 const nativeActionPluginSource = `
 export const meta = {apiVersion:1,key:"native-action",name:"Native Action",version:"1.0.0",author:{name:"Test"},channelTypes:[35],models:["MiniMax-H3"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
 export const native = {

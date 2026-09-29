@@ -62,6 +62,84 @@ func RelayTaskPluginNativeAction(c *gin.Context) {
 	}
 }
 
+// RelayTaskPluginNativeProxy 处理不创建任务的插件原生代理路由。
+// 代理只负责转发受控的 JSON 请求，不进入任务计费和轮询生命周期。
+func RelayTaskPluginNativeProxy(c *gin.Context) {
+	pinned, ok := nativeRoutePin(c)
+	if !ok || pinned.Route.Action != "proxy" {
+		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_plugin_route_failed", "Task plugin proxy route is unavailable")
+		return
+	}
+	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)
+	requestContext, requestOK := requestValue.(pluginruntime.RouteRequestContext)
+	if !exists || !requestOK {
+		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_plugin_route_failed", "Task plugin request context is unavailable")
+		return
+	}
+	channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+	channelModel, err := model.CacheGetChannel(channelID)
+	if err != nil || channelModel == nil {
+		respondTaskPluginNativeActionError(c, http.StatusBadRequest, "channel_unavailable", "Task plugin proxy channel is unavailable")
+		return
+	}
+	modelName := strings.TrimSpace(c.GetString("resolved_task_model"))
+	if modelName == "" {
+		modelName = "kling-v1"
+	}
+	key := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	if key == "" {
+		key = channelModel.Key
+	}
+	adaptor := taskjsplugin.New(pinned.Plugin)
+	response, err := adaptor.ExecuteNativeRequest(
+		c.Request.Context(),
+		requestContext,
+		modelName,
+		modelName,
+		channelModel.GetBaseURL(),
+		key,
+		channelModel.Type,
+		channelModel.GetSetting().Proxy,
+	)
+	if err != nil {
+		respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_proxy_failed", "Task plugin proxy request failed")
+		return
+	}
+	if response == nil {
+		respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_proxy_failed", "Task plugin proxy returned an empty response")
+		return
+	}
+	if response.RequestID != "" {
+		c.Header("X-Upstream-Request-Id", response.RequestID)
+	}
+	if len(response.Body) == 0 {
+		c.Status(response.StatusCode)
+		return
+	}
+	var upstreamBody any
+	if err = common.Unmarshal(response.Body, &upstreamBody); err != nil {
+		c.Data(response.StatusCode, "application/json", response.Body)
+		return
+	}
+	rendered, err := pinned.Plugin.Engine.CallMember(
+		c.Request.Context(),
+		"native",
+		pinned.Route.Render,
+		requestContext.JSValue(),
+		map[string]any{"statusCode": response.StatusCode, "body": upstreamBody},
+	)
+	if err != nil {
+		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_plugin_render_failed", "Task plugin proxy renderer failed")
+		return
+	}
+	encoded, err := common.Marshal(rendered)
+	if err != nil {
+		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_plugin_render_failed", "Task plugin proxy response is invalid")
+		return
+	}
+	c.Data(response.StatusCode, "application/json", encoded)
+}
+
 func nativeRoutePin(c *gin.Context) (pluginruntime.PinnedRoute, bool) {
 	value, exists := c.Get(pluginruntime.ContextKeyPinnedRoute)
 	if !exists {
@@ -92,9 +170,11 @@ func renderTaskPluginNativeList(
 			PageSize        int    `json:"pageSize"`
 			ServiceTier     string `json:"serviceTier"`
 			LookbackSeconds int64  `json:"lookbackSeconds"`
+			CreatedAfter    int64  `json:"createdAfter"`
+			CreatedBefore   int64  `json:"createdBefore"`
 		}
 		encoded, encodeErr := common.Marshal(raw)
-		if encodeErr != nil || common.Unmarshal(encoded, &options) != nil || options.PageNum < 1 || options.PageNum > 500 || options.PageSize < 1 || options.PageSize > 500 || options.LookbackSeconds < 0 || options.LookbackSeconds > 604800 || (options.ServiceTier != "" && options.ServiceTier != "default" && options.ServiceTier != "flex") {
+		if encodeErr != nil || common.Unmarshal(encoded, &options) != nil || options.PageNum < 1 || options.PageNum > 500 || options.PageSize < 1 || options.PageSize > 500 || options.LookbackSeconds < 0 || options.LookbackSeconds > 604800 || options.CreatedAfter < 0 || options.CreatedBefore < 0 || (options.CreatedAfter > 0 && options.CreatedBefore > 0 && options.CreatedAfter >= options.CreatedBefore) || (options.ServiceTier != "" && options.ServiceTier != "default" && options.ServiceTier != "flex") {
 			respondTaskPluginNativeActionError(c, http.StatusBadRequest, "invalid_request", "Task list options are invalid")
 			return
 		}
@@ -103,6 +183,12 @@ func renderTaskPluginNativeList(
 		if options.LookbackSeconds > 0 {
 			filter.CreatedBefore = time.Now().Unix()
 			filter.CreatedAfter = filter.CreatedBefore - options.LookbackSeconds
+		}
+		if options.CreatedAfter > 0 {
+			filter.CreatedAfter = options.CreatedAfter
+		}
+		if options.CreatedBefore > 0 {
+			filter.CreatedBefore = options.CreatedBefore
 		}
 	} else {
 		page, pageSize, err = parseTaskPluginNativePagination(requestContext.Query)
@@ -185,12 +271,40 @@ func taskPluginNativeListFilter(meta pluginruntime.Meta, query map[string][]stri
 		Platforms: taskPluginNativePlatforms(meta),
 		Model:     modelName,
 	}
+	if rawModels, present := intent["models"]; present {
+		models, valid := taskPluginNativeStringList(rawModels, 32)
+		if !valid {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("models is invalid")
+		}
+		filter.Models = models
+	}
+	if rawFilters, present := intent["dataFilters"]; present {
+		dataFilters, valid := taskPluginNativeDataFilters(rawFilters)
+		if !valid {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("dataFilters is invalid")
+		}
+		filter.DataFilters = dataFilters
+	}
+	if rawActions, present := intent["actions"]; present {
+		actions, valid := taskPluginNativeActions(rawActions)
+		if !valid {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("actions is invalid")
+		}
+		filter.Actions = actions
+	}
 	if rawIDs, present := intent["taskIds"]; present {
 		ids, valid := taskPluginNativeTaskIDs(rawIDs)
 		if !valid {
 			return model.TaskPluginTaskFilter{}, fmt.Errorf("filter.task_ids is invalid")
 		}
 		filter.TaskIDs = ids
+	}
+	if rawIDs, present := intent["externalTaskIds"]; present {
+		ids, valid := taskPluginNativeTaskIDs(rawIDs)
+		if !valid {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("external_task_ids is invalid")
+		}
+		filter.ExternalTaskIDs = ids
 	}
 	status, err := taskPluginNativeSingleQuery(query, "filter.status")
 	if err != nil {
@@ -214,6 +328,16 @@ func taskPluginNativeListFilter(meta pluginruntime.Meta, query map[string][]stri
 	default:
 		return model.TaskPluginTaskFilter{}, fmt.Errorf("filter.status is invalid")
 	}
+	if rawStatuses, present := intent["statuses"]; present {
+		if status != "" {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("filter.status and statuses cannot be used together")
+		}
+		values, valid := taskPluginNativeStatuses(rawStatuses)
+		if !valid {
+			return model.TaskPluginTaskFilter{}, fmt.Errorf("statuses is invalid")
+		}
+		filter.Statuses = values
+	}
 	taskType, err := taskPluginNativeSingleQuery(query, "filter.task_type")
 	if err != nil {
 		return model.TaskPluginTaskFilter{}, err
@@ -230,6 +354,142 @@ func taskPluginNativeListFilter(meta pluginruntime.Meta, query map[string][]stri
 		return model.TaskPluginTaskFilter{}, fmt.Errorf("filter.task_type is invalid")
 	}
 	return filter, nil
+}
+
+// taskPluginNativeStatuses 允许官方列表接口把多个状态映射为一次数据库 IN 查询。
+func taskPluginNativeStatuses(value any) ([]model.TaskStatus, bool) {
+	var values []any
+	switch typed := value.(type) {
+	case []any:
+		values = typed
+	case []string:
+		values = make([]any, len(typed))
+		for index, status := range typed {
+			values[index] = status
+		}
+	case nil:
+		return nil, true
+	default:
+		return nil, false
+	}
+	if len(values) > 5 {
+		return nil, false
+	}
+	statuses := make([]model.TaskStatus, 0, len(values))
+	seen := make(map[model.TaskStatus]struct{}, len(values))
+	for _, value := range values {
+		status, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		switch strings.TrimSpace(status) {
+		case "queued":
+			for _, candidate := range []model.TaskStatus{model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued} {
+				if _, exists := seen[candidate]; !exists {
+					statuses = append(statuses, candidate)
+					seen[candidate] = struct{}{}
+				}
+			}
+		case "running":
+			if _, exists := seen[model.TaskStatusInProgress]; !exists {
+				statuses = append(statuses, model.TaskStatusInProgress)
+				seen[model.TaskStatusInProgress] = struct{}{}
+			}
+		case "succeeded":
+			if _, exists := seen[model.TaskStatusSuccess]; !exists {
+				statuses = append(statuses, model.TaskStatusSuccess)
+				seen[model.TaskStatusSuccess] = struct{}{}
+			}
+		case "failed":
+			if _, exists := seen[model.TaskStatusFailure]; !exists {
+				statuses = append(statuses, model.TaskStatusFailure)
+				seen[model.TaskStatusFailure] = struct{}{}
+			}
+		default:
+			return nil, false
+		}
+	}
+	return statuses, true
+}
+
+func taskPluginNativeStringList(value any, maximum int) ([]string, bool) {
+	var values []any
+	switch typed := value.(type) {
+	case []any:
+		values = typed
+	case []string:
+		values = make([]any, len(typed))
+		for index, item := range typed {
+			values[index] = item
+		}
+	default:
+		return nil, false
+	}
+	if len(values) == 0 || len(values) > maximum {
+		return nil, false
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		item, ok := value.(string)
+		item = strings.TrimSpace(item)
+		if !ok || item == "" || len(item) > 191 {
+			return nil, false
+		}
+		if _, exists := seen[item]; exists {
+			return nil, false
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result, true
+}
+
+func taskPluginNativeDataFilters(value any) (map[string][]string, bool) {
+	filters, ok := value.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	result := make(map[string][]string, len(filters))
+	for field, rawValues := range filters {
+		if field != "template" && field != "resolution" {
+			return nil, false
+		}
+		values, valid := taskPluginNativeStringList(rawValues, 100)
+		if !valid {
+			return nil, false
+		}
+		result[field] = values
+	}
+	return result, true
+}
+
+func taskPluginNativeActions(value any) ([]string, bool) {
+	var values []any
+	switch typed := value.(type) {
+	case []any:
+		values = typed
+	case []string:
+		values = make([]any, len(typed))
+		for index, action := range typed {
+			values[index] = action
+		}
+	default:
+		return nil, false
+	}
+	if len(values) == 0 || len(values) > 16 {
+		return nil, false
+	}
+	actions := make([]string, 0, len(values))
+	for _, value := range values {
+		action, ok := value.(string)
+		action = strings.TrimSpace(action)
+		if !ok || action == "" || len(action) > 64 || slices.Contains(actions, action) {
+			return nil, false
+		}
+		actions = append(actions, action)
+	}
+	return actions, true
 }
 
 func taskPluginNativeSingleQuery(query map[string][]string, key string) (string, error) {

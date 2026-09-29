@@ -27,12 +27,13 @@ export type DecodedBody =
   | Readonly<{kind: "multipart"; fields: Readonly<Record<string, readonly string[]>>; files: readonly FileReference[]}>
   | Readonly<{kind: "none"}>;
 
-export interface NativeDecodeContext {method: string; path: string; params: Readonly<Record<string, string>>; query: Readonly<Record<string, readonly string[]>>; body: DecodedBody}
+export interface NativeDecodeContext {method: string; path: string; params: Readonly<Record<string, string>>; query: Readonly<Record<string, readonly string[]>>; body: DecodedBody; model?: string; upstreamModel?: string}
 export interface ProtocolDecodeContext extends NativeDecodeContext {protocol: ProtocolName; operation: string; model: string; upstreamModel?: string; stream: boolean}
 export type SubmitIntent = {kind: "submit"; model: string; action?: string; requestBody?: unknown; originTaskIds?: readonly string[]};
-export type QueryIntent = {kind: "query"; taskIds: readonly string[]; model?: string; listOptions?: {pageNum: number; pageSize: number; serviceTier?: "default" | "flex"; lookbackSeconds?: number}};
+export type QueryIntent = {kind: "query"; taskIds: readonly string[]; externalTaskIds?: readonly string[]; model?: string; models?: readonly string[]; actions?: readonly string[]; statuses?: readonly ("queued" | "running" | "succeeded" | "failed")[]; dataFilters?: Readonly<{template?: readonly string[]; resolution?: readonly string[]}>; listOptions?: {pageNum: number; pageSize: number; serviceTier?: "default" | "flex"; lookbackSeconds?: number; createdAfter?: number; createdBefore?: number}};
 export type DeleteIntent = {kind: "delete"; taskId: string; model?: string};
-export type TaskIntent = SubmitIntent | QueryIntent | DeleteIntent;
+export type ProxyIntent = {kind: "proxy"; model: string; requestBody?: unknown};
+export type TaskIntent = SubmitIntent | QueryIntent | DeleteIntent | ProxyIntent;
 export interface NativeRoute {method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; path: string; type: "submit" | "query" | "dynamic"; action?: string; taskIdParam?: string; decode?: string; render: string; models?: readonly string[]; retainResult?: boolean}
 export type ProtocolName = "openai_responses" | "openai_video" | "openai_image";
 export type ResponsesMode = "stream" | "sync" | "background";
@@ -74,6 +75,10 @@ export declare const protocols: {
   openai_image?: {decodeRequest(ctx: ProtocolDecodeContext): SubmitIntent; render(ctx: unknown, task: TaskView): {created?: number; data: readonly ImageResponseEntry[]} & Record<string, unknown>};
 };
 export declare function buildSubmitRequest(ctx: DriverContext): RequestDescriptor;
+/** 为动态 proxy 路由构造不创建任务的受控 JSON 请求。 */
+export declare function buildNativeRequest(ctx: NativeDecodeContext & {requestBody: unknown; model: string; upstreamModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext}): RequestDescriptor;
+/** 动态 proxy 路由的响应包络。 */
+export declare function proxyResponse(ctx: NativeDecodeContext, response: {statusCode: number; body: unknown}): unknown;
 export interface SubmitEvent {event: string; id: string; data: string}
 export type JSONPath = readonly (string | number)[];
 export type JSONChange =

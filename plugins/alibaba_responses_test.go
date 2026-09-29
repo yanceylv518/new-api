@@ -35,6 +35,10 @@ func TestAlibabaResponsesProtocol(t *testing.T) {
 	t.Run("claims every Ali model", func(t *testing.T) {
 		for _, model := range plugin.Meta.Models {
 			binding, found := registry.Generation().LookupEndpoint("POST", "/v1/responses", model)
+			if model == "wan2.2-s2v-detect" {
+				assert.False(t, found, model)
+				continue
+			}
 			require.True(t, found, model)
 			assert.Same(t, plugin, binding.Plugin)
 			assert.Equal(t, "openai_responses", binding.Protocol)
@@ -42,7 +46,7 @@ func TestAlibabaResponsesProtocol(t *testing.T) {
 	})
 
 	t.Run("selects image and video usage profiles for every declared model", func(t *testing.T) {
-		require.Len(t, plugin.Meta.UsageProfiles, 9)
+		require.Len(t, plugin.Meta.UsageProfiles, 12)
 		covered := make(map[string]bool)
 		for _, profile := range plugin.Meta.UsageProfiles {
 			for _, name := range profile.Models {
@@ -63,13 +67,21 @@ func TestAlibabaResponsesProtocol(t *testing.T) {
 			case name == "z-image-turbo":
 				assert.ElementsMatch(t, []string{"image_count", "prompt_extend"}, keysOf(schema), name)
 				assert.Equal(t, "boolean", schema["prompt_extend"].Type, name)
+			case name == "wan2.2-s2v-detect":
+				assert.Len(t, schema, 1, name)
+				assert.Equal(t, "Image detection unit price", schema["image_count"].Description["en"], name)
 			case isImage:
 				assert.Equal(t, map[string]jsplugin.UsageFieldSchema{"image_count": plugin.Meta.UsageSchema["image_count"]}, schema, name)
-			case name == "wan2.6-i2v-flash":
+			case name == "wan2.6-i2v-flash" || name == "wan2.6-r2v-flash":
 				assert.ElementsMatch(t, []string{"seconds", "resolution", "audio"}, keysOf(schema), name)
 				assert.Equal(t, plugin.Meta.UsageSchema["seconds"], schema["seconds"], name)
 				assert.Equal(t, []string{"720P", "1080P"}, schema["resolution"].Enum, name)
 				assert.Equal(t, "boolean", schema["audio"].Type, name)
+			case name == "wan2.2-animate-move" || name == "wan2.2-animate-mix":
+				assert.ElementsMatch(t, []string{"seconds", "mode"}, keysOf(schema), name)
+				assert.Equal(t, []string{"wan-std", "wan-pro"}, schema["mode"].Enum, name)
+			case name == "wanx2.1-vace-plus":
+				assert.ElementsMatch(t, []string{"seconds"}, keysOf(schema), name)
 			default:
 				assert.ElementsMatch(t, []string{"seconds", "resolution"}, keysOf(schema), name)
 				assert.Equal(t, plugin.Meta.UsageSchema["seconds"], schema["seconds"], name)
@@ -303,6 +315,140 @@ func TestAlibabaResponsesProtocol(t *testing.T) {
 		require.ErrorContains(t, callErr, "video artifact is unavailable")
 		assert.NotContains(t, callErr.Error(), "upstream.example")
 	})
+}
+
+func TestAlibabaDocumentedWanVideoExtensions(t *testing.T) {
+	plugin := newAlibabaPlugin(t)
+	for _, tc := range []struct {
+		name       string
+		model      string
+		input      map[string]any
+		parameters map[string]any
+		service    string
+		facts      map[string]any
+	}{
+		{
+			name:       "wan2.7 reference video",
+			model:      "wan2.7-r2v",
+			input:      map[string]any{"prompt": "图1中的人物走向镜头", "media": []any{map[string]any{"type": "reference_image", "url": "https://cdn.example/reference.png"}}},
+			parameters: map[string]any{"resolution": "720P", "duration": float64(5)},
+			service:    "video-generation",
+			facts:      map[string]any{"seconds": float64(5), "resolution": "720P"},
+		},
+		{
+			name:       "wan2.6 legacy reference",
+			model:      "wan2.6-r2v",
+			input:      map[string]any{"prompt": "character1走向镜头", "reference_urls": []any{"https://cdn.example/reference.png"}},
+			parameters: map[string]any{"size": "1280*720", "duration": float64(5)},
+			service:    "video-generation",
+			facts:      map[string]any{"seconds": float64(5), "resolution": "720P"},
+		},
+		{
+			name:       "wan2.7 video edit inherits duration",
+			model:      "wan2.7-videoedit",
+			input:      map[string]any{"media": []any{map[string]any{"type": "video", "url": "https://cdn.example/input.mp4"}}, "prompt": "改变建筑颜色"},
+			parameters: map[string]any{"duration": float64(0), "resolution": "1080P", "audio_setting": "origin"},
+			service:    "video-generation",
+			facts:      map[string]any{"seconds": float64(10), "resolution": "1080P"},
+		},
+		{
+			name:       "kf2v plus",
+			model:      "wanx2.1-kf2v-plus",
+			input:      map[string]any{"first_frame_url": "https://cdn.example/first.png", "last_frame_url": "https://cdn.example/last.png", "template": "mech1"},
+			parameters: map[string]any{"prompt_extend": true},
+			service:    "image2video",
+			facts:      map[string]any{"seconds": float64(5), "resolution": "720P"},
+		},
+		{
+			name:       "animate mode and usage",
+			model:      "wan2.2-animate-mix",
+			input:      map[string]any{"image_url": "https://cdn.example/person.png", "video_url": "https://cdn.example/motion.mp4"},
+			parameters: map[string]any{"mode": "wan-pro"},
+			service:    "image2video",
+			facts:      map[string]any{"seconds": float64(30), "mode": "wan-pro"},
+		},
+		{
+			name:       "vace image reference",
+			model:      "wanx2.1-vace-plus",
+			input:      map[string]any{"function": "image_reference", "prompt": "人物走过森林", "ref_images_url": []any{"https://cdn.example/person.png"}},
+			parameters: map[string]any{"size": "1280*720"},
+			service:    "video-generation",
+			facts:      map[string]any{"seconds": float64(5)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := plugin.Engine.CallPath(t.Context(), "native", []string{"createVideoTask"}, map[string]any{
+				"body": map[string]any{"kind": "json", "value": map[string]any{"model": tc.model, "input": tc.input, "parameters": tc.parameters}},
+			})
+			require.NoError(t, err)
+			request := alibabaObject(t, value)["requestBody"].(map[string]any)
+			body, facts, url := submitAlibabaRequest(t, plugin, tc.model, request)
+			assert.Equal(t, "https://dashscope.aliyuncs.com/api/v1/services/aigc/"+tc.service+"/video-synthesis", url)
+			assert.Equal(t, alibabaObject(t, tc.input), body["input"])
+			assert.Equal(t, tc.facts, facts)
+		})
+	}
+}
+
+func TestAlibabaFaceDetectionAndTaskErrors(t *testing.T) {
+	plugin := newAlibabaPlugin(t)
+	value, err := plugin.Engine.CallPath(t.Context(), "native", []string{"createFaceDetectTask"}, map[string]any{
+		"body": map[string]any{"kind": "json", "value": map[string]any{
+			"model": "wan2.2-s2v-detect",
+			"input": map[string]any{"image_url": "https://cdn.example/portrait.jpg"},
+		}},
+	})
+	require.NoError(t, err)
+	request := alibabaObject(t, value)["requestBody"].(map[string]any)
+	descriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "k", "baseUrl": "https://dashscope.aliyuncs.com", "requestBody": request,
+	})
+	require.NoError(t, err)
+	built := alibabaObject(t, descriptor)
+	assert.Equal(t, "https://dashscope.aliyuncs.com/api/v1/services/aigc/image2video/face-detect", built["url"])
+	assert.NotContains(t, built["headers"], "X-DashScope-Async")
+
+	directKeyDescriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "sk-vendor", "baseUrl": "https://dashscope.aliyuncs.com", "requestBody": request,
+	})
+	require.NoError(t, err)
+	directKeyBuilt := alibabaObject(t, directKeyDescriptor)
+	assert.Equal(t, "https://dashscope.aliyuncs.com/api/v1/services/aigc/image2video/face-detect", directKeyBuilt["url"])
+
+	gatewayDescriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "provider-key", "baseUrl": "https://example.com", "upstream": map[string]any{"kind": "new_api"}, "requestBody": request,
+	})
+	require.NoError(t, err)
+	gatewayBuilt := alibabaObject(t, gatewayDescriptor)
+	assert.Equal(t, "https://example.com/ali/api/v1/services/aigc/image2video/face-detect", gatewayBuilt["url"])
+
+	prefixedDescriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "provider-key", "baseUrl": "https://example.com/ali/", "requestBody": request,
+	})
+	require.NoError(t, err)
+	prefixedBuilt := alibabaObject(t, prefixedDescriptor)
+	assert.Equal(t, "https://example.com/ali/api/v1/services/aigc/image2video/face-detect", prefixedBuilt["url"])
+
+	parsed, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "publicTaskId": "task_public",
+	}, map[string]any{"status": 200, "body": map[string]any{
+		"request_id": "request-1", "output": map[string]any{"check_pass": false, "humanoid": false, "code": "not_human", "message": "no face"}, "usage": map[string]any{"image_count": 1},
+	}})
+	require.NoError(t, err)
+	result := alibabaObject(t, parsed)
+	assert.Equal(t, "task_public", result["taskId"])
+	assert.Equal(t, "SUCCESS", alibabaObject(t, result["immediate"])["status"])
+	facts, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect"}, map[string]any{"status": "SUCCESS"}, map[string]any{"usage": map[string]any{"image_count": 1}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"image_count": float64(1)}, alibabaObject(t, facts))
+
+	missing, err := plugin.Engine.Call(t.Context(), "parseTaskResult", map[string]any{"model": "wan2.7-t2v", "upstreamModel": "wan2.7-t2v"}, map[string]any{"code": "task_not_exist", "message": "task_not_exist", "data": nil})
+	require.NoError(t, err)
+	assert.Equal(t, "FAILURE", alibabaObject(t, missing)["status"])
+
+	animateFacts, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"model": "wan2.2-animate-move", "upstreamModel": "wan2.2-animate-move"}, map[string]any{"status": "SUCCESS"}, map[string]any{"usage": map[string]any{"video_duration": 5.2, "video_ratio": "pro"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"seconds": 5.2, "mode": "wan-pro"}, alibabaObject(t, animateFacts))
 }
 
 func newAlibabaPlugin(t *testing.T) *jsplugin.LoadedPlugin {
@@ -665,6 +811,7 @@ func TestAlibabaWanCompletionFactsAndArtifacts(t *testing.T) {
 		{"Wan3 without reference video", "wan3.0-video-prime", map[string]any{"input_video_duration": 0, "output_video_duration": 8, "SR": 1080}, map[string]any{"seconds": float64(8), "resolution": "1080P"}},
 		{"Wan3 missing input duration preserves reserved seconds", "wan3.0-video", map[string]any{"output_video_duration": 6, "SR": 720}, map[string]any{"resolution": "720P"}},
 		{"2.7 continuation uses total duration", "wan2.7-i2v", map[string]any{"duration": 15, "output_video_duration": 12, "SR": 1080}, map[string]any{"seconds": float64(15), "resolution": "1080P"}},
+		{"legacy video duration and ratio", "wan2.5-t2v-preview", map[string]any{"video_duration": 5.5, "video_ratio": "1280*720"}, map[string]any{"seconds": 5.5, "resolution": "720P"}},
 		{"flash silent output settles as silent", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 720, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "720P", "audio": false}},
 		{"flash without audio flag keeps the estimate", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 1080}, map[string]any{"seconds": float64(5), "resolution": "1080P"}},
 		{"audio flag is ignored for models priced without it", "wan2.6-i2v", map[string]any{"duration": 5, "SR": 1080, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "1080P"}},

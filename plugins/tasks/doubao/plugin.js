@@ -378,6 +378,14 @@ function modelKey(model) {
   return trimmed(model).toLowerCase();
 }
 
+function videoProfileForModel(model, declaredModel) {
+  for (const candidate of [declaredModel, model]) {
+    const profile = VIDEO_MODELS[modelKey(candidate)];
+    if (profile) return profile;
+  }
+  return null;
+}
+
 // 仅约束文档明确列出的模型；渠道别名和未列出的旧模型交给最终上游校验。
 function modelCapabilities(model) {
   const name = modelKey(model);
@@ -418,20 +426,21 @@ function integerFieldValue(value, allowNumericString) {
 }
 
 // 统一原生、兼容接口及最终渠道映射后的分辨率校验，缺省时按模型可用上限预估。
-function requestResolution(model, req) {
+function requestResolution(model, req, declaredModel) {
   const resolutionField = requestField(req, "resolution");
   const sizeField = requestField(req, "size");
   const rawValue = resolutionField.present ? resolutionField.value : sizeField.present ? sizeField.value : "";
   // 错误类型不能经trimmed的真假值处理变成缺省分辨率。
   if (rawValue !== undefined && rawValue !== null && typeof rawValue !== "string") throw new Error("resolution or size must be a string");
   const raw = trimmed(rawValue).toLowerCase();
-  const capability = VIDEO_MODELS[modelKey(model)];
+  // 渠道模型映射可能把已声明模型改成任意上游别名，能力仍以用户请求的模型为准。
+  const capability = videoProfileForModel(model, declaredModel);
   const available = capability ? capability.resolutions : SEEDANCE_RESOLUTIONS;
   if (!raw) return available.includes("1080p") ? "1080p" : available[available.length - 1];
   const recognized = ["480p", "720p", "1080p", "4k"].includes(raw) || /^\d+[x*]\d+$/.test(raw);
   if (!recognized) throw new Error("resolution must be 480p, 720p, 1080p, or 4k");
   const resolution = normalizeResolution(raw);
-  if (!available.includes(resolution)) throw new Error(model + " resolution must be one of " + available.join(", "));
+  if (!available.includes(resolution)) throw new Error((trimmed(declaredModel) || model) + " resolution must be one of " + available.join(", "));
   return resolution;
 }
 
@@ -682,10 +691,8 @@ function hasVideo(content) {
 // Capability profile of the executing Seedance model. Channel mapping may send
 // a declared model to an Ark endpoint ID; the declared name still describes it.
 function videoProfile(ctx) {
-  for (const model of [ctx && ctx.upstreamModel, ctx && ctx.model].map(trimmed)) {
-    const key = modelKey(model);
-    if (Object.prototype.hasOwnProperty.call(VIDEO_MODELS, key)) return VIDEO_MODELS[key];
-  }
+  const profile = videoProfileForModel(ctx && ctx.upstreamModel, ctx && ctx.model);
+  if (profile) return profile;
   return DEFAULT_VIDEO_PROFILE;
 }
 
@@ -1053,7 +1060,7 @@ export const native = {
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
     const model = trimmed(body.model);
     if (!model) throw new Error("model is required");
-    requestResolution(model, body);
+    requestResolution(model, body, model);
     validateGenerationParameters(body, model, true);
     if (!Array.isArray(body.content)) throw new Error("content must be an array");
     const content = body.content;
@@ -1163,7 +1170,7 @@ export function buildSubmitRequest(ctx) {
   }
   const req = ctx.requestBody;
   const model = ctx.upstreamModel || req.model || "";
-  requestResolution(model, req);
+  requestResolution(model, req, ctx.model || req.model);
   validateGenerationParameters(req, model, false);
   const metadata = req.metadata || {};
   // Reject output tiers the model does not offer before any quota is reserved.
@@ -1184,7 +1191,7 @@ export function buildSubmitRequest(ctx) {
   const resolutionField = requestField(req, "resolution");
   const sizeField = requestField(req, "size");
   if ((resolutionField.present && trimmed(resolutionField.value)) || (sizeField.present && trimmed(sizeField.value)))
-    body.resolution = requestResolution(model, req);
+    body.resolution = requestResolution(model, req, ctx.model || req.model);
   const contentInfo = validateDoubaoContent(model, body.content);
   validateDoubaoOptions(model, body, contentInfo, false);
   const hasReference = contentInfo.hasMedia;
@@ -1232,7 +1239,7 @@ export function extractUsage(ctx) {
   const content = requestContent(req, false);
   const contentInfo = content.length ? validateDoubaoContent(model, content) : { hasVisual: false };
   validateDoubaoOptions(model, req, contentInfo, false);
-  const resolution = requestResolution(model, req);
+  const resolution = requestResolution(model, req, ctx.model || req.model);
   if (ctx.usagePurpose === "billing_ratios") {
     // 预估 token 可以保守取上限，但不得改变未指定分辨率时旧倍率计费的单价。
     const requestedResolution = requestField(req, "resolution");
@@ -1531,7 +1538,7 @@ export const protocols = {
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
       const effectiveModel = ctx.upstreamModel || model;
-      requestResolution(effectiveModel, requestBody);
+      requestResolution(effectiveModel, requestBody, model);
       validateGenerationParameters(requestBody, effectiveModel, false);
       const content = requestContent(requestBody, true);
       const contentInfo = validateDoubaoContent(effectiveModel, content);
@@ -1599,7 +1606,7 @@ protocols.openai_video = {
       if (!ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
       const req = Object.assign({}, ctx.body.value);
       const model = ctx.upstreamModel || ctx.model;
-      requestResolution(model, req);
+      requestResolution(model, req, ctx.model);
       validateGenerationParameters(req, model, false);
       const content = requestContent(req, true);
       const contentInfo = validateDoubaoContent(model, content);
@@ -1655,7 +1662,7 @@ protocols.openai_video = {
     }
     if ((ctx.body.files || []).length) throw new Error("Doubao requires image and video references to be URLs inside metadata.content");
     const model = ctx.upstreamModel || ctx.model;
-    requestResolution(model, req);
+    requestResolution(model, req, ctx.model);
     validateGenerationParameters(req, model, false);
     if (req.seconds !== undefined) req.seconds = Number(req.seconds);
     else if (req.duration !== undefined) req.seconds = Number(req.duration);

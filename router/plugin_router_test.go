@@ -751,6 +751,21 @@ func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 		binding jsplugin.RouteBinding,
 	) []gin.HandlerFunc {
 		production := productionPluginRouteHandlers(generation, binding)
+		if binding.Route.Type == jsplugin.RouteTypeDynamic && binding.Route.Action == "list" {
+			return []gin.HandlerFunc{
+				production[0],
+				func(c *gin.Context) {
+					common.SetContextKey(c, constant.ContextKeyUserId, 91)
+					common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+					common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+					c.Next()
+				},
+				production[2],
+				production[3],
+				production[4],
+				production[5],
+			}
+		}
 		return []gin.HandlerFunc{
 			production[0],
 			func(c *gin.Context) {

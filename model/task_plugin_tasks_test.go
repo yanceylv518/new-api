@@ -115,6 +115,24 @@ func TestTaskPluginListDatabaseDialects(t *testing.T) {
 				}
 				require.NoError(t, db.Create(task).Error)
 			}
+			require.NoError(t, db.Create([]*Task{
+				{TaskID: "vidu-template", UserId: 7, Platform: "52", Action: "template", CreatedAt: now - 10,
+					Properties: Properties{OriginModelName: "viduq2"}, Data: json.RawMessage(`{"tasks":[{"template":"hugging","resolution":"720p"}]}`)},
+				{TaskID: "vidu-other-template", UserId: 7, Platform: "vidu", Action: "template", CreatedAt: now - 10,
+					Properties: Properties{OriginModelName: "viduq3-pro"}, Data: json.RawMessage(`{"tasks":[{"template":"beast_companion","resolution":"1080p"}]}`)},
+			}).Error)
+			dataFilter := TaskPluginTaskFilter{
+				Platforms:   []constant.TaskPlatform{"vidu", "52"},
+				Models:      []string{"viduq2"},
+				DataFilters: map[string][]string{"template": {"hugging"}, "resolution": {"720p"}},
+			}
+			dataTotal, err := CountTaskPluginUserTasks(7, dataFilter)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, dataTotal)
+			dataTasks, err := ListTaskPluginUserTasks(7, dataFilter, 0, 10)
+			require.NoError(t, err)
+			require.Len(t, dataTasks, 1)
+			assert.Equal(t, "vidu-template", dataTasks[0].TaskID)
 			filter := TaskPluginTaskFilter{Platforms: []constant.TaskPlatform{"doubao", "54", "45"}, ServiceTier: "default", CreatedAfter: now - 604800, CreatedBefore: now}
 			total, err := CountTaskPluginUserTasks(7, filter)
 			require.NoError(t, err)
@@ -124,6 +142,17 @@ func TestTaskPluginListDatabaseDialects(t *testing.T) {
 			require.Len(t, page, 2)
 			assert.Equal(t, "boundary", page[0].TaskID)
 			assert.Equal(t, "empty", page[1].TaskID)
+			require.NoError(t, db.Create([]*Task{
+				{TaskID: "external-object", UserId: 7, Platform: "doubao", CreatedAt: now - 10, Data: json.RawMessage(`{"service_tier":"special","data":{"external_id":"ext-001"}}`)},
+				{TaskID: "external-array", UserId: 7, Platform: "doubao", CreatedAt: now - 10, Data: json.RawMessage(`{"service_tier":"special","data":[{"external_id":"ext-002"}]}`)},
+			}).Error)
+			externalFilter := TaskPluginTaskFilter{Platforms: []constant.TaskPlatform{"doubao"}, ExternalTaskIDs: []string{"ext-001", "ext-002"}}
+			externalTotal, err := CountTaskPluginUserTasks(7, externalFilter)
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, externalTotal)
+			externalTasks, err := ListTaskPluginUserTasks(7, externalFilter, 0, 10)
+			require.NoError(t, err)
+			assert.Len(t, externalTasks, 2)
 			filter.ServiceTier, filter.Model = "flex", "ep-test"
 			total, err = CountTaskPluginUserTasks(7, filter)
 			require.NoError(t, err)

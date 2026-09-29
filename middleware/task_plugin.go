@@ -92,8 +92,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		bodyKind, _ := bodyObject["kind"].(string)
 		// 查询和管理接口无需 JSON 提交体，管理意图仍须在解码后匹配声明的操作和模型。
 		managementRoute := pinned.Route.Type == pluginruntime.RouteTypeDynamic && (pinned.Route.Action == "list" || pinned.Route.Action == "delete")
+		proxyRoute := pinned.Route.Type == pluginruntime.RouteTypeDynamic && pinned.Route.Action == "proxy"
 		bodyRequiresJSON := pinned.Route.Type != pluginruntime.RouteTypeQuery
-		if managementRoute {
+		if managementRoute || proxyRoute {
 			bodyRequiresJSON = false
 		}
 		if (pinned.Route.Type == pluginruntime.RouteTypeQuery && bodyKind != string(pluginruntime.BodyNone)) ||
@@ -142,7 +143,11 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		}
 
 		hookStarted := time.Now()
-		resolvedValue, err := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", pinned.Route.Decode, requestContext.JSValue())
+		nativeContext := requestContext.JSValue()
+		// 原生路由动作属于路由声明，必须传给解码器；新版 Kling 路由依赖
+		// 该字段区分 text-to-video、image-to-video 和 omni-video。
+		nativeContext["action"] = pinned.Route.Action
+		resolvedValue, err := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", pinned.Route.Decode, nativeContext)
 		if err != nil {
 			logger.LogWarn(
 				c,
@@ -201,6 +206,17 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
 			return
 		}
+		if proxyRoute && kind != "proxy" {
+			logger.LogWarn(
+				c,
+				"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=proxy_result_kind_mismatch kind=%q",
+				generation,
+				pinned.Plugin.Meta.Key,
+				kind,
+			)
+			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+			return
+		}
 		if managementRoute && len(pinned.Route.Models) > 0 {
 			modelName, valid := resolved["model"].(string)
 			if !valid || !slices.Contains(pinned.Route.Models, modelName) {
@@ -222,7 +238,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		}
 
 		switch kind {
-		case string(pluginruntime.RouteTypeSubmit):
+		case string(pluginruntime.RouteTypeSubmit), "proxy":
 			modelName, valid := resolved["model"].(string)
 			if !valid || strings.TrimSpace(modelName) == "" {
 				logger.LogWarn(
