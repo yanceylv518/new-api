@@ -209,6 +209,9 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 		return group.GroupID, nil
 	}
 
+	if strings.EqualFold(group.GroupType, "LivenessFace") {
+		return "", errors.New("verified real-person assets require verification on the selected upstream account")
+	}
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetPollLease.Seconds())
 	replica, claimed, err := model.ClaimSeedanceAssetGroupReplicaWithSnapshot(ctx, group.UserID, group.ID, client.ChannelID, client.AccountFingerprint, client.KeyFingerprint, group.Name, now, leaseUntil, snapshot)

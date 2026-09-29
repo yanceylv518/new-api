@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -215,6 +216,29 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 }
 
 func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[string]string) error {
+	// 插件在分配渠道前已解码请求，必须同步快照，避免驱动或二次解码再次发送原账号的 ID。
+	snapshots := make(map[string]any, 3)
+	for _, key := range []string{"task_request", pluginruntime.ContextKeyRouteRequest, pluginruntime.ContextKeyProtocolRequest} {
+		value, exists := c.Get(key)
+		if !exists {
+			continue
+		}
+		var rewritten any
+		var err error
+		switch request := value.(type) {
+		case pluginruntime.RouteRequestContext:
+			rewritten, err = rewriteSeedanceRouteSnapshot(request, previousMapping, newMapping)
+		case pluginruntime.ProtocolRequestContext:
+			request.RouteRequestContext, err = rewriteSeedanceRouteSnapshot(request.RouteRequestContext, previousMapping, newMapping)
+			rewritten = request
+		default:
+			rewritten, err = rewriteSeedanceRequestValue(value, false, false, previousMapping, newMapping)
+		}
+		if err != nil {
+			return err
+		}
+		snapshots[key] = rewritten
+	}
 	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil {
 		mediaType = c.GetHeader("Content-Type")
@@ -230,23 +254,113 @@ func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[
 			return err
 		}
 		rewritten, changed, err := rewriteSeedanceJSON(raw, previousMapping, newMapping)
-		if err != nil || !changed {
-			return err
-		}
-		bodyStorage, err := common.CreateBodyStorage(rewritten)
 		if err != nil {
 			return err
 		}
-		return replaceSeedanceRequestBody(c, bodyStorage, c.GetHeader("Content-Type"))
+		if changed {
+			bodyStorage, err := common.CreateBodyStorage(rewritten)
+			if err != nil {
+				return err
+			}
+			if err := replaceSeedanceRequestBody(c, bodyStorage, c.GetHeader("Content-Type")); err != nil {
+				return err
+			}
+		}
 	case mediaType == "multipart/form-data":
 		bodyStorage, contentType, changed, err := rewriteSeedanceMultipart(c, previousMapping, newMapping)
-		if err != nil || !changed {
+		if err != nil {
 			return err
 		}
-		return replaceSeedanceRequestBody(c, bodyStorage, contentType)
+		if changed {
+			if err := replaceSeedanceRequestBody(c, bodyStorage, contentType); err != nil {
+				return err
+			}
+		}
 	default:
 		return fmt.Errorf("%w: asset references require a JSON or multipart request", ErrInvalidSeedanceAssetRequest)
 	}
+	for key, value := range snapshots {
+		c.Set(key, value)
+	}
+	return nil
+}
+
+func rewriteSeedanceRouteSnapshot(request pluginruntime.RouteRequestContext, previousMapping, newMapping map[string]string) (pluginruntime.RouteRequestContext, error) {
+	var err error
+	request.Body, err = rewriteSeedanceRequestValue(request.Body, false, false, previousMapping, newMapping)
+	if err != nil {
+		return request, err
+	}
+	request.RequestBody, err = rewriteSeedanceRequestValue(request.RequestBody, false, false, previousMapping, newMapping)
+	return request, err
+}
+
+// 复制已解码容器，保留数值类型与文件引用，避免修改多个解码器共享的输入。
+func rewriteSeedanceRequestValue(value any, mediaField, jsonContainer bool, previousMapping, newMapping map[string]string) (any, error) {
+	switch current := value.(type) {
+	case string:
+		if mediaField {
+			rewritten, _, err := rewriteSeedanceAssetReference(current, previousMapping, newMapping)
+			return rewritten, err
+		}
+		trimmed := strings.TrimSpace(current)
+		if jsonContainer && strings.Contains(trimmed, "asset:") && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			rewritten, changed, err := rewriteSeedanceJSON([]byte(trimmed), previousMapping, newMapping)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				return string(rewritten), nil
+			}
+		}
+	case map[string]any:
+		cloned := maps.Clone(current)
+		for key, child := range current {
+			rewritten, err := rewriteSeedanceRequestValue(child, mediaField || seedanceAssetField(key), seedanceAssetJSONContainer(key), previousMapping, newMapping)
+			if err != nil {
+				return nil, err
+			}
+			cloned[key] = rewritten
+		}
+		return cloned, nil
+	case map[string][]string:
+		cloned := maps.Clone(current)
+		for key, child := range current {
+			rewritten, err := rewriteSeedanceRequestValue(child, mediaField || seedanceAssetField(key), seedanceAssetJSONContainer(key), previousMapping, newMapping)
+			if err != nil {
+				return nil, err
+			}
+			cloned[key] = rewritten.([]string)
+		}
+		return cloned, nil
+	case []any:
+		if current == nil {
+			return value, nil
+		}
+		cloned := make([]any, len(current))
+		for index, child := range current {
+			rewritten, err := rewriteSeedanceRequestValue(child, mediaField, jsonContainer, previousMapping, newMapping)
+			if err != nil {
+				return nil, err
+			}
+			cloned[index] = rewritten
+		}
+		return cloned, nil
+	case []string:
+		if current == nil {
+			return value, nil
+		}
+		cloned := make([]string, len(current))
+		for index, child := range current {
+			rewritten, err := rewriteSeedanceRequestValue(child, mediaField, jsonContainer, previousMapping, newMapping)
+			if err != nil {
+				return nil, err
+			}
+			cloned[index] = rewritten.(string)
+		}
+		return cloned, nil
+	}
+	return value, nil
 }
 
 func rewriteSeedanceJSON(raw []byte, previousMapping, newMapping map[string]string) ([]byte, bool, error) {

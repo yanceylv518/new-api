@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,6 +17,10 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -70,6 +75,145 @@ func TestRewriteSeedanceJSONRemapsMediaAndPreservesUnrelatedValues(t *testing.T)
 func TestRewriteSeedanceJSONRejectsUnknownReference(t *testing.T) {
 	_, _, err := rewriteSeedanceJSON([]byte(`{"content":[{"image_url":{"url":"asset://unknown"}}]}`), nil, map[string]string{})
 	assert.ErrorIs(t, err, ErrInvalidSeedanceAssetRequest)
+}
+
+func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
+	service.InitHttpClient()
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{Key: "doubao"})
+	require.NoError(t, err)
+	const modelName = "doubao-seedance-2-0-260128"
+	const prompt = "keep asset://local-asset as text"
+	content := `[{"type":"text","text":"` + prompt + `"},{"type":"image_url","role":"reference_image","image_url":{"url":"asset://local-asset"}}]`
+	for _, surface := range []string{"native", "video_json", "video_multipart"} {
+		t.Run(surface, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			path := "/v1/videos"
+			if surface == "native" {
+				path = "/doubao/api/v3/contents/generations/tasks"
+			}
+			if surface == "video_multipart" {
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				for key, value := range map[string]string{"model": modelName, "content": content, "duration": "4", "resolution": "480p", "generate_audio": "false"} {
+					require.NoError(t, writer.WriteField(key, value))
+				}
+				require.NoError(t, writer.Close())
+				c.Request = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body.Bytes()))
+				c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			} else {
+				body := `{"model":"` + modelName + `","content":` + content + `,"duration":4,"resolution":"480p","generate_audio":false}`
+				c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				c.Request.Header.Set("Content-Type", "application/json")
+			}
+			route, err := buildTaskPluginRouteRequest(c)
+			require.NoError(t, err)
+			var resolved any
+			if surface == "native" {
+				resolved, err = plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, route.JSValue())
+			} else {
+				protocol := pluginruntime.ProtocolRequestContext{RouteRequestContext: route, Protocol: "openai_video", Operation: "create", Model: modelName}
+				resolved, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, protocol.JSValue())
+				c.Set(pluginruntime.ContextKeyProtocolRequest, protocol)
+				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_video", Model: modelName})
+			}
+			require.NoError(t, err)
+			route.RequestBody = resolved.(map[string]any)["requestBody"]
+			c.Set(pluginruntime.ContextKeyRouteRequest, route)
+			c.Set("task_request", route.RequestBody)
+			c.Set("resolved_task_model", modelName)
+			var previous map[string]string
+			for _, account := range []string{"a", "b"} {
+				key := "key-" + account
+				remoteID := "remote-" + account
+				var received atomic.Bool
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "Bearer "+key, r.Header.Get("Authorization"))
+					var request struct {
+						Content []struct {
+							Text     string `json:"text"`
+							ImageURL struct {
+								URL string `json:"url"`
+							} `json:"image_url"`
+						} `json:"content"`
+						Duration      int  `json:"duration"`
+						GenerateAudio bool `json:"generate_audio"`
+					}
+					if !assert.NoError(t, common.DecodeJson(r.Body, &request)) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if !assert.Len(t, request.Content, 2) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					received.Store(true)
+					assert.Equal(t, prompt, request.Content[0].Text)
+					assert.Equal(t, 4, request.Duration)
+					assert.False(t, request.GenerateAudio)
+					if !assert.Equal(t, "asset://"+remoteID, request.Content[1].ImageURL.URL) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"accepted"}`)
+				}))
+				t.Cleanup(upstream.Close)
+				mapping := map[string]string{"local-asset": remoteID}
+				require.NoError(t, rewriteSeedanceRequestBody(c, previous, mapping))
+				info := &relaycommon.RelayInfo{
+					ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeDoubaoVideo, ChannelBaseUrl: upstream.URL, ApiKey: key, UpstreamModelName: modelName},
+					OriginModelName: modelName, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task-test"},
+				}
+				adaptor := taskplugin.New(plugin)
+				adaptor.Init(info)
+				require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+				body, err := adaptor.BuildRequestBody(c, info)
+				require.NoError(t, err)
+				response, err := adaptor.DoRequest(c, info, body)
+				require.NoError(t, err)
+				_, err = io.Copy(io.Discard, response.Body)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				assert.Equal(t, http.StatusOK, response.StatusCode)
+				assert.True(t, received.Load())
+				previous = mapping
+			}
+			original, err := common.Marshal(route.RequestBody)
+			require.NoError(t, err)
+			assert.Contains(t, string(original), `"url":"asset://local-asset"`, "request snapshots must not mutate shared decoder inputs")
+		})
+	}
+}
+
+func TestSeedanceSnapshotRewriteFailurePreservesRequest(t *testing.T) {
+	for _, invalidSnapshot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid_snapshot_%t", invalidSnapshot), func(t *testing.T) {
+			rawID, snapshotID := "unknown", "local-asset"
+			if invalidSnapshot {
+				rawID, snapshotID = snapshotID, rawID
+			}
+			original := `{"image_url":"asset://` + rawID + `"}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(original))
+			c.Request.Header.Set("Content-Type", "application/json")
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			request := map[string]any{"image_url": "asset://" + snapshotID, "seed": json.Number("18446744073709551615"), "generate_audio": false}
+			c.Set("task_request", request)
+			err := rewriteSeedanceRequestBody(c, nil, map[string]string{"local-asset": "remote"})
+			require.ErrorIs(t, err, ErrInvalidSeedanceAssetRequest)
+			stored, exists := c.Get("task_request")
+			require.True(t, exists)
+			assert.Equal(t, request, stored)
+			storage, err := common.GetBodyStorage(c)
+			require.NoError(t, err)
+			body, err := storage.Bytes()
+			require.NoError(t, err)
+			assert.Equal(t, original, string(body))
+		})
+	}
 }
 
 func TestPrepareSeedanceAssetRequestRejectsUnsupportedChannel(t *testing.T) {

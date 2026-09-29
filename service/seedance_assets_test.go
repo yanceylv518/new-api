@@ -1040,7 +1040,15 @@ func TestStoreSeedanceAssetUploadNormalizesProgressiveJPEG(t *testing.T) {
 
 func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T) {
 	previousDB := model.DB
-	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	var dialector gorm.Dialector
+	if dsn := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_MYSQL_DSN"); dsn != "" {
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("SEEDANCE_ASSET_LOAD_TEST_POSTGRES_DSN"); dsn != "" {
+		dialector = postgres.Open(dsn)
+	} else {
+		dialector = sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name()))
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("sam%d_", time.Now().UnixNano())}})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.SystemTask{},
@@ -1052,6 +1060,7 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = previousDB
+		assert.NoError(t, db.Migrator().DropTable(&model.SeedanceAssetReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetGroup{}, &model.SystemTask{}))
 		sqlDB, dbErr := db.DB()
 		if dbErr == nil {
 			_ = sqlDB.Close()
@@ -1065,7 +1074,7 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	useFakePrivateAssetOSSStorage(t)
 
 	group := &model.SeedanceAssetGroup{
-		UserID: 7, ChannelID: 11, GroupID: "source-group", Name: "Originals", GroupType: "LivenessFace",
+		UserID: 7, ChannelID: 11, GroupID: "source-group", Name: "Originals", GroupType: "AIGC",
 		Status: "Active", KeyFingerprint: "source-key", AccountFingerprint: "source-account",
 	}
 	require.NoError(t, db.Create(group).Error)
@@ -1081,7 +1090,7 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	var groupTypes []string
 	var sourceURLs []string
 	assetPolls := make(map[string]int)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		var payload map[string]string
 		if err := common.DecodeJson(request.Body, &payload); err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -1108,8 +1117,11 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 		default:
 			http.Error(writer, "unexpected Action", http.StatusBadRequest)
 		}
-	}))
+	})
+	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
+	otherServer := httptest.NewServer(handler)
+	t.Cleanup(otherServer.Close)
 
 	newClient := func(id int, key string) *SeedanceAssetClient {
 		channel := &model.Channel{Id: id, Type: constant.ChannelTypeDoubaoVideo, Key: key, Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
@@ -1151,11 +1163,15 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	assert.Equal(t, clientAAlias.ChannelID, replica.ChannelID)
 	assert.Equal(t, 4, len(actions), "reusing an account alias must not import the asset again")
 
-	clientB := newClient(22, "key-b")
+	clientB, err := NewSeedanceAssetClientForSelectedKey(&model.Channel{
+		Id: 22, Type: constant.ChannelTypeDoubaoVideo, Key: "key-b",
+		Status: common.ChannelStatusEnabled, BaseURL: &otherServer.URL,
+	}, "key-b")
+	require.NoError(t, err)
 	otherMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientB, []string{asset.AssetID})
 	require.NoError(t, err)
 	require.Equal(t, "remote-asset-key-b", otherMapping[asset.AssetID])
-	require.Equal(t, []string{"LivenessFace", "LivenessFace"}, groupTypes)
+	require.Equal(t, []string{"AIGC", "AIGC"}, groupTypes)
 	require.Len(t, sourceURLs, 2)
 	assert.Equal(t, "https://signed.example/"+asset.ObjectKey, sourceURLs[0])
 	assert.Equal(t, sourceURLs[0], sourceURLs[1])
@@ -1189,6 +1205,14 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&assetReplicaCount).Error)
 	assert.EqualValues(t, 2, groupReplicaCount)
 	assert.EqualValues(t, 2, assetReplicaCount)
+
+	require.NoError(t, db.Model(primaryGroup).Update("group_type", "LivenessFace").Error)
+	_, err = MapSeedanceAssetsToAccount(t.Context(), primaryGroup.UserID, primaryAlias, []string{primaryAsset.AssetID})
+	require.NoError(t, err, "verified assets remain usable through the same upstream account")
+	actionsBeforeVerificationCheck := len(actions)
+	_, err = MapSeedanceAssetsToAccount(t.Context(), primaryGroup.UserID, clientB, []string{primaryAsset.AssetID})
+	assert.ErrorContains(t, err, "require verification on the selected upstream account")
+	assert.Len(t, actions, actionsBeforeVerificationCheck, "copying media cannot substitute for upstream real-person verification")
 }
 
 func TestMapSeedanceAssetsToSelectedAccountHandlesMultipleAssetsInOneRequest(t *testing.T) {
