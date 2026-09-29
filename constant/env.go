@@ -1,5 +1,7 @@
 package constant
 
+import "sync/atomic"
+
 var StreamingTimeout int
 var DifyDebug bool
 var MaxFileDownloadMB int
@@ -23,7 +25,7 @@ var TaskPluginProtocolTimeoutSeconds int
 var TaskPluginProtocolTickMilliseconds int
 var TaskPluginProtocolTickJitterMilliseconds int
 var TaskPluginProtocolHeartbeatSeconds int
-var TaskRequestSnapshotEnabled bool
+var TaskRequestSnapshotEnabled atomic.Bool
 var TaskRequestSnapshotMaxBytes int
 var TaskRequestSnapshotMaxDepth int
 var TaskRequestSnapshotMaxItems int

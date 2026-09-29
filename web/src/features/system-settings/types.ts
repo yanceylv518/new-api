@@ -381,6 +381,7 @@ export type OperationsSettings = {
   'private_asset_oss.access_key_id': string
   'private_asset_oss.secret_configured': boolean
   LogConsumeEnabled: boolean
+  TaskRequestSnapshotEnabled: boolean
   'performance_setting.disk_cache_enabled': boolean
   'performance_setting.disk_cache_threshold_mb': number
   'performance_setting.disk_cache_max_size_mb': number

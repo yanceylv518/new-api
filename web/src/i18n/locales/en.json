@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Save video request bodies": "Save video request bodies",
+    "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

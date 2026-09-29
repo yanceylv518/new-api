@@ -49,7 +49,7 @@ type taskRequestSnapshotSanitizer struct {
 
 // NewTaskRequestSnapshot 将已解析的用户请求转换为有界且不含凭证的 JSON 快照，不修改原请求。
 func NewTaskRequestSnapshot(task *Task, requestBody any) (*TaskRequestSnapshot, error) {
-	if task == nil || !constant.TaskRequestSnapshotEnabled || requestBody == nil {
+	if task == nil || !constant.TaskRequestSnapshotEnabled.Load() || requestBody == nil {
 		return nil, nil
 	}
 	if !isVideoTaskAction(task.Action) {

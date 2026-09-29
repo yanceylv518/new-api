@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Save video request bodies": "保存视频请求体",
+    "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "不保存 Base64 内容和凭证。关闭后停止保存新请求，已有记录仍可查看。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

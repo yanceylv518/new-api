@@ -50,6 +50,7 @@ const defaultOperationsSettings: OperationsSettings = {
   'private_asset_oss.access_key_id': '',
   'private_asset_oss.secret_configured': false,
   LogConsumeEnabled: false,
+  TaskRequestSnapshotEnabled: true,
   'performance_setting.disk_cache_enabled': false,
   'performance_setting.disk_cache_threshold_mb': 10,
   'performance_setting.disk_cache_max_size_mb': 1024,

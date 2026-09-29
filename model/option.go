@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"maps"
 	"strconv"
 	"strings"
@@ -56,6 +57,7 @@ func InitOptionMap() {
 	common.OptionMap["DrawingEnabled"] = strconv.FormatBool(common.DrawingEnabled)
 	common.OptionMap["TaskEnabled"] = strconv.FormatBool(common.TaskEnabled)
 	common.OptionMap["TaskPluginEnabled"] = strconv.FormatBool(constant.TaskPluginEnabled)
+	common.OptionMap["TaskRequestSnapshotEnabled"] = strconv.FormatBool(constant.TaskRequestSnapshotEnabled.Load())
 	jsplugin.DefaultRegistry.SetEnabled(constant.TaskPluginEnabled)
 	common.OptionMap[setting.TaskPluginMarketplaceSourcesKey] = setting.TaskPluginMarketplaceSources2JsonString()
 	common.OptionMap[setting.TaskPluginDisabledFactoryKeysKey] = "[]"
@@ -232,6 +234,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == "TaskRequestSnapshotEnabled" && value != "true" && value != "false" {
+		return errors.New("TaskRequestSnapshotEnabled must be true or false")
+	}
 	if err := operation_setting.ValidateQuotaOption(key, value); err != nil {
 		return err
 	}
@@ -248,6 +253,9 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if key == "TaskRequestSnapshotEnabled" {
+		return UpdateOptionsBulk(map[string]string{key: value})
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -439,6 +447,8 @@ func updateOptionMap(key string, value string) (err error) {
 		case "TaskPluginEnabled":
 			constant.TaskPluginEnabled = boolValue
 			jsplugin.DefaultRegistry.SetEnabled(boolValue)
+		case "TaskRequestSnapshotEnabled":
+			constant.TaskRequestSnapshotEnabled.Store(boolValue)
 		case "DataExportEnabled":
 			common.DataExportEnabled = boolValue
 		case "DefaultCollapseSidebar":

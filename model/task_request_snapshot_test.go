@@ -26,17 +26,17 @@ import (
 func withTaskRequestSnapshotSettings(t *testing.T, enabled bool, maxBytes, maxDepth, maxItems int) {
 	t.Helper()
 	previous := [4]any{
-		constant.TaskRequestSnapshotEnabled,
+		constant.TaskRequestSnapshotEnabled.Load(),
 		constant.TaskRequestSnapshotMaxBytes,
 		constant.TaskRequestSnapshotMaxDepth,
 		constant.TaskRequestSnapshotMaxItems,
 	}
-	constant.TaskRequestSnapshotEnabled = enabled
+	constant.TaskRequestSnapshotEnabled.Store(enabled)
 	constant.TaskRequestSnapshotMaxBytes = maxBytes
 	constant.TaskRequestSnapshotMaxDepth = maxDepth
 	constant.TaskRequestSnapshotMaxItems = maxItems
 	t.Cleanup(func() {
-		constant.TaskRequestSnapshotEnabled = previous[0].(bool)
+		constant.TaskRequestSnapshotEnabled.Store(previous[0].(bool))
 		constant.TaskRequestSnapshotMaxBytes = previous[1].(int)
 		constant.TaskRequestSnapshotMaxDepth = previous[2].(int)
 		constant.TaskRequestSnapshotMaxItems = previous[3].(int)
@@ -281,6 +281,94 @@ func TestTaskRequestSnapshotDatabaseMatrix(t *testing.T) {
 	}
 }
 
+func TestTaskRequestSnapshotOptionPersistsAcrossReload(t *testing.T) {
+	engines := []struct {
+		name string
+		dsn  string
+		open func(string) gorm.Dialector
+	}{
+		{name: "sqlite", dsn: filepath.Join(t.TempDir(), "snapshot-option.db"), open: sqlite.Open},
+		{name: "mysql", dsn: os.Getenv("TEST_MYSQL_DSN"), open: mysql.Open},
+		{name: "postgres", dsn: os.Getenv("TEST_POSTGRES_DSN"), open: postgres.Open},
+	}
+	previousDB, previousMap := DB, common.OptionMap
+	previousEnabled := constant.TaskRequestSnapshotEnabled.Load()
+	t.Cleanup(func() {
+		DB = previousDB
+		common.OptionMap = previousMap
+		constant.TaskRequestSnapshotEnabled.Store(previousEnabled)
+	})
+	for _, engine := range engines {
+		t.Run(engine.name, func(t *testing.T) {
+			if engine.dsn == "" {
+				t.Skip("database DSN is not configured")
+			}
+			db, err := gorm.Open(engine.open(engine.dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			DB = db
+			common.OptionMap = map[string]string{}
+			require.NoError(t, db.AutoMigrate(&Option{}))
+			withTaskRequestSnapshotSettings(t, true, 256*1024, 16, 1000)
+			key := "TaskRequestSnapshotEnabled"
+			t.Cleanup(func() { _ = db.Where(&Option{Key: key}).Delete(&Option{}).Error })
+			task := &Task{Action: constant.TaskActionTextToVideo}
+			for _, enabled := range []bool{false, true} {
+				require.NoError(t, UpdateOption(key, fmt.Sprint(enabled)))
+				var stored Option
+				require.NoError(t, db.Where(&Option{Key: key}).First(&stored).Error)
+				assert.Equal(t, fmt.Sprint(enabled), stored.Value)
+				constant.TaskRequestSnapshotEnabled.Store(!enabled)
+				loadOptionsFromDatabase()
+				assert.Equal(t, enabled, constant.TaskRequestSnapshotEnabled.Load())
+				snapshot, err := NewTaskRequestSnapshot(task, map[string]any{"prompt": "test"})
+				require.NoError(t, err)
+				assert.Equal(t, enabled, snapshot != nil)
+			}
+			require.Error(t, UpdateOption(key, "not-a-boolean"))
+			assert.True(t, constant.TaskRequestSnapshotEnabled.Load())
+			var stored Option
+			require.NoError(t, db.Where(&Option{Key: key}).First(&stored).Error)
+			assert.Equal(t, "true", stored.Value)
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("snapshot_option_failure", func(tx *gorm.DB) {
+				tx.AddError(fmt.Errorf("test database failure"))
+			}))
+			require.Error(t, UpdateOption(key, "false"))
+			assert.True(t, constant.TaskRequestSnapshotEnabled.Load())
+			assert.Equal(t, "true", common.OptionMap[key])
+		})
+	}
+}
+
+func TestTaskRequestSnapshotOptionConcurrentToggle(t *testing.T) {
+	withTaskRequestSnapshotSettings(t, true, 256*1024, 16, 1000)
+	previousMap := common.OptionMap
+	common.OptionMap = map[string]string{}
+	t.Cleanup(func() { common.OptionMap = previousMap })
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for range 1000 {
+			assert.NoError(t, updateOptionMap("TaskRequestSnapshotEnabled", "false"))
+			assert.NoError(t, updateOptionMap("TaskRequestSnapshotEnabled", "true"))
+		}
+	})
+	for range 8 {
+		workers.Go(func() {
+			task := &Task{Action: constant.TaskActionTextToVideo}
+			for range 1000 {
+				snapshot, err := NewTaskRequestSnapshot(task, map[string]any{"prompt": "keep", "api_key": "test-secret"})
+				assert.NoError(t, err)
+				if snapshot != nil {
+					assert.NotContains(t, string(snapshot.Body), "test-secret")
+				}
+			}
+		})
+	}
+	workers.Wait()
+}
+
 func TestTaskRequestSnapshotMockLoad(t *testing.T) {
 	if os.Getenv("TASK_REQUEST_SNAPSHOT_LOAD_TEST") != "1" {
 		t.Skip("set TASK_REQUEST_SNAPSHOT_LOAD_TEST=1 to run the 200-user mock load test")
@@ -432,7 +520,7 @@ func runTaskRequestSnapshotPersistenceLoad(t *testing.T) {
 }
 
 func BenchmarkNewTaskRequestSnapshot(b *testing.B) {
-	constant.TaskRequestSnapshotEnabled = true
+	constant.TaskRequestSnapshotEnabled.Store(true)
 	constant.TaskRequestSnapshotMaxBytes = 256 * 1024
 	constant.TaskRequestSnapshotMaxDepth = 16
 	constant.TaskRequestSnapshotMaxItems = 1000
@@ -454,7 +542,7 @@ func BenchmarkNewTaskRequestSnapshot(b *testing.B) {
 }
 
 func BenchmarkNewTaskRequestSnapshotDisabled(b *testing.B) {
-	constant.TaskRequestSnapshotEnabled = false
+	constant.TaskRequestSnapshotEnabled.Store(false)
 	task := &Task{TaskID: "task_benchmark_disabled", UserId: 1, Platform: "doubao", Action: constant.TaskActionImageToVideo}
 	body := map[string]any{
 		"model":  "doubao-seedance-2-0-fast-260128",

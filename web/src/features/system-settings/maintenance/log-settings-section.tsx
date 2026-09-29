@@ -85,12 +85,14 @@ import type { LogCleanupTask } from '../types'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  TaskRequestSnapshotEnabled: z.boolean(),
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultRequestSnapshotEnabled?: boolean
 }
 
 type ServerLogInfo = {
@@ -146,6 +148,7 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
 
 export function LogSettingsSection({
   defaultEnabled,
+  defaultRequestSnapshotEnabled = true,
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
@@ -153,6 +156,7 @@ export function LogSettingsSection({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
+      TaskRequestSnapshotEnabled: defaultRequestSnapshotEnabled,
     },
   })
 
@@ -180,8 +184,11 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    form.reset({
+      LogConsumeEnabled: defaultEnabled,
+      TaskRequestSnapshotEnabled: defaultRequestSnapshotEnabled,
+    })
+  }, [defaultEnabled, defaultRequestSnapshotEnabled, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -263,11 +270,18 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    if (values.LogConsumeEnabled !== defaultEnabled) {
+      await updateOption.mutateAsync({
+        key: 'LogConsumeEnabled',
+        value: values.LogConsumeEnabled,
+      })
+    }
+    if (values.TaskRequestSnapshotEnabled !== defaultRequestSnapshotEnabled) {
+      await updateOption.mutateAsync({
+        key: 'TaskRequestSnapshotEnabled',
+        value: values.TaskRequestSnapshotEnabled,
+      })
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -359,6 +373,30 @@ export function LogSettingsSection({
                   <FormDescription>
                     {t(
                       'Track per-request consumption to power usage analytics. Keeping this on increases database writes.'
+                    )}
+                  </FormDescription>
+                </SettingsSwitchContent>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+                <FormMessage />
+              </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='TaskRequestSnapshotEnabled'
+            render={({ field }) => (
+              <SettingsSwitchItem>
+                <SettingsSwitchContent>
+                  <FormLabel>{t('Save video request bodies')}</FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>
