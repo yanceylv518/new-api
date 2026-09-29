@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type taskArtifactResponse struct {
@@ -61,6 +62,52 @@ func GetTask(c *gin.Context) {
 		"fail_reason": failReason,
 		"created_at":  createdAt,
 		"finished_at": task.FinishTime,
+	})
+}
+
+// GetTaskRequestSnapshot 按需返回脱敏请求体；任务列表不 JOIN 快照表，读取前先校验任务归属。
+func GetTaskRequestSnapshot(c *gin.Context) {
+	var (
+		task   *model.Task
+		exists bool
+		err    error
+	)
+	if c.GetInt("role") >= common.RoleAdminUser {
+		task, exists, err = model.GetUniqueByOnlyTaskId(c.Param("task_id"))
+	} else {
+		task, exists, err = model.GetByTaskId(c.GetInt("id"), c.Param("task_id"))
+	}
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !exists || task == nil {
+		common.ApiErrorMsg(c, "task not found")
+		return
+	}
+	snapshot, err := model.GetTaskRequestSnapshot(c.Request.Context(), task.ID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ApiErrorMsg(c, "task request snapshot not found")
+		return
+	}
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	var body any
+	if err := common.UnmarshalJsonStr(string(snapshot.Body), &body); err != nil {
+		common.ApiErrorMsg(c, "task request snapshot is invalid")
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"task_id":        snapshot.PublicTaskID,
+		"platform":       snapshot.Platform,
+		"model":          snapshot.Model,
+		"body":           body,
+		"body_bytes":     snapshot.BodyBytes,
+		"base64_omitted": snapshot.Base64Omitted,
+		"truncated":      snapshot.Truncated,
+		"created_at":     snapshot.CreatedAt,
 	})
 }
 

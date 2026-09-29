@@ -638,6 +638,14 @@ func executeTaskSubmissionWith(
 		task.PrivateData.PluginState = result.PluginState
 	}
 	task.Action = relayInfo.Action
+	if requestValue, exists := c.Get("task_request"); exists {
+		snapshot, snapshotErr := model.NewTaskRequestSnapshot(task, requestValue)
+		if snapshotErr != nil {
+			logger.LogWarn(c, fmt.Sprintf("task request snapshot build failed for %s: %v", task.TaskID, snapshotErr))
+		} else {
+			task.RequestSnapshot = snapshot
+		}
+	}
 	if immediate := result.Immediate; immediate != nil {
 		task.Status = model.TaskStatus(immediate.Status)
 		task.Progress = immediate.Progress
@@ -688,6 +696,11 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	durable = true
+	if task.RequestSnapshot != nil {
+		if snapshotErr := model.SaveTaskRequestSnapshot(c.Request.Context(), task.ID, task.RequestSnapshot); snapshotErr != nil {
+			logger.LogWarn(c, fmt.Sprintf("task request snapshot persistence failed for %s: %v", task.TaskID, snapshotErr))
+		}
+	}
 	stage = "settle"
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)

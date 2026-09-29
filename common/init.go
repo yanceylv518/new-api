@@ -209,6 +209,11 @@ func initConstantEnv() {
 	constant.TaskPluginProtocolTickMilliseconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_TICK_MILLISECONDS", 2000)
 	constant.TaskPluginProtocolTickJitterMilliseconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_TICK_JITTER_MILLISECONDS", 500)
 	constant.TaskPluginProtocolHeartbeatSeconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_HEARTBEAT_SECONDS", 15)
+	constant.TaskRequestSnapshotEnabled = GetEnvOrDefaultBool("TASK_REQUEST_SNAPSHOT_ENABLED", true)
+	constant.TaskRequestSnapshotMaxBytes = GetEnvOrDefault("TASK_REQUEST_SNAPSHOT_MAX_BYTES", 256*1024)
+	constant.TaskRequestSnapshotMaxDepth = GetEnvOrDefault("TASK_REQUEST_SNAPSHOT_MAX_DEPTH", 16)
+	constant.TaskRequestSnapshotMaxItems = GetEnvOrDefault("TASK_REQUEST_SNAPSHOT_MAX_ITEMS", 1000)
+	constant.TaskRequestSnapshotWriteTimeoutMilliseconds = GetEnvOrDefault("TASK_REQUEST_SNAPSHOT_WRITE_TIMEOUT_MS", 500)
 
 	soraPatchStr := GetEnvOrDefaultString("TASK_PRICE_PATCH", "")
 	if soraPatchStr != "" {

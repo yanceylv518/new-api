@@ -71,6 +71,9 @@ type Task struct {
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
+
+	// RequestSnapshot 只在初始提交阶段使用，不序列化到 tasks.private_data，也不返回给任务 DTO。
+	RequestSnapshot *TaskRequestSnapshot `json:"-" gorm:"-"`
 }
 
 func (t *Task) SetData(data any) {

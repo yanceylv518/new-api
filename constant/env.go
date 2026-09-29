@@ -23,6 +23,11 @@ var TaskPluginProtocolTimeoutSeconds int
 var TaskPluginProtocolTickMilliseconds int
 var TaskPluginProtocolTickJitterMilliseconds int
 var TaskPluginProtocolHeartbeatSeconds int
+var TaskRequestSnapshotEnabled bool
+var TaskRequestSnapshotMaxBytes int
+var TaskRequestSnapshotMaxDepth int
+var TaskRequestSnapshotMaxItems int
+var TaskRequestSnapshotWriteTimeoutMilliseconds int
 
 // temporary variable for sora patch, will be removed in future
 var TaskPricePatches []string

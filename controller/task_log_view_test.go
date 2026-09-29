@@ -1,13 +1,19 @@
 package controller
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
@@ -134,4 +140,64 @@ func TestTaskLogDTOKeepsFailureReasonAndDoesNotMarkPluginTaskLegacy(t *testing.T
 	assert.False(t, pluginView.LegacyVideoAvailable)
 	assert.Empty(t, pluginView.ResultURL)
 	assert.Empty(t, pluginView.FailReason)
+}
+
+func TestGetTaskRequestSnapshotEnforcesOwnershipAndRedactsBody(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:task_request_snapshot_controller?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		sqlDB, closeErr := db.DB()
+		if closeErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskRequestSnapshot{}))
+	task := &model.Task{TaskID: "task_request_view", UserId: 31, Platform: "doubao", Action: constant.TaskActionTextToVideo}
+	require.NoError(t, db.Create(task).Error)
+	body, err := common.Marshal(map[string]any{
+		"prompt": "keep this",
+		"image":  "[base64 content omitted]",
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.TaskRequestSnapshot{
+		TaskID:        task.ID,
+		PublicTaskID:  task.TaskID,
+		UserID:        task.UserId,
+		Platform:      task.Platform,
+		Model:         "video-model",
+		Body:          model.LongText(body),
+		BodyBytes:     len(body),
+		Base64Omitted: true,
+		CreatedAt:     common.GetTimestamp(),
+	}).Error)
+
+	request := func(userID, role int) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/task/"+task.TaskID+"/request", nil)
+		context.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+		context.Set("id", userID)
+		context.Set("role", role)
+		GetTaskRequestSnapshot(context)
+		return recorder
+	}
+
+	ownerResponse := request(task.UserId, common.RoleCommonUser)
+	var ownerPayload map[string]any
+	require.NoError(t, common.Unmarshal(ownerResponse.Body.Bytes(), &ownerPayload))
+	assert.Equal(t, true, ownerPayload["success"])
+	assert.Contains(t, ownerResponse.Body.String(), "base64 content omitted")
+
+	foreignResponse := request(99, common.RoleCommonUser)
+	var foreignPayload map[string]any
+	require.NoError(t, common.Unmarshal(foreignResponse.Body.Bytes(), &foreignPayload))
+	assert.Equal(t, false, foreignPayload["success"])
+
+	adminResponse := request(99, common.RoleAdminUser)
+	var adminPayload map[string]any
+	require.NoError(t, common.Unmarshal(adminResponse.Body.Bytes(), &adminPayload))
+	assert.Equal(t, true, adminPayload["success"])
 }
