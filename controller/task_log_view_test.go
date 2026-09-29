@@ -200,4 +200,12 @@ func TestGetTaskRequestSnapshotEnforcesOwnershipAndRedactsBody(t *testing.T) {
 	var adminPayload map[string]any
 	require.NoError(t, common.Unmarshal(adminResponse.Body.Bytes(), &adminPayload))
 	assert.Equal(t, true, adminPayload["success"])
+
+	require.NoError(t, db.Where("task_id = ?", task.ID).Delete(&model.TaskRequestSnapshot{}).Error)
+	missingResponse := request(task.UserId, common.RoleCommonUser)
+	var missingPayload map[string]any
+	require.NoError(t, common.Unmarshal(missingResponse.Body.Bytes(), &missingPayload))
+	assert.Equal(t, http.StatusOK, missingResponse.Code)
+	assert.Equal(t, false, missingPayload["success"])
+	assert.Equal(t, "task_request_snapshot_not_found", missingPayload["code"])
 }

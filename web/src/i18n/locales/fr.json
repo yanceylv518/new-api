@@ -1,7 +1,13 @@
 {
   "translation": {
+    "Request body": "Corps de la requête",
     "Save video request bodies": "Enregistrer les requêtes vidéo",
     "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "Exclut le contenu Base64 et les identifiants. La désactivation arrête l’enregistrement des nouvelles requêtes ; les enregistrements existants restent accessibles.",
+    "Base64 content omitted": "Contenu Base64 omis",
+    "Request body truncated": "Corps de la requête tronqué",
+    "Copy request body": "Copier le corps de la requête",
+    "No request body was saved for this task": "Aucun corps de requête enregistré pour cette tâche",
+    "Failed to load request body": "Échec du chargement du corps de la requête",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

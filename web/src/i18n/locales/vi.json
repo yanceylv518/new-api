@@ -1,7 +1,13 @@
 {
   "translation": {
+    "Request body": "Nội dung yêu cầu",
     "Save video request bodies": "Lưu nội dung yêu cầu video",
     "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "Loại bỏ nội dung Base64 và thông tin xác thực. Khi tắt, yêu cầu mới sẽ không được lưu; các bản ghi hiện có vẫn có thể xem.",
+    "Base64 content omitted": "Đã bỏ nội dung Base64",
+    "Request body truncated": "Nội dung yêu cầu đã bị cắt bớt",
+    "Copy request body": "Sao chép nội dung yêu cầu",
+    "No request body was saved for this task": "Không có nội dung yêu cầu được lưu cho tác vụ này",
+    "Failed to load request body": "Không thể tải nội dung yêu cầu",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

@@ -87,7 +87,11 @@ func GetTaskRequestSnapshot(c *gin.Context) {
 	}
 	snapshot, err := model.GetTaskRequestSnapshot(c.Request.Context(), task.ID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		common.ApiErrorMsg(c, "task request snapshot not found")
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"code":    "task_request_snapshot_not_found",
+			"message": "task request snapshot not found",
+		})
 		return
 	}
 	if err != nil {

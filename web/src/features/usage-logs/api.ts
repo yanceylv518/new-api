@@ -17,6 +17,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api, type ApiRequestConfig } from '@/lib/api'
+import {
+  createServerError,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
 
 import { buildQueryParams } from './lib/query-params'
 import { parseTaskArtifactsResponse } from './lib/task-artifacts'
@@ -28,6 +32,7 @@ import type {
   GetMidjourneyLogsParams,
   GetTaskLogsParams,
   TaskArtifactsResponse,
+  TaskRequestSnapshotResponse,
   UserInfo,
 } from './types'
 
@@ -130,4 +135,36 @@ export async function getTaskArtifacts(taskId: string, signal?: AbortSignal) {
     }
   )
   return parseTaskArtifactsResponse(response.data)
+}
+
+export async function getTaskRequestSnapshot(
+  taskId: string,
+  signal?: AbortSignal
+) {
+  const response = await api.get<TaskRequestSnapshotResponse>(
+    `/api/task/${encodeURIComponent(taskId)}/request`,
+    {
+      ...taskArtifactRequestConfig,
+      signal,
+      disableDuplicate: true,
+      timeout: 10000,
+    }
+  )
+  const payload = response.data
+  if (
+    !payload.success &&
+    (payload.code === 'task_request_snapshot_not_found' ||
+      payload.message === 'task request snapshot not found')
+  ) {
+    return null
+  }
+  requireServerSuccess(payload)
+  if (
+    !payload.data ||
+    payload.data.task_id !== taskId ||
+    !Object.hasOwn(payload.data, 'body')
+  ) {
+    throw createServerError(payload, 'Failed to load request body')
+  }
+  return payload.data
 }

@@ -1,7 +1,13 @@
 {
   "translation": {
+    "Request body": "Request body",
     "Save video request bodies": "Save video request bodies",
     "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.",
+    "Base64 content omitted": "Base64 content omitted",
+    "Request body truncated": "Request body truncated",
+    "Copy request body": "Copy request body",
+    "No request body was saved for this task": "No request body was saved for this task",
+    "Failed to load request body": "Failed to load request body",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

@@ -1,7 +1,13 @@
 {
   "translation": {
+    "Request body": "Тело запроса",
     "Save video request bodies": "Сохранять тела видеозапросов",
     "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "Содержимое Base64 и учётные данные исключаются. Отключение прекращает сохранение новых запросов; существующие записи остаются доступными.",
+    "Base64 content omitted": "Содержимое Base64 пропущено",
+    "Request body truncated": "Тело запроса сокращено",
+    "Copy request body": "Копировать тело запроса",
+    "No request body was saved for this task": "Тело запроса для этой задачи не сохранено",
+    "Failed to load request body": "Не удалось загрузить тело запроса",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

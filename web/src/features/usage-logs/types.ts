@@ -424,6 +424,24 @@ export interface TaskArtifactsResponse {
   }
 }
 
+export interface TaskRequestSnapshot {
+  task_id: string
+  platform: string
+  model: string
+  body: unknown
+  body_bytes: number
+  base64_omitted: boolean
+  truncated: boolean
+  created_at: number
+}
+
+export interface TaskRequestSnapshotResponse {
+  success: boolean
+  message?: string
+  code?: string
+  data?: TaskRequestSnapshot
+}
+
 // ============================================================================
 // Common Log Types
 // ============================================================================

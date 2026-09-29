@@ -1,7 +1,13 @@
 {
   "translation": {
+    "Request body": "請求體",
     "Save video request bodies": "儲存影片請求體",
     "Exclude Base64 content and credentials. Disabling stops saving new requests; existing records remain available.": "不儲存 Base64 內容和憑證。關閉後停止儲存新請求，既有記錄仍可查看。",
+    "Base64 content omitted": "Base64 內容已省略",
+    "Request body truncated": "請求體已截斷",
+    "Copy request body": "複製請求體",
+    "No request body was saved for this task": "此任務未儲存請求體",
+    "Failed to load request body": "請求體載入失敗",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
