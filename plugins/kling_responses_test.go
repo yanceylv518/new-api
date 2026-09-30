@@ -38,6 +38,67 @@ func TestKlingResponsesProtocol(t *testing.T) {
 	})
 }
 
+func TestKlingRequestURLsRespectConfiguredPrefix(t *testing.T) {
+	source, err := builtinplugins.Source("kling")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "kling"})
+	require.NoError(t, err)
+
+	cases := []struct {
+		name    string
+		baseURL string
+		apiKey  string
+		gateway bool
+		want    string
+	}{
+		{"official", "https://provider.example", "access|secret", false, "https://provider.example"},
+		{"official trailing slash", "https://provider.example/", "access|secret", false, "https://provider.example"},
+		{"gateway root", "https://provider.example", "gateway-token", true, "https://provider.example/kling"},
+		{"gateway prefix", "https://provider.example/kling", "gateway-token", true, "https://provider.example/kling"},
+		{"gateway prefix trailing slashes", "https://provider.example/kling///", "gateway-token", true, "https://provider.example/kling"},
+		{"nested gateway prefix", "https://provider.example/proxy/kling/", "gateway-token", true, "https://provider.example/proxy/kling"},
+		{"legacy relay prefix", "https://provider.example/kling/", "sk-test", false, "https://provider.example/kling"},
+		{"vendor custom prefix", "https://provider.example/kling/", "access|secret", false, "https://provider.example/kling"},
+		{"different suffix", "https://provider.example/kling-proxy/", "gateway-token", true, "https://provider.example/kling-proxy/kling"},
+	}
+	hooks := []struct {
+		name   string
+		hook   string
+		action string
+		path   string
+	}{
+		{"native submit", "buildSubmitRequest", "text_to_video", "/v1/videos/text2video"},
+		{"native query", "buildQueryRequest", "text_to_video", "/v1/videos/text2video/upstream-task"},
+		{"proxy", "buildNativeRequest", "presets_voices", "/v1/general/presets-voices"},
+		{"new submit", "buildSubmitRequest", "new_text_to_video", "/text-to-video/kling-v3"},
+		{"new query", "buildQueryRequest", "new_text_to_video", "/tasks?task_ids=upstream-task"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, hook := range hooks {
+				t.Run(hook.name, func(t *testing.T) {
+					ctx := map[string]any{
+						"baseUrl": tc.baseURL, "apiKey": tc.apiKey, "action": hook.action,
+						"model": "kling-v3", "upstreamModel": "kling-v3", "taskId": "upstream-task",
+						"path": "/kling/v1/general/presets-voices", "method": "GET",
+						"requestBody": map[string]any{"prompt": "camera orbit", "duration": 5},
+					}
+					if tc.gateway {
+						ctx["upstream"] = map[string]any{"kind": "new_api"}
+					}
+					value, callErr := plugin.Engine.Call(t.Context(), hook.hook, ctx)
+					require.NoError(t, callErr)
+					descriptor := value.(map[string]any)
+					assert.Equal(t, tc.want+hook.path, descriptor["url"])
+					if tc.gateway || tc.apiKey == "sk-test" {
+						assert.Equal(t, "Bearer "+tc.apiKey, descriptor["headers"].(map[string]any)["Authorization"])
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestKlingNativeRoutesCoverShuyanTaskSurface(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
 	require.NotNil(t, generation)

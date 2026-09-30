@@ -195,7 +195,7 @@ export const meta = {
     en: "Kuaishou Kling video generation and media APIs",
     zh: "快手可灵视频生成及媒体接口",
   },
-  version: "1.3.0",
+  version: "1.3.1",
   author: { name: "QuantumNous" },
   channelTypes: [50],
   models: KLING_MODELS,
@@ -332,25 +332,27 @@ function pathFor(action) {
 }
 
 function urlFor(ctx, action) {
-  return ctx.baseUrl + (viaGateway(ctx) ? "/kling" : "") + pathFor(action);
+  return apiRoot(ctx) + pathFor(action);
 }
 
 function isNewKlingAction(action) {
   return KLING_NEW_ACTIONS.includes(action);
 }
 
-function newURLPrefix(ctx) {
-  return ctx.baseUrl + (viaGateway(ctx) ? "/kling" : "");
+function apiRoot(ctx) {
+  const base = trimmed(ctx.baseUrl).replace(/\/+$/, "");
+  if (base.toLowerCase().endsWith("/kling")) return base;
+  return base + (viaGateway(ctx) ? "/kling" : "");
 }
 
 function newSubmitURL(ctx, action, model) {
   const endpoint = KLING_NEW_ENDPOINTS[action];
   if (!endpoint) throw new Error("unsupported Kling new action: " + action);
-  return newURLPrefix(ctx) + endpoint.path + "/" + encodeURIComponent(model);
+  return apiRoot(ctx) + endpoint.path + "/" + encodeURIComponent(model);
 }
 
 function newQueryURL(ctx, taskId) {
-  return newURLPrefix(ctx) + "/tasks?task_ids=" + encodeURIComponent(taskId);
+  return apiRoot(ctx) + "/tasks?task_ids=" + encodeURIComponent(taskId);
 }
 
 function submitModel(ctx, req) {
