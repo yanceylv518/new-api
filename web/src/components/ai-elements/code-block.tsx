@@ -60,7 +60,9 @@ import {
 import { cn } from '@/lib/utils'
 
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
+  bodyMaxHeight?: string
   code: string
+  compact?: boolean
   collapsedLines?: number
   defaultCollapsed?: boolean
   enableCollapse?: boolean
@@ -72,6 +74,7 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   showLineNumbers?: boolean
   showToolbar?: boolean
   title?: ReactNode
+  wrapLines?: boolean
 }
 
 type CodeBlockEditorProps = Omit<
@@ -93,6 +96,7 @@ type CodeBlockEditorProps = Omit<
 type CodeMirrorCodeViewProps = {
   ariaLabel: string
   autoFocus?: boolean
+  compact?: boolean
   language: BundledLanguage | string
   onChange?: (value: string) => void
   onKeyDown?: (event: globalThis.KeyboardEvent) => void
@@ -101,6 +105,7 @@ type CodeMirrorCodeViewProps = {
   rows?: number
   showLineNumbers?: boolean
   value: string
+  wrapLines?: boolean
 }
 
 type CodeBlockFrameProps = Omit<HTMLAttributes<HTMLDivElement>, 'title'> & {
@@ -281,11 +286,13 @@ function getCodeBlockMaxHeight(
 }
 
 function getCodeMirrorExtensions(options: {
+  compact: boolean
   language: BundledLanguage | string
   onKeyDown: (event: globalThis.KeyboardEvent) => void
   placeholder?: string
   readOnly: boolean
   showLineNumbers: boolean
+  wrapLines: boolean
 }): Extension[] {
   const extensions: Extension[] = [
     getCodeMirrorLanguageExtension(options.language),
@@ -310,12 +317,34 @@ function getCodeMirrorExtensions(options: {
     extensions.unshift(lineNumbers())
   }
 
+  if (options.wrapLines) {
+    extensions.unshift(
+      EditorView.lineWrapping,
+      EditorView.theme({ '.cm-content': { minWidth: '0' } })
+    )
+  }
+
+  if (options.compact) {
+    extensions.unshift(
+      EditorView.theme({
+        '.cm-content': { lineHeight: '20px', padding: '12px 12px 12px 0' },
+        '.cm-gutters': { lineHeight: '20px', paddingRight: '8px' },
+        '.cm-lineNumbers .cm-gutterElement': {
+          minWidth: '28px',
+          paddingRight: '8px',
+        },
+        '.cm-scroller': { lineHeight: '20px' },
+      })
+    )
+  }
+
   return extensions
 }
 
 function CodeMirrorCodeView({
   ariaLabel,
   autoFocus = false,
+  compact = false,
   language,
   onChange,
   onKeyDown,
@@ -324,13 +353,16 @@ function CodeMirrorCodeView({
   rows = 8,
   showLineNumbers = true,
   value,
+  wrapLines = false,
 }: CodeMirrorCodeViewProps) {
   const editorHostRef = useRef<HTMLDivElement>(null)
   const editorViewRef = useRef<EditorView | null>(null)
   const initialValueRef = useRef(value)
   const onChangeRef = useRef(onChange)
   const onKeyDownRef = useRef(onKeyDown)
-  const editorMinHeight = `${Math.max(4, rows) * 1.5 + 2}rem`
+  const editorMinHeight = compact
+    ? `${Math.max(4, rows) * 20 + 24}px`
+    : `${Math.max(4, rows) * 1.5 + 2}rem`
   // onKeyDown is delivered through a ref so a new handler identity from the
   // parent (recreated on every keystroke-driven render) does not invalidate
   // the extensions and tear down the EditorView, which would reset the cursor
@@ -338,13 +370,15 @@ function CodeMirrorCodeView({
   const editorExtensions = useMemo(
     () =>
       getCodeMirrorExtensions({
+        compact,
         language,
         onKeyDown: (event) => onKeyDownRef.current?.(event),
         placeholder,
         readOnly,
         showLineNumbers,
+        wrapLines,
       }),
-    [language, placeholder, readOnly, showLineNumbers]
+    [compact, language, placeholder, readOnly, showLineNumbers, wrapLines]
   )
 
   useEffect(() => {
@@ -467,7 +501,9 @@ export const CodeBlockFrame = ({
 )
 
 export const CodeBlock = ({
+  bodyMaxHeight: customBodyMaxHeight,
   code,
+  compact = false,
   collapsedLines = 12,
   defaultCollapsed,
   enableCollapse = true,
@@ -480,6 +516,7 @@ export const CodeBlock = ({
   title,
   className,
   children,
+  wrapLines = false,
   ...props
 }: CodeBlockProps) => {
   const { t } = useTranslation()
@@ -514,7 +551,7 @@ export const CodeBlock = ({
     <CodeBlockContext.Provider value={{ code, language: displayLanguage }}>
       <CodeBlockFrame
         bodyClassName='p-0'
-        bodyMaxHeight={bodyMaxHeight}
+        bodyMaxHeight={customBodyMaxHeight ?? bodyMaxHeight}
         bodyOverlay={
           <>
             {isCodeCollapsed && (
@@ -586,10 +623,12 @@ export const CodeBlock = ({
             typeof displayTitle === 'string' ? displayTitle : displayLanguage
           }
           language={language}
+          compact={compact}
           readOnly
           rows={Math.min(Math.max(lineCount, 4), maxExpandedLines ?? lineCount)}
           showLineNumbers={showLineNumbers}
           value={code}
+          wrapLines={wrapLines}
         />
       </CodeBlockFrame>
     </CodeBlockContext.Provider>

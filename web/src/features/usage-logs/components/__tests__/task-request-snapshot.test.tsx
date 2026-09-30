@@ -73,6 +73,7 @@ function renderDetails(open = true, log = task) {
   const result = render(view(open, log))
   return {
     ...result,
+    client,
     update: (isOpen: boolean, currentLog = log) =>
       result.rerender(view(isOpen, currentLog)),
   }
@@ -101,6 +102,81 @@ test('request body is collapsed and fetched only after expansion', async () => {
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible()
   )
+})
+
+test('header copy keeps expanded content and its scroll position during log updates', async () => {
+  const user = userEvent.setup()
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: snapshot },
+  })
+  const result = renderDetails()
+  const trigger = screen.getByRole('button', { name: 'Request body' })
+  await user.click(trigger)
+  const editor = await screen.findByRole('textbox', { name: 'Request body' })
+  const scroll = editor.closest('.code-block-scroll')
+  expect(scroll).toBeInstanceOf(HTMLElement)
+  if (!(scroll instanceof HTMLElement)) {
+    throw new Error('Missing local scroll area')
+  }
+  scroll.scrollTop = 120
+  const copy = screen.getByRole('button', { name: 'Copy request body' })
+  expect(copy.parentElement).toBe(trigger.parentElement)
+  expect(trigger).not.toContainElement(copy)
+  await user.click(copy)
+  expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  expect(await navigator.clipboard.readText()).toBe(
+    JSON.stringify(snapshot.body, null, 2)
+  )
+  result.update(true, { ...task, progress: '100%' })
+  result.client.setQueryData(['task-request-snapshot', task.task_id], {
+    ...snapshot,
+  })
+  expect(screen.getByRole('textbox', { name: 'Request body' })).toBe(editor)
+  expect(scroll.scrollTop).toBe(120)
+})
+
+test('collapsing and reopening retains the loaded body without another request', async () => {
+  const user = userEvent.setup()
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: snapshot },
+  })
+  renderDetails()
+  const trigger = screen.getByRole('button', { name: 'Request body' })
+  await user.click(trigger)
+  const editor = await screen.findByRole('textbox', { name: 'Request body' })
+  const scroll = editor.closest('.code-block-scroll')
+  expect(scroll).toBeInstanceOf(HTMLElement)
+  if (!(scroll instanceof HTMLElement)) {
+    throw new Error('Missing local scroll area')
+  }
+  scroll.scrollTop = 120
+  await user.click(trigger)
+  expect(editor).not.toBeVisible()
+  await user.click(trigger)
+  expect(screen.getByRole('textbox', { name: 'Request body' })).toBe(editor)
+  expect(scroll.scrollTop).toBe(120)
+  expect(get).toHaveBeenCalledTimes(1)
+})
+
+test('collapsing a pending read cancels it and expansion can retry', async () => {
+  const user = userEvent.setup()
+  let signal: AbortSignal | undefined
+  vi.spyOn(api, 'get')
+    .mockImplementationOnce((_url, config) => {
+      signal = config?.signal as AbortSignal
+      return new Promise(() => undefined)
+    })
+    .mockResolvedValue({ data: { success: true, data: snapshot } })
+  renderDetails()
+  const trigger = screen.getByRole('button', { name: 'Request body' })
+  await user.click(trigger)
+  await screen.findByRole('status')
+  await user.click(trigger)
+  await waitFor(() => expect(signal?.aborted).toBe(true))
+  await user.click(trigger)
+  expect(
+    await screen.findByRole('textbox', { name: 'Request body' })
+  ).toBeVisible()
 })
 
 test('historical task without a snapshot shows an empty state', async () => {

@@ -19,10 +19,61 @@ For commercial licensing, please contact support@quantumnous.com
 import { cleanup, render } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 
-import { CodeBlockEditor } from '../code-block'
+import { CodeBlock, CodeBlockEditor } from '../code-block'
 
 afterEach(() => {
   cleanup()
+})
+
+describe('CodeBlock request layout', () => {
+  test('wraps long URLs with a compact view and a bounded local scroll area', () => {
+    const { getByRole } = render(
+      <CodeBlock
+        code={JSON.stringify(
+          { url: `https://example.test/${'a'.repeat(500)}` },
+          null,
+          2
+        )}
+        language='json'
+        title='Request body'
+        compact
+        wrapLines
+        bodyMaxHeight='min(420px, 55dvh)'
+        showLineNumbers
+        enableCollapse={false}
+      />
+    )
+    const editor = getByRole('textbox', { name: 'Request body' })
+    const content = editor.querySelector('.cm-content')
+    expect(content).toHaveClass('cm-lineWrapping')
+    expect(content).toHaveStyle({
+      minWidth: '0',
+      lineHeight: '20px',
+      paddingTop: '12px',
+    })
+    expect(editor.querySelector('.cm-gutters')).toHaveStyle({
+      paddingTop: '0px',
+      paddingBottom: '0px',
+    })
+    expect(editor.closest('.code-block-scroll')).toHaveStyle({
+      maxHeight: 'min(420px, 55dvh)',
+    })
+  })
+
+  test('keeps existing code views unwrapped and at their original density by default', () => {
+    const { getByRole } = render(
+      <CodeBlock code='plain text' language='text' />
+    )
+    const content = getByRole('textbox', { name: 'text' }).querySelector(
+      '.cm-content'
+    )
+    expect(content).not.toHaveClass('cm-lineWrapping')
+    expect(content).toHaveStyle({
+      minWidth: 'max-content',
+      lineHeight: '1.5rem',
+      paddingTop: '1rem',
+    })
+  })
 })
 
 function editorTree(value: string) {
