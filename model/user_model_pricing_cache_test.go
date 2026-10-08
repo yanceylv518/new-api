@@ -19,7 +19,7 @@ import (
 func setupUserModelPricingCacheTest(t *testing.T) User {
 	t.Helper()
 	setupUserUpdateTestState(t)
-	require.NoError(t, DB.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}))
+	require.NoError(t, DB.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}, &UserModelPricingHistory{}))
 	previousCache := userModelPricingCache
 	userModelPricingCache = &pricingSnapshotCache{}
 	t.Cleanup(func() { userModelPricingCache = previousCache })
@@ -53,6 +53,63 @@ func TestUserModelPricingCacheHitAndEmptyRules(t *testing.T) {
 			assert.Zero(t, queries.Load(), "cache hit must not execute SQL queries")
 		})
 	}
+}
+
+func TestUserModelPricingNoRedisCacheValidatesCommittedVersion(t *testing.T) {
+	user := setupUserModelPricingCacheTest(t)
+	previousRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedis })
+	operator := User{Username: "pricing-cache-operator", AffCode: "pricing-cache-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&operator).Error)
+	periods := make([]UserModelPricingPeriod, 1000)
+	base := time.Now().Unix() - 500*3600
+	for i := range periods {
+		start, end := base+int64(i)*3600, base+int64(i+1)*3600
+		periods[i] = UserModelPricingPeriod{DiscountBPS: 8000, StartTime: &start, EndTime: &end}
+	}
+	periods[999].EndTime = nil
+	items := []UserModelPricingItem{{ModelName: "cache-model", Mode: "scheduled", Periods: periods}}
+	revision, err := ReplaceUserModelPricingSchedules(t.Context(), user.Id, items, 1, operator.Id)
+	require.NoError(t, err)
+	var ruleQueries, versionQueries atomic.Int32
+	const callback = "test:no-redis-pricing-queries"
+	require.NoError(t, DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "user_model_pricings" {
+			ruleQueries.Add(1)
+		}
+		if tx.Statement.Table == "users" && len(tx.Statement.Joins) > 0 {
+			versionQueries.Add(1)
+		}
+	}))
+	t.Cleanup(func() { _ = DB.Callback().Query().Remove(callback) })
+	old, err := GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	require.NoError(t, err)
+	ruleQueries.Store(0)
+	versionQueries.Store(0)
+	for range 10 {
+		got, err := GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, 8000, got.DiscountBPS("cache-model"))
+	}
+	assert.Zero(t, ruleQueries.Load(), "warm reads must not fetch 1000 periods again")
+	assert.EqualValues(t, 10, versionQueries.Load(), "each caller must independently validate the committed version")
+	items[0].Periods[500].DiscountBPS = 6000
+	_, err = ReplaceUserModelPricingSchedules(t.Context(), user.Id, items, revision, operator.Id)
+	require.NoError(t, err)
+	changed, err := GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 6000, changed.DiscountBPS("cache-model"))
+	assert.Equal(t, 8000, old.DiscountBPS("cache-model"))
+	failure := errors.New("pricing version unavailable")
+	const failing = "test:no-redis-version-failure"
+	require.NoError(t, DB.Callback().Query().Before("gorm:query").Register(failing, func(tx *gorm.DB) { tx.AddError(failure) }))
+	_, err = GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	require.NoError(t, DB.Callback().Query().Remove(failing))
+	require.ErrorIs(t, err, failure)
+	require.NoError(t, DB.Delete(&user).Error)
+	_, err = GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
 // 改价和清空都递增版本；模拟迟到的旧快照后仍必须按新版本读取。
@@ -319,6 +376,7 @@ func TestUserModelPricingRetriesSharedCancellationOnce(t *testing.T) {
 	for _, failures := range []int32{1, 2} {
 		t.Run(fmt.Sprint(failures), func(t *testing.T) {
 			user := setupUserModelPricingCacheTest(t)
+			useUserCacheMiniRedis(t)
 			var queries atomic.Int32
 			const callback = "test:pricing-load-cancellation"
 			require.NoError(t, DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {

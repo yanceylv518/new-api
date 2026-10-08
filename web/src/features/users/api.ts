@@ -176,6 +176,26 @@ export async function replaceUserModelPricing(
   return res.data
 }
 
+export async function getUserModelPricingHistory(
+  userId: number | undefined,
+  page: number,
+  signal: AbortSignal
+) {
+  const res = await api.get<
+    ApiResponse<{
+      items: import('./types').UserModelPricingHistoryItem[]
+      total: number
+      page_size: number
+    }>
+  >('/api/user/model-pricing/history', {
+    params: { user_id: userId, p: page, page_size: 20 },
+    signal,
+    disableDuplicate: true,
+    skipErrorHandler: true,
+  })
+  return res.data
+}
+
 /** 总览请求用户摘要和少量模型预览，完整规则通过抽屉分页接口按需加载。 */
 export async function getUserModelPricingOverview(
   params: UserModelPricingOverviewParams = {},
@@ -193,6 +213,7 @@ export async function getUserModelPricingOverview(
       p: params.p,
       page_size: params.page_size,
       summary: true,
+      status: params.status,
     },
   })
   return res.data
@@ -203,7 +224,8 @@ export async function getUserModelPricingRulePage(
   userId: number,
   keyword: string,
   page: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  status?: string
 ) {
   const res = await api.get<
     ApiResponse<{
@@ -214,7 +236,7 @@ export async function getUserModelPricingRulePage(
   >(`/api/user/${userId}/model-pricing/rules`, {
     disableDuplicate: true,
     skipErrorHandler: true,
-    params: { keyword, p: page },
+    params: { keyword, p: page, status },
     signal,
   })
   return res.data

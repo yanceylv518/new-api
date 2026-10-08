@@ -71,20 +71,37 @@ import {
 } from '@/components/ui/empty'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
   Sheet,
   SheetContent,
   SheetDescription,
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
-import { TableCell, TableRow } from '@/components/ui/table'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useMediaQuery } from '@/hooks'
+import { useServerBoundaryRefresh } from '@/hooks/use-server-boundary-refresh'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
+import dayjs from '@/lib/dayjs'
 import { cn } from '@/lib/utils'
 
 import {
@@ -93,6 +110,7 @@ import {
   getUserModelPricingRulePage,
 } from '../api'
 import { getUserRoleOptions, USER_ROLES } from '../constants'
+import { getUserModelPricingStatusOptions } from '../lib/user-model-pricing-form'
 import type {
   UserModelPricingItem,
   UserModelPricingOverviewData,
@@ -100,6 +118,8 @@ import type {
   UserModelPricingOverviewUser,
 } from '../types'
 import { UserModelPricingDialog } from './dialogs/user-model-pricing-dialog'
+import { UserModelPricingHistoryButton } from './user-model-pricing-history'
+import { PricingPeriodStatusBadge } from './user-model-pricing-schedule'
 
 const route = getRouteApi('/_authenticated/users/model-pricing')
 
@@ -130,6 +150,14 @@ function getUserInitials(user: UserModelPricingOverviewUser): string {
 
 // 抽屉头部展示当前用户的折扣区间，主表使用模型预览避免信息过于抽象。
 function DiscountSummary({ item }: { item: UserModelPricingOverviewItem }) {
+  const { t } = useTranslation()
+  if (item.active_rules === 0) {
+    return (
+      <span className='text-muted-foreground text-xs'>
+        {t('No active discount')}
+      </span>
+    )
+  }
   return (
     <span className='text-info font-mono font-semibold tabular-nums'>
       {formatDiscountRate(item.min_discount_bps ?? 10000)}
@@ -155,7 +183,7 @@ function DiscountModelPreview({
     <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
       {previewRules.map((rule) => (
         <span
-          key={rule.model_name}
+          key={`${rule.model_name}:${rule.slot ?? 0}`}
           className='border-border/70 bg-muted/40 inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs'
           title={`${rule.model_name} - ${formatDiscountRate(rule.discount_bps)}`}
         >
@@ -183,19 +211,29 @@ type UserModelPricingRulePage = {
 }
 
 /** 抽屉内按滚动位置加载模型，页面本身只保留用户分页。 */
-function DiscountRuleList(props: { userId: number; keyword: string }) {
+function DiscountRuleList(props: {
+  userId: number
+  keyword: string
+  status?: string
+}) {
   const { t } = useTranslation()
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const loadMoreRef = useRef<HTMLDivElement>(null)
   const query = useInfiniteQuery<UserModelPricingRulePage>({
-    queryKey: ['user-model-pricing-rules', props.userId, props.keyword],
+    queryKey: [
+      'user-model-pricing-rules',
+      props.userId,
+      props.keyword,
+      props.status,
+    ],
     initialPageParam: 1,
     queryFn: async ({ pageParam, signal }) => {
       const response = await getUserModelPricingRulePage(
         props.userId,
         props.keyword,
         Number(pageParam),
-        signal
+        signal,
+        props.status
       )
       if (!response.success || !response.data) {
         throw new Error(response.message || t('Failed to load user discounts'))
@@ -315,7 +353,7 @@ function DiscountRuleList(props: { userId: number; keyword: string }) {
       ) : null}
       {query.data && rules.length > 0 ? (
         <ScrollArea className='min-h-0 flex-1 pr-2'>
-          <DiscountRuleGrid rules={rules} />
+          <DiscountRuleTable rules={rules} />
           <div
             ref={loadMoreRef}
             data-slot='load-more-sentinel'
@@ -344,6 +382,7 @@ function DiscountRuleList(props: { userId: number; keyword: string }) {
 export function UserModelPricingDetailsSheet(props: {
   item: UserModelPricingOverviewItem
   keyword: string
+  status?: string
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
@@ -351,7 +390,7 @@ export function UserModelPricingDetailsSheet(props: {
 
   return (
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
-      <SheetContent className={sideDrawerContentClassName('sm:max-w-2xl')}>
+      <SheetContent className={sideDrawerContentClassName('sm:max-w-4xl')}>
         <SheetHeader className={sideDrawerHeaderClassName()}>
           <div className='min-w-0 pr-8'>
             <SheetTitle className='flex min-w-0 items-center gap-2'>
@@ -375,6 +414,7 @@ export function UserModelPricingDetailsSheet(props: {
             <UserRole user={props.item.user} />
             <RuleCount count={props.item.rule_count} />
             <DiscountSummary item={props.item} />
+            <UserModelPricingHistoryButton userId={props.item.user.id} />
           </div>
         </SheetHeader>
         <div
@@ -383,6 +423,7 @@ export function UserModelPricingDetailsSheet(props: {
           <DiscountRuleList
             userId={props.item.user.id}
             keyword={props.keyword}
+            status={props.status}
           />
         </div>
       </SheetContent>
@@ -390,37 +431,58 @@ export function UserModelPricingDetailsSheet(props: {
   )
 }
 
-function DiscountRuleGrid({ rules }: { rules: UserModelPricingItem[] }) {
+function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
   const { t } = useTranslation()
 
   return (
-    <ul
+    <Table
       aria-label={t('Model discounts')}
-      // 根据内容区宽度自动增减列数，窄屏退化为单列，长模型名在卡片内换行。
-      className='grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,18rem),1fr))] gap-3 whitespace-normal'
+      tabIndex={0}
+      className='min-w-[720px] table-fixed'
     >
-      {rules.map((rule) => (
-        <li
-          key={rule.model_name}
-          className='bg-background/80 flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3.5 py-3'
-        >
-          <div className='min-w-0'>
-            <p
-              className='font-mono text-sm leading-relaxed [overflow-wrap:anywhere]'
-              title={rule.model_name}
-              translate='no'
-            >
-              {rule.model_name}
-            </p>
-          </div>
-          <div className='shrink-0 text-right'>
-            <p className='text-info font-mono text-sm font-semibold tabular-nums'>
+      <TableHeader>
+        <TableRow>
+          <TableHead className='w-[34%]'>{t('Model')}</TableHead>
+          <TableHead className='w-[10%] text-right [overflow-wrap:anywhere] whitespace-normal'>
+            {t('Discount percentage')}
+          </TableHead>
+          <TableHead className='w-[12%]'>{t('Status')}</TableHead>
+          <TableHead className='w-[22%]'>{t('Start time')}</TableHead>
+          <TableHead className='w-[22%]'>{t('End time')}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rules.map((rule) => (
+          <TableRow key={`${rule.model_name}:${rule.slot ?? 0}`}>
+            <TableCell className='whitespace-normal'>
+              <span
+                className='font-mono text-sm leading-relaxed [overflow-wrap:anywhere]'
+                title={rule.model_name}
+                translate='no'
+              >
+                {rule.model_name}
+              </span>
+            </TableCell>
+            <TableCell className='text-info text-right font-mono font-semibold tabular-nums'>
               {formatDiscountRate(rule.discount_bps)}
-            </p>
-          </div>
-        </li>
-      ))}
-    </ul>
+            </TableCell>
+            <TableCell>
+              <PricingPeriodStatusBadge period={rule} />
+            </TableCell>
+            <TableCell className='text-muted-foreground font-mono'>
+              {rule.start_time
+                ? dayjs.unix(rule.start_time).format('YYYY-MM-DD HH:mm')
+                : t('Existing rule')}
+            </TableCell>
+            <TableCell className='text-muted-foreground font-mono'>
+              {rule.end_time == null
+                ? t('Permanent')
+                : dayjs.unix(rule.end_time).format('YYYY-MM-DD HH:mm')}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -807,6 +869,7 @@ export function UserModelPricingOverview() {
   const queryClient = useQueryClient()
   const isMobile = useMediaQuery('(max-width: 640px)')
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
+  const [statusFilter, setStatusFilter] = useState('all')
   const [editingUser, setEditingUser] =
     useState<UserModelPricingOverviewUser | null>(null)
 
@@ -862,6 +925,7 @@ export function UserModelPricingOverview() {
       globalFilter,
       groupFilter,
       roleFilter,
+      statusFilter,
     ],
     queryFn: async ({ signal }) => {
       const response = await getUserModelPricingOverview(
@@ -871,6 +935,7 @@ export function UserModelPricingOverview() {
           role: roleFilter.length > 0 ? roleFilter[0] : undefined,
           p: pagination.pageIndex + 1,
           page_size: pagination.pageSize,
+          status: statusFilter === 'all' ? undefined : statusFilter,
         },
         signal
       )
@@ -908,6 +973,14 @@ export function UserModelPricingOverview() {
       queryKey: ['user-model-pricing-rules'],
     })
   }, [query, queryClient])
+
+  useServerBoundaryRefresh({
+    enabled: !query.isFetching && !query.isError,
+    serverTime: overview.server_time,
+    nextChange: overview.next_discount_change,
+    receivedAt: query.dataUpdatedAt,
+    refresh: refreshOverview,
+  })
 
   const handleSaved = useCallback(async () => {
     await queryClient.invalidateQueries({
@@ -1022,6 +1095,7 @@ export function UserModelPricingOverview() {
         </SectionPageLayout.Breadcrumb>
         <SectionPageLayout.Title>{t('User Discounts')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
+          <UserModelPricingHistoryButton />
           <Button
             variant='outline'
             size='sm'
@@ -1051,6 +1125,7 @@ export function UserModelPricingOverview() {
         </SectionPageLayout.Breadcrumb>
         <SectionPageLayout.Title>{t('User Discounts')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
+          <UserModelPricingHistoryButton />
           <Button
             variant='outline'
             size='sm'
@@ -1068,6 +1143,34 @@ export function UserModelPricingOverview() {
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-3 sm:gap-4'>
             <OverviewStats data={overview} isLoading={query.isLoading} />
+            <div className='flex flex-wrap items-center justify-between gap-2'>
+              <span className='text-muted-foreground text-sm'>
+                {t('{{n}} active period(s)', { n: overview.active_rules ?? 0 })}
+              </span>
+              <Select
+                value={statusFilter}
+                items={getUserModelPricingStatusOptions(t)}
+                onValueChange={(value) => {
+                  if (value) {
+                    setStatusFilter(value)
+                    setSelectedUserId(null)
+                    onPaginationChange({ ...pagination, pageIndex: 0 })
+                  }
+                }}
+              >
+                <SelectTrigger aria-label={t('Discount status')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value='all'>{t('All statuses')}</SelectItem>
+                    <SelectItem value='active'>{t('Active')}</SelectItem>
+                    <SelectItem value='pending'>{t('Not started')}</SelectItem>
+                    <SelectItem value='expired'>{t('Expired')}</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
             {query.isError && query.data ? (
               <OverviewRefreshError onRetry={refreshOverview} />
             ) : null}
@@ -1129,6 +1232,7 @@ export function UserModelPricingOverview() {
           open
           item={selectedUser}
           keyword={globalFilter ?? ''}
+          status={statusFilter === 'all' ? undefined : statusFilter}
           onOpenChange={(open) => {
             if (!open) setSelectedUserId(null)
           }}

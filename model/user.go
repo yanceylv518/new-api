@@ -571,12 +571,12 @@ func DeleteUserById(id int) (err error) {
 	return user.Delete()
 }
 
-func HardDeleteUserById(id int) error {
+func HardDeleteUserById(id int, actorIDs ...int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
 	user := User{Id: id}
-	return user.HardDelete()
+	return user.HardDelete(actorIDs...)
 }
 
 func inviteUser(inviterId int) error {
@@ -998,11 +998,15 @@ func (user *User) delete(identity *AuthSessionIdentity) error {
 	return invalidateUserCache(user.Id)
 }
 
-func (user *User) HardDelete() error {
+func (user *User) HardDelete(actorIDs ...int) error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
 	var tokens []Token
+	actorID := 0
+	if len(actorIDs) > 0 {
+		actorID = actorIDs[0]
+	}
 	var deletedAuthVersion int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -1014,6 +1018,9 @@ func (user *User) HardDelete() error {
 			if err := tx.Unscoped().Select("id", commonKeyCol).Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
 				return err
 			}
+		}
+		if err := archiveDeletedUserModelPricing(tx, user.Id, actorID); err != nil {
+			return err
 		}
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err

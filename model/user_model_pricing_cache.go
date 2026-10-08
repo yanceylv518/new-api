@@ -198,7 +198,7 @@ return 1`
 }
 
 // GetUserModelDiscountSnapshotContext 每次只校验 Redis 版本，命中后直接共享只读快照。
-// Redis 缺失或故障时从数据库读取，不能将异常或未知版本解释成原价。无后台永久协程。
+// Redis 缺失或故障时校验数据库已提交版本，再复用同版本快照；异常不解释成原价。
 func GetUserModelDiscountSnapshotContext(ctx context.Context, userID int) (hosttypes.UserModelDiscountSnapshot, error) {
 	return getUserModelDiscountSnapshot(ctx, userID, nil)
 }
@@ -234,10 +234,29 @@ func getUserModelDiscountSnapshot(ctx context.Context, userID int, prefetched *p
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	if !redisHealthy {
+		// 用户与版本一起读取，删除用户或查询失败时不能继续使用本地旧快照。
+		var version UserModelPricingRevision
+		if err := DB.WithContext(ctx).Model(&User{}).
+			Select("COALESCE(user_model_pricing_revisions.revision, 0) AS revision").
+			Joins("LEFT JOIN user_model_pricing_revisions ON user_model_pricing_revisions.user_id = users.id").
+			Where("users.id = ?", userID).Take(&version).Error; err != nil {
+			return hosttypes.UserModelDiscountSnapshot{}, err
+		}
+		floor = version.Revision
+		if floor < 0 || floor > 9007199254740991 {
+			return hosttypes.UserModelDiscountSnapshot{}, ErrUserModelPricingInvalid
+		}
+		if floor > 0 {
+			if cached, exists := userModelPricingCache.get(key, floor); exists {
+				return cached.discounts, nil
+			}
+		}
+	}
 	// 同版本的并发未命中只回源一次；发起者取消时，仍有效的等待者最多重试一次。
 	for attempt := 0; ; attempt++ {
 		result := userModelPricingCache.loads.DoChan(fmt.Sprintf("%s:%d:%t", key, floor, redisHealthy), func() (any, error) {
-			snapshot, err := loadUserModelPricingSnapshot(ctx, userID, redisHealthy)
+			snapshot, err := loadUserModelPricingSnapshot(ctx, userID, redisHealthy, !redisHealthy)
 			if err != nil {
 				return nil, err
 			}

@@ -149,6 +149,36 @@ export interface ManageUserQuotaPayload {
 export interface UserModelPricingItem {
   model_name: string
   discount_bps: number
+  mode?: 'single' | 'scheduled'
+  start_time?: number | null
+  end_time?: number | null
+  slot?: number
+  periods?: UserModelPricingPeriod[]
+}
+
+export interface UserModelPricingPeriod {
+  discount_bps: number
+  start_time?: number | null
+  end_time?: number | null
+}
+
+export interface UserModelPricingHistoryItem {
+  id: number
+  user_id: number
+  actor_id: number
+  model_name: string
+  action: 'create' | 'update' | 'remove' | 'user_deleted'
+  revision: number
+  created_at: number
+  user_deleted: boolean
+  before: {
+    mode: 'single' | 'scheduled'
+    periods: UserModelPricingPeriod[]
+  } | null
+  after: {
+    mode: 'single' | 'scheduled'
+    periods: UserModelPricingPeriod[]
+  } | null
 }
 
 export interface UserModelPricingCollection {
@@ -156,6 +186,7 @@ export interface UserModelPricingCollection {
   items: UserModelPricingItem[]
   revision: number
   model_names: string[]
+  server_time?: number
 }
 
 export interface UserModelPricingReplacePayload {
@@ -179,20 +210,27 @@ export interface UserModelPricingOverviewItem {
   rules: UserModelPricingItem[]
   preview_rules?: UserModelPricingItem[]
   rule_count: number
+  period_count?: number
+  active_rules?: number
   min_discount_bps?: number
   max_discount_bps?: number
 }
 
 export interface UserModelPricingOverviewData {
+  next_discount_change?: number
   items: UserModelPricingOverviewItem[]
   total: number
   page: number
   page_size: number
   total_rules: number
+  total_periods?: number
   total_models: number
+  active_rules?: number
+  server_time?: number
 }
 
 export interface UserModelPricingOverviewParams {
+  status?: string
   keyword?: string
   group?: string
   role?: string

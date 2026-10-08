@@ -46,6 +46,13 @@ interface DateTimePickerProps {
   onChange?: (date: Date | undefined) => void
   placeholder?: string
   className?: string
+  disabled?: boolean
+  clearable?: boolean
+  hideTimeWhenEmpty?: boolean
+  id?: string
+  'aria-label'?: string
+  'aria-invalid'?: boolean
+  'aria-describedby'?: string
 }
 
 export function DateTimePicker({
@@ -53,6 +60,13 @@ export function DateTimePicker({
   onChange,
   placeholder,
   className,
+  disabled = false,
+  clearable = true,
+  hideTimeWhenEmpty = false,
+  id,
+  'aria-label': ariaLabel,
+  'aria-invalid': ariaInvalid,
+  'aria-describedby': ariaDescribedBy,
 }: DateTimePickerProps) {
   const { t, i18n } = useTranslation()
   const placeholderText = placeholder ?? t('Select date')
@@ -65,6 +79,10 @@ export function DateTimePicker({
   const [time, setTime] = React.useState<string>('00:00')
 
   React.useEffect(() => {
+    // 时间输入暂时为空时，保留已选日期，恢复时间后即可修正父表单中的无效值。
+    if (value && !Number.isFinite(value.getTime())) {
+      return
+    }
     setDate(value)
     setMonth(value)
     if (value) {
@@ -76,7 +94,9 @@ export function DateTimePicker({
 
   const handleDateSelect = (selectedDate: Date | undefined) => {
     if (selectedDate) {
-      const [hours, minutes] = time.split(':').map(Number)
+      const selectedTime = time || '00:00'
+      const [hours, minutes] = selectedTime.split(':').map(Number)
+      setTime(selectedTime)
       const newDate = new Date(selectedDate)
       newDate.setHours(hours, minutes, 0, 0)
       setDate(newDate)
@@ -95,6 +115,10 @@ export function DateTimePicker({
     setTime(newTime)
 
     if (date) {
+      if (!newTime) {
+        onChange?.(new Date(Number.NaN))
+        return
+      }
       const [hours, minutes] = newTime.split(':').map(Number)
       const newDate = new Date(date)
       newDate.setHours(hours, minutes, 0, 0)
@@ -116,9 +140,15 @@ export function DateTimePicker({
         <PopoverTrigger
           render={
             <Button
+              id={id}
+              type='button'
+              disabled={disabled}
+              aria-label={ariaLabel ?? placeholderText}
+              aria-invalid={ariaInvalid}
+              aria-describedby={ariaDescribedBy}
               variant='outline'
               className={cn(
-                'flex-1 justify-between font-normal',
+                'min-w-0 flex-1 justify-between font-normal aria-invalid:border-destructive',
                 !date && 'text-muted-foreground'
               )}
             />
@@ -141,21 +171,28 @@ export function DateTimePicker({
           />
         </PopoverContent>
       </Popover>
-      <Input
-        type='time'
-        value={time}
-        onChange={handleTimeChange}
-        className='w-32 appearance-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
-        disabled={!date}
-      />
-      {date && (
+      {(!hideTimeWhenEmpty || date) && (
+        <Input
+          id={id ? `${id}-time` : undefined}
+          type='time'
+          value={time}
+          onChange={handleTimeChange}
+          className='w-32 appearance-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
+          disabled={disabled || !date}
+          aria-invalid={ariaInvalid}
+          aria-describedby={ariaDescribedBy}
+          aria-label={ariaLabel ? `${ariaLabel} (${t('Time')})` : t('Time')}
+        />
+      )}
+      {date && clearable && (
         <Button
+          disabled={disabled}
           type='button'
           variant='outline'
           size='icon'
           onClick={handleClear}
           className='shrink-0'
-          aria-label='Clear'
+          aria-label={t('Clear')}
         >
           <span aria-hidden='true'>✕</span>
         </Button>

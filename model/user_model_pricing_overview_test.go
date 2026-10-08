@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
@@ -43,9 +44,9 @@ func TestUserModelPricingSummaryAndRulePages(t *testing.T) {
 	require.Len(t, result.Items, 1)
 	assert.Empty(t, result.Items[0].Rules)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "match-00", DiscountBPS: 5000},
-		{ModelName: "match-01", DiscountBPS: 5001},
-		{ModelName: "match-02", DiscountBPS: 5002},
+		{ModelName: "match-00", DiscountBPS: 5000, Mode: "single"},
+		{ModelName: "match-01", DiscountBPS: 5001, Mode: "single"},
+		{ModelName: "match-02", DiscountBPS: 5002, Mode: "single"},
 	}, result.Items[0].PreviewRules)
 	assert.Equal(t, 25, result.Items[0].RuleCount)
 	assert.Equal(t, 5000, result.Items[0].MinDiscountBPS)
@@ -159,8 +160,8 @@ func TestGetUserModelPricingOverviewGroupsRulesAndAppliesRoleBoundary(t *testing
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, visibleUser.Id, result.Items[0].User.Id)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "doubao-video", DiscountBPS: 6500},
-		{ModelName: "gpt-4o", DiscountBPS: 8000},
+		{ModelName: "doubao-video", DiscountBPS: 6500, Mode: "single"},
+		{ModelName: "gpt-4o", DiscountBPS: 8000, Mode: "single"},
 	}, result.Items[0].Rules)
 	assert.Equal(t, 2, result.Items[0].RuleCount)
 }
@@ -194,7 +195,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, "alpha-user", result.Items[0].User.Username)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "claude-3-7", DiscountBPS: 9000},
+		{ModelName: "claude-3-7", DiscountBPS: 9000, Mode: "single"},
 	}, result.Items[0].Rules)
 
 	// 同名模型属于不同用户时不能跨用户去重，且分页统计只计算匹配规则。
@@ -206,7 +207,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	require.Len(t, result.Items, 2)
 	for i, discount := range []int{8000, 7000} {
 		assert.Equal(t, users[i].Id, result.Items[i].User.Id)
-		assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "gpt-4o", DiscountBPS: discount}}, result.Items[i].Rules)
+		assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "gpt-4o", DiscountBPS: discount, Mode: "single"}}, result.Items[i].Rules)
 		assert.Equal(t, 1, result.Items[i].RuleCount)
 	}
 	page, err := GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 1, 1, UserModelPricingOverviewFilters{})
@@ -307,13 +308,71 @@ func TestUserModelPricingOverviewHidesStaleAndFullPriceRules(t *testing.T) {
 	assert.Equal(t, int64(2), result.TotalRules)
 	assert.Equal(t, int64(2), result.TotalModels)
 	require.Len(t, result.Items, 2)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, result.Items[0].PreviewRules)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000, Mode: "single"}}, result.Items[0].PreviewRules)
 	assert.Equal(t, 1, result.Items[0].RuleCount)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "other-model", DiscountBPS: 6000}}, result.Items[1].PreviewRules)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "other-model", DiscountBPS: 6000, Mode: "single"}}, result.Items[1].PreviewRules)
 	assert.Equal(t, 1, result.Items[1].RuleCount)
 
 	items, total, err := GetUserModelPricingRulePage(t.Context(), users[0].Id, common.RoleRootUser, "", 1)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), total)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, items)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000, Mode: "single"}}, items)
+}
+
+func TestUserModelPricingScheduledOverviewCountsModelsAndSelectsCurrentPeriod(t *testing.T) {
+	setupUserUpdateTestState(t)
+	assertUserModelPricingScheduledOverview(t)
+}
+
+// 同一数据集用于三种真实数据库，保护模型去重与时间段选择的查询契约。
+func assertUserModelPricingScheduledOverview(t *testing.T) {
+	t.Helper()
+	user := User{Username: "scheduled-overview-user", AffCode: "scheduled-overview-user", Role: common.RoleCommonUser}
+	require.NoError(t, DB.Create(&user).Error)
+	createEnabledPricingAbilities(t, "schedule-alpha", "schedule-beta", "schedule-gamma", "schedule-delta")
+	now := time.Now().Unix()
+	end := func(value int64) *int64 { return &value }
+	rules := []UserModelPricing{
+		{ModelName: "schedule-alpha", Slot: 0, DiscountBPS: 5000, StartTime: now - 900, EndTime: end(now - 600)},
+		{ModelName: "schedule-alpha", Slot: 1, DiscountBPS: 6000, StartTime: now - 600, EndTime: end(now + 600)},
+		{ModelName: "schedule-alpha", Slot: 2, DiscountBPS: 7000, StartTime: now + 600},
+		{ModelName: "schedule-beta", Slot: 0, DiscountBPS: 8000, StartTime: now + 900, EndTime: end(now + 1800)},
+		{ModelName: "schedule-beta", Slot: 1, DiscountBPS: 7500, StartTime: now + 600, EndTime: end(now + 900)},
+		{ModelName: "schedule-delta", Slot: 0, DiscountBPS: 4000, StartTime: now - 900, EndTime: end(now - 600)},
+		{ModelName: "schedule-delta", Slot: 1, DiscountBPS: 4500, StartTime: now - 600, EndTime: end(now - 300)},
+		{ModelName: "schedule-gamma", Slot: 0, DiscountBPS: 9000, StartTime: now - 300},
+	}
+	for index := range rules {
+		rules[index].UserId = user.Id
+		rules[index].Mode = "scheduled"
+	}
+	require.NoError(t, DB.Create(&rules).Error)
+	for _, summary := range []bool{false, true} {
+		result, err := GetUserModelPricingOverview(t.Context(), user.Username, common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, summary)
+		require.NoError(t, err)
+		require.Len(t, result.Items, 1)
+		assert.EqualValues(t, 4, result.TotalRules)
+		assert.EqualValues(t, 8, result.TotalPeriods)
+		assert.EqualValues(t, 4, result.TotalModels)
+		assert.EqualValues(t, 2, result.ActiveRules)
+		assert.Equal(t, 4, result.Items[0].RuleCount)
+		assert.Equal(t, 8, result.Items[0].PeriodCount)
+		if summary {
+			preview := result.Items[0].PreviewRules
+			require.Len(t, preview, 3)
+			assert.Equal(t, []string{"schedule-alpha", "schedule-beta", "schedule-delta"}, []string{preview[0].ModelName, preview[1].ModelName, preview[2].ModelName})
+			assert.Equal(t, 6000, preview[0].DiscountBPS)
+			assert.Equal(t, 7500, preview[1].DiscountBPS)
+			assert.Equal(t, 4500, preview[2].DiscountBPS)
+		} else {
+			assert.Len(t, result.Items[0].Rules, 8)
+		}
+	}
+	result, err := GetUserModelPricingOverview(t.Context(), "schedule-alpha", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{Status: "pending"}, true)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.TotalRules)
+	assert.EqualValues(t, 1, result.TotalPeriods)
+	require.Len(t, result.Items, 1)
+	require.Len(t, result.Items[0].PreviewRules, 1)
+	assert.Equal(t, 7000, result.Items[0].PreviewRules[0].DiscountBPS)
 }

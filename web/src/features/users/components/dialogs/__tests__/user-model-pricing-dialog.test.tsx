@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
 
-import { afterEach, describe, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+
+import type { UserModelPricingItem } from '../../../types'
 
 // 使用 Vitest 的 jsdom，避免混用 DOM 实现导致节点归属判断失真。
 const domWindow = window
@@ -80,7 +82,10 @@ let renderedDialog: RenderedDialog | null = null
 // 为组件测试提供稳定的定价、状态和已有折扣数据，避免依赖真实后端。
 function installApiFixtures(
   pricingModels = models,
-  pricingItems = [{ model_name: 'model-03', discount_bps: 8000 }]
+  pricingItems: UserModelPricingItem[] = [
+    { model_name: 'model-03', discount_bps: 8000 },
+  ],
+  serverTime?: number
 ) {
   apiClient.get = async (url) => {
     switch (url) {
@@ -94,6 +99,7 @@ function installApiFixtures(
               user_id: 42,
               items: pricingItems,
               revision: 1,
+              server_time: serverTime,
               model_names: pricingModels.map((model) => model.model_name),
             },
           },
@@ -341,18 +347,15 @@ describe('user model pricing dialog', () => {
     }
     assert.equal(submittedPayload.revision, 1)
     assert.equal(submittedPayload.items.length, models.length)
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-01'),
-      { model_name: 'model-01', discount_bps: 6525 }
-    )
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-30'),
-      { model_name: 'model-30', discount_bps: 6525 }
-    )
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-29'),
-      { model_name: 'model-29', discount_bps: 8000 }
-    )
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-01')
+    ).toMatchObject({ model_name: 'model-01', discount_bps: 6525 })
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-30')
+    ).toMatchObject({ model_name: 'model-30', discount_bps: 6525 })
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-29')
+    ).toMatchObject({ model_name: 'model-29', discount_bps: 8000 })
   })
 
   // 多选修改批量折扣后，必须显式应用且所有选中模型已同步才能保存。
@@ -460,6 +463,22 @@ describe('user model pricing dialog', () => {
       ...document.querySelectorAll<HTMLButtonElement>('button'),
     ].find((button) => button.textContent === 'Apply discount')
     assert.ok(apply)
+    const clear = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Clear selection"]'
+    )
+    assert.ok(clear)
+    const toolbar = clear.parentElement
+    assert.ok(toolbar)
+    const validity = [...toolbar.querySelectorAll('button')].find(
+      (button) => button.textContent === 'Validity'
+    )
+    assert.ok(validity)
+    expect(
+      Boolean(
+        validity.compareDocumentPosition(clear) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+      )
+    ).toBe(true)
     await act(async () => apply.click())
     assert.equal(getModelInput('model-03').value, '100')
     assert.ok(renderedDialog)
@@ -562,7 +581,7 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     })
-    assert.deepEqual(submitted, {
+    expect(submitted).toMatchObject({
       revision: 1,
       items: [{ model_name: 'disabled-model', discount_bps: 6000 }],
     })
@@ -663,7 +682,7 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     })
-    assert.deepEqual(submitted, {
+    expect(submitted).toMatchObject({
       revision: 1,
       items: [{ model_name: 'model-03', discount_bps: 5500 }],
     })
@@ -824,10 +843,98 @@ describe('user model pricing dialog', () => {
     await renderDialog(1, true)
 
     assert.deepEqual(visibleModelNames(), ['model-03'])
-    assert.equal(
-      document.querySelector<HTMLElement>('[data-slot="select-trigger"]'),
-      null
+    const filters = [
+      ...document.querySelectorAll<HTMLElement>('[data-slot="select-trigger"]'),
+    ]
+    expect(filters).toHaveLength(1)
+    expect(filters[0].getAttribute('aria-label')).toBe('Discount status')
+  })
+
+  test('uses browser time for scheduled status even when server time differs', async () => {
+    const browserNow = Math.floor(Date.now() / 1000)
+    const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(browserNow * 1000)
+    try {
+      installApiFixtures(
+        models.slice(0, 1),
+        [
+          {
+            model_name: 'model-01',
+            discount_bps: 8000,
+            mode: 'single',
+            start_time: browserNow + 3600,
+            end_time: null,
+          },
+        ],
+        browserNow + 7200
+      )
+      await renderDialog(1, true)
+      expect(document.body.textContent).toContain('Not started')
+      const filter = document.querySelector<HTMLElement>(
+        '[aria-label="Discount status"]'
+      )
+      assert.ok(filter)
+      await act(async () => filter.click())
+      const pending = [
+        ...document.querySelectorAll<HTMLElement>('[role="option"]'),
+      ].find((option) => option.textContent === 'Not started')
+      assert.ok(pending)
+      await act(async () => pending.click())
+      expect(visibleModelNames()).toEqual(['model-01'])
+    } finally {
+      dateSpy.mockRestore()
+    }
+  })
+
+  test('saves valid scheduled periods after clearing the unused single discount', async () => {
+    installApiFixtures(models.slice(0, 1), [
+      { model_name: 'model-01', discount_bps: 8000 },
+    ])
+    await renderDialog(1, true)
+    await changeInput(getModelInput('model-01'), '')
+    const validity = document.querySelector<HTMLElement>(
+      '[aria-label="Edit validity for model-01"]'
     )
+    assert.ok(validity)
+    await act(async () => validity.click())
+    const scheduled = [
+      ...document.querySelectorAll<HTMLElement>('[role="tab"]'),
+    ].find((tab) => tab.textContent === 'Multiple periods')
+    assert.ok(scheduled)
+    await act(async () => scheduled.click())
+    const periodInput =
+      document.querySelector<HTMLInputElement>('#pricing-period-0')
+    assert.ok(periodInput)
+    await changeInput(periodInput, '75')
+    const apply = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Apply')
+    assert.ok(apply)
+    await act(async () => apply.click())
+    expect(document.querySelector('#pricing-period-0')).toBeNull()
+    let submitted: unknown
+    apiClient.put = async (_url, payload) => {
+      submitted = payload
+      return { data: { success: true } }
+    }
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () =>
+      form.dispatchEvent(
+        new domWindow.Event('submit', { bubbles: true, cancelable: true })
+      )
+    )
+    expect(submitted).toMatchObject({
+      revision: 1,
+      items: [
+        {
+          model_name: 'model-01',
+          mode: 'scheduled',
+          periods: [{ discount_bps: 7500 }],
+        },
+      ],
+    })
   })
 
   // 用户管理入口展示接口返回的全部启用模型，未配置项按原价回填。

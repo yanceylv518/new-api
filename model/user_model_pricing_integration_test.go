@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	hosttypes "github.com/QuantumNous/new-api/types"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,7 +57,7 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			common.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:16389", DB: engine.redisDB})
 			common.RedisEnabled = true
 			t.Cleanup(func() {
-				assert.NoError(t, db.Migrator().DropTable(&UserModelPricing{}, &UserModelPricingRevision{}, &Task{}, &Midjourney{}, &Ability{}, &User{}))
+				assert.NoError(t, db.Migrator().DropTable(&UserModelPricingHistory{}, &UserModelPricing{}, &UserModelPricingRevision{}, &Task{}, &Midjourney{}, &Ability{}, &User{}))
 				assert.NoError(t, common.RDB.FlushDB(context.Background()).Err())
 				_ = common.RDB.Close()
 				DB, common.RDB, common.RedisEnabled = oldDB, oldRedis, oldEnabled
@@ -71,8 +73,11 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			user := User{Username: "pricing-integration", Password: "unused"}
 			require.NoError(t, db.Create(&user).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}))
+				require.NoError(t, db.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}, &UserModelPricingHistory{}))
+				require.NoError(t, migrateUserModelPricingScheduleIndex(db))
 			}
+			assertUserModelPricingScheduleMigration(t, db)
+			assertUserModelPricingHistoryCapacityAndUpgrade(t, db)
 			// 启用能力是总览判断模型是否仍存在的权威目录。
 			require.NoError(t, db.Create(&[]Ability{
 				{Group: "default", Model: "Model-A", ChannelId: 1, Enabled: true},
@@ -175,6 +180,110 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			got, err = GetUserModelDiscountBPSContext(t.Context(), user.Id)
 			require.NoError(t, err)
 			assert.Empty(t, got)
+			assertUserModelPricingScheduledOverview(t)
 		})
 	}
+}
+
+type legacyUserModelPricingForMigration struct {
+	Id          int    `gorm:"primaryKey"`
+	UserId      int    `gorm:"not null;uniqueIndex:idx_user_model_pricing_user_key,priority:1"`
+	ModelName   string `gorm:"size:128;not null"`
+	ModelKey    string `gorm:"size:64;not null;uniqueIndex:idx_user_model_pricing_user_key,priority:2"`
+	DiscountBPS int    `gorm:"not null"`
+}
+
+func (legacyUserModelPricingForMigration) TableName() string { return "user_model_pricings" }
+
+func TestUserModelPricingScheduleMigrationSQLite(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}, &UserModelPricingHistory{}))
+		require.NoError(t, migrateUserModelPricingScheduleIndex(db))
+	}
+	assertUserModelPricingScheduleMigration(t, db)
+	assertUserModelPricingHistoryCapacityAndUpgrade(t, db)
+}
+
+func assertUserModelPricingHistoryCapacityAndUpgrade(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	before := hosttypes.UserModelDiscountConfig{Mode: "single", Periods: []hosttypes.UserModelDiscountWindow{{DiscountBPS: 8000}}}
+	legacy, err := newUserModelPricingHistory(987654321, common.RoleCommonUser, 1, "history-capacity-model", "create", 1, time.Now().Unix(), hosttypes.UserModelDiscountConfig{}, before)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&legacy).Error)
+	if db.Dialector.Name() == "mysql" {
+		// 重建原有 TEXT 列，验证含旧数据升级，而不只验证空表的新建类型。
+		require.NoError(t, db.Exec("ALTER TABLE user_model_pricing_histories MODIFY COLUMN before_json TEXT NOT NULL, MODIFY COLUMN after_json TEXT NOT NULL").Error)
+	}
+	after := hosttypes.UserModelDiscountConfig{Mode: "scheduled", Periods: make([]hosttypes.UserModelDiscountWindow, 1000)}
+	base := time.Now().Unix()
+	for i := range after.Periods {
+		end := base + int64(i+1)*3600
+		after.Periods[i] = hosttypes.UserModelDiscountWindow{DiscountBPS: 6000, StartTime: base + int64(i)*3600, EndTime: &end}
+	}
+	after.Periods[999].EndTime = nil
+	large, err := newUserModelPricingHistory(legacy.UserId, common.RoleCommonUser, 1, legacy.ModelName, "update", 2, base, after, after)
+	require.NoError(t, err)
+	require.Greater(t, len(large.BeforeJSON), 65535)
+	for attempt := range 2 {
+		require.NoError(t, db.AutoMigrate(&UserModelPricingHistory{}))
+		var kept UserModelPricingHistory
+		require.NoError(t, db.First(&kept, legacy.Id).Error)
+		assert.Equal(t, legacy.BeforeJSON, kept.BeforeJSON)
+		assert.Equal(t, legacy.AfterJSON, kept.AfterJSON)
+		columns, err := db.Migrator().ColumnTypes(&UserModelPricingHistory{})
+		require.NoError(t, err)
+		for _, column := range columns {
+			if column.Name() != "before_json" && column.Name() != "after_json" {
+				continue
+			}
+			expected := "text"
+			if db.Dialector.Name() == "mysql" {
+				expected = "mediumtext"
+			}
+			assert.Equal(t, expected, strings.ToLower(column.DatabaseTypeName()))
+		}
+		if attempt == 0 {
+			require.NoError(t, db.Create(&large).Error)
+		}
+		var stored UserModelPricingHistory
+		require.NoError(t, db.First(&stored, large.Id).Error)
+		assert.Equal(t, large.BeforeJSON, stored.BeforeJSON)
+		assert.Equal(t, large.AfterJSON, stored.AfterJSON)
+		var decoded hosttypes.UserModelDiscountConfig
+		require.NoError(t, common.UnmarshalJsonStr(string(stored.AfterJSON), &decoded))
+		assert.Equal(t, after, decoded)
+	}
+}
+
+func assertUserModelPricingScheduleMigration(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(&UserModelPricing{}).Count(&count).Error)
+	require.Zero(t, count, "migration fixture requires an empty isolated rules table")
+	require.NoError(t, db.Migrator().DropTable(&UserModelPricing{}))
+	require.NoError(t, db.AutoMigrate(&legacyUserModelPricingForMigration{}))
+	legacy := legacyUserModelPricingForMigration{UserId: 12345, ModelName: "migration-model", ModelKey: userModelPricingModelKey("migration-model"), DiscountBPS: 8000}
+	require.NoError(t, db.Create(&legacy).Error)
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}, &UserModelPricingHistory{}))
+		require.NoError(t, migrateUserModelPricingScheduleIndex(db))
+		var row UserModelPricing
+		require.NoError(t, db.First(&row, legacy.Id).Error)
+		assert.Equal(t, 8000, row.DiscountBPS)
+		assert.Equal(t, "single", row.Mode)
+		assert.Zero(t, row.StartTime)
+		assert.Zero(t, row.Slot)
+		assert.Nil(t, row.EndTime)
+		assert.True(t, db.Migrator().HasIndex(&UserModelPricing{}, "idx_user_model_pricing_slot"))
+		assert.False(t, db.Migrator().HasIndex(&UserModelPricing{}, "idx_user_model_pricing_user_key"))
+	}
+	require.NoError(t, db.Create(&UserModelPricing{UserId: legacy.UserId, ModelName: legacy.ModelName, Slot: 1, DiscountBPS: 7000}).Error)
+	require.Error(t, db.Create(&UserModelPricing{UserId: legacy.UserId, ModelName: legacy.ModelName, Slot: 1, DiscountBPS: 6000}).Error)
+	require.NoError(t, db.Where("user_id = ?", legacy.UserId).Delete(&UserModelPricing{}).Error)
 }

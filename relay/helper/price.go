@@ -48,7 +48,7 @@ func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.Pric
 		return
 	}
 	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
-	discountBPS := info.UserModelDiscountBPS.DiscountBPS(modelName)
+	discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(modelName, info.StartTime.Unix())
 	if discountBPS < 1 || discountBPS >= 10000 {
 		return
 	}
@@ -138,7 +138,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
 		discountRatio := 1.0
-		if discountBPS := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(billingModelName)); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
+		if discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(ratio_setting.FormatMatchingModelName(billingModelName), info.StartTime.Unix()); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
 			discountRatio = float64(discountBPS) / 10000
 		}
 		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio

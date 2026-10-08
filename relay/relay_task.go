@@ -298,7 +298,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		priceData = types.PriceData{GroupRatioInfo: groupRatioInfo}
 		// 任务表达式已返回美元费用；不采用文本的每百万换算。
 		// 渠道映射仅选择上游计价配置；折扣始终匹配用户请求的公开计费身份。
-		discount := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(modelName)))
+		discount := info.UserModelDiscountBPS.DiscountBPSAt(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(modelName)), info.StartTime.Unix())
 		if discount >= 1 && discount < 10000 && !info.IsChannelTest {
 			priceData.AddOtherRatio(types.UserModelDiscountRatioKey, float64(discount)/10000)
 			beforeValue := decimal.NewFromFloat(cost).

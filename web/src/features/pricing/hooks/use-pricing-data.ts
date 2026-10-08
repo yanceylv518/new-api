@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 
+import { useServerBoundaryRefresh } from '@/hooks/use-server-boundary-refresh'
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -29,13 +30,22 @@ export function usePricingData(enabled = true) {
   const userId = useAuthStore((state) => state.auth.user?.id)
   const sessionId = useAuthStore((state) => state.auth.session?.sid)
 
-  const { data, isLoading, error, refetch } = useQuery({
-    // 个性化定价不能复用其他账号的缓存响应。
-    queryKey: ['pricing', userId ?? 'anonymous', sessionId ?? 'anonymous'],
-    queryFn: getPricing,
-    enabled,
-    // 用户折扣可由其他管理员随时更新，重新进入页面时必须重新读取。
-    staleTime: 0,
+  const { data, isLoading, error, refetch, dataUpdatedAt, isFetching } =
+    useQuery({
+      // 个性化定价不能复用其他账号的缓存响应。
+      queryKey: ['pricing', userId ?? 'anonymous', sessionId ?? 'anonymous'],
+      queryFn: getPricing,
+      enabled,
+      // 用户折扣可由其他管理员随时更新，重新进入页面时必须重新读取。
+      staleTime: 0,
+    })
+
+  useServerBoundaryRefresh({
+    enabled: enabled && !isFetching && !error,
+    serverTime: data?.server_time,
+    nextChange: data?.next_discount_change,
+    receivedAt: dataUpdatedAt,
+    refresh: refetch,
   })
 
   // Ensure rates never reach zero to prevent division errors

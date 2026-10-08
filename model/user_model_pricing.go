@@ -51,10 +51,14 @@ var (
 // UserModelPricing 在独立表中保存单个用户的规范化模型折扣。
 type UserModelPricing struct {
 	Id          int    `json:"id" gorm:"primaryKey"`
-	UserId      int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_model_pricing_user_key,priority:1"`
+	UserId      int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_model_pricing_slot,priority:1"`
 	ModelName   string `json:"model_name" gorm:"type:varchar(128);not null"`
-	ModelKey    string `json:"-" gorm:"size:64;not null;uniqueIndex:idx_user_model_pricing_user_key,priority:2"`
+	ModelKey    string `json:"-" gorm:"size:64;not null;uniqueIndex:idx_user_model_pricing_slot,priority:2"`
 	DiscountBPS int    `json:"discount_bps" gorm:"type:int;not null"`
+	Slot        int    `json:"-" gorm:"not null;default:0;uniqueIndex:idx_user_model_pricing_slot,priority:3"`
+	Mode        string `json:"mode" gorm:"size:16;not null;default:single"`
+	StartTime   int64  `json:"start_time" gorm:"type:bigint;not null;default:0"`
+	EndTime     *int64 `json:"end_time" gorm:"type:bigint"`
 }
 
 // userModelPricingModelKey 使用规范化模型名生成稳定键，查询时绕开数据库大小写和重音排序规则。
@@ -157,23 +161,6 @@ func normalizeUserModelDiscounts(discounts map[string]int) (map[string]int, erro
 	return normalized, nil
 }
 
-// readUserModelPricing 在单条查询中读取规则；事务快照保证不会看到替换事务的半成品。
-func readUserModelPricing(tx *gorm.DB, userId int) (map[string]int, error) {
-	discounts := make(map[string]int)
-	var rows []struct {
-		ModelName   string
-		DiscountBPS int
-	}
-	// 运行时按模型名查表，不需要排序及主键、哈希等管理字段，缩短持锁查询时间。
-	if err := tx.Model(&UserModelPricing{}).Select("model_name", "discount_bps").Where("user_id = ?", userId).Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	for _, row := range rows {
-		discounts[row.ModelName] = row.DiscountBPS
-	}
-	return discounts, nil
-}
-
 // GetUserModelPricing 在同一事务内锁定用户行，再读取规则和 revision，保证管理页面拿到同一版本的完整快照。
 func GetUserModelPricing(userId int) (map[string]int, int64, error) {
 	return GetUserModelPricingContext(context.Background(), userId)
@@ -181,14 +168,28 @@ func GetUserModelPricing(userId int) (map[string]int, int64, error) {
 
 // GetUserModelPricingContext 将管理查询和缓存回源绑定到调用方取消信号及统一时间预算。
 func GetUserModelPricingContext(ctx context.Context, userId int) (map[string]int, int64, error) {
-	snapshot, err := loadUserModelPricingSnapshot(ctx, userId, false)
+	snapshot, err := loadUserModelPricingSnapshot(ctx, userId, false, false)
 	return snapshot.discounts.Copy(), snapshot.revision, err
 }
 
+func GetUserModelPricingRulesContext(ctx context.Context, userId int) ([]UserModelPricingItem, int64, error) {
+	snapshot, err := loadUserModelPricingSnapshot(ctx, userId, false, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	configs := snapshot.discounts.Configurations()
+	items := make([]UserModelPricingItem, 0, len(configs))
+	for name, config := range configs {
+		items = append(items, userModelPricingItem(name, config))
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ModelName < items[j].ModelName })
+	return items, snapshot.revision, nil
+}
+
 // loadUserModelPricingSnapshot 在同一用户锁内读取规则和发布缓存版本，防止迟到的回源复活旧版本。
-func loadUserModelPricingSnapshot(ctx context.Context, userId int, publishVersion bool) (userModelPricingSnapshot, error) {
+func loadUserModelPricingSnapshot(ctx context.Context, userId int, publishVersion, reuseCache bool) (userModelPricingSnapshot, error) {
 	var snapshot userModelPricingSnapshot
-	var discounts map[string]int
+	var discounts map[string]hosttypes.UserModelDiscountConfig
 	if userId <= 0 {
 		return snapshot, ErrUserModelPricingInvalid
 	}
@@ -196,18 +197,29 @@ func loadUserModelPricingSnapshot(ctx context.Context, userId int, publishVersio
 	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
 	defer cancel()
 	expiresAt := time.Now().Add(userModelPricingCacheTTL)
+	key := fmt.Sprintf("%p:%d", DB, userId)
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		version, err := lockUserModelPricing(tx, userId)
 		if err != nil {
 			return err
 		}
 		snapshot.revision = version.Revision
+		// 数据库锁内验证版本后才复用快照，其他节点改价不依赖本地失效通知。
+		if reuseCache {
+			if cached, exists := userModelPricingCache.get(key, version.Revision); exists {
+				snapshot = cached
+				return nil
+			}
+		}
 
-		discounts, err = readUserModelPricing(tx, userId)
+		discounts, err = readUserModelPricingSchedules(tx, userId)
 		if err != nil {
 			return err
 		}
 		if publishVersion && publishUserModelPricingVersion(ctx, userId, snapshot.revision, false) == nil {
+			snapshot.expiresAt = expiresAt
+		}
+		if reuseCache && !publishVersion {
 			snapshot.expiresAt = expiresAt
 		}
 		return nil
@@ -216,7 +228,12 @@ func loadUserModelPricingSnapshot(ctx context.Context, userId int, publishVersio
 		return userModelPricingSnapshot{}, err
 	}
 	// 规则映射由本次查询独占，事务提交后再构造只读副本，减少用户行锁持有时间。
-	snapshot.discounts = hosttypes.NewUserModelDiscountSnapshot(discounts)
+	if discounts != nil {
+		snapshot.discounts = hosttypes.NewUserModelDiscountScheduleSnapshot(discounts)
+	}
+	if reuseCache && !snapshot.expiresAt.IsZero() {
+		userModelPricingCache.put(key, snapshot)
+	}
 	return snapshot, nil
 }
 
@@ -241,69 +258,13 @@ func ReplaceUserModelPricingContext(ctx context.Context, userId int, discounts m
 // replaceUserModelPricing 在同一事务中完成版本校验、规则替换和版本递增。
 // expectedRevision 为 nil 时仅供内部更新入口使用，对外替换必须携带正 revision。
 func replaceUserModelPricing(ctx context.Context, userId int, discounts map[string]int, expectedRevision *int64) (int64, error) {
-	if userId <= 0 || (expectedRevision != nil && *expectedRevision <= 0) {
-		return 0, ErrUserModelPricingInvalid
-	}
 	normalized, err := normalizeUserModelDiscounts(discounts)
 	if err != nil {
 		return 0, err
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
-	defer cancel()
-	var nextRevision int64
-	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		version, err := lockUserModelPricing(tx, userId)
-		if err != nil {
-			return err
-		}
-		if expectedRevision != nil && version.Revision != *expectedRevision {
-			return ErrUserModelPricingRevisionConflict
-		}
-		// JSON 数字版本必须保持浏览器可精确表示，拒绝溢出和版本回绕。
-		if version.Revision >= 9007199254740991 {
-			return ErrUserModelPricingInvalid
-		}
-		nextRevision = version.Revision + 1
-		result := tx.Model(&UserModelPricingRevision{}).
-			Where("user_id = ? AND revision = ?", userId, version.Revision).
-			UpdateColumn("revision", nextRevision)
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return ErrUserModelPricingRevisionConflict
-		}
-
-		// 提交前建立跨节点屏障；失败则回滚，禁止仍可能命中旧缓存时提交新价格。
-		if common.RedisEnabled {
-			if err := publishUserModelPricingVersion(ctx, userId, nextRevision, true); err != nil {
-				return err
-			}
-		}
-		if err := tx.Where("user_id = ?", userId).Delete(&UserModelPricing{}).Error; err != nil {
-			return err
-		}
-		if len(normalized) > 0 {
-			rows := make([]UserModelPricing, 0, len(normalized))
-			for modelName, discountBPS := range normalized {
-				rows = append(rows, UserModelPricing{
-					UserId:      userId,
-					ModelName:   modelName,
-					DiscountBPS: discountBPS,
-				})
-			}
-			sort.Slice(rows, func(i, j int) bool { return rows[i].ModelName < rows[j].ModelName })
-			if err := tx.Create(&rows).Error; err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		return 0, err
+	items := make([]UserModelPricingItem, 0, len(normalized))
+	for name, bps := range normalized {
+		items = append(items, UserModelPricingItem{ModelName: name, UserModelPricingPeriod: UserModelPricingPeriod{DiscountBPS: bps}})
 	}
-	// 保留提交前屏障，由下一次持有用户锁的回源发布已提交版本，避免事务外迟到发布。
-	return nextRevision, nil
+	return replaceUserModelPricingSchedules(ctx, userId, items, expectedRevision, 0)
 }

@@ -111,6 +111,15 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, DB.Delete(&user).Error)
 
 	require.NoError(t, HardDeleteUserById(user.Id))
+	entries, total, err := GetUserModelPricingHistory(t.Context(), user.Id, common.RoleRootUser, 1, 20)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	require.Len(t, entries, 2)
+	assert.Equal(t, "user_deleted", entries[0].Action)
+	assert.True(t, entries[0].UserDeleted)
+	require.NotNil(t, entries[0].Before)
+	assert.Equal(t, 8000, entries[0].Before.Periods[0].DiscountBPS)
+	assert.Nil(t, entries[0].After)
 
 	var count int64
 	require.NoError(t, DB.Unscoped().Model(&User{}).Where("id = ?", user.Id).Count(&count).Error)

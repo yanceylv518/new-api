@@ -525,6 +525,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 	if startTime.IsZero() {
 		startTime = time.Now()
+		common.SetContextKey(c, constant.ContextKeyRequestStartTime, startTime)
 	}
 
 	isStream := false

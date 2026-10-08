@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -29,7 +30,7 @@ func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Set("group", "default")
 	for _, channelTest := range []bool{false, true} {
-		info := &relaycommon.RelayInfo{OriginModelName: "discount-model@temperature:0.2", UserGroup: "default", UsingGroup: "default", IsChannelTest: channelTest,
+		info := &relaycommon.RelayInfo{StartTime: time.Now(), OriginModelName: "discount-model@temperature:0.2", UserGroup: "default", UsingGroup: "default", IsChannelTest: channelTest,
 			UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{"discount-model": 8000})}
 		price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
 		require.NoError(t, err)
@@ -52,6 +53,7 @@ func TestModelDiscountPreConsumeRoundsDiscountedQuota(t *testing.T) {
 	ctx.Set("group", "default")
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "discount-rounding-model",
+		StartTime:       time.Now(),
 		UserGroup:       "default",
 		UsingGroup:      "default",
 		UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{
@@ -78,6 +80,7 @@ func TestFixedPriceDiscountPreConsumeRoundsDiscountedQuota(t *testing.T) {
 	ctx.Set("group", "default")
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "discount-fixed-price",
+		StartTime:       time.Now(),
 		UserGroup:       "default",
 		UsingGroup:      "default",
 		UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{

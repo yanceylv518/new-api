@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -20,7 +20,6 @@ import (
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/QuantumNous/new-api/constant"
 
@@ -408,10 +407,7 @@ func GetUser(c *gin.Context) {
 	return
 }
 
-type userModelPricingItem struct {
-	ModelName   string `json:"model_name"`
-	DiscountBPS int    `json:"discount_bps"`
-}
+type userModelPricingItem = model.UserModelPricingItem
 
 type updateUserModelPricingRequest struct {
 	Items []userModelPricingItem `json:"items"`
@@ -444,23 +440,18 @@ func GetUserModelPricing(c *gin.Context) {
 	if !ok {
 		return
 	}
-	discounts, revision, err := model.GetUserModelPricingContext(c.Request.Context(), user.Id)
+	items, revision, err := model.GetUserModelPricingRulesContext(c.Request.Context(), user.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	items := make([]userModelPricingItem, 0, len(discounts))
-	for modelName, discountBPS := range discounts {
-		items = append(items, userModelPricingItem{ModelName: modelName, DiscountBPS: discountBPS})
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].ModelName < items[j].ModelName })
 	// 已完成目标用户管理权限校验，返回跨全部分组的启用模型目录。
 	modelNames, err := model.GetUserModelPricingModelNames(c.Request.Context())
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"user_id": user.Id, "items": items, "revision": revision, "model_names": modelNames})
+	common.ApiSuccess(c, gin.H{"user_id": user.Id, "items": items, "revision": revision, "model_names": modelNames, "server_time": time.Now().Unix()})
 }
 
 // UpdateUserModelPricing 归一化模型别名后替换完整规则集。
@@ -479,26 +470,7 @@ func UpdateUserModelPricing(c *gin.Context) {
 		return
 	}
 
-	// 10000 表示原价，持久化时省略该规则以保持设置精简。
-	discounts := make(map[string]int, len(req.Items))
-	seenModels := make(map[string]struct{}, len(req.Items))
-	for _, item := range req.Items {
-		modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(strings.TrimSpace(item.ModelName)))
-		if modelName == "" || len(modelName) > 128 || item.DiscountBPS < 1 || item.DiscountBPS > 10000 {
-			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
-			return
-		}
-		// 思考预算和 Gizmo 别名可能归一化到同一个模型，重复规则必须显式拒绝，避免静默覆盖。
-		if _, exists := seenModels[modelName]; exists {
-			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
-			return
-		}
-		seenModels[modelName] = struct{}{}
-		if item.DiscountBPS < 10000 {
-			discounts[modelName] = item.DiscountBPS
-		}
-	}
-	revision, err := model.ReplaceUserModelPricingContext(c.Request.Context(), user.Id, discounts, *req.Revision)
+	revision, err := model.ReplaceUserModelPricingSchedules(c.Request.Context(), user.Id, req.Items, *req.Revision, c.GetInt("id"))
 	if err != nil {
 		if errors.Is(err, model.ErrUserModelPricingRevisionConflict) {
 			c.JSON(http.StatusConflict, gin.H{
@@ -515,7 +487,9 @@ func UpdateUserModelPricing(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	recordManageAuditFor(c, user.Id, "user.model_pricing_update", map[string]interface{}{"revision": revision, "rule_count": len(discounts)})
+	if revision != *req.Revision {
+		recordManageAuditFor(c, user.Id, "user.model_pricing_update", map[string]interface{}{"revision": revision, "model_count": len(req.Items)})
+	}
 	common.ApiSuccess(c, gin.H{"revision": revision})
 }
 
@@ -1036,7 +1010,7 @@ func DeleteUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
 		return
 	}
-	err = model.HardDeleteUserById(id)
+	err = model.HardDeleteUserById(id, c.GetInt("id"))
 	if err != nil {
 		common.ApiError(c, err)
 		return

@@ -111,6 +111,8 @@ export type ModelCapability =
   | 'embeddings'
 
 export type PricingData = {
+  server_time?: number
+  next_discount_change?: number
   success: boolean
   message?: string
   data: PricingModel[]

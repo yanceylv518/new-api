@@ -20,6 +20,33 @@ func TestUserModelDiscountSnapshotOwnership(t *testing.T) {
 	assert.Zero(t, (UserModelDiscountSnapshot{}).DiscountBPS("model"))
 }
 
+func TestUserModelDiscountScheduleBoundariesAndOwnership(t *testing.T) {
+	firstEnd, secondEnd := int64(200), int64(300)
+	configs := map[string]UserModelDiscountConfig{"model": {Mode: UserModelPricingScheduled, Periods: []UserModelDiscountWindow{
+		{DiscountBPS: 6000, StartTime: 200, EndTime: &secondEnd},
+		{DiscountBPS: 4000, StartTime: 400},
+		{DiscountBPS: 8000, StartTime: 100, EndTime: &firstEnd},
+	}}}
+	snapshot := NewUserModelDiscountScheduleSnapshot(configs)
+	for _, tc := range []struct {
+		at   int64
+		bps  int
+		next int64
+	}{
+		{99, 0, 100}, {100, 8000, 200}, {199, 8000, 200},
+		{200, 6000, 300}, {299, 6000, 300}, {300, 0, 400},
+		{399, 0, 400}, {400, 4000, 0}, {253402300799, 4000, 0},
+	} {
+		assert.Equal(t, tc.bps, snapshot.DiscountBPSAt("model", tc.at), "at=%d", tc.at)
+		assert.Equal(t, tc.next, snapshot.NextChangeAt("model", tc.at), "at=%d", tc.at)
+	}
+	firstEnd = 101
+	configs["model"].Periods[2].DiscountBPS = 1
+	exported := snapshot.Configurations()
+	*exported["model"].Periods[0].EndTime = 101
+	assert.Equal(t, 8000, snapshot.DiscountBPSAt("model", 199))
+}
+
 // 比较实际规则查询操作的分配，不执行网络或数据库 I/O；两组使用相同规则和查询。
 func BenchmarkUserModelDiscountLookup(b *testing.B) {
 	for _, count := range []int{1, 100, 1000} {

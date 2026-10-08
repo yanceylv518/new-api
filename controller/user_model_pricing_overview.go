@@ -2,11 +2,31 @@ package controller
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 )
+
+func GetUserModelPricingHistory(c *gin.Context) {
+	userID := 0
+	if value := c.Query("user_id"); value != "" {
+		var err error
+		userID, err = strconv.Atoi(value)
+		if err != nil || userID <= 0 {
+			common.ApiError(c, model.ErrUserModelPricingInvalid)
+			return
+		}
+	}
+	page := common.GetPageQuery(c)
+	items, total, err := model.GetUserModelPricingHistory(c.Request.Context(), userID, c.GetInt("role"), page.GetPage(), page.GetPageSize())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"items": items, "total": total, "page": page.GetPage(), "page_size": page.GetPageSize()})
+}
 
 // GetUserModelPricingOverview 返回管理员可见的用户折扣汇总及少量模型预览。
 func GetUserModelPricingOverview(c *gin.Context) {
@@ -24,8 +44,9 @@ func GetUserModelPricingOverview(c *gin.Context) {
 		pageInfo.GetStartIdx(),
 		pageInfo.GetPageSize(),
 		model.UserModelPricingOverviewFilters{
-			Group: c.Query("group"),
-			Role:  roleFilter,
+			Group:  c.Query("group"),
+			Role:   roleFilter,
+			Status: c.Query("status"),
 		},
 		c.Query("summary") == "true",
 	)
@@ -35,12 +56,16 @@ func GetUserModelPricingOverview(c *gin.Context) {
 	}
 
 	common.ApiSuccess(c, gin.H{
-		"items":        result.Items,
-		"total":        result.TotalUsers,
-		"page":         pageInfo.GetPage(),
-		"page_size":    pageInfo.GetPageSize(),
-		"total_rules":  result.TotalRules,
-		"total_models": result.TotalModels,
+		"items":                result.Items,
+		"total":                result.TotalUsers,
+		"page":                 pageInfo.GetPage(),
+		"page_size":            pageInfo.GetPageSize(),
+		"total_rules":          result.TotalRules,
+		"total_periods":        result.TotalPeriods,
+		"total_models":         result.TotalModels,
+		"active_rules":         result.ActiveRules,
+		"server_time":          time.Now().Unix(),
+		"next_discount_change": result.NextChange,
 	})
 }
 
@@ -51,7 +76,7 @@ func GetUserModelPricingRulePage(c *gin.Context) {
 		return
 	}
 	page := common.GetPageQuery(c).GetPage()
-	items, total, err := model.GetUserModelPricingRulePage(c.Request.Context(), user.Id, c.GetInt("role"), c.Query("keyword"), page)
+	items, total, err := model.GetUserModelPricingRulePage(c.Request.Context(), user.Id, c.GetInt("role"), c.Query("keyword"), page, c.Query("status"))
 	if err != nil {
 		common.ApiError(c, err)
 		return

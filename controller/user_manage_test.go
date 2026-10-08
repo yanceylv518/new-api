@@ -96,7 +96,9 @@ func performManageUserRequest(t *testing.T, body string) *httptest.ResponseRecor
 // 管理接口必须跨组列出启用模型，拒绝非法草稿和旧版本覆盖，并沿用目标用户权限边界。
 func TestUserModelPricingManagementContract(t *testing.T) {
 	db := setupManageUserTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.Ability{}))
+	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.Ability{}))
+	actor := model.User{Id: 9999, Username: "root-operator", AffCode: "root-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&actor).Error)
 	user := model.User{Username: "pricing-contract", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
 	require.NoError(t, db.Create(&user).Error)
 	require.NoError(t, db.Create(&[]model.Ability{
@@ -111,6 +113,7 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	router.PUT("/pricing/:id", UpdateUserModelPricing)
 	router.GET("/overview", GetUserModelPricingOverview)
 	router.GET("/rules/:id", GetUserModelPricingRulePage)
+	router.GET("/history", GetUserModelPricingHistory)
 	request := func(method, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, fmt.Sprintf("/pricing/%d", user.Id), strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -148,7 +151,30 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 			assert.Contains(t, recorder.Body.String(), `"model_name":"pricing-private"`)
 		}
 	}
+	scheduled := `{"revision":2,"items":[{"model_name":"pricing-private","mode":"scheduled","periods":[{"discount_bps":8000,"start_time":100,"end_time":200},{"discount_bps":6000,"start_time":200,"end_time":null}]}]}`
+	assert.Contains(t, request(http.MethodPut, scheduled).Body.String(), `"revision":3`)
+	scheduledItems, scheduledRevision, err := model.GetUserModelPricingRulesContext(t.Context(), user.Id)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, scheduledRevision)
+	require.Len(t, scheduledItems, 1)
+	assert.Equal(t, "scheduled", scheduledItems[0].Mode)
+	assert.Len(t, scheduledItems[0].Periods, 2)
+	historyRequest := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/history?user_id=%d&page_size=20", user.Id), nil))
+		return recorder
+	}
+	assert.Contains(t, historyRequest().Body.String(), `"total":2`)
+	assert.Contains(t, historyRequest().Body.String(), `"actor_id":9999`)
+	assert.Contains(t, historyRequest().Body.String(), `"action":"update"`)
+	noChange := strings.Replace(scheduled, `"revision":2`, `"revision":3`, 1)
+	assert.Contains(t, request(http.MethodPut, noChange).Body.String(), `"revision":3`)
+	assert.Contains(t, historyRequest().Body.String(), `"total":2`)
+	overlap := strings.Replace(noChange, `"end_time":200`, `"end_time":null`, 1)
+	assert.Contains(t, request(http.MethodPut, overlap).Body.String(), `"success":false`)
+	assert.Contains(t, historyRequest().Body.String(), `"total":2`)
 	role = common.RoleCommonUser
+	assert.Contains(t, historyRequest().Body.String(), `"success":false`)
 	denied := httptest.NewRecorder()
 	router.ServeHTTP(denied, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/rules/%d", user.Id), nil))
 	assert.Contains(t, denied.Body.String(), `"success":false`)

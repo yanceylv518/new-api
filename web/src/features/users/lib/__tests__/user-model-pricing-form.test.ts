@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 
 import type { TFunction } from 'i18next'
-import { describe, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import {
   buildUserModelPricingPayload,
@@ -32,8 +32,83 @@ import {
 // 测试只需要恒等翻译，类型断言用于满足 i18next 的运行时类型约束。
 const t = ((key: string) => key) as TFunction
 
+afterEach(() => vi.useRealTimers())
+
 describe('user model pricing form', () => {
   const schema = createUserModelPricingFormSchema(t)
+
+  test.each([null, undefined, Number.NaN, 0, 101])(
+    'accepts valid scheduled periods when the unused single discount is %s',
+    (discount) => {
+      const result = schema.safeParse({
+        items: [
+          {
+            model_name: 'scheduled-model',
+            mode: 'scheduled',
+            discount_percent: discount,
+            periods: [{ discount_percent: 80, start_time: 100, end_time: 200 }],
+          },
+        ],
+      })
+      expect(result.success).toBe(true)
+    }
+  )
+
+  test('rejects an invalid scheduled period discount even when the single value is valid', () => {
+    expect(
+      schema.safeParse({
+        items: [
+          {
+            model_name: 'scheduled-model',
+            mode: 'scheduled',
+            discount_percent: 80,
+            periods: [
+              { discount_percent: 100, start_time: 100, end_time: 200 },
+            ],
+          },
+        ],
+      }).success
+    ).toBe(false)
+  })
+
+  test('fills missing starts once from browser time and preserves existing schedules', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-08T02:00:00Z'))
+    const now = Math.floor(Date.now() / 1000)
+    const payload = buildUserModelPricingPayload(
+      {
+        items: [
+          { model_name: 'new-single', discount_percent: 80 },
+          {
+            model_name: 'new-scheduled',
+            mode: 'scheduled',
+            discount_percent: 100,
+            periods: [{ discount_percent: 70, end_time: now + 600 }],
+          },
+          { model_name: 'existing', discount_percent: 60 },
+        ],
+      },
+      [
+        {
+          model_name: 'existing',
+          mode: 'single',
+          discount_bps: 6000,
+          start_time: 100,
+          end_time: 200,
+        },
+      ]
+    )
+    expect(
+      payload.items.find((item) => item.model_name === 'new-single')?.start_time
+    ).toBe(now)
+    expect(
+      payload.items.find((item) => item.model_name === 'new-scheduled')
+        ?.periods?.[0].start_time
+    ).toBe(now)
+    expect(
+      payload.items.find((item) => item.model_name === 'existing')
+    ).toMatchObject({ start_time: 100, end_time: 200 })
+  })
 
   test('normalizes aliases with the same backend matching rules', () => {
     assert.equal(
@@ -136,6 +211,9 @@ describe('user model pricing form', () => {
   })
 
   test('builds a payload by filtering full-price rows and converting percentages', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-08T02:00:00Z'))
+    const startTime = Math.floor(Date.now() / 1000)
     const payload = buildUserModelPricingPayload({
       items: [
         { model_name: ' gpt-4o ', discount_percent: 80 },
@@ -150,10 +228,21 @@ describe('user model pricing form', () => {
 
     assert.deepEqual(payload, {
       items: [
-        { model_name: 'gpt-4o', discount_bps: 8000 },
+        {
+          model_name: 'gpt-4o',
+          discount_bps: 8000,
+          mode: 'single',
+          start_time: startTime,
+          end_time: undefined,
+          periods: undefined,
+        },
         {
           model_name: 'gemini-2.5-pro-thinking-*',
           discount_bps: 7550,
+          mode: 'single',
+          start_time: startTime,
+          end_time: undefined,
+          periods: undefined,
         },
       ],
     })
