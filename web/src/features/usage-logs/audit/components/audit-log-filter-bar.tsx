@@ -53,6 +53,7 @@ function AuditFilterSelect(props: {
 export function AuditLogFilterBar(props: {
   table: Table<AuditLog>
   filters: AuditFilters
+  defaultTimeRange: Pick<AuditFilters, 'start_timestamp' | 'end_timestamp'>
   onChange: (patch: Partial<AuditFilters>) => void
   scope: 'all' | 'self'
   accessOnly?: boolean
@@ -197,8 +198,8 @@ export function AuditLogFilterBar(props: {
     ].filter(Boolean).length
   const hasFilters =
     filterCount > 0 ||
-    props.filters.start_timestamp !== undefined ||
-    props.filters.end_timestamp !== undefined
+    props.filters.start_timestamp !== props.defaultTimeRange.start_timestamp ||
+    props.filters.end_timestamp !== props.defaultTimeRange.end_timestamp
   return (
     <LogsFilterToolbar
       table={props.table}

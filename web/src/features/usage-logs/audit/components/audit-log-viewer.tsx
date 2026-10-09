@@ -48,10 +48,11 @@ export function AuditLogViewer(props: {
 }) {
   const { t } = useTranslation()
   const userId = useAuthStore((state) => state.auth.user?.id)
+  const [defaultTimeRange, setDefaultTimeRange] = useState(getDefaultAuditTimeRange)
   const [filters, setFilters] = useState<AuditFilters>(() => ({
     p: 1,
     page_size: 20,
-    ...getDefaultAuditTimeRange(),
+    ...defaultTimeRange,
   }))
   const defaultTokenScope = props.defaultTokenScope ?? 'all'
   const [tokenScope, setTokenScope] = useState<string>(defaultTokenScope)
@@ -138,6 +139,7 @@ export function AuditLogViewer(props: {
             <AuditLogFilterBar
               table={table}
               filters={filters}
+              defaultTimeRange={defaultTimeRange}
               onChange={update}
               scope={props.scope}
               accessOnly={props.accessOnly}
@@ -153,11 +155,13 @@ export function AuditLogViewer(props: {
                 if (!invalidRange && canQuery) void query.refetch()
               }}
               onReset={() => {
+                const timeRange = getDefaultAuditTimeRange()
+                setDefaultTimeRange(timeRange)
                 setTokenScope(defaultTokenScope)
                 setFilters({
                   p: 1,
                   page_size: filters.page_size,
-                  ...getDefaultAuditTimeRange(),
+                  ...timeRange,
                 })
               }}
             />
