@@ -141,3 +141,8 @@ func MaskEmail(email string) string {
 func MaskSensitiveInfo(str string) string {
 	return kitutil.MaskSensitiveInfo(str)
 }
+
+// MaskCredentials 只移除密钥和认证凭证，保留日志排障需要的地址与普通参数。
+func MaskCredentials(str string, knownKeys ...string) string {
+	return kitutil.MaskCredentials(str, knownKeys...)
+}

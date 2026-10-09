@@ -117,6 +117,9 @@ func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
 		logs[i].ChannelName = ""
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		if logs[i].Type == LogTypeError {
+			logs[i].Content = common.MaskCredentials(logs[i].Content)
+		}
 	}
 	assignDisplayLogIds(logs, startIdx)
 }
@@ -125,6 +128,9 @@ func formatUserLogs(logs []*Log, startIdx int) {
 // admin_info. Root callers must not pass their results through this formatter.
 func FormatAdminLogs(logs []*Log) {
 	for i := range logs {
+		if logs[i].Type == LogTypeError {
+			logs[i].Content = common.MaskCredentials(logs[i].Content)
+		}
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin)
 	}
 }
@@ -133,6 +139,9 @@ func FormatAdminLogs(logs []*Log) {
 // without removing root-only diagnostics.
 func FormatRootLogs(logs []*Log) {
 	for i := range logs {
+		if logs[i].Type == LogTypeError {
+			logs[i].Content = common.MaskCredentials(logs[i].Content)
+		}
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot)
 	}
 }
@@ -276,7 +285,9 @@ func RecordTopupLog(userId int, content string, callerIp string, paymentMethod s
 }
 
 func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string, tokenName string, content string, tokenId int, useTimeSeconds int,
-	isStream bool, group string, other *LogOther) {
+	isStream bool, group string, other *LogOther, knownKeys ...string) {
+	// 写入前移除凭证，旧节点读取同一日志库时也不会获得新日志中的密钥。
+	content = common.MaskCredentials(content, knownKeys...)
 	logger.LogInfo(c, fmt.Sprintf("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)

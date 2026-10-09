@@ -45,7 +45,12 @@ func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
 	oai := err.ToOpenAIError()
 	oai.Type = string(types.ErrorCodeViolationFeeGrokCSAM)
 	oai.Code = string(types.ErrorCodeViolationFeeGrokCSAM)
-	return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	normalized := types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	// 对外转换后的消息可能已脱敏，日志仍需保留原始诊断信息。
+	if err.Err != nil {
+		normalized.Err = err.Err
+	}
+	return normalized
 }
 
 // NormalizeViolationFeeError ensures:
@@ -64,7 +69,11 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 
 	if IsViolationFeeCode(err.GetErrorCode()) {
 		oai := err.ToOpenAIError()
-		return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+		normalized := types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+		if err.Err != nil {
+			normalized.Err = err.Err
+		}
+		return normalized
 	}
 
 	return err

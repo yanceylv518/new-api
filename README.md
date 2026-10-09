@@ -343,6 +343,16 @@ docker run --name new-api -d --restart always \
 
 📖 **Complete configuration:** [Environment Variables Documentation](https://docs.newapi.pro/en/docs/installation/config-maintenance/environment-variables)
 
+With `ERROR_LOG_ENABLED=true`, database error logs retain diagnostic domains,
+IP addresses, URL paths, and non-credential parameters. API keys, authentication
+tokens, passwords, private keys, and signed access credentials are removed before
+logging. Each error is stored once; root, administrators, user self-log queries,
+and token log queries receive the same credential-redacted error text. Existing
+masked fields cannot be recovered. Client-facing relay errors retain their
+existing address masking and also redact credential fields. No schema migration
+is required. Old readers can read new logs safely because credential redaction
+happens before insertion; old writers still produce their original masked text.
+
 </details>
 
 ### 🔧 Deployment Methods
