@@ -1,0 +1,1008 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>请求追踪日志方案</title>
+<style>html { color-scheme: light; } body { margin: 0; } img { max-width: 100%; } [hidden] { display: none !important; }</style>
+<style>
+/* 布局：顶部固定控制条切换场景/角色，下面依次是 原始报文映射 -> 落库记录 -> 界面预览。配色与字体沿用 new-api 前端的 theme.css。 */
+:root {
+  --bg: oklch(1 0 0);
+  --fg: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-fg: oklch(0.49 0 0);
+  --border: oklch(0.9 0 0);
+  --primary: oklch(0.6 0.15 245);
+  --primary-soft: oklch(0.95 0.03 245);
+  --danger: oklch(0.577 0.245 27.325);
+  --danger-soft: oklch(0.96 0.03 27);
+  --ok: oklch(0.52 0.14 163);
+  --ok-soft: oklch(0.95 0.04 163);
+  --warn: oklch(0.6 0.15 70);
+  --warn-soft: oklch(0.96 0.05 80);
+  --hit: oklch(0.93 0.09 95);
+  --sans: 'Public Sans', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, 'PingFang SC', 'Microsoft YaHei', monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: oklch(0.235 0 0); --fg: oklch(0.965 0 0); --card: oklch(0.285 0 0); --muted: oklch(0.305 0 0);
+    --muted-fg: oklch(0.78 0 0); --border: oklch(0.4 0 0); --primary: oklch(0.72 0.13 245);
+    --primary-soft: oklch(0.35 0.06 245); --danger: oklch(0.74 0.17 22); --danger-soft: oklch(0.33 0.07 22);
+    --ok: oklch(0.76 0.15 162); --ok-soft: oklch(0.33 0.05 162); --warn: oklch(0.8 0.15 75);
+    --warn-soft: oklch(0.35 0.05 75); --hit: oklch(0.45 0.09 95); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: oklch(0.235 0 0); --fg: oklch(0.965 0 0); --card: oklch(0.285 0 0); --muted: oklch(0.305 0 0);
+  --muted-fg: oklch(0.78 0 0); --border: oklch(0.4 0 0); --primary: oklch(0.72 0.13 245);
+  --primary-soft: oklch(0.35 0.06 245); --danger: oklch(0.74 0.17 22); --danger-soft: oklch(0.33 0.07 22);
+  --ok: oklch(0.76 0.15 162); --ok-soft: oklch(0.33 0.05 162); --warn: oklch(0.8 0.15 75);
+  --warn-soft: oklch(0.35 0.05 75); --hit: oklch(0.45 0.09 95); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.55; }
+.wrap { max-width: 1320px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 56px; display: flex; flex-direction: column; gap: 28px; }
+h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+h2 { font-size: 17px; font-weight: 600; margin: 0; }
+p { margin: 0; }
+.lead { color: var(--muted-fg); max-width: 68ch; margin-top: 6px; }
+.sec { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.sec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; }
+.sec-head p { color: var(--muted-fg); font-size: 13px; }
+button { font: inherit; color: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 控制条 */
+.bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); border-bottom: 1px solid var(--border);
+  margin-inline: -20px; padding: 10px 20px; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.ctl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ctl > span { font-size: 12px; color: var(--muted-fg); white-space: nowrap; }
+.seg { display: flex; gap: 2px; background: var(--muted); border-radius: 10px; padding: 3px; overflow-x: auto; max-width: 100%; }
+.seg button { border: 0; background: transparent; padding: 5px 11px; border-radius: 8px; font-size: 13px; white-space: nowrap; color: var(--muted-fg); }
+.seg button[aria-pressed="true"] { background: var(--card); color: var(--fg); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
+
+/* 图例 */
+.legend { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--card); border-radius: 999px; padding: 3px 10px 3px 8px; font-size: 12px; }
+.chip[aria-pressed="true"] { border-color: var(--fg); }
+.dot { width: 9px; height: 9px; border-radius: 3px; flex: none; background: var(--k); border: 1.5px solid var(--k); }
+.k-old { --k: var(--muted-fg); } .k-new { --k: var(--primary); } .k-der { --k: var(--ok); } .k-fail { --k: var(--warn); }
+.k-no { --k: var(--muted-fg); } .k-no .dot, .dot.k-no { background: transparent; }
+
+/* 原始报文 */
+.raw-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.pane { border: 1px solid var(--border); border-radius: 14px; background: var(--card); min-width: 0; overflow: hidden; display: flex; flex-direction: column; }
+.pane-h { padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; letter-spacing: 0.02em; display: flex; justify-content: space-between; gap: 10px; color: var(--muted-fg); }
+.code { font-family: var(--mono); font-size: 12px; line-height: 1.6; padding: 8px 0; overflow-x: auto; max-height: 560px; overflow-y: auto; }
+.ln { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 8px; width: 100%; text-align: left; border: 0; background: transparent; padding: 0 14px 0 10px; font-family: inherit; font-size: inherit; line-height: inherit; }
+.ln span.t { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+.ln .mk { width: 9px; height: 9px; border-radius: 3px; margin-top: 5px; background: var(--k, transparent); border: 1.5px solid var(--k, transparent); }
+.ln.k-no .mk { background: transparent; } .ln.k-no .t { color: var(--muted-fg); }
+button.ln:hover { background: var(--muted); }
+.ln.sel { background: var(--hit); }
+.ln.dim { opacity: 0.28; }
+.ln.sep { padding-block: 6px 2px; font-family: var(--sans); font-weight: 600; font-size: 12px; color: var(--muted-fg); }
+
+/* 检查器 + 落库记录 */
+.insp { border: 1px solid var(--border); border-radius: 14px; background: var(--muted); padding: 12px 14px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; align-items: baseline; font-size: 13px; }
+.insp dt { color: var(--muted-fg); font-size: 12px; white-space: nowrap; } .insp dd { margin: 0; min-width: 0; word-break: break-word; }
+.insp code, .path { font-family: var(--mono); font-size: 12px; }
+.rec-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 14px; }
+.json .jl { padding: 0 14px; white-space: pre-wrap; word-break: break-word; }
+.json .jl.new { box-shadow: inset 3px 0 0 var(--primary); background: var(--primary-soft); }
+.json .jl.fail { box-shadow: inset 3px 0 0 var(--warn); background: var(--warn-soft); }
+.json .jl.hit { background: var(--hit); }
+.json .jk { color: var(--muted-fg); }
+.tag { display: inline-block; font-family: var(--sans); font-size: 11px; font-weight: 600; border-radius: 6px; padding: 0 6px; line-height: 18px; }
+.tag.new { background: var(--primary-soft); color: var(--primary); } .tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.ok { background: var(--ok-soft); color: var(--ok); } .tag.bad { background: var(--danger-soft); color: var(--danger); }
+.tag.plain { background: var(--muted); color: var(--muted-fg); }
+.note { color: var(--muted-fg); font-size: 12px; padding: 10px 14px; }
+
+/* 界面预览 */
+.ui-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 512px); gap: 14px; align-items: start; }
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 600; font-size: 11.5px; color: var(--muted-fg); padding: 8px 7px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+td { padding: 9px 7px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { padding-left: 14px; }
+tbody tr { cursor: pointer; } tbody tr:hover { background: var(--muted); } tbody tr[aria-selected="true"] { background: var(--primary-soft); }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr.err td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.detail { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+.d-title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.d-title b { font-size: 15px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; }
+.stat { background: var(--muted); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+.stat i { display: block; font-style: normal; font-size: 11px; color: var(--muted-fg); } .stat b { font-size: 15px; font-variant-numeric: tabular-nums; word-break: break-word; }
+.dsec { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dsec > label { font-size: 12px; font-weight: 600; display: flex; gap: 6px; align-items: center; }
+.dsec.danger > label { color: var(--danger); }
+.dbox { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--muted); display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.dsec.danger .dbox { background: var(--danger-soft); border-color: var(--danger); }
+.row { display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: 10px; font-size: 12px; }
+.row > span:first-child { color: var(--muted-fg); } .row > span:last-child { word-break: break-word; min-width: 0; }
+.att { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; }
+.track { height: 12px; background: var(--card); border-radius: 4px; position: relative; overflow: hidden; border: 1px solid var(--border); }
+.track u { position: absolute; top: 0; bottom: 0; display: block; }
+.track u.h { background: var(--primary); } .track u.b { background: var(--ok); } .track u.e { background: var(--danger); }
+.keys { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted-fg); }
+.keys span { display: inline-flex; align-items: center; gap: 5px; } .keys u { width: 10px; height: 10px; border-radius: 3px; display: block; }
+pre.snip { margin: 0; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-height: 180px; overflow: auto; }
+.foot { color: var(--muted-fg); font-size: 12px; border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 4px; max-width: 80ch; }
+/* 后台设置：对齐 new-api 设置页的“标题 + 说明 + 右侧开关”条目。 */
+.set { border: 1px solid var(--border); border-radius: 14px; background: var(--card); overflow: hidden; }
+.set-item { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px 20px; padding: 13px 16px; border-bottom: 1px solid var(--border); }
+.set-item:last-child { border-bottom: 0; }
+.set-item > :first-child { flex: 1 1 280px; min-width: 0; cursor: default; }
+.set-item label { cursor: pointer; }
+.set-item b { font-weight: 600; font-size: 14px; display: block; }
+.set-item p { color: var(--muted-fg); font-size: 12.5px; max-width: 68ch; margin-top: 2px; }
+.sw { appearance: none; -webkit-appearance: none; margin: 0; width: 38px; height: 22px; border-radius: 999px; background: var(--border); position: relative; cursor: pointer; flex: none; }
+.sw::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--card); }
+.sw:checked { background: var(--primary); }
+.sw:checked::after { transform: translateX(16px); }
+.sw:disabled { opacity: 0.4; cursor: not-allowed; }
+.empty { border: 1px dashed var(--border); border-radius: 8px; padding: 22px 16px; text-align: center; }
+.empty b { display: block; font-size: 14px; margin-bottom: 6px; }
+.empty p { color: var(--muted-fg); font-size: 12.5px; }
+@media (prefers-reduced-motion: no-preference) { .sw, .sw::after { transition: background-color 0.15s, transform 0.15s; } }
+/* 日志详情弹窗：尺寸、间距、字号对齐 new-api 的 Dialog + DetailRow + DetailSection。 */
+.dlg { border: 1px solid var(--border); border-radius: 16px; background: var(--card); box-shadow: 0 12px 32px -14px oklch(0 0 0 / 0.3); min-width: 0; overflow: hidden; display: flex; flex-direction: column; }
+.dlg-h { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 18px 22px 10px; }
+.dlg-t { font-size: 16px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+.dlg-x { color: var(--muted-fg); font-size: 20px; line-height: 1; }
+.dlg-b { padding: 4px 22px 18px; max-height: min(72vh, 720px); overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.dlg-f { border-top: 1px solid var(--border); padding: 9px 22px; font-size: 12px; color: var(--muted-fg); }
+.ov { display: flex; flex-direction: column; gap: 4px; }
+.dlg .dbox { background: color-mix(in oklch, var(--muted) 40%, var(--card)); border-radius: 6px; gap: 4px; }
+.dlg .dsec.danger .dbox { background: var(--danger-soft); }
+.dlg .row b { font-weight: 600; }
+.nd { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--primary); margin-left: 5px; vertical-align: middle; }
+.mut { color: var(--muted-fg); }
+.ctt { font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+@media (max-width: 860px) { .raw-grid, .ui-grid { grid-template-columns: minmax(0, 1fr); } .code { max-height: 420px; } }
+@media (prefers-reduced-motion: no-preference) { .ln, .jl, tbody tr { transition: background-color .12s; } }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <header>
+    <h1>请求追踪日志方案</h1>
+    <p class="lead">七个典型请求经过网关的原始报文，逐行标出会从中提取什么、保存到哪里、谁能看到，以及在用量日志里怎么显示。请求体和响应体的正文不落库。点任意一行报文可定位到落库字段。</p>
+  </header>
+
+  <div class="bar">
+    <div class="ctl"><span>场景</span><div class="seg" id="scn" role="group" aria-label="场景"></div></div>
+    <div class="ctl"><span>查看身份</span><div class="seg" id="role" role="group" aria-label="查看身份"></div></div>
+  </div>
+
+  <section class="sec">
+    <div class="sec-head"><h2>后台设置</h2><p>加在“系统设置 → 维护 → 日志维护”里的一组选项。改动会立刻反映到下面的报文标记、落库记录和界面预览。</p></div>
+    <div class="set">
+      <div class="set-item"><div><b>请求追踪级别</b><p>关闭时行为与现在完全一致。“仅失败详细”时，成功请求只多存耗时、请求体与响应体大小、结束原因四项。</p></div><div class="seg" id="lvl" role="group" aria-label="请求追踪级别"></div></div>
+      <div class="set-item"><label for="c-authed"><b>记录未到达渠道的失败</b><p>请求校验失败、无可用渠道、用户限流等。能归属到具体用户和令牌。</p></label><input type="checkbox" class="sw" id="c-authed"></div>
+      <div class="set-item"><label for="c-anon"><b>记录未鉴权的失败</b><p>令牌无效、IP 限流等。不属于任何用户，被扫描时量可能很大，默认关闭。</p></label><input type="checkbox" class="sw" id="c-anon"></div>
+      <div class="set-item"><label for="c-body"><b>保存上游错误原文</b><p>仅失败记录，截断到 4 KB，写入前脱敏，只有 Root 能看到。</p></label><input type="checkbox" class="sw" id="c-body"></div>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head"><h2>原始请求与响应</h2><p id="scn-sub"></p></div>
+    <div class="legend" id="legend" role="group" aria-label="按保存方式筛选"></div>
+    <div class="raw-grid">
+      <div class="pane"><div class="pane-h"><span>客户端请求</span><span id="req-meta"></span></div><div class="code" id="req"></div></div>
+      <div class="pane"><div class="pane-h"><span id="resp-title">上游响应</span><span id="resp-meta"></span></div><div class="code" id="resp"></div></div>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head"><h2>落库记录</h2><p>写入 <span class="path">logs</span> 表的行。蓝色为新增字段，黄色为失败时保存的上游错误原文。</p></div>
+    <dl class="insp" id="insp"></dl>
+    <div class="rec-grid" id="records"></div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head"><h2>界面预览</h2><p>列表保持现有的列不变。右侧弹窗按现有的日志详情布局绘制，新增内容只是多出几行和几个分区。点一行切换场景。</p></div>
+    <div class="ui-grid">
+      <div class="pane"><div class="pane-h"><span>用量日志</span><span id="tbl-meta"></span></div><div class="tbl-wrap"><table id="tbl"></table></div></div>
+      <div class="dlg"><div class="dlg-h"><span class="dlg-t">日志详情 <span id="d-type"></span></span><span class="dlg-x" aria-hidden="true">×</span></div><div class="dlg-b" id="detail"></div><div class="dlg-f" id="d-meta"></div></div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <p>请求体和响应体的正文不保存，唯一的原文是失败时上游返回的错误响应体。上游响应头也不保存。报文和数值均为虚构示例。<span class="path">trace</span> 下的字段名是提案，尚未实现。</p>
+    <p>分层沿用现有规则：<span class="path">other</span> 顶层用户可见，<span class="path">admin_info</span> 仅管理员，<span class="path">root_info</span> 仅 Root。</p>
+  </div>
+</div>
+<script>
+// 每行报文：[文本, 保存方式, 落库路径, 说明]。保存方式为空表示结构行。
+const A = 'other.admin_info.trace.', T = 'other.trace.', R = 'other.root_info.';
+const UA_PY = 'OpenAI/Python 1.51.0';
+const SCN = [
+{
+  id: 'ok', name: '非流式成功', sub: 'OpenAI 格式，带一张截图和一个工具，一次成功。',
+  reqMeta: 'gzip 35.1 KB，解压后 47.1 KB', respMeta: '200 · 612 B',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'old', 'other.request_path', '路径已记录；查询串不保存。'],
+    ['Host: api.example.com', 'no', '', '网关自己的域名，没有排查价值。'],
+    ['Authorization: Bearer sk-••••••••••••wX9f', 'old', 'token_name', '只保存令牌 ID 和名称，密钥本身永不落库。'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type', '区分 JSON、multipart 上传等入口。'],
+    ['Content-Encoding: gzip', 'new', A + 'client.content_encoding', '客户端是否压缩；解压失败类问题靠它定位。'],
+    ['Content-Length: 35904', 'new', A + 'client.wire_bytes', '线上实际传输的字节数（压缩后）。解压后的大小另存为 req_bytes。'],
+    ['User-Agent: ' + UA_PY, 'new', A + 'client.ua', '截断到 256 字符。'],
+    ['X-Stainless-Retry-Count: 0', 'new', A + 'client.sdk_retry', '官方 SDK 的客户端重试计数，能看出客户端是否在重放同一请求。'],
+    ['X-Forwarded-For: 203.0.113.24', 'old', 'ip', '沿用现有规则：仅当用户开启“记录 IP”时保存。'],
+    [''],
+    ['{'],
+    ['  "model": "gpt-4o",', 'old', 'model_name'],
+    ['  "stream": false,', 'old', 'is_stream'],
+    ['  "max_tokens": 1024,', 'new', A + 'shape.max_tokens', '排查“输出被截断”时要对照这个上限。'],
+    ['  "temperature": 0.2,', 'new', A + 'shape.temperature'],
+    ['  "tool_choice": "auto",', 'new', A + 'shape.tool_choice'],
+    ['  "user": "end-user-7f3a",', 'no', '', '终端用户标识，可能是个人信息，不保存。'],
+    ['  "messages": [', 'der', A + 'shape.messages', '只保存消息条数。'],
+    ['    {"role": "system", "content": "你是订单客服助手，只回答与订单相关的问题。"},', 'der', A + 'shape.text_chars', '正文不保存，只累计文本字符数。'],
+    ['    {"role": "user", "content": ['],
+    ['      {"type": "text", "text": "帮我查一下这张截图里的订单什么时候发货"},', 'der', A + 'shape.text_chars', '正文不保存，只累计文本字符数。'],
+    ['      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo…（约 46 KB）"}}', 'der', A + 'shape.images', '图片数据不保存，只记张数。请求体大的原因通常在这里。'],
+    ['    ]}'],
+    ['  ],'],
+    ['  "tools": [', 'der', A + 'shape.tools', '只保存工具个数，不保存定义。'],
+    ['    {"type": "function", "function": {"name": "get_order_status", "description": "按订单号查询物流状态",', 'no', '', '工具定义不保存。'],
+    ['      "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}', 'no', '', '工具定义不保存。'],
+    ['  ]'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/2 200', 'new', A + 'upstream.status', '上游状态码和协议版本。现在成功请求不记录这两项。'],
+    ['content-type: application/json', 'no'],
+    ['x-request-id: req_8c1f0e6b2a7d4c53', 'old', 'upstream_request_id', '已保存，可拿去找上游查单。'],
+    ['openai-processing-ms: 2811', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['x-ratelimit-remaining-requests: 4999', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['x-ratelimit-remaining-tokens: 798012', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['cf-ray: 8f2a6c1d9b7e-NRT', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    [''],
+    ['{'],
+    ['  "id": "chatcmpl-AV9xQmT2pLk7",', 'new', A + 'upstream.resp_id', '上游的响应 ID。'],
+    ['  "object": "chat.completion",', 'no'],
+    ['  "created": 1791531612,', 'no'],
+    ['  "model": "gpt-4o-2024-08-06",', 'new', A + 'upstream.resp_model', '上游实际使用的模型版本，可能与请求的名字不同。'],
+    ['  "system_fingerprint": "fp_a7d06e42a7",', 'new', A + 'upstream.fingerprint'],
+    ['  "choices": [', 'der', A + 'resp.choices'],
+    ['    {'],
+    ['      "index": 0,'],
+    ['      "message": {'],
+    ['        "role": "assistant",'],
+    ['        "content": null,', 'der', A + 'resp.content_chars', '回复正文不保存，只记字符数。'],
+    ['        "tool_calls": [', 'der', A + 'resp.tool_calls', '只记工具调用个数。'],
+    ['          {"id": "call_Zk3", "type": "function", "function": {"name": "get_order_status", "arguments": "{\\"order_id\\":\\"SO-20261008-4471\\"}"}}', 'no', '', '成功响应的工具参数不保存。'],
+    ['        ]'],
+    ['      },'],
+    ['      "finish_reason": "tool_calls"', 'new', T + 'finish_reason', '结束原因。判断“被截断”“被拦截”“正常结束”的关键字段，现在没有记录。'],
+    ['    }'],
+    ['  ],'],
+    ['  "usage": {'],
+    ['    "prompt_tokens": 1187,', 'old', 'prompt_tokens'],
+    ['    "completion_tokens": 24,', 'old', 'completion_tokens'],
+    ['    "total_tokens": 1211,', 'no', '', '可由前两项相加得到。'],
+    ['    "prompt_tokens_details": {"cached_tokens": 0},', 'old', 'other.cache_tokens'],
+    ['    "completion_tokens_details": {"reasoning_tokens": 0}', 'new', A + 'resp.reasoning_tokens'],
+    ['  }'],
+    ['}']
+  ],
+  records: [{ title: '消费日志', row: {
+    id: 918342, created_at: 1791531615, type: 2, username: 'acme-dev', token_name: 'prod-backend', model_name: 'gpt-4o',
+    quota: 1603, prompt_tokens: 1187, completion_tokens: 24, use_time: 3, is_stream: false, channel: 12, group: 'default', ip: '',
+    request_id: '20261009154012483219aK7', upstream_request_id: 'req_8c1f0e6b2a7d4c53', content: '',
+    other: {
+      request_path: '/v1/chat/completions', model_ratio: 1.25, completion_ratio: 4, group_ratio: 1, cache_tokens: 0,
+      trace: { ms: 3412, req_bytes: 48211, resp_bytes: 612, finish_reason: 'tool_calls' },
+      admin_info: { use_channel: ['12'], trace: {
+        attempt: 0,
+        client: { ua: UA_PY, content_type: 'application/json', content_encoding: 'gzip', wire_bytes: 35904, sdk_retry: 0 },
+        shape: { messages: 2, text_chars: 40, images: 1, tools: 1, tool_choice: 'auto', max_tokens: 1024, temperature: 0.2 },
+        upstream: { status: 200, proto: 'HTTP/2.0', req_bytes: 48236, header_ms: 2893, resp_id: 'chatcmpl-AV9xQmT2pLk7', resp_model: 'gpt-4o-2024-08-06', fingerprint: 'fp_a7d06e42a7' },
+        resp: { choices: 1, content_chars: 0, tool_calls: 1, reasoning_tokens: 0 }
+      } }
+    } } }]
+},
+{
+  id: 'stream', name: '流式成功', sub: 'Claude Messages 原生格式，流式返回，命中提示缓存。',
+  reqMeta: '6.1 KB', respMeta: '200 · 67 个事件 · 21.4 KB',
+  req: [
+    ['POST /v1/messages HTTP/1.1', 'old', 'other.request_path'],
+    ['x-api-key: sk-••••••••••••p4Lt', 'old', 'token_name', '只保存令牌 ID 和名称。'],
+    ['anthropic-version: 2023-06-01', 'new', A + 'client.headers', '白名单请求头：协议版本不对是常见的 400 原因。'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 6204', 'new', A + 'client.wire_bytes'],
+    ['User-Agent: Anthropic/JS 0.39.0', 'new', A + 'client.ua'],
+    [''],
+    ['{'],
+    ['  "model": "claude-sonnet-5-5",', 'old', 'model_name'],
+    ['  "max_tokens": 2048,', 'new', A + 'shape.max_tokens'],
+    ['  "stream": true,', 'old', 'is_stream'],
+    ['  "system": [{"type": "text", "text": "（约 2000 字的运维手册，此处省略）", "cache_control": {"type": "ephemeral"}}],', 'der', A + 'shape.system', '只记是否带系统提示，字符数并入 text_chars。'],
+    ['  "metadata": {"user_id": "u_58213"},', 'no', '', '终端用户标识，不保存。'],
+    ['  "messages": [', 'der', A + 'shape.messages'],
+    ['    {"role": "user", "content": "nginx 报 502，帮我看看这段日志 …"},', 'der', A + 'shape.text_chars'],
+    ['    {"role": "assistant", "content": "先确认上游服务是否存活 …"},', 'der', A + 'shape.text_chars'],
+    ['    {"role": "user", "content": "存活的，这是 upstream 的错误日志 …"}', 'der', A + 'shape.text_chars'],
+    ['  ]'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/2 200', 'new', A + 'upstream.status'],
+    ['content-type: text/event-stream', 'no'],
+    ['request-id: req_011CTxK9vHq2mZ', 'new', 'upstream_request_id', '现有代码只识别 X-Oneapi-Request-Id 和 X-Request-Id。Anthropic 用的是 request-id，现在记不到，需要补认。'],
+    ['anthropic-ratelimit-requests-remaining: 49', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['anthropic-ratelimit-tokens-remaining: 76000', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    [''],
+    ['event: message_start'],
+    ['data: {"type":"message_start","message":{"id":"msg_01QeZr8dVn3Kp","model":"claude-sonnet-5-5",', 'new', A + 'upstream.resp_id', '从首个事件取响应 ID 和实际模型。'],
+    ['       "usage":{"input_tokens":412,"cache_read_input_tokens":2048,"output_tokens":1}}}', 'old', 'other.cache_tokens', '输入和缓存用量已保存。'],
+    [''],
+    ['event: content_block_start'],
+    ['data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'],
+    [''],
+    ['event: content_block_delta', 'old', 'other.frt', '首个内容分片到达的时间已保存为 frt（毫秒）。'],
+    ['data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"根据日志，"}}', 'der', A + 'resp.content_chars', '正文不保存，只累计字符数。'],
+    [''],
+    ['… 此处省略 60 个 content_block_delta …', 'der', A + 'resp.chunks', '分片总数。代码里已有这个计数器，只是没写进日志。'],
+    [''],
+    ['event: content_block_delta'],
+    ['data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"调大 proxy_read_timeout。"}}', 'new', A + 'resp.last_chunk_ms', '最后一个分片到达的时间，用来区分“上游慢”和“上游中途卡住”。'],
+    [''],
+    ['event: content_block_stop'],
+    ['data: {"type":"content_block_stop","index":0}'],
+    [''],
+    ['event: message_delta'],
+    ['data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},', 'new', T + 'finish_reason', 'Claude 的 stop_reason 统一存为 finish_reason，保留原值。'],
+    ['       "usage":{"output_tokens":318}}', 'old', 'completion_tokens'],
+    [''],
+    ['event: message_stop', 'old', 'other.stream_status', '流的结束状态已保存。'],
+    ['data: {"type":"message_stop"}', 'new', A + 'resp.done', '是否收到了协议规定的结束事件。']
+  ],
+  records: [{ title: '消费日志', newPaths: ['upstream_request_id'], row: {
+    id: 918377, created_at: 1791531702, type: 2, username: 'acme-dev', token_name: 'ops-agent', model_name: 'claude-sonnet-5-5',
+    quota: 3310, prompt_tokens: 412, completion_tokens: 318, use_time: 9, is_stream: true, channel: 21, group: 'default', ip: '',
+    request_id: '20261009154133907412bQ2', upstream_request_id: 'req_011CTxK9vHq2mZ', content: '',
+    other: {
+      request_path: '/v1/messages', claude: true, frt: 742, model_ratio: 1.5, completion_ratio: 5, group_ratio: 1, cache_tokens: 2048, cache_ratio: 0.1,
+      stream_status: { status: 'ok', end_reason: 'done' },
+      trace: { ms: 9120, req_bytes: 6204, resp_bytes: 21877, finish_reason: 'end_turn' },
+      admin_info: { use_channel: ['21'], trace: {
+        attempt: 0,
+        client: { ua: 'Anthropic/JS 0.39.0', content_type: 'application/json', wire_bytes: 6204, headers: { 'anthropic-version': '2023-06-01' } },
+        shape: { messages: 3, text_chars: 2917, system: true, max_tokens: 2048 },
+        upstream: { status: 200, proto: 'HTTP/2.0', req_bytes: 6204, header_ms: 731, resp_id: 'msg_01QeZr8dVn3Kp', resp_model: 'claude-sonnet-5-5' },
+        resp: { chunks: 67, content_chars: 731, last_chunk_ms: 9098, done: true }
+      } }
+    } } }]
+},
+{
+  id: 'retry', name: '限流后重试', sub: '第一个渠道返回 429，自动换渠道后成功。客户端最终收到 200。',
+  reqMeta: '2.3 KB', respMeta: '429 → 200',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'old', 'other.request_path'],
+    ['Authorization: Bearer sk-••••••••••••wX9f', 'old', 'token_name'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 2310', 'new', A + 'client.wire_bytes'],
+    ['User-Agent: ' + UA_PY, 'new', A + 'client.ua'],
+    ['X-Stainless-Retry-Count: 2', 'new', A + 'client.sdk_retry', '客户端已经是第 3 次发同一个请求。结合网关侧的重试，能还原完整的重放情况。'],
+    [''],
+    ['{'],
+    ['  "model": "gpt-4o",', 'old', 'model_name'],
+    ['  "stream": false,', 'old', 'is_stream'],
+    ['  "max_tokens": 800,', 'new', A + 'shape.max_tokens'],
+    ['  "response_format": {"type": "json_object"},', 'new', A + 'shape.response_format', '只保存类型，不保存 schema。'],
+    ['  "messages": [', 'der', A + 'shape.messages'],
+    ['    {"role": "system", "content": "把下面的工单内容整理成 JSON …"},', 'der', A + 'shape.text_chars', '正文不保存，只累计文本字符数。'],
+    ['    {"role": "user", "content": "（约 1900 字的工单正文，此处省略）"}', 'der', A + 'shape.text_chars'],
+    ['  ]'],
+    ['}']
+  ],
+  resp: [
+    ['第 1 次尝试 · 渠道 #12 · 184 ms', 'sep'],
+    ['HTTP/2 429', 'old', 'other.status_code', '失败时的状态码已保存。'],
+    ['x-request-id: req_5d0a91c7e3b84f26', 'old', 'upstream_request_id'],
+    ['retry-after: 7', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['x-ratelimit-remaining-tokens: 0', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    ['x-ratelimit-reset-tokens: 6.8s', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    [''],
+    ['{'],
+    ['  "error": {'],
+    ['    "message": "Rate limit reached for gpt-4o in organization org-•••• on tokens per min (TPM): Limit 800000, Used 799120, Requested 2310. Please try again in 6.8s.",', 'old', 'content', '错误消息已保存到 content，写入前会脱敏。'],
+    ['    "type": "tokens",', 'new', A + 'upstream.error_type', '上游自己的错误类型。现在的 error_type 是网关的分类，丢了这个原值。'],
+    ['    "param": null,', 'no'],
+    ['    "code": "rate_limit_exceeded"', 'old', 'other.error_code'],
+    ['  }'],
+    ['}'],
+    ['▸ 以上整段响应体（前 4 KB，脱敏后）', 'fail', R + 'upstream_error_body', '现在解析出 message 后原文就丢了。上游返回非标准格式时，只有原文能看出问题。'],
+    [''],
+    ['第 2 次尝试 · 渠道 #7 · 2.66 s', 'sep'],
+    ['HTTP/2 200', 'new', A + 'upstream.status'],
+    ['x-request-id: req_e71b2f4490ac4d18', 'old', 'upstream_request_id'],
+    ['x-ratelimit-remaining-tokens: 797690', 'no', '', '上游响应头不保存。很多上游不返回这类头，取舍后不纳入方案。'],
+    [''],
+    ['{'],
+    ['  "id": "chatcmpl-AV9y3HnW8sRd",', 'new', A + 'upstream.resp_id'],
+    ['  "model": "gpt-4o-2024-08-06",', 'new', A + 'upstream.resp_model'],
+    ['  "choices": [{', 'der', A + 'resp.choices'],
+    ['    "index": 0,'],
+    ['    "message": {"role": "assistant", "content": "{\\"title\\": \\"打印机无法联网\\", …}"},', 'der', A + 'resp.content_chars'],
+    ['    "finish_reason": "stop"', 'new', T + 'finish_reason'],
+    ['  }],'],
+    ['  "usage": {"prompt_tokens": 1420, "completion_tokens": 186, "total_tokens": 1606}', 'old', 'prompt_tokens'],
+    ['}']
+  ],
+  records: [
+    { title: '错误日志 · 第 1 次尝试', adminOnly: true, row: {
+      id: 918401, created_at: 1791531790, type: 5, username: 'acme-dev', token_name: 'prod-backend', model_name: 'gpt-4o',
+      quota: 0, prompt_tokens: 0, completion_tokens: 0, use_time: 0, is_stream: false, channel: 12, group: 'default', ip: '',
+      request_id: '20261009154310118734cT5', upstream_request_id: 'req_5d0a91c7e3b84f26',
+      content: 'status_code=429, Rate limit reached for gpt-4o in organization org-•••• on tokens per min (TPM): Limit 800000, Used 799120, Requested 2310. Please try again in 6.8s.',
+      other: {
+        request_path: '/v1/chat/completions', error_type: 'openai_error', error_code: 'rate_limit_exceeded', status_code: 429,
+        trace: { ms: 191, req_bytes: 2310, stage: 'upstream' },
+        admin_info: { use_channel: ['12'], trace: {
+          attempt: 0,
+          client: { ua: UA_PY, content_type: 'application/json', wire_bytes: 2310, sdk_retry: 2 },
+          shape: { messages: 2, text_chars: 1938, max_tokens: 800, response_format: 'json_object' },
+          upstream: { status: 429, proto: 'HTTP/2.0', req_bytes: 2334, header_ms: 184, error_type: 'tokens' }
+        } },
+        root_info: {
+          upstream_error_body: '{"error":{"message":"Rate limit reached for gpt-4o in organization org-•••• on tokens per min (TPM): Limit 800000, Used 799120, Requested 2310. Please try again in 6.8s.","type":"tokens","param":null,"code":"rate_limit_exceeded"}}',
+          upstream_error_body_truncated: false
+        }
+      } } },
+    { title: '消费日志 · 第 2 次尝试', row: {
+      id: 918402, created_at: 1791531793, type: 2, username: 'acme-dev', token_name: 'prod-backend', model_name: 'gpt-4o',
+      quota: 2705, prompt_tokens: 1420, completion_tokens: 186, use_time: 2, is_stream: false, channel: 7, group: 'default', ip: '',
+      request_id: '20261009154310118734cT5', upstream_request_id: 'req_e71b2f4490ac4d18', content: '',
+      other: {
+        request_path: '/v1/chat/completions', model_ratio: 1.25, completion_ratio: 4, group_ratio: 1, cache_tokens: 0,
+        trace: { ms: 2847, req_bytes: 2310, resp_bytes: 498, finish_reason: 'stop' },
+        admin_info: { use_channel: ['12', '7'], trace: {
+          attempt: 1,
+          client: { ua: UA_PY, content_type: 'application/json', wire_bytes: 2310, sdk_retry: 2 },
+          shape: { messages: 2, text_chars: 1938, max_tokens: 800, response_format: 'json_object' },
+          upstream: { status: 200, proto: 'HTTP/2.0', req_bytes: 2334, header_ms: 2630, resp_id: 'chatcmpl-AV9y3HnW8sRd', resp_model: 'gpt-4o-2024-08-06' },
+          resp: { choices: 1, content_chars: 212, tool_calls: 0 }
+        } }
+      } } }
+  ]
+},
+{
+  id: 'bad', name: '请求校验失败', sub: '字段名拼错，网关直接返回 400，没有到达任何渠道。', respTitle: '网关响应',
+  reqMeta: '187 B', respMeta: '400 · 未到达渠道',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'new', 'other.request_path'],
+    ['Authorization: Bearer sk-••••••••••••Qm2c', 'new', 'token_name', '令牌已通过鉴权，可以归属到用户。'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 187', 'new', A + 'client.wire_bytes'],
+    ['User-Agent: python-requests/2.32.3', 'new', A + 'client.ua', '不是官方 SDK，是手写的请求。'],
+    [''],
+    ['{'],
+    ['  "model": "gpt-4o",', 'new', 'model_name'],
+    ['  "mesages": [', 'der', A + 'shape.keys', '字段名拼错，正是这次失败的原因。校验失败时保存请求体顶层的字段名列表，不含任何值，拼错一眼可见。'],
+    ['    {"role": "user", "content": "你好"}', 'no', '', '请求正文任何情况下都不保存。'],
+    ['  ],'],
+    ['  "max_tokens": 256', 'new', A + 'shape.max_tokens'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/1.1 400 Bad Request', 'new', 'other.status_code'],
+    ['Content-Type: application/json', 'no'],
+    ['X-Oneapi-Request-Id: 20261009154502660921dV8', 'new', 'request_id', '客户端报障时给的就是这个 ID，但现在拿它在日志页搜不到任何记录。'],
+    [''],
+    ['{'],
+    ['  "error": {'],
+    ['    "message": "field messages is required (request id: 20261009154502660921dV8)",', 'new', 'content'],
+    ['    "type": "new_api_error",', 'new', 'other.error_type'],
+    ['    "param": "",', 'no'],
+    ['    "code": "invalid_request"', 'new', 'other.error_code'],
+    ['  }'],
+    ['}']
+  ],
+  records: [{ title: '错误日志', newRow: true, row: {
+    id: 918433, created_at: 1791531902, type: 5, username: 'beta-tester', token_name: 'test-key', model_name: 'gpt-4o',
+    quota: 0, prompt_tokens: 0, completion_tokens: 0, use_time: 0, is_stream: false, channel: 0, group: 'default', ip: '',
+    request_id: '20261009154502660921dV8', upstream_request_id: '', content: 'field messages is required',
+    other: {
+      request_path: '/v1/chat/completions', error_type: 'new_api_error', error_code: 'invalid_request', status_code: 400,
+      trace: { ms: 3, req_bytes: 187, stage: 'validate' },
+      admin_info: { trace: {
+        client: { ua: 'python-requests/2.32.3', content_type: 'application/json', wire_bytes: 187 },
+        shape: { messages: 0, max_tokens: 256, keys: ['model', 'mesages', 'max_tokens'] }
+      } }
+    } } }]
+},
+{
+  id: 'cut', name: '流中途断开', sub: 'OpenAI 流式，客户端在 6.2 秒时断开，没有收到结束标记。',
+  reqMeta: '1.1 KB', respMeta: '200 · 214 个分片后中断',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'old', 'other.request_path'],
+    ['Authorization: Bearer sk-••••••••••••wX9f', 'old', 'token_name'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 1104', 'new', A + 'client.wire_bytes'],
+    ['User-Agent: node-fetch', 'new', A + 'client.ua'],
+    [''],
+    ['{'],
+    ['  "model": "gpt-4o-mini",', 'old', 'model_name'],
+    ['  "stream": true,', 'old', 'is_stream'],
+    ['  "stream_options": {"include_usage": true},', 'new', A + 'shape.include_usage', '客户端是否要求返回用量分片。没要求时只能本地估算 token。'],
+    ['  "max_tokens": 4096,', 'new', A + 'shape.max_tokens'],
+    ['  "messages": [', 'der', A + 'shape.messages'],
+    ['    {"role": "user", "content": "（约 300 字的写作要求，此处省略）"}', 'der', A + 'shape.text_chars'],
+    ['  ]'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/2 200', 'new', A + 'upstream.status'],
+    ['content-type: text/event-stream', 'no'],
+    ['x-request-id: req_27c4d9a0f6e145b3', 'old', 'upstream_request_id'],
+    [''],
+    ['data: {"id":"chatcmpl-AV9zK4","model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}', 'new', A + 'upstream.resp_id'],
+    [''],
+    ['data: {"id":"chatcmpl-AV9zK4","choices":[{"index":0,"delta":{"content":"各位"},"finish_reason":null}]}', 'old', 'other.frt'],
+    [''],
+    ['… 此处省略 211 个分片 …', 'der', A + 'resp.chunks'],
+    [''],
+    ['data: {"id":"chatcmpl-AV9zK4","choices":[{"index":0,"delta":{"content":"，同时"},"finish_reason":null}]}', 'new', A + 'resp.last_chunk_ms', '最后一个分片在 6.19 秒到达，说明上游一直在正常输出，是客户端先断的。'],
+    [''],
+    ['✕ 连接在此断开', 'old', 'other.stream_status', '结束状态已保存为 client_gone。'],
+    ['（未收到）finish_reason', 'new', T + 'finish_reason', '保存为空字符串，界面上显示“缺失”。'],
+    ['（未收到）用量分片', 'new', A + 'resp.usage_chunk', '没收到用量分片，token 数是网关本地估算的。'],
+    ['（未收到）data: [DONE]', 'new', A + 'resp.done']
+  ],
+  records: [{ title: '消费日志', row: {
+    id: 918466, created_at: 1791531998, type: 2, username: 'acme-dev', token_name: 'prod-backend', model_name: 'gpt-4o-mini',
+    quota: 123, prompt_tokens: 38, completion_tokens: 402, use_time: 6, is_stream: true, channel: 12, group: 'default', ip: '',
+    request_id: '20261009154632274105eH3', upstream_request_id: 'req_27c4d9a0f6e145b3', content: '',
+    other: {
+      request_path: '/v1/chat/completions', frt: 512, model_ratio: 0.075, completion_ratio: 4, group_ratio: 1, cache_tokens: 0,
+      stream_status: { status: 'error', end_reason: 'client_gone' },
+      trace: { ms: 6204, req_bytes: 1104, resp_bytes: 30918, finish_reason: '' },
+      admin_info: { use_channel: ['12'], local_count_tokens: true, trace: {
+        attempt: 0,
+        client: { ua: 'node-fetch', content_type: 'application/json', wire_bytes: 1104 },
+        shape: { messages: 1, text_chars: 312, max_tokens: 4096, include_usage: true },
+        upstream: { status: 200, proto: 'HTTP/2.0', req_bytes: 1128, header_ms: 498, resp_id: 'chatcmpl-AV9zK4', resp_model: 'gpt-4o-mini-2024-07-18' },
+        resp: { chunks: 214, content_chars: 1206, last_chunk_ms: 6190, done: false, usage_chunk: false }
+      } }
+    } } }]
+},
+{
+  id: 'video', name: '视频输入', sub: 'OpenAI 兼容格式，带一个视频地址，发给支持视频理解的模型。',
+  reqMeta: '412 B', respMeta: '200 · 356 B',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'old', 'other.request_path'],
+    ['Authorization: Bearer sk-••••••••••••wX9f', 'old', 'token_name'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 412', 'new', A + 'client.wire_bytes'],
+    ['User-Agent: ' + UA_PY, 'new', A + 'client.ua'],
+    [''],
+    ['{'],
+    ['  "model": "qwen-vl-max",', 'old', 'model_name'],
+    ['  "stream": false,', 'old', 'is_stream'],
+    ['  "max_tokens": 512,', 'new', A + 'shape.max_tokens'],
+    ['  "messages": [', 'der', A + 'shape.messages'],
+    ['    {"role": "user", "content": ['],
+    ['      {"type": "text", "text": "这段监控视频里有没有人摔倒？"},', 'der', A + 'shape.text_chars'],
+    ['      {"type": "video_url", "video_url": {"url": "https://files.example.com/cam-03/20261009-1530.mp4"}}', 'der', A + 'shape.videos', '视频地址不保存，只记个数。视频以地址传入，请求体很小，所以从日志里看不出视频本身的大小和时长。'],
+    ['    ]}'],
+    ['  ]'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/1.1 200 OK', 'new', A + 'upstream.status'],
+    ['content-type: application/json', 'no'],
+    ['x-request-id: 6f0c2a9e-41d7-9b3a-a2c5-0e8d7f3b1c64', 'old', 'upstream_request_id'],
+    [''],
+    ['{'],
+    ['  "id": "chatcmpl-6f0c2a9e-41d7",', 'new', A + 'upstream.resp_id'],
+    ['  "model": "qwen-vl-max",', 'new', A + 'upstream.resp_model'],
+    ['  "choices": [{', 'der', A + 'resp.choices'],
+    ['    "index": 0,'],
+    ['    "message": {"role": "assistant", "content": "视频第 12 秒左右，画面右侧有一人滑倒后自行站起。"},', 'der', A + 'resp.content_chars'],
+    ['    "finish_reason": "stop"', 'new', T + 'finish_reason'],
+    ['  }],'],
+    ['  "usage": {"prompt_tokens": 6342, "completion_tokens": 31, "total_tokens": 6373}', 'old', 'prompt_tokens', '视频按帧折算成输入 token，所以输入 token 远大于文本长度。这是判断“这个请求带了视频”的旁证。'],
+    ['}']
+  ],
+  records: [{ title: '消费日志', row: {
+    id: 918490, created_at: 1791532080, type: 2, username: 'acme-dev', token_name: 'prod-backend', model_name: 'qwen-vl-max',
+    quota: 5148, prompt_tokens: 6342, completion_tokens: 31, use_time: 4, is_stream: false, channel: 33, group: 'default', ip: '',
+    request_id: '20261009154800356120gN4', upstream_request_id: '6f0c2a9e-41d7-9b3a-a2c5-0e8d7f3b1c64', content: '',
+    other: {
+      request_path: '/v1/chat/completions', model_ratio: 0.8, completion_ratio: 3, group_ratio: 1, cache_tokens: 0,
+      trace: { ms: 4388, req_bytes: 412, resp_bytes: 356, finish_reason: 'stop' },
+      admin_info: { use_channel: ['33'], trace: {
+        attempt: 0,
+        client: { ua: UA_PY, content_type: 'application/json', wire_bytes: 412, sdk_retry: 0 },
+        shape: { messages: 1, text_chars: 14, videos: 1, max_tokens: 512 },
+        upstream: { status: 200, proto: 'HTTP/1.1', req_bytes: 430, header_ms: 4301, resp_id: 'chatcmpl-6f0c2a9e-41d7', resp_model: 'qwen-vl-max' },
+        resp: { choices: 1, content_chars: 25, tool_calls: 0 }
+      } }
+    } } }]
+},
+{
+  id: 'anon', name: '令牌无效', sub: '令牌不存在，鉴权阶段直接返回 401。这个请求不属于任何用户。', respTitle: '网关响应',
+  reqMeta: '96 B', respMeta: '401 · 未识别到用户',
+  req: [
+    ['POST /v1/chat/completions HTTP/1.1', 'new', 'other.request_path'],
+    ['Authorization: Bearer sk-••••••••••••0000', 'no', '', '无效的令牌不保存，也没有可以归属的用户和令牌。'],
+    ['Content-Type: application/json', 'new', A + 'client.content_type'],
+    ['Content-Length: 96', 'new', A + 'client.wire_bytes', '鉴权在读取请求体之前就失败了，只能从请求头知道传输大小。'],
+    ['User-Agent: curl/8.9.1', 'new', A + 'client.ua'],
+    ['X-Forwarded-For: 198.51.100.77', 'new', 'ip', '未鉴权的请求没有“用户是否开启记录 IP”可依据。来源 IP 是排查扫描的唯一线索，所以这一档单独设开关且默认关闭。'],
+    [''],
+    ['{'],
+    ['  "model": "gpt-4o",', 'no', '', '请求体没有被解析，模型名记不到。'],
+    ['  "messages": [{"role": "user", "content": "hi"}]', 'no', '', '请求体没有被解析。'],
+    ['}']
+  ],
+  resp: [
+    ['HTTP/1.1 401 Unauthorized', 'new', 'other.status_code'],
+    ['Content-Type: application/json', 'no'],
+    ['X-Oneapi-Request-Id: 20261009154755019377fR1', 'new', 'request_id'],
+    [''],
+    ['{'],
+    ['  "error": {'],
+    ['    "message": "无效的令牌 (request id: 20261009154755019377fR1)",', 'new', 'content'],
+    ['    "type": "new_api_error",', 'new', 'other.error_type'],
+    ['    "param": "",', 'no'],
+    ['    "code": ""', 'no'],
+    ['  }'],
+    ['}']
+  ],
+  records: [{ title: '错误日志', newRow: true, anon: true, adminOnly: true, row: {
+    id: 918512, created_at: 1791532075, type: 5, username: '', token_name: '', model_name: '',
+    quota: 0, prompt_tokens: 0, completion_tokens: 0, use_time: 0, is_stream: false, channel: 0, group: '', ip: '198.51.100.77',
+    request_id: '20261009154755019377fR1', upstream_request_id: '', content: '无效的令牌',
+    other: {
+      request_path: '/v1/chat/completions', error_type: 'new_api_error', error_code: '', status_code: 401,
+      trace: { ms: 1, stage: 'auth' },
+      admin_info: { trace: { client: { ua: 'curl/8.9.1', content_type: 'application/json', wire_bytes: 96 } } }
+    } } }]
+}
+];
+</script>
+<script>
+const KIND = {
+  old: { label: '已保存（现有）', desc: '现在的代码已经保存，方案不改。' },
+  new: { label: '新增保存', desc: '方案新增，保存原值。' },
+  der: { label: '新增，只存统计值或字段名', desc: '正文不保存，只保存数量、长度、字段名这类不含内容的信息。' },
+  fail: { label: '失败时存上游错误原文', desc: '只在失败记录上保存上游返回的错误响应体，截断到 4 KB 并脱敏，仅 Root 可见。' },
+  no: { label: '不保存', desc: '不落库。' }
+};
+const ROLE_NAME = { user: '普通用户', admin: '管理员', root: 'Root' };
+const LEVEL_NAME = { off: '关闭', errors: '仅失败详细', all: '全部详细' };
+const STAGE = { validate: '请求校验（未到达渠道）', upstream: '上游返回错误', auth: '鉴权（未识别到用户）' };
+const LABEL = {
+  messages: '消息条数', text_chars: '文本字符数', images: '图片张数', videos: '视频个数', audios: '音频个数', files: '文件个数',
+  tools: '工具个数', tool_choice: '工具选择', max_tokens: 'max_tokens', temperature: 'temperature', response_format: '响应格式',
+  include_usage: '要求返回用量', system: '带系统提示', keys: '顶层字段名'
+};
+const CHANNEL_NAME = { 7: 'OpenAI-备', 12: 'OpenAI-主', 21: 'Anthropic-直连', 33: '阿里百炼' };
+const ORDER = ['ok', 'stream', 'video', 'retry', 'cut', 'bad', 'anon'];
+SCN.sort((x, y) => ORDER.indexOf(x.id) - ORDER.indexOf(y.id));
+
+const state = { scn: 0, role: 'admin', level: 'all', authed: true, anon: false, body: true, filter: null, sel: null, rec: null };
+let STORED = [];
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmtB = n => n == null ? '—' : n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB';
+const fmtMs = n => n == null ? '—' : n < 1000 ? n + ' ms' : (n / 1000).toFixed(2) + ' s';
+const yn = v => v === true ? '是' : v === false ? '否' : Array.isArray(v) ? v.join(', ') : v;
+const clone = v => JSON.parse(JSON.stringify(v));
+const get = (obj, path) => path.split('.').reduce((o, k) => o == null ? undefined : o[k], obj);
+const vis = path => path.startsWith('other.root_info') ? 'root' : path.startsWith('other.admin_info') ? 'admin' : 'user';
+const canSee = v => v === 'user' || (v === 'admin' && state.role !== 'user') || (v === 'root' && state.role === 'root');
+
+// 按后台设置算出实际会落库的记录：级别决定追踪字段的详略，三个开关分别决定未到达渠道的失败和上游错误原文是否保存。
+function stored(scn) {
+  return scn.records.map((r, i) => {
+    if (r.newRow && (state.level === 'off' || !(r.anon ? state.anon : state.authed))) return null;
+    const row = clone(r.row), o = row.other;
+    if ((state.level === 'off' || (state.level === 'errors' && row.type !== 5)) && o.admin_info) {
+      delete o.admin_info.trace;
+      if (!Object.keys(o.admin_info).length) delete o.admin_info;
+    }
+    if (state.level === 'off') delete o.trace;
+    if (state.level === 'off' || !state.body) delete o.root_info;
+    return Object.assign({}, r, { i, row });
+  }).filter(Boolean);
+}
+// 再按查看身份裁剪，规则与现有的 formatUserLogs / FormatAdminLogs 一致。
+function visibleRecords(scn) {
+  return stored(scn).filter(r => state.role !== 'user' || !r.adminOnly).map(r => {
+    const row = clone(r.row);
+    if (state.role !== 'root') delete row.other.root_info;
+    if (state.role === 'user') delete row.other.admin_info;
+    return Object.assign({}, r, { row });
+  });
+}
+function currentRec(scn) {
+  const recs = visibleRecords(scn);
+  return recs.find(r => r.i === state.rec) || recs[recs.length - 1];
+}
+// 一行报文在当前设置下的实际保存方式：路径在落库记录里取不到值，就是没保存。
+function eff(l) {
+  const kind = l[1];
+  if (!kind || kind === 'old' || kind === 'no' || kind === 'sep') return kind;
+  if (l[2] && !STORED.some(r => get(r.row, l[2]) !== undefined)) return 'no';
+  return kind;
+}
+
+function renderRaw(el, lines, side) {
+  el.innerHTML = lines.map((l, i) => {
+    const text = l[0] || '', kind = eff(l);
+    if (kind === 'sep') return '<div class="ln sep"><span></span><span class="t">' + esc(text) + '</span></div>';
+    if (!kind) return '<div class="ln"><span class="mk"></span><span class="t">' + (esc(text) || '&nbsp;') + '</span></div>';
+    const dim = state.filter && state.filter !== kind ? ' dim' : '';
+    const sel = state.sel && state.sel.side === side && state.sel.i === i ? ' sel' : '';
+    return '<button type="button" class="ln k-' + kind + dim + sel + '" data-side="' + side + '" data-i="' + i + '" title="' + esc(KIND[kind].label) +
+      '"><span class="mk"></span><span class="t">' + esc(text) + '</span></button>';
+  }).join('');
+}
+
+function jsonLines(val, path, depth, key, last, rec, out) {
+  const pad = '  '.repeat(depth);
+  const k = key != null ? '<span class="jk">"' + esc(key) + '"</span>: ' : '';
+  const comma = last ? '' : ',';
+  let cls = '';
+  if (path.startsWith('other.root_info')) cls = ' fail';
+  else if (path && (rec.newRow || /(^|\.)trace(\.|$)/.test(path) || (rec.newPaths || []).includes(path))) cls = ' new';
+  const p = state.sel && state.sel.path;
+  if (p && path && (path === p || path.startsWith(p + '.'))) cls += ' hit';
+  const line = body => out.push('<div class="jl' + cls + '">' + pad + body + '</div>');
+  const flat = Array.isArray(val) && val.every(v => typeof v !== 'object');
+  if (val && typeof val === 'object' && !flat) {
+    const arr = Array.isArray(val), keys = Object.keys(val);
+    line(k + (arr ? '[' : '{'));
+    keys.forEach((kk, i) => jsonLines(val[kk], path ? path + '.' + kk : kk, depth + 1, arr ? null : kk, i === keys.length - 1, rec, out));
+    line((arr ? ']' : '}') + comma);
+  } else {
+    line(k + esc(JSON.stringify(val)) + comma);
+  }
+}
+
+// 当前场景在这组设置或这个身份下没有可见记录时，说明原因。
+function missingReason(scn) {
+  if (!STORED.length) {
+    const anon = scn.records[0].anon;
+    if (state.level === 'off') return '请求追踪级别为“关闭”，行为与现在一致：这次失败只写本地文件日志，不进 logs 表。';
+    return '“' + (anon ? '记录未鉴权的失败' : '记录未到达渠道的失败') + '”开关已关闭，这次失败只写本地文件日志，不进 logs 表。在上面的后台设置里打开它即可看到记录。';
+  }
+  return '这条记录不属于任何用户，只有管理员和 Root 能看到。';
+}
+
+function renderRecords(scn) {
+  const recs = visibleRecords(scn);
+  let html = recs.map(r => {
+    const out = [];
+    jsonLines(r.row, '', 0, null, true, r, out);
+    const badge = r.newRow ? '<span class="tag new">整条新增</span>' : r.adminOnly ? '<span class="tag plain">仅管理员可见</span>' : '';
+    const note = r.newRow ? '<p class="note">现在这类失败只写本地文件日志，不进 logs 表。用的全是 logs 表现有的列，不改表结构。</p>' : '';
+    return '<div class="pane"><div class="pane-h"><span>' + esc(r.title) + '</span>' + badge + '</div>' + note + '<div class="code json">' + out.join('') + '</div></div>';
+  }).join('');
+  if (!recs.length) html = '<div class="pane"><p class="note">' + missingReason(scn) + '</p></div>';
+  else if (state.role === 'user' && STORED.some(r => r.adminOnly)) {
+    html += '<div class="pane"><p class="note">普通用户只看到同一个请求 ID 的最后一条记录。失败的中间尝试只对管理员显示，这是现有行为。</p></div>';
+  }
+  $('records').innerHTML = html;
+  document.querySelectorAll('#records .json').forEach(box => {
+    const hit = box.querySelector('.hit');
+    if (hit) box.scrollTop = Math.max(0, hit.offsetTop - box.offsetTop - box.clientHeight / 3);
+  });
+}
+
+function renderInsp(scn) {
+  const s = state.sel;
+  if (!s) { $('insp').innerHTML = '<dt>提示</dt><dd>点上面任意一行带色块的报文，查看它保存到哪里、谁能看到。</dd>'; return; }
+  const l = scn[s.side][s.i], kind = eff(l), path = l[2] || '';
+  let rows = '<dt>保存方式</dt><dd><span class="chip k-' + kind + '"><span class="dot k-' + kind + '"></span>' + KIND[kind].label + '</span>' +
+    (kind !== l[1] ? ' 按当前的后台设置不保存；设置允许时是“' + KIND[l[1]].label + '”。' : '') + '</dd>';
+  if (path && kind !== 'no') {
+    const v = vis(path);
+    const rec = STORED.find(r => get(r.row, path) !== undefined);
+    let val = JSON.stringify(get(rec.row, path));
+    if (val.length > 140) val = val.slice(0, 140) + '…';
+    rows += '<dt>保存位置</dt><dd><code>logs.' + esc(path) + '</code></dd><dt>本例的值</dt><dd><code>' + esc(val) + '</code></dd>';
+    rows += '<dt>谁能看到</dt><dd>' + (v === 'user' ? '用户本人、管理员、Root' : v === 'admin' ? '管理员、Root' : '仅 Root') +
+      (canSee(v) ? '' : '。当前是' + ROLE_NAME[state.role] + '视角，下方记录里看不到这个字段。') + '</dd>';
+  }
+  rows += '<dt>说明</dt><dd>' + esc(l[3] || KIND[l[1]].desc) + '</dd>';
+  $('insp').innerHTML = rows;
+}
+
+function renderTable() {
+  const admin = state.role !== 'user';
+  const cur = currentRec(SCN[state.scn]);
+  const head = '<thead><tr><th>时间</th>' + (admin ? '<th>渠道</th><th>用户</th>' : '') + '<th>令牌</th><th>模型</th><th>流</th><th>Tokens</th><th>花费</th><th>耗时</th><th>详情</th></tr></thead>';
+  const rows = [];
+  SCN.forEach((scn, si) => visibleRecords(scn).forEach(r => {
+    const row = r.row, o = row.other;
+    const sel = !!cur && si === state.scn && r.i === cur.i;
+    const time = new Date(row.created_at * 1000).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+    const timing = (row.is_stream ? '首字 ' + fmtMs(o.frt) + ' · ' : '') + row.use_time + ' s';
+    const detail = row.type === 5 ? '<span class="tag bad">错误</span> ' + esc(row.content.slice(0, 34)) + (row.content.length > 34 ? '…' : '') : '点击查看';
+    rows.push('<tr tabindex="0"' + (row.type === 5 ? ' class="err"' : '') + ' data-scn="' + si + '" data-rec="' + r.i + '" aria-selected="' + sel + '"><td class="mono">' + time + '</td>' +
+      (admin ? '<td>' + (row.channel ? '#' + row.channel : '—') + '</td><td>' + (esc(row.username) || '—') + '</td>' : '') +
+      '<td>' + (esc(row.token_name) || '—') + '</td><td>' + (esc(row.model_name) || '—') + '</td><td>' + (row.is_stream ? '流' : '非流') + '</td><td>' +
+      row.prompt_tokens + ' / ' + row.completion_tokens + '</td><td>$' + (row.quota / 500000).toFixed(4) + '</td><td>' + timing + '</td><td>' + detail + '</td></tr>');
+  }));
+  $('tbl').innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+  $('tbl-meta').textContent = rows.length + ' 条 · ' + ROLE_NAME[state.role] + '视角 · 列与现在一致';
+}
+
+// 详情区按 new-api 现有的 details-dialog.tsx 绘制：顶部无边框的概览行，其后是「小标题 + 浅色边框盒子」分区，全部由标签/值行组成。
+function renderDetail(scn) {
+  const cur = currentRec(scn);
+  if (!cur) {
+    $('detail').innerHTML = '<div class="empty"><b>日志页里没有这条请求</b><p>' + missingReason(scn) + '</p></div>';
+    $('d-type').innerHTML = '';
+    $('d-meta').textContent = ROLE_NAME[state.role] + '视角 · 追踪级别：' + LEVEL_NAME[state.level];
+    return;
+  }
+  const row = cur.row, o = row.other, t = o.trace || {}, admin = state.role !== 'user';
+  const a = o.admin_info && o.admin_info.trace, root = o.root_info, isErr = row.type === 5;
+  const dot = '<span class="nd" title="新增"></span>';
+  const kv = (k, v, isNew, plain) => '<div class="row"><span>' + k + (isNew ? dot : '') + '</span><span' + (plain ? '' : ' class="mono"') + '>' + v + '</span></div>';
+  const sec = (label, body, isNew, danger) => '<div class="dsec' + (danger ? ' danger' : '') + '"><label>' + label + (isNew ? ' <span class="tag new">新增</span>' : '') + '</label><div class="dbox">' + body + '</div></div>';
+  const usd = n => '$' + +n.toFixed(6);
+  const missing = '<span class="tag warn">未收到</span>';
+
+  let ov = kv('请求 ID', esc(row.request_id));
+  if (row.upstream_request_id) ov += kv('上游请求 ID', esc(row.upstream_request_id));
+  if (admin && row.channel > 0) ov += kv('渠道', row.channel + ' <span class="mut">(' + CHANNEL_NAME[row.channel] + ')</span>');
+  if (admin && o.admin_info && o.admin_info.use_channel) ov += kv('重试链路', o.admin_info.use_channel.join(' → '));
+  if (row.token_name) ov += kv('令牌', esc(row.token_name));
+  if (row.group) ov += kv('分组', esc(row.group));
+  if (admin && row.ip) ov += kv('IP 地址', esc(row.ip));
+  const frt = row.is_stream && o.frt > 0 ? ' (FRT: ' + fmtMs(o.frt) + ')' : '';
+  if (t.ms != null) ov += kv('响应时间', '<b>' + fmtMs(t.ms) + '</b>' + frt, true, true);
+  else if (row.use_time > 0) ov += kv('响应时间', '<b>' + row.use_time + ' s</b>' + frt, false, true);
+  let html = '<div class="ov">' + ov + '</div>';
+
+  if (admin) html += sec('请求转换', kv('路径', esc(o.request_path)) + '<div class="row"><span></span><span>原生格式</span></div>');
+
+  if (isErr) {
+    let e = kv('状态码', o.status_code, true);
+    if (o.error_code) e += kv('错误码', esc(o.error_code), true);
+    if (t.stage) e += kv('失败阶段', STAGE[t.stage] || t.stage, true, true);
+    if (a && a.upstream && a.upstream.error_type) e += kv('上游错误类型', esc(a.upstream.error_type), true);
+    html += sec('错误信息', e, true, true);
+  }
+
+  let req = '';
+  if (t.req_bytes != null) req += kv('请求体大小', fmtB(t.req_bytes) + (a && a.client.content_encoding ? ' <span class="mut">(' + esc(a.client.content_encoding) + ' 传输 ' + fmtB(a.client.wire_bytes) + ')</span>' : ''));
+  else if (a) req += kv('传输大小', fmtB(a.client.wire_bytes));
+  if (a) {
+    if (a.upstream) req += kv('发往上游', fmtB(a.upstream.req_bytes));
+    Object.keys(a.shape || {}).forEach(k => { req += kv(LABEL[k] || k, esc(yn(a.shape[k]))); });
+    req += kv('User-Agent', esc(a.client.ua));
+    if (a.client.sdk_retry != null) req += kv('客户端重试', a.client.sdk_retry + ' 次');
+    Object.keys(a.client.headers || {}).forEach(h => { req += kv(esc(h), esc(a.client.headers[h])); });
+  }
+  if (req) html += sec('请求信息', req, true);
+
+  if (a && a.upstream) {
+    const up = a.upstream, chain = STORED.filter(r => r.row.other.trace);
+    let u = '', off = 0;
+    if (chain.length > 1) chain.forEach((r, idx) => {
+      const ro = r.row.other, own = idx === chain.length - 1 ? ro.trace.ms - off : ro.trace.ms;
+      off += own;
+      u += kv('第 ' + (idx + 1) + ' 次尝试', '#' + r.row.channel + ' · ' + (ro.status_code || 200) + ' · ' + fmtMs(own));
+    });
+    u += kv('状态', up.status + ' · ' + esc(up.proto)) + kv('响应头耗时', fmtMs(up.header_ms));
+    if (up.resp_id) u += kv('响应 ID', esc(up.resp_id));
+    if (up.resp_model) u += kv('实际模型', esc(up.resp_model));
+    if (up.fingerprint) u += kv('指纹', esc(up.fingerprint));
+    html += sec('上游响应', u, true);
+  }
+
+  if (!isErr && t.resp_bytes != null) {
+    let rs = kv('响应体大小', fmtB(t.resp_bytes)) + kv('结束原因', t.finish_reason ? esc(t.finish_reason) : '<span class="tag warn">缺失</span>');
+    if (a && a.resp) {
+      const r = a.resp;
+      rs += kv('回复字符数', r.content_chars);
+      if (r.tool_calls != null) rs += kv('工具调用数', r.tool_calls);
+      if (r.reasoning_tokens != null) rs += kv('推理 Tokens', r.reasoning_tokens);
+      if (row.is_stream) {
+        rs += kv('分片数', r.chunks) + kv('末片到达', fmtMs(r.last_chunk_ms)) + kv('结束标记', r.done ? '已收到' : missing, false, true);
+        if (r.usage_chunk != null) rs += kv('用量分片', r.usage_chunk ? '已收到' : missing, false, true);
+      }
+    }
+    html += sec('响应信息', rs, true);
+  }
+
+  if (root && root.upstream_error_body) {
+    html += sec('Root 诊断', kv('上游错误原文', '<span class="tag plain">已脱敏</span> <span class="tag plain">前 4 KB</span>', true, true) + '<pre class="snip">' + esc(root.upstream_error_body) + '</pre>');
+  }
+
+  if (row.prompt_tokens > 0 || row.completion_tokens > 0) {
+    let tk = kv('输入 Tokens', row.prompt_tokens.toLocaleString()) + kv('输出 Tokens', row.completion_tokens.toLocaleString());
+    if (o.cache_tokens > 0) tk += kv('缓存读取', o.cache_tokens.toLocaleString());
+    html += sec('Token 明细', tk);
+  }
+
+  if (row.type === 2) {
+    const base = o.model_ratio * 2;
+    let b = kv('计费模式', '按量计费', false, true) + kv('输入', usd(base) + '/M') + kv('输出', usd(base * o.completion_ratio) + '/M') + kv('分组倍率', o.group_ratio.toFixed(4) + 'x');
+    if (o.claude && o.cache_tokens > 0) b += kv('缓存读取', usd(base * o.cache_ratio) + '/M');
+    if (admin) b += kv('计费路径', o.admin_info && o.admin_info.local_count_tokens ? '本地计费' : '上游返回', false, true);
+    html += sec('计费详情', b + kv('总花费', usd(row.quota / 500000)));
+  }
+
+  if (o.stream_status && o.stream_status.status !== 'ok') {
+    html += sec('流状态', kv('状态', '<span class="tag bad">' + esc(o.stream_status.status) + '</span>', false, true) + kv('结束原因', esc(o.stream_status.end_reason), false, true));
+  }
+
+  if (row.content) html += '<div class="dsec"><label>内容</label><div class="dbox"><p class="ctt">' + esc(row.content) + '</p></div></div>';
+
+  $('detail').innerHTML = html;
+  $('d-type').innerHTML = isErr ? '<span class="tag bad">错误</span>' : '<span class="tag ok">消费</span>';
+  $('d-meta').textContent = cur.title + ' · ' + ROLE_NAME[state.role] + '视角 · 追踪级别：' + LEVEL_NAME[state.level] + ' · 蓝点和“新增”是这次要加的内容';
+}
+
+function render() {
+  const scn = SCN[state.scn];
+  STORED = stored(scn);
+  const press = (sel, test) => document.querySelectorAll(sel).forEach((b, i) => b.setAttribute('aria-pressed', test(b, i)));
+  press('#scn button', (b, i) => i === state.scn);
+  press('#role button', b => b.dataset.role === state.role);
+  press('#lvl button', b => b.dataset.level === state.level);
+  press('#legend button', b => b.dataset.kind === state.filter);
+  ['authed', 'anon', 'body'].forEach(k => { $('c-' + k).checked = state[k]; $('c-' + k).disabled = state.level === 'off'; });
+  $('scn-sub').textContent = scn.sub;
+  $('req-meta').textContent = scn.reqMeta;
+  $('resp-title').textContent = scn.respTitle || '上游响应';
+  $('resp-meta').textContent = scn.respMeta;
+  renderRaw($('req'), scn.req, 'req');
+  renderRaw($('resp'), scn.resp, 'resp');
+  renderInsp(scn);
+  renderRecords(scn);
+  renderTable();
+  renderDetail(scn);
+}
+
+$('scn').innerHTML = SCN.map((s, i) => '<button type="button" data-scn="' + i + '">' + s.name + '</button>').join('');
+$('role').innerHTML = Object.keys(ROLE_NAME).map(r => '<button type="button" data-role="' + r + '">' + ROLE_NAME[r] + '</button>').join('');
+$('lvl').innerHTML = Object.keys(LEVEL_NAME).map(l => '<button type="button" data-level="' + l + '">' + LEVEL_NAME[l] + '</button>').join('');
+$('legend').innerHTML = Object.keys(KIND).map(k => '<button type="button" class="chip k-' + k + '" data-kind="' + k + '"><span class="dot k-' + k + '"></span>' + KIND[k].label + '</button>').join('');
+
+function pickRow(tr) {
+  state.scn = +tr.dataset.scn; state.rec = +tr.dataset.rec; state.sel = null;
+  render();
+  const again = document.querySelector('#tbl tr[aria-selected="true"]');
+  if (again) again.focus({ preventScroll: true });
+}
+$('app').addEventListener('click', e => {
+  const b = e.target.closest('button, tr[data-scn]');
+  if (!b) return;
+  if (b.matches('tr')) return pickRow(b);
+  if (b.dataset.scn != null) { state.scn = +b.dataset.scn; state.rec = null; state.sel = null; }
+  else if (b.dataset.role) state.role = b.dataset.role;
+  else if (b.dataset.level) state.level = b.dataset.level;
+  else if (b.dataset.kind) state.filter = state.filter === b.dataset.kind ? null : b.dataset.kind;
+  else if (b.dataset.side) state.sel = { side: b.dataset.side, i: +b.dataset.i, path: SCN[state.scn][b.dataset.side][+b.dataset.i][2] || '' };
+  else return;
+  render();
+  if (b.dataset.side) { const s = document.querySelector('.ln.sel'); if (s) s.focus({ preventScroll: true }); }
+});
+$('tbl').addEventListener('keydown', e => {
+  const tr = e.target.closest('tr[data-scn]');
+  if (tr && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); pickRow(tr); }
+});
+['authed', 'anon', 'body'].forEach(k => $('c-' + k).addEventListener('change', e => { state[k] = e.target.checked; render(); }));
+render();
+</script>
+</body>
+</html>
