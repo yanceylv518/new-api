@@ -48,6 +48,23 @@ func TestExtractSeedanceAssetIDsFromJSONHandlesEscapedSlashes(t *testing.T) {
 	assert.Contains(t, string(rewritten), "asset://remote-image")
 }
 
+func TestSeedanceAssetEscapingCannotBypassOwnershipMapping(t *testing.T) {
+	for _, reference := range []string{`asset://victim`, `\u0061sset://victim`, `ASSET://victim`, `\u0061\u0073\u0073\u0065\u0074\u003a\/\/victim`} {
+		t.Run(reference, func(t *testing.T) {
+			raw := []byte(`{"content":[{"image_url":{"url":"` + reference + `"}}]}`)
+			ids, err := extractSeedanceAssetIDsFromJSON(raw)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"victim"}, ids)
+			_, _, err = rewriteSeedanceJSON(raw, nil, map[string]string{})
+			assert.ErrorIs(t, err, ErrInvalidSeedanceAssetRequest)
+			rewritten, changed, err := rewriteSeedanceJSON(raw, nil, map[string]string{"victim": "authorized"})
+			require.NoError(t, err)
+			assert.True(t, changed)
+			assert.Contains(t, string(rewritten), "asset://authorized")
+		})
+	}
+}
+
 func TestRewriteSeedanceJSONRemapsMediaAndPreservesUnrelatedValues(t *testing.T) {
 	raw := []byte(`{"model":"doubao-seedance-2-0-fast-260128","seed":18446744073709551615,"prompt":"keep asset://remote-old as text","content":[{"type":"image_url","image_url":{"url":"asset://remote-old"}}]}`)
 	previous := map[string]string{"local-image": "remote-old"}

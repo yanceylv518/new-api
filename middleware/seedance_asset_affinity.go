@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,10 +57,10 @@ func seedanceAssetJSONContainer(name string) bool {
 
 func appendSeedanceAssetReference(raw string, ids *[]string, seen map[string]struct{}) error {
 	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, seedanceAssetReferencePrefix) {
+	if len(raw) < len(seedanceAssetReferencePrefix) || !strings.EqualFold(raw[:len(seedanceAssetReferencePrefix)], seedanceAssetReferencePrefix) {
 		return nil
 	}
-	assetID := strings.TrimPrefix(raw, seedanceAssetReferencePrefix)
+	assetID := raw[len(seedanceAssetReferencePrefix):]
 	if assetID == "" || len(assetID) > 128 || strings.IndexFunc(assetID, func(r rune) bool { return r <= ' ' }) >= 0 {
 		return fmt.Errorf("%w: malformed reference", ErrInvalidSeedanceAssetRequest)
 	}
@@ -103,9 +102,7 @@ func collectSeedanceAssetReferences(value any, mediaField bool, ids *[]string, s
 }
 
 func extractSeedanceAssetIDsFromJSON(raw []byte) ([]string, error) {
-	if !bytes.Contains(raw, []byte("asset:")) {
-		return nil, nil
-	}
+	// 归属校验必须读取解码后的值，原始字节预筛选会漏掉 Unicode 转义。
 	var value any
 	if err := common.Unmarshal(raw, &value); err != nil {
 		return nil, err
@@ -188,10 +185,10 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 		if err != nil {
 			return fmt.Errorf("%w: failed to inspect references: %v", ErrInvalidSeedanceAssetRequest, err)
 		}
-		if len(assetIDs) == 0 {
-			return nil
-		}
 		common.SetContextKey(c, constant.ContextKeySeedanceAssetReferences, assetIDs)
+	}
+	if len(assetIDs) == 0 {
+		return nil
 	}
 	if !service.SupportsSeedanceAssets(channel) {
 		return fmt.Errorf("%w: selected channel does not support Seedance assets", ErrInvalidSeedanceAssetRequest)
@@ -314,7 +311,7 @@ func rewriteSeedanceRequestValue(value any, mediaField, jsonContainer bool, prev
 			return rewritten, err
 		}
 		trimmed := strings.TrimSpace(current)
-		if jsonContainer && strings.Contains(trimmed, "asset:") && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		if jsonContainer && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
 			rewritten, changed, err := rewriteSeedanceJSON([]byte(trimmed), previousMapping, newMapping)
 			if err != nil {
 				return nil, err
@@ -449,10 +446,11 @@ func rewriteSeedanceJSONValue(raw json.RawMessage, mediaField bool, previousMapp
 }
 
 func rewriteSeedanceAssetReference(value string, previousMapping, newMapping map[string]string) (string, bool, error) {
-	if !strings.HasPrefix(value, seedanceAssetReferencePrefix) {
+	raw := strings.TrimSpace(value)
+	if len(raw) < len(seedanceAssetReferencePrefix) || !strings.EqualFold(raw[:len(seedanceAssetReferencePrefix)], seedanceAssetReferencePrefix) {
 		return value, false, nil
 	}
-	assetID := strings.TrimPrefix(value, seedanceAssetReferencePrefix)
+	assetID := raw[len(seedanceAssetReferencePrefix):]
 	localID := assetID
 	for candidateLocalID, previousRemoteID := range previousMapping {
 		if previousRemoteID == assetID {
