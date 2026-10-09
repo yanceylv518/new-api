@@ -35,7 +35,7 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 		return nil, fmt.Errorf("native proxy base URL is empty")
 	}
 	requestContext.RequestBody = jsonValue(requestContext.RequestBody)
-	hookContext := requestContext.JSValue()
+	hookContext := requestContext.JSValueFor(a.plugin.Meta)
 	hookContext["requestBody"] = requestContext.RequestBody
 	hookContext["model"] = modelName
 	hookContext["upstreamModel"] = upstreamModel
@@ -43,12 +43,8 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 	if err := a.applyUpstreamCredentials(hookContext, channelType, key, proxy); err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(ctx, "buildNativeRequest", hookContext)
+	descriptor, err := a.requestDescriptor(ctx, "buildNativeRequest", hookContext)
 	if err != nil {
-		return nil, err
-	}
-	var descriptor requestDescriptor
-	if err = convert(value, &descriptor); err != nil {
 		return nil, err
 	}
 	if descriptor.Credentialless || (descriptor.BodyType != "" && strings.ToLower(strings.TrimSpace(descriptor.BodyType)) != "json") || len(descriptor.Parts) > 0 {
@@ -63,11 +59,15 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 
 	var body io.Reader
 	if descriptor.Body != nil {
-		encoded, marshalErr := common.Marshal(descriptor.Body)
-		if marshalErr != nil {
-			return nil, fmt.Errorf("native proxy request body is invalid")
+		if descriptor.BodyText != nil {
+			body = bytes.NewReader(descriptor.BodyText)
+		} else {
+			encoded, marshalErr := common.Marshal(descriptor.Body)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("native proxy request body is invalid")
+			}
+			body = bytes.NewReader(encoded)
 		}
-		body = bytes.NewReader(encoded)
 	}
 	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
 	if method == "" {

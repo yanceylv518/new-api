@@ -8,17 +8,17 @@ type TaskPluginError struct {
 }
 
 // TaskView 是唯一暴露给 JavaScript 插件的持久化任务形状。
-// 它排除归属、渠道、额度、Properties 和上游私有标识，但保留任务动作以便
-// 原生查询在任务尚未完成时仍能还原正确的任务类型。
+// 它排除归属、渠道、额度和上游私有标识；Action 保留原生任务类型。
+// 字段按 JSON 名排序，使有序 JSON 与原有 map 编码保持一致。
 type TaskView struct {
-	TaskID     string `json:"task_id"`
-	Platform   string `json:"platform"`
 	Action     string `json:"action"`
-	Status     string `json:"status"`
-	Progress   string `json:"progress"`
-	FailReason string `json:"fail_reason"`
 	CreatedAt  int64  `json:"created_at"`
-	UpdatedAt  int64  `json:"updated_at,omitempty"`
-	FinishedAt int64  `json:"finished_at,omitempty"`
 	Data       any    `json:"data,omitempty"`
+	FailReason string `json:"fail_reason"`
+	FinishedAt int64  `json:"finished_at,omitempty"`
+	Platform   string `json:"platform"`
+	Progress   string `json:"progress"`
+	Status     string `json:"status"`
+	TaskID     string `json:"task_id"`
+	UpdatedAt  int64  `json:"updated_at,omitempty"`
 }

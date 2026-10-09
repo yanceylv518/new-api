@@ -217,8 +217,8 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 
 func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[string]string) error {
 	// 插件在分配渠道前已解码请求，必须同步快照，避免驱动或二次解码再次发送原账号的 ID。
-	snapshots := make(map[string]any, 3)
-	for _, key := range []string{"task_request", pluginruntime.ContextKeyRouteRequest, pluginruntime.ContextKeyProtocolRequest} {
+	snapshots := make(map[string]any, 4)
+	for _, key := range []string{"task_request", pluginruntime.ContextKeyRouteRequest, pluginruntime.ContextKeyProtocolRequest, pluginruntime.ContextKeyRequestBodyText} {
 		value, exists := c.Get(key)
 		if !exists {
 			continue
@@ -226,6 +226,10 @@ func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[
 		var rewritten any
 		var err error
 		switch request := value.(type) {
+		case json.RawMessage:
+			var raw []byte
+			raw, _, err = rewriteSeedanceJSON(request, previousMapping, newMapping)
+			rewritten = json.RawMessage(raw)
 		case pluginruntime.RouteRequestContext:
 			rewritten, err = rewriteSeedanceRouteSnapshot(request, previousMapping, newMapping)
 		case pluginruntime.ProtocolRequestContext:
@@ -287,6 +291,12 @@ func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[
 
 func rewriteSeedanceRouteSnapshot(request pluginruntime.RouteRequestContext, previousMapping, newMapping map[string]string) (pluginruntime.RouteRequestContext, error) {
 	var err error
+	if len(request.BodyText) > 0 {
+		request.BodyText, _, err = rewriteSeedanceJSON(request.BodyText, previousMapping, newMapping)
+		if err != nil {
+			return request, err
+		}
+	}
 	request.Body, err = rewriteSeedanceRequestValue(request.Body, false, false, previousMapping, newMapping)
 	if err != nil {
 		return request, err
