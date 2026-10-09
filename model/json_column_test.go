@@ -2,8 +2,10 @@ package model
 
 import (
 	"database/sql/driver"
+	"encoding/json"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,8 +31,8 @@ func TestJSONColumnValuersReturnString(t *testing.T) {
 		},
 		{
 			name:   "TaskPrivateData",
-			valuer: TaskPrivateData{Key: "k"},
-			want:   `{"key":"k"}`,
+			valuer: TaskPrivateData{TokenId: 7},
+			want:   `{"token_id":7}`,
 		},
 		{
 			name:   "JSONValue",
@@ -48,6 +50,24 @@ func TestJSONColumnValuersReturnString(t *testing.T) {
 			assert.JSONEq(t, testCase.want, str)
 		})
 	}
+}
+
+func TestTaskPrivateDataEncryptsCredentialsAndRecoveryEvidence(t *testing.T) {
+	value := TaskPrivateData{Key: "fixture-upstream-key", SubmissionPending: true, SubmissionResponse: json.RawMessage(`{"body":{"id":"fixture-id"}}`), SubmissionContext: json.RawMessage(`{"image":"private-fixture-url"}`)}
+	stored, err := value.Value()
+	require.NoError(t, err)
+	text := stored.(string)
+	assert.NotContains(t, text, "fixture-upstream-key")
+	assert.NotContains(t, text, "private-fixture-url")
+	var loaded TaskPrivateData
+	require.NoError(t, loaded.Scan(stored))
+	assert.Equal(t, value.Key, loaded.Key)
+	assert.JSONEq(t, string(value.SubmissionResponse), string(loaded.SubmissionResponse))
+	assert.JSONEq(t, string(value.SubmissionContext), string(loaded.SubmissionContext))
+	old := common.CryptoSecret
+	common.CryptoSecret = "different-fixture-secret"
+	t.Cleanup(func() { common.CryptoSecret = old })
+	assert.Error(t, loaded.Scan(stored))
 }
 
 // 空值仍返回 nil,保持列的 NULL 语义。

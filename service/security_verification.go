@@ -45,6 +45,7 @@ const (
 	VerificationScopeAdminUserPasskeyReset = "admin.user.passkey.reset"
 	VerificationScopeAdminUserTwoFADisable = "admin.user.2fa.disable"
 	VerificationScopeAdminUserBindingClear = "admin.user.binding.clear"
+	VerificationScopeTaskReconcile         = "admin.task.reconcile"
 	verificationScopeAdminUserPrefix       = "admin.user."
 )
 
@@ -89,6 +90,13 @@ type AdminUserContext struct {
 type AdminUserManageContext struct {
 	UserID int    `json:"user_id"`
 	Action string `json:"action"`
+}
+
+type TaskReconciliationContext struct {
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	Before int    `json:"quota_before"`
+	After  int    `json:"quota_after"`
 }
 
 // AdminUserBindingContext names exactly one binding: a built-in binding type
@@ -207,6 +215,12 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 	case VerificationScopeAdminUserManage:
 		var context AdminUserManageContext
 		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil || context.UserID <= 0 || !slices.Contains(adminUserManageActions, context.Action) {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeTaskReconcile:
+		var context TaskReconciliationContext
+		if len(fields) != 4 || common.Unmarshal(operation.Context, &context) != nil || context.TaskID == "" || len(context.TaskID) > 191 || (context.Status != model.TaskStatusSuccess && context.Status != model.TaskStatusFailure) || context.Before < 0 || context.Before > common.MaxQuota || context.After < 0 || context.After > context.Before || (context.Status == model.TaskStatusFailure && (context.Before != 0 || context.After != 0)) {
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}
 		normalized = context
@@ -330,7 +344,10 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 		VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 		VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
-		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
+		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear, VerificationScopeTaskReconcile:
+		if scope == VerificationScopeTaskReconcile && state.Role != common.RoleRootUser {
+			return nil, ErrVerificationForbidden
+		}
 		if scope == VerificationScopeAccountDelete && state.Role == common.RoleRootUser {
 			return nil, ErrVerificationForbidden
 		}
@@ -395,7 +412,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
-				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
+				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear, VerificationScopeTaskReconcile:
 				methods[i].Available, methods[i].Reason = false, "Password authentication is disabled."
 			}
 		}

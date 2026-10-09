@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	hosttypes "github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
 )
 
 // FinalizeVideoTaskBilling 仅在主库原子结算获胜后写一次差额日志，失败不结束任务。
@@ -17,6 +19,9 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 		return false, fmt.Errorf("video task is required")
 	}
 	reserved := task.Quota
+	original := task
+	final := *task
+	task = &final
 	if len(amounts) > 0 && amounts[0] != nil {
 		task.PrivateData.DiscountAmounts = amounts[0]
 	} else if actual == 0 && task.PrivateData.DiscountAmounts != nil {
@@ -55,6 +60,7 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 		return false, err
 	}
 	if won {
+		*original = *task
 		RecordTaskPerformance(task)
 	}
 	if model.LOG_DB != model.DB {
@@ -74,28 +80,26 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 	return won, nil
 }
 
-// atomicVideoSettlementEnabled 仅覆盖本次审查的两个插件；传统适配器继续使用既有生命周期。
+// 所有插件的终态与资金一起提交，不能先结束轮询再单独退款。
 func atomicVideoSettlementEnabled(adaptor TaskPollingAdaptor) bool {
-	identity, ok := adaptor.(interface{ TaskPluginKey() string })
-	return ok && (identity.TaskPluginKey() == "doubao" || identity.TaskPluginKey() == "hailuo")
-}
-
-// 超时清理没有适配器实例，优先使用冻结插件身份，旧记录按其历史平台识别。
-func atomicVideoTask(task *model.Task) bool {
-	if execution := task.PrivateData.Execution; execution != nil && execution.TaskPlugin != nil {
-		key := execution.TaskPlugin.Key
-		return key == "doubao" || key == "hailuo"
-	}
-	switch task.Platform {
-	case "doubao", "hailuo", "35", "45", "54":
-		return true
-	default:
-		return false
-	}
+	return adaptor != nil
 }
 
 // settleAtomicVideoTask 在写终态前计算金额，表达式错误保留预扣；主库失败则由下一轮重试。
-func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, previous model.TaskStatus, result *relaycommon.TaskInfo) error {
+func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, previous model.TaskStatus, result *relaycommon.TaskInfo) (err error) {
+	original := *task
+	defer func() {
+		if err != nil {
+			*task = original
+			task.Status = previous
+			task.PrivateData.ReconciliationRequired = true
+			task.PrivateData.ReconciliationReason = "task settlement is pending; reserved quota retained"
+			task.PrivateData.NextPollAt = time.Now().Unix() + 30
+			if _, saveErr := task.UpdateWithStatus(previous); saveErr != nil {
+				logger.LogWarn(ctx, "persist pending settlement failed: "+saveErr.Error())
+			}
+		}
+	}()
 	actual, reason := task.Quota, "video task settlement"
 	var clamp *common.QuotaClamp
 	var amounts *hosttypes.DiscountAmounts
@@ -106,13 +110,14 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 	case bc != nil && bc.TieredSnapshot != nil:
 		priced, facts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, result.UsageFacts)
 		if err != nil {
-			logger.LogWarn(ctx, fmt.Sprintf("task %s pricing failed; retaining reserve: %v", task.TaskID, err))
+			return fmt.Errorf("task %s pricing failed; retaining reserve: %w", task.TaskID, err)
 		} else {
 			before, after := priced.ActualQuotaAfterGroup, priced.ActualQuotaAfterGroup
 			if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
+				value := decimal.NewFromFloat(priced.ActualQuotaBeforeGroup).Mul(decimal.NewFromFloat(bc.TieredSnapshot.GroupRatio))
 				var beforeClamp *common.QuotaClamp
-				before, beforeClamp = common.QuotaRoundChecked(priced.ActualQuotaBeforeGroup * bc.TieredSnapshot.GroupRatio)
-				after, clamp = common.QuotaRoundChecked(float64(before) * price.UserModelDiscountMultiplier())
+				before, beforeClamp = common.QuotaRoundChecked(value.InexactFloat64())
+				after, clamp = common.QuotaDiscountDecimalChecked(value, price.UserModelDiscountMultiplier())
 				if before > 0 && after == 0 {
 					after = 1
 				}
@@ -124,7 +129,11 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 			if clamp == nil {
 				clamp = priced.Clamp
 			}
-			bc.TieredSnapshot.UsageFacts, bc.TieredSnapshot.EstimatedTier = facts, priced.MatchedTier
+			billing := *bc
+			snapshot := *bc.TieredSnapshot
+			snapshot.UsageFacts, snapshot.EstimatedTier = facts, priced.MatchedTier
+			billing.TieredSnapshot = &snapshot
+			task.PrivateData.BillingContext = &billing
 		}
 	case bc != nil && bc.PerCallBilling:
 		// 按次价格在提交时已固定，终态只提交状态。
@@ -149,6 +158,6 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 			}
 		}
 	}
-	_, err := FinalizeVideoTaskBilling(ctx, task, previous, actual, reason, clamp, amounts)
+	_, err = FinalizeVideoTaskBilling(ctx, task, previous, actual, reason, clamp, amounts)
 	return err
 }

@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -459,30 +461,126 @@ func RelayTask(c *gin.Context) {
 	presentTaskSubmission(c, outcome)
 }
 
-// executeTaskSubmission owns the retry, billing, and persistence lifecycle.
-// It deliberately performs no client response writes so JSON and protocol
-// presenters share the same durable task barrier. Its cancellation semantics
-// come from c.Request.Context: native task endpoints use the client context,
-// while the Responses bridge supplies an independently bounded context.
+// executeTaskSubmission 统一重试、账务和持久化，展示层仅使用已保存结果。
+// 发起上游提交前接管有界上下文，客户端断连不能丢失已受理任务。
 func executeTaskSubmission(c *gin.Context, relayInfo *relaycommon.RelayInfo) (*taskSubmissionOutcome, *taskdto.TaskError) {
 	return executeTaskSubmissionWith(c, relayInfo, relay.RelayTaskSubmit)
 }
 
 type taskSubmitAttempt func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError)
 
+func newSubmittedTask(c *gin.Context, info *relaycommon.RelayInfo, result *relay.TaskSubmitResult) *model.Task {
+	task := model.InitTask(result.Platform, info)
+	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
+	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.DiscountAmounts = info.PriceData.DiscountAmounts
+	task.PrivateData.BillingContext = &model.TaskBillingContext{
+		ModelPrice: info.PriceData.ModelPrice, GroupRatio: info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio: info.PriceData.ModelRatio, OtherRatios: buildTaskBillingOtherRatios(&info.PriceData),
+		OriginModelName: info.OriginModelName,
+		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice,
+		TieredSnapshot:  info.TieredBillingSnapshot,
+	}
+	task.Quota, task.Data, task.Action = result.Quota, result.TaskData, info.Action
+	task.PrivateData.PluginState = result.PluginState
+	return task
+}
+
 func executeTaskSubmissionWith(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
-) (*taskSubmissionOutcome, *taskdto.TaskError) {
+) (_ *taskSubmissionOutcome, taskErr *taskdto.TaskError) {
 	policy := service.RequestPolicy(c)
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
 	var result *relay.TaskSubmitResult
-	var taskErr *taskdto.TaskError
 	durable := false
 	stage := "start"
+	var staged *model.Task
+	clientRequest := c.Request
+	var cancelSubmission context.CancelFunc
 	defer func() {
+		if cancelSubmission != nil {
+			cancelSubmission()
+		}
+		c.Request = clientRequest
+		c.Set("task_submission_start", nil)
+	}()
+	c.Set("task_submission_start", func(platform constant.TaskPlatform) error {
+		if clientRequest.Context().Err() != nil {
+			return clientRequest.Context().Err()
+		}
+		if cancelSubmission == nil {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(clientRequest.Context()), 5*time.Minute)
+			cancelSubmission = cancel
+			c.Request = clientRequest.Clone(ctx)
+		}
+		staged = newSubmittedTask(c, relayInfo, &relay.TaskSubmitResult{Platform: platform, Quota: relayInfo.PriceData.Quota})
+		staged.Status = model.TaskStatusUnknown
+		staged.PrivateData.SubmissionPending = true
+		staged.PrivateData.InitialAccountingPending = true
+		staged.PrivateData.NextPollAt = time.Now().Add(5 * time.Minute).Unix()
+		staged.FailReason = "submission result awaiting confirmation"
+		if err := staged.InsertWithContext(c.Request.Context()); err != nil {
+			staged = nil
+			return err
+		}
+		c.Set("task_submission_rejected", false)
+		return nil
+	})
+	defer func() {
+		if !durable && staged != nil && !c.GetBool("task_submission_rejected") {
+			staged.PrivateData.NextPollAt = 0
+			staged.PrivateData.SubmissionResponse, _ = common.GetContextKeyType[json.RawMessage](c, "task_submission_response")
+			staged.PrivateData.SubmissionContext, _ = common.GetContextKeyType[json.RawMessage](c, "task_submission_context")
+			if result != nil {
+				var data any
+				if len(result.TaskData) == 0 || common.Unmarshal(result.TaskData, &data) == nil {
+					parsed := map[string]any{"taskId": result.UpstreamTaskID, "taskData": data}
+					if immediate := result.Immediate; immediate != nil {
+						parsed["immediate"] = map[string]any{"status": immediate.Status, "progress": immediate.Progress, "reason": immediate.Reason, "url": immediate.Url, "completionTokens": immediate.CompletionTokens, "totalTokens": immediate.TotalTokens}
+					}
+					if len(result.PluginState) > 0 {
+						var state any
+						if common.Unmarshal(result.PluginState, &state) == nil {
+							parsed["state"] = state
+						}
+					}
+					staged.PrivateData.SubmissionResponse, _ = common.Marshal(map[string]any{"parsed": parsed})
+				}
+				if body, exists := c.Get("task_request"); exists {
+					if encoded, err := common.Marshal(body); err == nil && len(encoded) <= 1<<20 {
+						staged.PrivateData.SubmissionContext = encoded
+					}
+				}
+			}
+			staged.PrivateData.ReconciliationRequired = true
+			staged.PrivateData.ReconciliationReason = "submission outcome is uncertain; reserved quota retained"
+			recoveryContext, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+			defer cancel()
+			if _, err := model.PersistTaskSubmission(recoveryContext, staged, false); err != nil {
+				logger.LogError(c, "persist submission recovery evidence failed: "+err.Error())
+			}
+			if relayInfo.Billing != nil {
+				if err := service.SettleBilling(c, relayInfo, staged.Quota); err != nil {
+					logger.LogError(c, "retain submission reserve failed: "+err.Error())
+				}
+			}
+			price := relayInfo.PriceData
+			relayInfo.PriceData.Quota, relayInfo.PriceData.DiscountAmounts = staged.Quota, staged.PrivateData.DiscountAmounts
+			service.LogTaskConsumption(c, relayInfo, staged)
+			relayInfo.PriceData = price
+			if taskErr != nil {
+				taskErr.Data = map[string]any{"task_id": staged.TaskID, "reconciliation_required": true}
+				taskErr.NoRetry = true
+			}
+			return
+		}
 		if !durable && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
@@ -546,6 +644,26 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil && staged != nil && c.GetBool("task_submission_rejected") {
+			if err := model.DB.WithContext(c.Request.Context()).Delete(staged).Error; err != nil {
+				taskErr.NoRetry = true
+				// 意图删除失败时保留预扣和明确拒绝证据，恢复后原子退款，不能先退款再补初始统计。
+				c.Set("task_submission_rejected", false)
+				evidence, _ := common.Marshal(map[string]any{"parsed": map[string]any{"taskId": staged.TaskID, "immediate": map[string]any{"status": model.TaskStatusFailure, "reason": "upstream rejected submission"}}})
+				c.Set("task_submission_response", json.RawMessage(evidence))
+			} else {
+				staged = nil
+			}
+		}
+		if taskErr == nil && result != nil && c.Request.Context().Err() != nil {
+			// 已受理的结果必须完成落库，不随观察者断开而全额退款。
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+			if cancelSubmission != nil {
+				cancelSubmission()
+			}
+			cancelSubmission = cancel
+			c.Request = c.Request.Clone(ctx)
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -615,29 +733,11 @@ func executeTaskSubmissionWith(
 	}
 
 	stage = "insert"
-	task := model.InitTask(result.Platform, relayInfo)
-	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
-	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
-	task.PrivateData.BillingSource = relayInfo.BillingSource
-	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
-	task.PrivateData.TokenId = relayInfo.TokenId
-	task.PrivateData.NodeName = common.NodeName
-	task.PrivateData.DiscountAmounts = relayInfo.PriceData.DiscountAmounts
-	task.PrivateData.BillingContext = &model.TaskBillingContext{
-		ModelPrice:      relayInfo.PriceData.ModelPrice,
-		GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
-		ModelRatio:      relayInfo.PriceData.ModelRatio,
-		OtherRatios:     buildTaskBillingOtherRatios(&relayInfo.PriceData),
-		OriginModelName: relayInfo.OriginModelName,
-		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
-		TieredSnapshot:  relayInfo.TieredBillingSnapshot,
+	task := newSubmittedTask(c, relayInfo, result)
+	if staged != nil {
+		task.ID, task.TaskID = staged.ID, staged.TaskID
+		task.PrivateData.InitialAccountingPending = true
 	}
-	task.Quota = result.Quota
-	task.Data = result.TaskData
-	if len(result.PluginState) > 0 {
-		task.PrivateData.PluginState = result.PluginState
-	}
-	task.Action = relayInfo.Action
 	if requestValue, exists := c.Get("task_request"); exists {
 		snapshot, snapshotErr := model.NewTaskRequestSnapshot(task, requestValue)
 		if snapshotErr != nil {
@@ -689,7 +789,24 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	var insertErr error
+	if staged == nil {
+		insertErr = task.InsertWithContext(c.Request.Context(), insertOmits...)
+	} else {
+		stored := *task
+		if stored.PrivateData.ResultDiscarded {
+			stored.Data = nil
+		}
+		var won bool
+		won, insertErr = model.PersistTaskSubmission(c.Request.Context(), &stored, true)
+		if insertErr == nil && !won {
+			insertErr = errors.New("task submission state changed")
+		}
+		if won {
+			task.PrivateData.InitialAccountingPending, task.CreatedAt = stored.PrivateData.InitialAccountingPending, stored.CreatedAt
+		}
+	}
+	if insertErr != nil {
 		common.SysError("insert task error: " + insertErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)

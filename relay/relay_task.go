@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -387,6 +388,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
+	if info.ApiKey != "" && os.Getenv("CRYPTO_SECRET") == "" && os.Getenv("SESSION_SECRET") == "" {
+		failure := service.TaskErrorWrapperLocal(errors.New("configure a persistent CRYPTO_SECRET or SESSION_SECRET before submitting tasks"), "task_encryption_not_configured", http.StatusServiceUnavailable)
+		failure.NoRetry = true
+		return nil, failure
+	}
 	if info.Billing == nil && !info.PriceData.FreeModel {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
@@ -401,17 +407,29 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 9. 发送请求
+	if value, exists := c.Get("task_submission_start"); exists {
+		if start, ok := value.(func(constant.TaskPlatform) error); ok {
+			if err := start(platform); err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "task_submission_intent_failed", http.StatusServiceUnavailable)
+			}
+		}
+	}
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
-		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
+		failure := service.TaskErrorWrapper(err, "do_request_failed", http.StatusBadGateway)
+		failure.NoRetry = true
+		return nil, failure
 	}
 	if resp == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
+		failure := service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
+		failure.NoRetry = true
+		return nil, failure
 	}
 	defer resp.Body.Close()
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
+		c.Set("task_submission_rejected", true)
 		responseBody, _ := io.ReadAll(resp.Body)
 		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
 	}
@@ -420,10 +438,13 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// task barrier and billing settlement.
 	parsed, taskErr := adaptor.ParseResponse(c, resp, info)
 	if taskErr != nil {
+		taskErr.NoRetry = true
 		return nil, taskErr
 	}
 	if parsed == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		failure := service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		failure.NoRetry = true
+		return nil, failure
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios

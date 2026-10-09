@@ -784,13 +784,14 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	require.NoError(t, model.DB.First(&reloadedLegacy, legacyTask.ID).Error)
 	require.NoError(t, model.DB.First(&reloadedModern, modernTask.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedLegacy.Status)
-	assert.EqualValues(t, model.TaskStatusFailure, reloadedModern.Status)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloadedModern.Status)
 	assert.Zero(t, reloadedLegacy.Quota)
-	assert.Zero(t, reloadedModern.Quota)
+	assert.Equal(t, modernTaskQuota, reloadedModern.Quota)
 	assert.Contains(t, reloadedLegacy.FailReason, "旧系统遗留任务")
-	assert.Contains(t, reloadedModern.FailReason, "任务超时")
-	assert.Equal(t, initialQuota+modernTaskQuota, getUserQuota(t, userID))
-	assert.Equal(t, int64(1), countLogs(t))
+	assert.Contains(t, reloadedModern.PrivateData.ReconciliationReason, "任务超时")
+	assert.True(t, reloadedModern.PrivateData.ReconciliationRequired)
+	assert.Equal(t, initialQuota, getUserQuota(t, userID))
+	assert.Zero(t, countLogs(t))
 }
 
 type scriptedPollingAdaptor struct {
@@ -863,12 +864,11 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 		wantUnchanged bool
 	}{
 		{
-			name:          "404 fails immediately and refunds",
+			name:          "404 retains reserve and retries lookup",
 			statusCode:    http.StatusNotFound,
-			wantStatus:    model.TaskStatusFailure,
-			wantRefund:    true,
-			wantReason:    "upstream task not found (HTTP 404)",
-			wantUnchanged: false,
+			wantStatus:    model.TaskStatusInProgress,
+			wantFailures:  1,
+			wantUnchanged: true,
 		},
 		{
 			name:          "401 increments without changing status",
@@ -878,14 +878,13 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			wantUnchanged: true,
 		},
 		{
-			name:          "429 reaches threshold and refunds",
+			name:          "429 threshold requires reconciliation without refund",
 			statusCode:    http.StatusTooManyRequests,
 			priorFailures: 2,
 			maxFailures:   3,
-			wantStatus:    model.TaskStatusFailure,
+			wantStatus:    model.TaskStatusInProgress,
 			wantFailures:  3,
-			wantRefund:    true,
-			wantReason:    "poll failed: transient (HTTP 429)",
+			wantUnchanged: true,
 		},
 		{
 			name:          "UNKNOWN increments",
@@ -965,6 +964,12 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 			assert.EqualValues(t, testCase.wantStatus, persisted.Status)
 			assert.Equal(t, testCase.wantFailures, persisted.PrivateData.PollFailures)
+			if testCase.wantFailures > 0 {
+				assert.Greater(t, persisted.PrivateData.NextPollAt, time.Now().Unix())
+			}
+			if testCase.maxFailures > 0 {
+				assert.True(t, persisted.PrivateData.ReconciliationRequired)
+			}
 			if testCase.wantUnchanged {
 				assert.Empty(t, persisted.FailReason)
 			}
@@ -1000,11 +1005,10 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 		wantReason   string
 	}{
 		{
-			name:       "404 fails the batch and refunds",
-			statusCode: http.StatusNotFound,
-			wantStatus: model.TaskStatusFailure,
-			wantRefund: true,
-			wantReason: "upstream task not found (HTTP 404)",
+			name:         "404 keeps the batch pending without refund",
+			statusCode:   http.StatusNotFound,
+			wantStatus:   model.TaskStatusInProgress,
+			wantFailures: 1,
 		},
 		{
 			name:         "401 increments every task",

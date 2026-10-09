@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -353,7 +354,7 @@ func TestAdminUserVerificationPolicy(t *testing.T) {
 	})
 	t.Run("a user:write token completes the deletion on its own proof", func(t *testing.T) {
 		operator, _, target := setupAdminUserTest(t)
-		require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Token{}))
+		require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Token{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
 		raw, _ := createScopedAccessToken(t, operator.Id, 0, "user:write")
 		router := newAccessTokenTestRouter()
 		response := accessTokenRequest(router, http.MethodPost, "/api/verify", raw, "", fmt.Sprintf(`{"scope":"admin.user.delete","method":"password","password":"enrollment-password","context":{"user_id":%d}}`, target.Id))
@@ -386,4 +387,52 @@ func TestAdminUserVerificationPolicy(t *testing.T) {
 		require.NoError(t, model.DB.Model(&model.AuthFlow{}).Count(&flows).Error)
 		assert.Zero(t, flows)
 	})
+}
+
+func TestTaskReconciliationRequiresBoundOwnerProofAndSettlesOnce(t *testing.T) {
+	_, identity, target := setupAdminUserTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.Channel{}, &model.Token{}, &model.UserSubscription{}, &model.VideoTaskPendingLog{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	require.NoError(t, model.DB.Model(target).Updates(map[string]any{"quota": 900, "used_quota": 100}).Error)
+	channel := model.Channel{UsedQuota: 200}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	task := model.Task{TaskID: "reconcile-fixture", UserId: target.Id, ChannelId: channel.Id, Status: model.TaskStatusUnknown, Quota: 100, PrivateData: model.TaskPrivateData{ReconciliationRequired: true, DiscountAmounts: types.NewDiscountAmounts(200, 100)}}
+	require.NoError(t, model.DB.Create(&task).Error)
+	operation := service.VerificationOperation{Scope: service.VerificationScopeTaskReconcile, Context: []byte(`{"task_id":"reconcile-fixture","status":"FAILURE","quota_before":0,"quota_after":0}`)}
+	proof := issueSecurityEnrollmentProof(t, identity, operation, service.VerificationMethodPassword)
+	request := func(role int, pat bool, body, origin, proof string) *httptest.ResponseRecorder {
+		r := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(r)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/task/reconcile-fixture/reconcile", strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Header.Set("Origin", origin)
+		c.Request.Header.Set("X-Security-Proof", proof)
+		c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+		c.Set("id", identity.UserID)
+		c.Set("role", role)
+		c.Set("use_access_token", pat)
+		c.Set("session_id", identity.SessionID)
+		c.Set("auth_version", identity.UserAuthVersion)
+		c.Set("session_version", identity.SessionVersion)
+		ReconcileTask(c)
+		return r
+	}
+	body := `{"status":"FAILURE","quota_before":0,"quota_after":0,"confirmation":"reconcile-fixture"}`
+	assert.Equal(t, 403, request(common.RoleCommonUser, false, body, "", proof).Code)
+	assert.Equal(t, 403, request(common.RoleRootUser, true, body, "", proof).Code)
+	assert.Equal(t, 403, request(common.RoleRootUser, false, body, "https://untrusted.example", proof).Code)
+	assert.Equal(t, 403, request(common.RoleRootUser, false, body, "", "").Code)
+	changed := `{"status":"SUCCESS","quota_before":80,"quota_after":40,"confirmation":"reconcile-fixture"}`
+	assert.Equal(t, 403, request(common.RoleRootUser, false, changed, "", proof).Code)
+	response := request(common.RoleRootUser, false, body, "", proof)
+	assert.Equal(t, 200, response.Code, response.Body.String())
+	require.NoError(t, model.DB.First(target, target.Id).Error)
+	assert.Equal(t, 1000, target.Quota)
+	assert.Zero(t, target.UsedQuota)
+	require.NoError(t, model.DB.First(&channel, channel.Id).Error)
+	assert.Zero(t, channel.UsedQuota)
+	assert.Equal(t, 403, request(common.RoleRootUser, false, body, "", proof).Code)
+	var logs int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeRefund).Count(&logs).Error)
+	assert.EqualValues(t, 1, logs)
 }

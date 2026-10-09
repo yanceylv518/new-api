@@ -25,6 +25,17 @@ import (
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
+	tracked := task.PrivateData.InitialAccountingPending
+	if tracked {
+		won, err := model.CommitTaskInitialAccounting(c.Request.Context(), task)
+		if err != nil {
+			logger.LogWarn(c, "initial task accounting is pending: "+err.Error())
+			return
+		}
+		if !won {
+			return
+		}
+	}
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费
@@ -94,8 +105,24 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Group:     info.UsingGroup,
 		Other:     other,
 	})
-	model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
-	model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.DiscountAmounts.ChannelQuota(info.PriceData.Quota))
+	if !tracked {
+		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
+		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.DiscountAmounts.ChannelQuota(info.PriceData.Quota))
+	}
+}
+
+func RecoverTaskInitialAccounting(ctx context.Context, task *model.Task) error {
+	if !task.PrivateData.InitialAccountingPending {
+		return nil
+	}
+	won, err := model.CommitTaskInitialAccounting(ctx, task)
+	if err != nil || !won {
+		return err
+	}
+	other := taskBillingOther(task)
+	other.SetPublic("is_task", true)
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{UserId: task.UserId, LogType: model.LogTypeConsume, Content: "task initial accounting recovered", ChannelId: task.ChannelId, ModelName: taskModelName(task), Quota: task.Quota, TokenId: task.PrivateData.TokenId, Group: task.Group, Other: other})
+	return nil
 }
 
 // ---------------------------------------------------------------------------

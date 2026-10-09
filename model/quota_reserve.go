@@ -4,12 +4,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
 )
 
 type cacheQuotaResult int
+
+var quotaCacheLastWarning atomic.Int64
+
+// 缓存故障时拒绝不安全预扣；进程内最多每30秒告警一次，避免请求量放大日志开销。
+func reportQuotaCacheUnavailable(operation string) {
+	now := time.Now().Unix()
+	previous := quotaCacheLastWarning.Load()
+	if now-previous >= 30 && quotaCacheLastWarning.CompareAndSwap(previous, now) {
+		common.SysError("quota_cache_unavailable operation=" + operation + "; refusing stale-balance fallback; verify Redis health")
+	}
+}
 
 const (
 	cacheQuotaInsufficient cacheQuotaResult = iota
@@ -196,6 +209,7 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	}
 	if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
 		// Redis启用时可能存在尚未批量落库的预扣；故障不能回退到更高的旧DB余额。
+		reportQuotaCacheUnavailable("reserve_user")
 		return false, ErrQuotaCachePending
 	}
 	if result == cacheQuotaInsufficient {
@@ -239,6 +253,7 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		}
 	}
 	if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
+		reportQuotaCacheUnavailable("reserve_token")
 		return false, ErrQuotaCachePending
 	}
 	if result == cacheQuotaInsufficient {

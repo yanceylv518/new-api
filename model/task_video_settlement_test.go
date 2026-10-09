@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
@@ -86,8 +87,14 @@ func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
 					require.NoError(t, db.Create(&User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: 900, UsedQuota: 100}).Error)
 					require.NoError(t, db.Create(&Token{Id: id, UserId: id, Key: fmt.Sprintf("audit-token-%d", id), RemainQuota: 900, UsedQuota: 100}).Error)
 					require.NoError(t, db.Create(&Channel{Id: id, UsedQuota: 100}).Error)
-					task := &Task{TaskID: fmt.Sprint(id), UserId: id, ChannelId: id, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: id}}
+					task := &Task{TaskID: fmt.Sprint(id), UserId: id, ChannelId: id, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: id, Key: "fixture-upstream-secret"}}
 					require.NoError(t, db.Create(task).Error)
+					var encrypted string
+					require.NoError(t, db.Model(&Task{}).Where("id = ?", task.ID).Select("private_data").Scan(&encrypted).Error)
+					assert.NotContains(t, encrypted, "fixture-upstream-secret")
+					var loaded Task
+					require.NoError(t, db.First(&loaded, task.ID).Error)
+					assert.Equal(t, task.PrivateData.Key, loaded.PrivateData.Key)
 					task.Status, task.Progress = TaskStatusSuccess, "100%"
 					if failTable != "" {
 						require.NoError(t, db.Callback().Update().Before("gorm:update").Register("audit_reject_settlement", func(tx *gorm.DB) {
@@ -196,13 +203,13 @@ func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
 				quota := []int{0, 50, 125}[index%3]
 				expected[owner] += quota
 				reserved[owner] += 100
-				tasks[index] = Task{TaskID: fmt.Sprintf("load-%d", index), UserId: 1000 + owner, ChannelId: 1000 + owner, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: 1000 + owner}}
+				tasks[index] = Task{TaskID: fmt.Sprintf("load-%d", index), UserId: 1000 + owner, ChannelId: 1000 + owner, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: 1000 + owner, DiscountAmounts: types.NewDiscountAmounts(200, 100)}}
 			}
 			for owner := range userCount {
 				id := 1000 + owner
 				require.NoError(t, db.Create(&User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: initialQuota - reserved[owner], UsedQuota: reserved[owner]}).Error)
 				require.NoError(t, db.Create(&Token{Id: id, UserId: id, Key: fmt.Sprintf("audit-load-token-%d", id), RemainQuota: initialQuota - reserved[owner], UsedQuota: reserved[owner]}).Error)
-				require.NoError(t, db.Create(&Channel{Id: id, UsedQuota: int64(reserved[owner])}).Error)
+				require.NoError(t, db.Create(&Channel{Id: id, UsedQuota: int64(reserved[owner] * 2)}).Error)
 			}
 			require.NoError(t, db.CreateInBatches(tasks, 64).Error)
 			// 可选真实 Redis 只连接本次隔离环境，验证事务后增量与历史缓存快照不会互相覆盖。
@@ -241,6 +248,7 @@ func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
 							copy.Status = TaskStatusFailure
 						}
 						begin := time.Now()
+						copy.PrivateData.DiscountAmounts = types.NewDiscountAmounts(quota*2, quota)
 						won, err := FinalizeVideoTask(t.Context(), &copy, TaskStatusQueued, quota)
 						completed <- timedOutcome{index, won, err, time.Since(begin)}
 					}
@@ -293,7 +301,7 @@ func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
 				assert.EqualValues(t, expected[owner], user.UsedQuota)
 				assert.Equal(t, initialQuota-expected[owner], token.RemainQuota)
 				assert.Equal(t, expected[owner], token.UsedQuota)
-				assert.EqualValues(t, expected[owner], channel.UsedQuota)
+				assert.EqualValues(t, expected[owner]*2, channel.UsedQuota)
 				if common.RedisEnabled {
 					cached, err := GetUserCache(user.Id)
 					require.NoError(t, err)

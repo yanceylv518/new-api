@@ -203,9 +203,9 @@ func initConstantEnv() {
 	constant.ErrorLogEnabled = GetEnvOrDefaultBool("ERROR_LOG_ENABLED", false)
 	// 任务轮询时查询的最大数量
 	constant.TaskQueryLimit = GetEnvOrDefault("TASK_QUERY_LIMIT", 1000)
-	// 异步任务超时时间（分钟），超过此时间未完成的任务将被标记为失败并退款。0 表示禁用。
+	// 超过执行期限仅标记待核实，不能据此断言上游没有收费。0 表示禁用。
 	constant.TaskTimeoutMinutes = GetEnvOrDefault("TASK_TIMEOUT_MINUTES", 1440)
-	// Consecutive unrecognized/transient poll failures before the task is failed and refunded.
+	// 连续查询失败达到阈值后标记待对账，仍保留预扣并退避重试。
 	constant.TaskPollMaxFailures = GetEnvOrDefault("TASK_POLL_MAX_FAILURES", 20)
 	constant.PrivateAssetUserMaxCount = max(GetEnvOrDefault("PRIVATE_ASSET_USER_MAX_COUNT", 1000), 0)
 	storageMB := GetEnvOrDefault("PRIVATE_ASSET_USER_MAX_STORAGE_MB", 1024)

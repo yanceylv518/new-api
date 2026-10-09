@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -22,6 +25,87 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+// ReconcileTask 由站点所有者确认上游账单后结束待对账任务，不允许普通用户操作或修改已结算任务。
+func ReconcileTask(c *gin.Context) {
+	if c.GetInt("role") != common.RoleRootUser || c.GetBool("use_access_token") {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "Owner session authentication is required"})
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		c.JSON(http.StatusUnsupportedMediaType, gin.H{"success": false, "message": "JSON is required"})
+		return
+	}
+	if origin := c.GetHeader("Origin"); origin != "" {
+		parsed, err := url.Parse(origin)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.User != nil || !strings.EqualFold(parsed.Host, c.Request.Host) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "Same-origin owner session is required"})
+			return
+		}
+	}
+	var req struct {
+		Status       model.TaskStatus `json:"status"`
+		Before       *int             `json:"quota_before"`
+		After        *int             `json:"quota_after"`
+		Confirmation string           `json:"confirmation"`
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
+	if err := c.ShouldBindJSON(&req); err != nil || req.Before == nil || req.After == nil || *req.Before < 0 || *req.Before > common.MaxQuota || *req.After < 0 || *req.After > *req.Before || (req.Status != model.TaskStatusSuccess && req.Status != model.TaskStatusFailure) || (req.Status == model.TaskStatusFailure && (*req.Before != 0 || *req.After != 0)) || req.Confirmation != c.Param("task_id") {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Explicit confirmed task ID, terminal status and valid final quotas are required"})
+		return
+	}
+	// 金额与任务身份绑定到一次性二次验证，登录会话本身不能授权财务对账。
+	bound, err := common.Marshal(service.TaskReconciliationContext{TaskID: c.Param("task_id"), Status: string(req.Status), Before: *req.Before, After: *req.After})
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeTaskReconcile, Context: bound}) == nil {
+		return
+	}
+	task, exists, err := model.GetByOnlyTaskId(c.Param("task_id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !exists || task == nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Task not found"})
+		return
+	}
+	if !task.PrivateData.ReconciliationRequired || task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Task is not awaiting reconciliation"})
+		return
+	}
+	if task.PrivateData.SubmissionPending && task.PrivateData.NextPollAt > time.Now().Unix() {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Task submission is still in progress"})
+		return
+	}
+	previous := task.Status
+	if err := service.RecoverTaskInitialAccounting(c.Request.Context(), task); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	task.Status, task.Progress, task.FinishTime = req.Status, "100%", time.Now().Unix()
+	task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason, task.PrivateData.SubmissionPending = false, "", false
+	task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext = nil, nil
+	reason := fmt.Sprintf("administrator %d confirmed final task billing", c.GetInt("id"))
+	task.FailReason = ""
+	if req.Status == model.TaskStatusFailure {
+		task.FailReason = "administrator confirmed upstream failure"
+	}
+	won, err := service.FinalizeVideoTaskBilling(c.Request.Context(), task, previous, *req.After, reason, nil, types.NewDiscountAmounts(*req.Before, *req.After))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !won {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Task state changed; reload before reconciliation"})
+		return
+	}
+	model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: common.RoleRootUser, Category: model.AuditCategoryOperation, Action: "task.reconcile", Success: true, Content: fmt.Sprintf("task=%s owner=%d status=%s before=%d after=%d", task.TaskID, task.UserId, task.Status, *req.Before, *req.After)})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": task.TaskID})
+}
 
 type taskArtifactResponse struct {
 	Key        string `json:"key"`

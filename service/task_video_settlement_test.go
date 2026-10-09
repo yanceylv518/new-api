@@ -4,17 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 // 仅模拟不可控的上游查询，状态推进和账务都经过生产轮询入口。
@@ -26,8 +35,160 @@ type atomicVideoPollingFixture struct {
 func (a *atomicVideoPollingFixture) TaskPluginKey() string { return a.key }
 
 // 成功/失败回包遇到主库故障时必须保持原状态；重试后再次投递不能重复记账或记录日志。
+func TestVideoPollingMockLoadDatabaseMatrix(t *testing.T) {
+	const users, workers, initialQuota = 200, 64, 100000000
+	count := 4096
+	if value := os.Getenv("VIDEO_SERVICE_AUDIT_TASKS"); value != "" {
+		var err error
+		count, err = strconv.Atoi(value)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, users)
+		require.LessOrEqual(t, count, 65536)
+	}
+	for _, engine := range []string{"mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			var dialect gorm.Dialector
+			if engine == "mysql" {
+				dsn := os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("test MySQL DSN is unset")
+				}
+				dialect = mysql.Open(dsn)
+			} else {
+				dsn := os.Getenv("TASK_PLUGIN_TEST_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("test PostgreSQL DSN is unset")
+				}
+				dialect = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(dialect, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "video_service_audit_"}, Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+			require.NoError(t, err)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			connection.SetMaxOpenConns(workers)
+			connection.SetMaxIdleConns(workers)
+			oldDB, oldLog := model.DB, model.LOG_DB
+			oldMain, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(common.DatabaseType(engine), common.DatabaseType(engine))
+			models := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}}
+			t.Cleanup(func() {
+				assert.NoError(t, db.Migrator().DropTable(models...))
+				model.DB, model.LOG_DB = oldDB, oldLog
+				common.SetDatabaseTypes(oldMain, oldLogType)
+				assert.NoError(t, connection.Close())
+			})
+			require.NoError(t, db.AutoMigrate(models...))
+			require.NoError(t, db.AutoMigrate(models...))
+			expected, reserved := make([]int, users), make([]int, users)
+			tasks := make([]model.Task, count)
+			for index := range tasks {
+				owner := index % users
+				reserved[owner] += 100
+				expression := `tier("video",u("tokens")*0.5/1000000)`
+				if index%2 == 1 {
+					expression = `tier("video",u("seconds")*0.0004)`
+				}
+				actual := 125
+				if index%2 == 1 {
+					actual = 300
+				}
+				if index%5 == 0 {
+					actual = 0
+				}
+				expected[owner] += actual
+				tasks[index] = model.Task{TaskID: fmt.Sprintf("service-load-%d", index), UserId: 1000 + owner, ChannelId: 1, Quota: 100, Status: model.TaskStatusQueued, Progress: "10%", PrivateData: model.TaskPrivateData{TokenId: 1000 + owner, UpstreamTaskID: fmt.Sprint(index), DiscountAmounts: types.NewDiscountAmounts(200, 100), BillingContext: &model.TaskBillingContext{OtherRatios: map[string]float64{types.UserModelDiscountRatioKey: 0.5}, TieredSnapshot: &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprVersion: 1, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), QuotaPerUnit: 500000, GroupRatio: 1}}}}
+			}
+			totalReserved, totalActual := 0, 0
+			for owner := range users {
+				id := 1000 + owner
+				totalReserved += reserved[owner]
+				totalActual += expected[owner]
+				require.NoError(t, db.Create(&model.User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: initialQuota - reserved[owner], UsedQuota: reserved[owner]}).Error)
+				require.NoError(t, db.Create(&model.Token{Id: id, UserId: id, Key: fmt.Sprintf("service-load-token-%d", id), RemainQuota: initialQuota - reserved[owner], UsedQuota: reserved[owner]}).Error)
+			}
+			require.NoError(t, db.Create(&model.Channel{Id: 1, UsedQuota: int64(totalReserved * 2)}).Error)
+			require.NoError(t, db.CreateInBatches(tasks, 64).Error)
+			type outcome struct {
+				err     error
+				elapsed time.Duration
+			}
+			jobs := make(chan int, workers*2)
+			results := make(chan outcome, count*2)
+			var group sync.WaitGroup
+			start := time.Now()
+			for range workers {
+				group.Go(func() {
+					for index := range jobs {
+						copy := tasks[index]
+						facts := map[string]any{"tokens": float64(1000)}
+						if index%2 == 1 {
+							facts = map[string]any{"seconds": float64(3)}
+						}
+						status := model.TaskStatusSuccess
+						if index%5 == 0 {
+							status = model.TaskStatusFailure
+						}
+						adaptor := &atomicVideoPollingFixture{key: []string{"doubao", "hailuo", "kling", "vidu", "alibaba", "jimeng", "sora"}[index%7], scriptedPollingAdaptor: scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: status, UsageFacts: facts}}}
+						begin := time.Now()
+						err := updateVideoSingleTask(t.Context(), adaptor, &model.Channel{Id: 1}, copy.GetUpstreamTaskID(), map[string]*model.Task{copy.GetUpstreamTaskID(): &copy})
+						results <- outcome{err, time.Since(begin)}
+					}
+				})
+			}
+			for index := range tasks {
+				jobs <- index
+				jobs <- index
+			}
+			close(jobs)
+			group.Wait()
+			close(results)
+			elapsed := time.Since(start)
+			latencies := make([]time.Duration, 0, count*2)
+			for result := range results {
+				require.NoError(t, result.err)
+				latencies = append(latencies, result.elapsed)
+			}
+			for owner := range users {
+				var user model.User
+				var token model.Token
+				require.NoError(t, db.First(&user, 1000+owner).Error)
+				require.NoError(t, db.First(&token, 1000+owner).Error)
+				assert.Equal(t, initialQuota-expected[owner], user.Quota)
+				assert.Equal(t, expected[owner], user.UsedQuota)
+				assert.Equal(t, user.Quota, token.RemainQuota)
+				assert.Equal(t, user.UsedQuota, token.UsedQuota)
+			}
+			var channel model.Channel
+			require.NoError(t, db.First(&channel, 1).Error)
+			assert.EqualValues(t, totalActual*2, channel.UsedQuota)
+			var logs []model.Log
+			require.NoError(t, db.Find(&logs).Error)
+			require.Len(t, logs, count)
+			seen := make(map[string]bool, count)
+			for _, entry := range logs {
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+				id, ok := other["task_id"].(string)
+				require.True(t, ok)
+				assert.False(t, seen[id])
+				seen[id] = true
+				index, err := strconv.Atoi(id[len("service-load-"):])
+				require.NoError(t, err)
+				assert.Equal(t, tasks[index].UserId, entry.UserId)
+				assert.Equal(t, tasks[index].PrivateData.TokenId, entry.TokenId)
+			}
+			var pending int64
+			require.NoError(t, db.Model(&model.Task{}).Where("status NOT IN ?", []string{model.TaskStatusSuccess, model.TaskStatusFailure}).Count(&pending).Error)
+			assert.Zero(t, pending)
+			slices.Sort(latencies)
+			t.Logf("SERVICE_LOAD engine=%s tasks=%d attempts=%d users=%d workers=%d shared_channels=1 elapsed=%s attempts_per_second=%.1f p50=%s p95=%s p99=%s token_seconds_discount_accounting_logs=exact", engine, count, len(latencies), users, workers, elapsed, float64(len(latencies))/elapsed.Seconds(), latencies[len(latencies)/2], latencies[len(latencies)*95/100], latencies[len(latencies)*99/100])
+		})
+	}
+}
+
 func TestVideoPollingAtomicSettlementRetry(t *testing.T) {
-	for _, key := range []string{"hailuo", "doubao"} {
+	for _, key := range []string{"hailuo", "doubao", "kling", "vidu", "alibaba", "jimeng", "sora"} {
 		for _, status := range []string{model.TaskStatusSuccess, model.TaskStatusFailure} {
 			t.Run(key+"/"+status, func(t *testing.T) {
 				truncate(t)
@@ -124,7 +285,7 @@ func TestVideoSettlementConcurrentLogs(t *testing.T) {
 }
 
 // 超时回收也走事务；再次清理不能重复退款。
-func TestVideoTimeoutRefundAtomic(t *testing.T) {
+func TestVideoTimeoutKeepsReserveUntilUpstreamOutcomeIsConfirmed(t *testing.T) {
 	truncate(t)
 	seedUser(t, 960, 900)
 	seedChannel(t, 960)
@@ -135,8 +296,13 @@ func TestVideoTimeoutRefundAtomic(t *testing.T) {
 	require.NoError(t, model.DB.Create(task).Error)
 	sweepTimedOutTasks(t.Context())
 	sweepTimedOutTasks(t.Context())
-	assert.Equal(t, 1000, getUserQuota(t, 960))
-	assert.Equal(t, int64(1), countLogs(t))
+	assert.Equal(t, 900, getUserQuota(t, 960))
+	assert.Zero(t, countLogs(t))
+	var retained model.Task
+	require.NoError(t, model.DB.First(&retained, task.ID).Error)
+	assert.True(t, retained.PrivateData.ReconciliationRequired)
+	assert.Equal(t, 100, retained.Quota)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), retained.Status)
 }
 
 // 渠道查询失败不能直接结束已预扣的视频任务，否则短暂数据库故障会使后续结算永远丢失。
@@ -150,6 +316,28 @@ func TestVideoChannelLookupFailureKeepsTaskPending(t *testing.T) {
 	require.NoError(t, model.DB.First(&pending, task.ID).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), pending.Status)
 	assert.Equal(t, 100, pending.Quota)
+}
+
+func TestTaskPollingCursorVisitsBeyondBatchAndWraps(t *testing.T) {
+	truncate(t)
+	tasks := make([]model.Task, 7)
+	for index := range tasks {
+		tasks[index] = model.Task{TaskID: fmt.Sprintf("cursor-%d", index), Status: model.TaskStatusQueued, Progress: "10%"}
+	}
+	require.NoError(t, model.DB.Create(&tasks).Error)
+	seen := map[int64]bool{}
+	var cursor int64
+	for range 4 {
+		batch, err := model.GetUnfinishedSyncTasksAfter(2, cursor)
+		require.NoError(t, err)
+		require.Len(t, batch, 2)
+		for _, task := range batch {
+			seen[task.ID] = true
+		}
+		cursor = batch[len(batch)-1].ID
+	}
+	assert.Len(t, seen, len(tasks))
+	assert.Equal(t, tasks[0].ID, cursor)
 }
 
 // 不同渠道/账号可以返回相同上游 ID，轮询必须始终更新各自的网关任务和用户账务。

@@ -1575,6 +1575,48 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	assert.JSONEq(t, `{"req_key":"from-submit"}`, string(parsed.PluginState))
 }
 
+func TestTaskAdaptorRecoversAcceptedSubmissionWithCurrentParser(t *testing.T) {
+	const source = `
+export const meta={apiVersion:1,key:"recover-submit",name:"Recovery",version:"2.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task"};
+export function buildSubmitRequest(){throw new Error("must not resubmit")}
+export function parseSubmitResponse(ctx,response){return {taskId:response.body.id,taskData:response.body,state:{recovered:true}}}
+export function buildQueryRequest(){return {url:"https://unused.example/query"}}
+export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://unused.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}})
+	brokenSource := strings.Replace(source, `return {taskId:response.body.id,taskData:response.body,state:{recovered:true}}`, `throw new Error("old parser failure")`, 1)
+	broken, err := pluginruntime.NewRegistry().Register(brokenSource, pluginruntime.Options{})
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://unused.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	old := New(broken)
+	old.Init(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("task_request", map[string]any{"model": "m"})
+	_, failure := old.ParseResponse(c, &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"accepted-once"}`))}, info)
+	require.NotNil(t, failure)
+	assert.True(t, failure.NoRetry)
+	evidence, ok := common.GetContextKeyType[json.RawMessage](c, "task_submission_response")
+	require.True(t, ok)
+	task := &model.Task{Status: model.TaskStatusUnknown, PrivateData: model.TaskPrivateData{SubmissionPending: true, SubmissionResponse: evidence}}
+	result, err := adaptor.RecoverSubmission(t.Context(), task, "fixture-key", "https://unused.example", "")
+	require.NoError(t, err)
+	assert.Equal(t, "accepted-once", result.TaskID)
+	assert.Equal(t, "accepted-once", task.PrivateData.UpstreamTaskID)
+	assert.False(t, task.PrivateData.SubmissionPending)
+	assert.Empty(t, task.PrivateData.SubmissionResponse)
+	assert.JSONEq(t, `{"recovered":true}`, string(task.PrivateData.PluginState))
+	task.PrivateData.SubmissionPending = true
+	task.PrivateData.SubmissionResponse = []byte(`{"body":{}}`)
+	_, err = adaptor.RecoverSubmission(t.Context(), task, "fixture-key", "https://unused.example", "")
+	require.Error(t, err)
+	assert.True(t, task.PrivateData.SubmissionPending)
+	assert.NotEmpty(t, task.PrivateData.SubmissionResponse)
+}
+
 func TestTaskAdaptorBatchQueryReceivesTaskObjects(t *testing.T) {
 	service.InitHttpClient()
 	var captured map[string]any

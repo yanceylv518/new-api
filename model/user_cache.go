@@ -170,7 +170,8 @@ func GetUserCache(userId int) (*UserBase, error) {
 	// Redis启用时，冷填充同时遵守鉴权栅栏和视频结算标记，故障不返回旧余额。
 	if common.RedisEnabled {
 		if err := recoverVideoQuotaCache(context.Background(), userId); err != nil {
-			return nil, err
+			reportQuotaCacheUnavailable("read_user")
+			return nil, fmt.Errorf("%w: %w", ErrQuotaCachePending, err)
 		}
 		// 锁住数据库快照到缓存发布的间隔，防止旧余额晚于结算回填。
 		var result *UserBase
@@ -189,7 +190,11 @@ func GetUserCache(userId int) (*UserBase, error) {
 			result, err = cacheReadUserBase(userId)
 			return err
 		})
-		return result, err
+		if err != nil {
+			reportQuotaCacheUnavailable("hydrate_user")
+			return nil, fmt.Errorf("%w: %w", ErrQuotaCachePending, err)
+		}
+		return result, nil
 	}
 	user, err := GetUserById(userId, false)
 	if err != nil {

@@ -302,7 +302,7 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 	}
 }
 
-func TestExecuteTaskSubmissionRefundsCancellationBeforeDurableBarrier(t *testing.T) {
+func TestExecuteTaskSubmissionAcceptedResultSurvivesDisconnect(t *testing.T) {
 	events := make([]string, 0, 2)
 	setupTaskSubmissionDatabase(t, true, &events)
 	billing := &taskSubmissionTestBilling{events: &events}
@@ -319,11 +319,11 @@ func TestExecuteTaskSubmissionRefundsCancellationBeforeDurableBarrier(t *testing
 		}, nil
 	})
 
-	assert.Nil(t, outcome)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "request_cancelled", taskErr.Code)
-	assert.Equal(t, []string{"refund"}, events)
-	assert.Equal(t, 1, billing.refunds)
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	assert.Equal(t, "upstream_private", outcome.Task.PrivateData.UpstreamTaskID)
+	assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+	assert.Zero(t, billing.refunds)
 	assert.False(t, c.Writer.Written())
 }
 
@@ -433,6 +433,9 @@ func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testi
 func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB
+	previousRedis, previousLogConsume := common.RedisEnabled, common.LogConsumeEnabled
+	common.RedisEnabled, common.LogConsumeEnabled = false, false
+	t.Cleanup(func() { common.RedisEnabled, common.LogConsumeEnabled = previousRedis, previousLogConsume })
 	var models []any
 	if migrate {
 		models = append(models, &model.Task{})
@@ -625,8 +628,105 @@ func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
 }
 
+func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.T) {
+	events := []string{}
+	db := setupTaskSubmissionDatabase(t, true, &events)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
+	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "journal-owner", Quota: 900}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+	billing := &taskSubmissionTestBilling{events: &events}
+	info := taskSubmissionRelayInfo(billing)
+	info.PriceData.Quota, info.PriceData.DiscountAmounts = 100, types.NewDiscountAmounts(200, 100)
+	c := taskSubmissionTestContext()
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		start, _ := c.Get("task_submission_start")
+		require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+		return nil, &dto.TaskError{Code: "plugin_submit_response_failed", StatusCode: 502, NoRetry: true}
+	})
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Zero(t, billing.refunds)
+	var task model.Task
+	require.NoError(t, db.Where("task_id = ?", "task_public").First(&task).Error)
+	assert.Equal(t, 100, task.Quota)
+	assert.True(t, task.PrivateData.SubmissionPending)
+	assert.True(t, task.PrivateData.ReconciliationRequired)
+	assert.False(t, task.PrivateData.InitialAccountingPending)
+	var user model.User
+	var channel model.Channel
+	require.NoError(t, db.First(&user, 1).Error)
+	require.NoError(t, db.First(&channel, 1).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.EqualValues(t, 200, channel.UsedQuota)
+	stale := task
+	stale.PrivateData.InitialAccountingPending = true
+	_, err := model.PersistTaskSubmission(t.Context(), &stale, false)
+	require.NoError(t, err)
+	assert.False(t, stale.PrivateData.InitialAccountingPending)
+	won, err := model.CommitTaskInitialAccounting(t.Context(), &stale)
+	require.NoError(t, err)
+	assert.False(t, won)
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 1, user.RequestCount)
+}
+
 // Local task rejections carry a message but no cause; the response and the
 // decision record must still be produced.
+func TestSubmissionJournalSurvivesClientDisconnectAndRejectionCleanupFailure(t *testing.T) {
+	for _, rejected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rejected=%t", rejected), func(t *testing.T) {
+			events := []string{}
+			db := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
+			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "journal-owner", Quota: 900}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+			billing := &taskSubmissionTestBilling{events: &events}
+			info := taskSubmissionRelayInfo(billing)
+			info.PriceData.Quota, info.PriceData.DiscountAmounts = 100, types.NewDiscountAmounts(200, 100)
+			c := taskSubmissionTestContext()
+			client, cancel := context.WithCancel(c.Request.Context())
+			defer cancel()
+			c.Request = c.Request.WithContext(client)
+			if rejected {
+				require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("journal-delete-failure", func(tx *gorm.DB) { tx.AddError(errors.New("delete unavailable")) }))
+				t.Cleanup(func() { require.NoError(t, db.Callback().Delete().Remove("journal-delete-failure")) })
+			}
+			attempts := 0
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				start, _ := c.Get("task_submission_start")
+				require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+				cancel()
+				require.NoError(t, c.Request.Context().Err())
+				if rejected {
+					c.Set("task_submission_rejected", true)
+					return nil, &dto.TaskError{Code: "rejected", StatusCode: 503}
+				}
+				return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted-once", Quota: 100}, nil
+			})
+			assert.Equal(t, 1, attempts)
+			assert.Zero(t, billing.refunds)
+			var stored model.Task
+			require.NoError(t, db.Where("task_id = ?", "task_public").First(&stored).Error)
+			assert.False(t, stored.PrivateData.InitialAccountingPending)
+			if rejected {
+				require.NotNil(t, taskErr)
+				assert.True(t, taskErr.NoRetry)
+				assert.Nil(t, outcome)
+				assert.True(t, stored.PrivateData.SubmissionPending)
+				assert.Contains(t, string(stored.PrivateData.SubmissionResponse), "FAILURE")
+			} else {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+				assert.False(t, stored.PrivateData.SubmissionPending)
+				assert.Equal(t, "accepted-once", stored.PrivateData.UpstreamTaskID)
+			}
+		})
+	}
+}
+
 func TestRespondTaskSubmissionErrorWithoutCause(t *testing.T) {
 	previousErrorLog := constant.ErrorLogEnabled
 	constant.ErrorLogEnabled = false

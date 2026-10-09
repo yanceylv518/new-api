@@ -505,8 +505,15 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	acceptedStream := streaming || mediaType == "text/event-stream"
 	defer func() {
-		if acceptedStream && taskErr != nil {
+		if resp.StatusCode/100 == 2 && taskErr != nil {
 			taskErr.NoRetry = true
+			// 只在解析失败时保留恢复证据，正常热路径不重复序列化请求和响应。
+			if saved, saveErr := common.Marshal(map[string]any{"statusCode": resp.StatusCode, "headers": resp.Header, "body": responseBody}); saveErr == nil && len(saved) <= maxTaskPluginPersistedJSONBytes {
+				c.Set("task_submission_response", json.RawMessage(saved))
+			}
+			if saved, saveErr := common.Marshal(a.submitContext(c, info)["requestBody"]); saveErr == nil && len(saved) <= maxTaskPluginPersistedJSONBytes {
+				c.Set("task_submission_context", json.RawMessage(saved))
+			}
 		}
 	}()
 	if !streaming && acceptedStream {
@@ -531,7 +538,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	}
 	if err != nil {
 		failure := service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusBadGateway)
-		failure.NoRetry = streaming
+		failure.NoRetry = resp.StatusCode/100 == 2
 		return nil, failure
 	}
 	headers := make(map[string][]string, len(resp.Header))
@@ -1113,6 +1120,74 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 		return nil, err
 	}
 	return ctx, nil
+}
+
+// RecoverSubmission 只重放已保存的成功响应，不再次向上游提交付费请求。
+func (a *TaskAdaptor) RecoverSubmission(ctx context.Context, task *model.Task, key, baseURL, proxy string) (*relaycommon.TaskInfo, error) {
+	original := task
+	recovered := *task
+	task = &recovered
+	if len(task.PrivateData.SubmissionResponse) == 0 {
+		return nil, fmt.Errorf("submission response is unavailable; reconciliation is required")
+	}
+	driver, err := a.queryContext(task, key, baseURL, proxy)
+	if err != nil {
+		return nil, err
+	}
+	if len(task.PrivateData.SubmissionContext) > 0 {
+		var body any
+		if err := common.Unmarshal(task.PrivateData.SubmissionContext, &body); err != nil {
+			return nil, err
+		}
+		driver["requestBody"] = body
+	}
+	var response any
+	if err := common.Unmarshal(task.PrivateData.SubmissionResponse, &response); err != nil {
+		return nil, err
+	}
+	var value any
+	if object, ok := response.(map[string]any); ok && object["parsed"] != nil {
+		value = object["parsed"]
+	} else {
+		value, err = a.plugin.Engine.Call(ctx, "parseSubmitResponse", driver, response)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var parsed submitResponse
+	if err := convert(value, &parsed); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(parsed.TaskID) == "" {
+		return nil, fmt.Errorf("plugin returned an empty taskId")
+	}
+	data, err := common.Marshal(parsed.TaskData)
+	if err != nil || len(data) > maxTaskPluginPersistedJSONBytes {
+		return nil, fmt.Errorf("recovered task data exceeds size limit")
+	}
+	state, _ := encodeReturnedPluginState(value)
+	if len(state) > maxTaskPluginPersistedJSONBytes {
+		return nil, fmt.Errorf("recovered plugin state exceeds size limit")
+	}
+	task.Data, task.PrivateData.UpstreamTaskID, task.PrivateData.PluginState = data, parsed.TaskID, state
+	task.PrivateData.SubmissionPending = false
+	task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext = nil, nil
+	result := &relaycommon.TaskInfo{TaskID: parsed.TaskID, Status: model.TaskStatusQueued, Progress: "10%"}
+	if parsed.Immediate != nil {
+		result.Status, result.Progress, result.Reason, result.Url = parsed.Immediate.Status, parsed.Immediate.Progress, parsed.Immediate.Reason, parsed.Immediate.URL
+		result.CompletionTokens, result.TotalTokens = positiveInt(parsed.Immediate.CompletionTokens), positiveInt(parsed.Immediate.TotalTokens)
+		if result.Status == model.TaskStatusSuccess && a.hasHook(ctx, "extractUsageOnComplete") {
+			facts, err := a.plugin.Engine.Call(ctx, "extractUsageOnComplete", driver, jsonValue(result), parsed.TaskData)
+			if err != nil {
+				return nil, err
+			}
+			if err := a.applyCompletionUsageFacts(result, facts, task.Properties.UpstreamModelName, task.Properties.OriginModelName); err != nil {
+				return nil, err
+			}
+		}
+	}
+	*original = recovered
+	return result, nil
 }
 
 func (a *TaskAdaptor) batchQueryContext(key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {

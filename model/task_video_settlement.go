@@ -29,10 +29,17 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if stored.Status != fromStatus || stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure {
 			return nil
 		}
+		if stored.PrivateData.InitialAccountingPending {
+			return fmt.Errorf("task initial accounting is pending")
+		}
 		if stored.Quota < 0 || stored.Quota > math.MaxInt32 || stored.Quota != task.Quota {
 			return fmt.Errorf("video task reserved quota changed")
 		}
 		delta = actualQuota - stored.Quota
+		channelDelta := delta
+		if stored.PrivateData.DiscountAmounts.ValidFor(stored.Quota) && task.PrivateData.DiscountAmounts.ValidFor(actualQuota) {
+			channelDelta = task.PrivateData.DiscountAmounts.Before - stored.PrivateData.DiscountAmounts.Before
+		}
 		wallet = stored.PrivateData.BillingSource != "subscription" || stored.PrivateData.SubscriptionId <= 0
 		if delta != 0 {
 			if wallet {
@@ -91,8 +98,10 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			if err := prepareVideoQuotaCache(ctx, tx, &stored, actualQuota, wallet, tokenKey); err != nil {
 				return err
 			}
-			// Redis往返不占用共享渠道行锁，避免不同用户的结算互相排队。
-			if err := tx.Model(&Channel{}).Where("id = ?", stored.ChannelId).Update("used_quota", gorm.Expr("used_quota + ?", delta)).Error; err != nil {
+		}
+		// 渠道统计使用折前差额，折后金额相同也可能需要调整。
+		if stored.ChannelId > 0 && channelDelta != 0 {
+			if err := tx.Model(&Channel{}).Where("id = ?", stored.ChannelId).Update("used_quota", gorm.Expr("used_quota + ?", channelDelta)).Error; err != nil {
 				return err
 			}
 		}
@@ -145,4 +154,92 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		}
 	}
 	return true, nil
+}
+
+// CommitTaskInitialAccounting 将初始统计和待入账标记一起提交，恢复或重放不会重复增加用量。
+func CommitTaskInitialAccounting(ctx context.Context, task *Task) (bool, error) {
+	var stored Task
+	updated := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if !stored.PrivateData.InitialAccountingPending {
+			return nil
+		}
+		if stored.Quota < 0 || stored.Quota > common.MaxQuota {
+			return fmt.Errorf("invalid initial task quota")
+		}
+		userUpdate := tx.Model(&User{}).Where("id = ?", stored.UserId).Updates(map[string]any{"used_quota": gorm.Expr("used_quota + ?", stored.Quota), "request_count": gorm.Expr("request_count + ?", 1)})
+		if userUpdate.Error != nil {
+			return userUpdate.Error
+		}
+		if userUpdate.RowsAffected != 1 {
+			return fmt.Errorf("initial task accounting user is unavailable")
+		}
+		before := stored.PrivateData.DiscountAmounts.ChannelQuota(stored.Quota)
+		if err := tx.Model(&Channel{}).Where("id = ?", stored.ChannelId).Update("used_quota", gorm.Expr("used_quota + ?", before)).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.InitialAccountingPending = false
+		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error; err != nil {
+			return err
+		}
+		updated = true
+		return nil
+	})
+	if err == nil {
+		task.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
+	}
+	return updated, err
+}
+
+// PersistTaskSubmission 交接提交结果时保留数据库中的入账标记，旧请求快照不能重新打开已完成的初始入账。
+func PersistTaskSubmission(ctx context.Context, task *Task, complete bool) (bool, error) {
+	var final Task
+	won := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if stored.Status != TaskStatusUnknown || !stored.PrivateData.SubmissionPending {
+			return nil
+		}
+		if complete {
+			if task.Quota < 0 || task.Quota > common.MaxQuota || task.ChannelId != stored.ChannelId {
+				return fmt.Errorf("invalid task submission handoff")
+			}
+			final = *task
+			final.CreatedAt, final.TaskID = stored.CreatedAt, stored.TaskID
+			final.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
+			if !stored.PrivateData.InitialAccountingPending {
+				delta := final.Quota - stored.Quota
+				if delta != 0 {
+					if err := tx.Model(&User{}).Where("id = ?", stored.UserId).Update("used_quota", gorm.Expr("used_quota + ?", delta)).Error; err != nil {
+						return err
+					}
+				}
+				beforeDelta := final.PrivateData.DiscountAmounts.ChannelQuota(final.Quota) - stored.PrivateData.DiscountAmounts.ChannelQuota(stored.Quota)
+				if beforeDelta != 0 {
+					if err := tx.Model(&Channel{}).Where("id = ?", stored.ChannelId).Update("used_quota", gorm.Expr("used_quota + ?", beforeDelta)).Error; err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			final = stored
+			final.PrivateData.SubmissionResponse, final.PrivateData.SubmissionContext = task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext
+			final.PrivateData.ReconciliationRequired, final.PrivateData.ReconciliationReason, final.PrivateData.NextPollAt = true, task.PrivateData.ReconciliationReason, 0
+		}
+		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Select("*").Updates(&final).Error; err != nil {
+			return err
+		}
+		won = true
+		return nil
+	})
+	if err == nil && won {
+		*task = final
+	}
+	return won, err
 }

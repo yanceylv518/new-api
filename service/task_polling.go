@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -66,6 +67,8 @@ type BatchTaskResult struct {
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
+var taskPollingCursor atomic.Int64
+
 // RecordTaskPerformance 在任务终态已被当前轮询者确认后异步写入性能聚合。
 // 先复制必要的标量快照，避免后台写入读取会被下一轮轮询修改的 Task 指针；CAS 由调用方保证每个任务只进入一次。
 func RecordTaskPerformance(task *model.Task) {
@@ -111,30 +114,26 @@ func sweepTimedOutTasks(ctx context.Context) {
 
 	for _, task := range tasks {
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
+		if !isLegacy {
+			if task.PrivateData.ReconciliationRequired {
+				continue
+			}
+			previous := task.Status
+			task.PrivateData.ReconciliationRequired = true
+			task.PrivateData.ReconciliationReason = reason + "; final upstream usage is unconfirmed; reserved quota retained"
+			if _, err := task.UpdateWithStatus(previous); err != nil {
+				logger.LogError(ctx, "record overdue task failed: "+err.Error())
+			}
+			continue
+		}
 
 		oldStatus := task.Status
 		task.Status = model.TaskStatusFailure
 		task.Progress = "100%"
 		task.FinishTime = now
-		if isLegacy {
-			task.FailReason = legacyReason
-			// 旧系统任务明确不退款，随终态 CAS 一并清掉 quota，
-			// 避免留下可再次退款的计费状态。
-			task.Quota = 0
-		} else {
-			task.FailReason = reason
-		}
-
-		// 超时退款与正常终态共用事务；保留明确不退款的历史迁移边界。
-		if !isLegacy && atomicVideoTask(task) {
-			won, err := FinalizeVideoTaskBilling(ctx, task, oldStatus, 0, reason, nil)
-			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("video timeout settlement failed task=%s: %v", task.TaskID, err))
-			} else if won {
-				timedOutCount++
-			}
-			continue
-		}
+		task.FailReason = legacyReason
+		// 旧系统任务明确不退款，随终态 CAS 清掉 quota，避免重复退款。
+		task.Quota = 0
 		won, err := task.UpdateWithStatus(oldStatus)
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
@@ -146,9 +145,6 @@ func sweepTimedOutTasks(ctx context.Context) {
 		}
 		timedOutCount++
 		RecordTaskPerformance(task)
-		if !isLegacy && task.Quota != 0 {
-			RefundTaskQuota(ctx, task, reason)
-		}
 	}
 
 	if timedOutCount > 0 {
@@ -183,7 +179,14 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		logger.LogWarn(ctx, "video billing log retry pending: "+err.Error())
 	}
 	sweepTimedOutTasks(ctx)
-	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
+	allTasks, err := model.GetUnfinishedSyncTasksAfter(constant.TaskQueryLimit, taskPollingCursor.Load())
+	if err != nil {
+		logger.LogError(ctx, "load pending tasks failed: "+err.Error())
+		return summary
+	}
+	if len(allTasks) > 0 {
+		taskPollingCursor.Store(allTasks[len(allTasks)-1].ID)
+	}
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
@@ -208,17 +211,23 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
+			if task.PrivateData.NextPollAt > time.Now().Unix() {
+				continue
+			}
+			if task.PrivateData.InitialAccountingPending {
+				if err := RecoverTaskInitialAccounting(ctx, task); err != nil {
+					logger.LogWarn(ctx, "task initial accounting recovery failed: "+err.Error())
+					continue
+				}
+			}
 			upstreamID := task.GetUpstreamTaskID()
-			if upstreamID == "" {
+			if upstreamID == "" && !task.PrivateData.SubmissionPending {
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
 			}
 			// 视频上游 ID 只在其账号内唯一，轮询工作项必须以网关记录标识隔离。
-			taskKey := upstreamID
-			if atomicVideoTask(task) {
-				taskKey = fmt.Sprintf("task:%d", task.ID)
-			}
+			taskKey := fmt.Sprintf("task:%d", task.ID)
 			taskM[taskKey] = task
 			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], taskKey)
 		}
@@ -291,23 +300,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	}
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
-		common.SysLog(fmt.Sprintf("CacheGetChannel: %v", err))
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
-		var failedIDs []int64
-		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
-			}
-		}
-		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if err != nil {
-			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
-		}
-		return err
+		return fmt.Errorf("polling channel unavailable: %w", err)
 	}
 	proxy := ch.GetSetting().Proxy
 	baseURL := ch.GetBaseURL()
@@ -317,8 +310,43 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	tasks := make([]*model.Task, 0, len(taskIds))
 	for _, upstreamID := range taskIds {
 		if task := taskM[upstreamID]; task != nil {
+			if task.PrivateData.SubmissionPending {
+				if err := updateVideoSingleTask(ctx, adaptor, ch, upstreamID, taskM); err != nil {
+					logger.LogWarn(ctx, err.Error())
+				}
+				continue
+			}
 			tasks = append(tasks, task)
 		}
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	groups := make(map[string][]string)
+	for _, task := range tasks {
+		id := fmt.Sprintf("task:%d", task.ID)
+		if taskM[id] != task {
+			id = task.GetUpstreamTaskID()
+		}
+		if !task.PrivateData.SubmissionPending {
+			key := task.PrivateData.Key
+			if key == "" {
+				key = ch.Key
+			}
+			groups[key] = append(groups[key], id)
+		}
+	}
+	if len(groups) > 1 {
+		for _, ids := range groups {
+			if err := updateBatchTasks(ctx, adaptor, channelId, ids, taskM); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	key := tasks[0].PrivateData.Key
+	if key == "" {
+		key = ch.Key
 	}
 	// The channel type tells plugin adaptors whether the upstream is another
 	// New API gateway, the same signal submission derives from the request.
@@ -326,7 +354,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: baseURL}
 	info.ApiKey = ch.Key
 	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	resp, err := adaptor.FetchBatchTasks(baseURL, key, tasks, proxy)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
@@ -339,7 +367,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	}
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
-		return failTasksFromPoll(ctx, adaptor, tasks, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
+		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassNotFound, resp.StatusCode, "upstream task lookup is unconfirmed")
 	case pollClassAuth:
 		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d http=%d", channelId, resp.StatusCode))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassAuth, resp.StatusCode, "")
@@ -350,13 +378,15 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	if err != nil {
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassHookError, resp.StatusCode, err.Error())
 	}
-	for upstreamID, responseItem := range responseItems {
+	for _, task := range tasks {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		task := taskM[upstreamID]
-		if task == nil {
-			logger.LogWarn(ctx, fmt.Sprintf("Batch task response ignored: unknown task_id=%s", upstreamID))
+		responseItem := responseItems[task.GetUpstreamTaskID()]
+		if responseItem == nil {
+			if err := recordPollFailure(ctx, adaptor, task, task.Status, pollClassUnrecognized, resp.StatusCode, "task omitted from batch response"); err != nil {
+				return err
+			}
 			continue
 		}
 		snap := task.Snapshot()
@@ -376,6 +406,8 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		if isNonTerminalPollStatus(parsedStatus) {
 			task.PrivateData.PollFailures = 0
+			task.PrivateData.NextPollAt = 0
+			task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
 		}
 		if len(responseItem.TaskInfo.PluginState) > 0 {
 			task.PrivateData.PluginState = responseItem.TaskInfo.PluginState
@@ -388,7 +420,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		if responseItem.TaskInfo.Progress != "" {
 			task.Progress = responseItem.TaskInfo.Progress
 		}
-		if responseItem.TaskInfo.Reason != "" || task.Status == model.TaskStatusFailure {
+		if task.Status == model.TaskStatusFailure {
 			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
 			task.Status = model.TaskStatusFailure
 			task.Progress = "100%"
@@ -410,6 +442,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition {
+			if err := settleAtomicVideoTask(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo); err != nil {
+				return err
+			}
+			continue
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
@@ -418,9 +456,6 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		if !won {
 			logger.LogWarn(ctx, fmt.Sprintf("Batch task %s already transitioned by another process, skip billing", task.TaskID))
 			continue
-		}
-		if terminalTransition {
-			finalizeTerminalTask(ctx, adaptor, task, &responseItem.TaskInfo)
 		}
 	}
 	return nil
@@ -435,9 +470,17 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 	sort.Ints(channelIDs)
 
 	var wg sync.WaitGroup
+	slots := make(chan struct{}, 64)
 	for _, channelId := range channelIDs {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
 		taskIds := taskChannelM[channelId]
 		if len(taskIds) == 0 {
+			<-slots
 			continue
 		}
 		taskIds = append([]string(nil), taskIds...)
@@ -445,6 +488,7 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 		wg.Add(1)
 		gopool.Go(func() {
 			defer wg.Done()
+			defer func() { <-slots }()
 			if err := updateVideoTasks(ctx, platform, channelId, taskIds, taskM); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("Channel #%d failed to update video async tasks: %s", channelId, err.Error()))
 			}
@@ -467,27 +511,6 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
-		// 查询故障不等同上游任务失败；视频任务保留非终态，恢复后重试或由超时策略结算。
-		for _, taskKey := range taskIds {
-			if task := taskM[taskKey]; task != nil && atomicVideoTask(task) {
-				return fmt.Errorf("video polling channel lookup failed: %w", err)
-			}
-		}
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
-		var failedIDs []int64
-		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
-			}
-		}
-		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if errUpdate != nil {
-			common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
-		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
@@ -527,6 +550,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 // RefreshTaskForManagement 在取消或删除前同步未完成任务，复用轮询的 CAS 和差额结算。
 // 避免本地仍处于排队状态时先删除已完成的上游记录，导致结果丢失后被错误全额退款。
 func RefreshTaskForManagement(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, task *model.Task) (*model.Task, error) {
+	if task.PrivateData.SubmissionPending {
+		return nil, fmt.Errorf("task submission is awaiting confirmation")
+	}
+	if err := RecoverTaskInitialAccounting(ctx, task); err != nil {
+		return nil, err
+	}
 	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		return task, nil
 	}
@@ -576,6 +605,27 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	snap := task.Snapshot()
+	if privateData.SubmissionPending {
+		recovery, ok := adaptor.(interface {
+			RecoverSubmission(context.Context, *model.Task, string, string, string) (*relaycommon.TaskInfo, error)
+		})
+		if !ok {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, 0, "submission recovery is unavailable")
+		}
+		result, err := recovery.RecoverSubmission(ctx, task, key, baseURL, proxy)
+		if err != nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, 0, "submission response requires reconciliation")
+		}
+		task.Status, task.Progress, task.FailReason = model.TaskStatus(result.Status), result.Progress, result.Reason
+		task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason, task.PrivateData.NextPollAt = false, "", 0
+		if result.Status == model.TaskStatusSuccess || result.Status == model.TaskStatusFailure {
+			task.FinishTime = time.Now().Unix()
+			task.PrivateData.ResultURL = result.Url
+			return settleAtomicVideoTask(ctx, adaptor, task, snap.Status, result)
+		}
+		_, err = task.UpdateWithStatus(snap.Status)
+		return err
+	}
 	var resp *http.Response
 	var err error
 	// 插件同步查询支持调用方取消；传统适配器继续使用既有接口。
@@ -602,7 +652,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
-		return failTaskFromPoll(ctx, adaptor, task, snap.Status, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
+		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassNotFound, resp.StatusCode, "upstream task lookup is unconfirmed")
 	case pollClassAuth:
 		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d task=%s http=%d", ch.Id, task.TaskID, resp.StatusCode))
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassAuth, resp.StatusCode, "")
@@ -642,6 +692,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 	if isNonTerminalPollStatus(parsedStatus) {
 		task.PrivateData.PollFailures = 0
+		task.PrivateData.NextPollAt = 0
+		task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
 	}
 
 	now := time.Now().Unix()
@@ -691,7 +743,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
-	// 两个视频插件将终态与资金调整一起提交，数据库故障不能留下不可重试的半结算任务。
+	// 插件终态与资金调整一起提交，数据库故障不能留下不可重试的半结算任务。
 	if isDone && snap.Status != task.Status && atomicVideoSettlementEnabled(adaptor) {
 		return settleAtomicVideoTask(ctx, adaptor, task, snap.Status, taskResult)
 	}
@@ -893,17 +945,20 @@ func unrecognizedPollDetail(reason string, body []byte) string {
 }
 
 func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, class string, statusCode int, detail string) error {
-	task.PrivateData.PollFailures++
+	task.PrivateData.PollFailures = min(task.PrivateData.PollFailures+1, 65535)
+	delay := min(int64(15)<<min(task.PrivateData.PollFailures-1, 5), int64(300))
+	task.PrivateData.NextPollAt = time.Now().Unix() + delay
 	if class == pollClassUnrecognized || class == pollClassHookError {
 		// The redacted body is intentionally not persisted to Task.Data on these
 		// paths, so the WARN line is the only operator-visible copy of what the
 		// plugin could not interpret.
 		logger.LogWarn(ctx, fmt.Sprintf("task %s poll %s (failures=%d, http=%d): %s", task.TaskID, class, task.PrivateData.PollFailures, statusCode, detail))
 	}
-	// TASK_POLL_MAX_FAILURES <= 0 disables the consecutive-failure cutoff, matching
-	// TASK_TIMEOUT_MINUTES semantics; the 24h sweep remains the only backstop.
+	// 连续失败阈值只标记对账；查询故障和超时都不能证明生成失败。
 	if constant.TaskPollMaxFailures > 0 && task.PrivateData.PollFailures >= constant.TaskPollMaxFailures {
-		return failTaskFromPoll(ctx, adaptor, task, fromStatus, pollFailureReason(class, statusCode, detail))
+		task.PrivateData.ReconciliationRequired = true
+		task.PrivateData.ReconciliationReason = pollFailureReason(class, statusCode, detail)
+		logger.LogWarn(ctx, fmt.Sprintf("task %s requires reconciliation; reserve retained, failures=%d class=%s", task.TaskID, task.PrivateData.PollFailures, class))
 	}
 	if _, err := task.UpdateWithStatus(fromStatus); err != nil {
 		return err

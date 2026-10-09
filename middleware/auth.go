@@ -602,6 +602,11 @@ func TokenAuth() func(c *gin.Context) {
 
 		userCache, discounts, err := model.GetUserCacheWithModelDiscounts(c.Request.Context(), token.UserId)
 		if err != nil {
+			if errors.Is(err, model.ErrQuotaCachePending) {
+				c.Header("Retry-After", "5")
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "quota_cache_unavailable", "type": "service_unavailable", "message": "Quota synchronization is temporarily unavailable; please retry later"}})
+				return
+			}
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,
 				common.TranslateMessage(c, i18n.MsgDatabaseError))

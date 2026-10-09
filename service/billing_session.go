@@ -210,6 +210,9 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	// ---- 1) 预扣令牌额度 ----
 	if effectiveQuota > 0 {
 		if err := PreConsumeTokenQuota(s.relayInfo, effectiveQuota); err != nil {
+			if errors.Is(err, model.ErrQuotaCachePending) {
+				return types.NewErrorWithStatusCode(errors.New("quota synchronization is temporarily unavailable"), types.ErrorCode("quota_cache_unavailable"), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			}
 			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
 		s.tokenConsumed = effectiveQuota
@@ -224,6 +227,9 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 					s.relayInfo.UserId, s.relayInfo.TokenId, s.tokenConsumed, err.Error(), rollbackErr.Error()))
 			}
 			s.tokenConsumed = 0
+		}
+		if errors.Is(err, model.ErrQuotaCachePending) {
+			return types.NewErrorWithStatusCode(errors.New("quota synchronization is temporarily unavailable"), types.ErrorCode("quota_cache_unavailable"), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
 		}
 		// TODO: model 层应定义哨兵错误（如 ErrNoActiveSubscription），用 errors.Is 替代字符串匹配
 		if errors.Is(err, ErrInsufficientWalletQuota) {

@@ -114,6 +114,14 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
+	// 提交意图先落库；未确认响应的任务保留预扣，绝不当作生成失败退款。
+	SubmissionPending        bool            `json:"submission_pending,omitempty"`
+	InitialAccountingPending bool            `json:"initial_accounting_pending,omitempty"`
+	SubmissionResponse       json.RawMessage `json:"submission_response,omitempty"`
+	SubmissionContext        json.RawMessage `json:"submission_context,omitempty"`
+	ReconciliationRequired   bool            `json:"reconciliation_required,omitempty"`
+	ReconciliationReason     string          `json:"reconciliation_reason,omitempty"`
+	NextPollAt               int64           `json:"next_poll_at,omitempty"`
 	// 当前任务总费用，不是本次补扣或退款流水。
 	DiscountAmounts *hosttypes.DiscountAmounts `json:"discount_amounts,omitempty"`
 	Key             string                     `json:"key,omitempty"`
@@ -213,7 +221,28 @@ func (p *TaskPrivateData) Scan(val any) error {
 	if len(bytesValue) == 0 {
 		return nil
 	}
-	return common.Unmarshal(bytesValue, p)
+	if err := common.Unmarshal(bytesValue, p); err != nil {
+		return err
+	}
+	var err error
+	p.Key, err = common.OpenTaskSecret(p.Key)
+	if err != nil {
+		return err
+	}
+	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext} {
+		if len(*field) > 0 && (*field)[0] == '"' {
+			var sealed string
+			if err := common.Unmarshal(*field, &sealed); err != nil {
+				return err
+			}
+			plain, err := common.OpenTaskSecret(sealed)
+			if err != nil {
+				return err
+			}
+			*field = json.RawMessage(plain)
+		}
+	}
+	return nil
 }
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
@@ -221,10 +250,28 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded && !p.SubmissionPending && !p.InitialAccountingPending && len(p.SubmissionResponse) == 0 && len(p.SubmissionContext) == 0 && !p.ReconciliationRequired && p.ReconciliationReason == "" && p.NextPollAt == 0 {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
+	var err error
+	p.Key, err = common.SealTaskSecret(p.Key)
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext} {
+		if len(*field) > 0 {
+			sealed, err := common.SealTaskSecret(string(*field))
+			if err != nil {
+				return nil, err
+			}
+			encoded, err := common.Marshal(sealed)
+			if err != nil {
+				return nil, err
+			}
+			*field = encoded
+		}
+	}
 	b, err := common.Marshal(p)
 	if err != nil {
 		return nil, err
@@ -249,15 +296,8 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 	properties := Properties{}
 	privateData := TaskPrivateData{}
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
-		// A New API channel may rotate between several gateway tokens, so the
-		// task keeps the key that submitted it and polls with the same identity.
-		if relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeVertexAi ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeNewAPI ||
-			platform == "hailuo" || platform == "doubao" {
-			// 视频任务属于提交时的上游账号，后续渠道密钥轮换或重排不能切换其查询账号。
-			privateData.Key = relayInfo.ChannelMeta.ApiKey
-		}
+		// 任务属于提交时的上游账号，密钥轮换或重排不能切换查询账号。
+		privateData.Key = relayInfo.ChannelMeta.ApiKey
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName
 		}
@@ -397,6 +437,26 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	return tasks
 }
 
+// GetUnfinishedSyncTasksAfter 按主键游标循环取有限批次，避免最早的慢任务长期占满轮询窗口。
+func GetUnfinishedSyncTasksAfter(limit int, after int64) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	query := DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses())
+	if err := query.Where("id > ?", after).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
+		return nil, err
+	}
+	if len(tasks) < limit && after > 0 {
+		var wrapped []*Task
+		if err := DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses()).Where("id <= ?", after).Order("id").Limit(limit - len(tasks)).Find(&wrapped).Error; err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, wrapped...)
+	}
+	return tasks, nil
+}
+
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is
 // still in progress. It is a cheap existence check (LIMIT 1) used to decide
 // whether the async_task_poll system task needs to run; when no task is pending
@@ -511,15 +571,18 @@ func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) 
 }
 
 type taskSnapshot struct {
-	Status       TaskStatus
-	Progress     string
-	StartTime    int64
-	FinishTime   int64
-	FailReason   string
-	ResultURL    string
-	Data         json.RawMessage
-	PluginState  json.RawMessage
-	PollFailures int
+	Status                 TaskStatus
+	Progress               string
+	StartTime              int64
+	FinishTime             int64
+	FailReason             string
+	ResultURL              string
+	Data                   json.RawMessage
+	PluginState            json.RawMessage
+	PollFailures           int
+	NextPollAt             int64
+	ReconciliationRequired bool
+	ReconciliationReason   string
 }
 
 func (s taskSnapshot) Equal(other taskSnapshot) bool {
@@ -531,20 +594,23 @@ func (s taskSnapshot) Equal(other taskSnapshot) bool {
 		s.ResultURL == other.ResultURL &&
 		bytes.Equal(s.Data, other.Data) &&
 		bytes.Equal(s.PluginState, other.PluginState) &&
-		s.PollFailures == other.PollFailures
+		s.PollFailures == other.PollFailures && s.NextPollAt == other.NextPollAt && s.ReconciliationRequired == other.ReconciliationRequired && s.ReconciliationReason == other.ReconciliationReason
 }
 
 func (t *Task) Snapshot() taskSnapshot {
 	return taskSnapshot{
-		Status:       t.Status,
-		Progress:     t.Progress,
-		StartTime:    t.StartTime,
-		FinishTime:   t.FinishTime,
-		FailReason:   t.FailReason,
-		ResultURL:    t.PrivateData.ResultURL,
-		Data:         t.Data,
-		PluginState:  t.PrivateData.PluginState,
-		PollFailures: t.PrivateData.PollFailures,
+		Status:                 t.Status,
+		Progress:               t.Progress,
+		StartTime:              t.StartTime,
+		FinishTime:             t.FinishTime,
+		FailReason:             t.FailReason,
+		ResultURL:              t.PrivateData.ResultURL,
+		Data:                   t.Data,
+		PluginState:            t.PrivateData.PluginState,
+		PollFailures:           t.PrivateData.PollFailures,
+		NextPollAt:             t.PrivateData.NextPollAt,
+		ReconciliationRequired: t.PrivateData.ReconciliationRequired,
+		ReconciliationReason:   t.PrivateData.ReconciliationReason,
 	}
 }
 

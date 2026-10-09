@@ -456,7 +456,8 @@ func TestRelayTaskPluginNativeActionSynchronizesBeforeDelete(t *testing.T) {
 				assert.Equal(t, 1, deletes)
 				assert.Equal(t, 9000, user.Quota)
 				assert.Equal(t, 1000, task.Quota)
-				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), task.Status)
+				assert.True(t, task.PrivateData.ReconciliationRequired)
 				assert.Contains(t, task.FailReason, "reserved quota retained")
 				return
 			}
