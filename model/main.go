@@ -361,6 +361,7 @@ func migrateDB() error {
 		&Task{},
 		&TaskRequestSnapshot{},
 		&VideoTaskPendingLog{},
+		&SeedanceAssetSize{},
 		&TaskPlugin{},
 		&Model{},
 		&Vendor{},

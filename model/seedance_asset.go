@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -93,6 +94,7 @@ func IsSeedanceAssetGroupNameDuplicated(id uint, userID int, name string) (bool,
 
 // SeedanceAsset 保存上游素材状态及其所属用户，所有读取必须带 UserID 条件。
 type SeedanceAsset struct {
+	UploadBytes        int64                `gorm:"-" json:"-"`
 	ID                 uint                 `gorm:"primaryKey;index:idx_seedance_asset_user_group_id,priority:3;index:idx_seedance_asset_status_key_poll_due,priority:4;index:idx_seedance_asset_user_group_pending_status,priority:4" json:"id"`
 	UserID             int                  `gorm:"index;not null;index:idx_seedance_asset_user_group_id,priority:1;index:idx_seedance_asset_user_group_pending_status,priority:1" json:"user_id"`
 	ChannelID          int                  `gorm:"index;not null" json:"channel_id"`
@@ -116,6 +118,45 @@ type SeedanceAsset struct {
 	PollLeaseUntil     int64                `gorm:"index;index:idx_seedance_asset_status_key_poll_due,priority:3;not null;default:0" json:"-"`
 	CreatedAt          time.Time            `json:"created_at"`
 	UpdatedAt          time.Time            `json:"updated_at"`
+}
+
+// SeedanceAssetSize 独立记录已知对象大小，避免给大素材表新增或回填列。
+type SeedanceAssetSize struct {
+	AssetID uint  `gorm:"primaryKey"`
+	UserID  int   `gorm:"index;not null"`
+	Bytes   int64 `gorm:"not null"`
+}
+
+func CheckSeedanceAssetCapacity(ctx context.Context, userID int, incomingBytes int64) error {
+	return checkSeedanceAssetCapacity(DB.WithContext(ctx), userID, incomingBytes)
+}
+
+func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64) error {
+	if incomingBytes < 0 {
+		return errors.New("invalid private asset size")
+	}
+	if constant.PrivateAssetUserMaxCount > 0 {
+		var count int64
+		if err := tx.Model(&SeedanceAsset{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count >= int64(constant.PrivateAssetUserMaxCount) {
+			return errors.New("private asset count limit exceeded")
+		}
+	}
+	if constant.PrivateAssetUserMaxBytes > 0 {
+		var used int64
+		assets := tx.NamingStrategy.TableName("SeedanceAsset")
+		sizes := tx.NamingStrategy.TableName("SeedanceAssetSize")
+		// 旧对象没有大小记录时按单文件上限预留，不请求 OSS，也不低估已占容量。
+		if err := tx.Table(assets+" AS a").Joins("LEFT JOIN "+sizes+" AS s ON s.asset_id = a.id").Where("a.user_id = ? AND a.object_key <> ?", userID, "").Select("COALESCE(SUM(CASE WHEN s.asset_id IS NULL THEN ? ELSE s.bytes END), 0)", int64(50<<20)).Scan(&used).Error; err != nil {
+			return err
+		}
+		if incomingBytes > constant.PrivateAssetUserMaxBytes || used > constant.PrivateAssetUserMaxBytes-incomingBytes {
+			return errors.New("private asset storage limit exceeded")
+		}
+	}
+	return nil
 }
 
 type SeedanceAssetSchemaMigration struct {
@@ -252,6 +293,16 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error
 			}
 		}
 		var group SeedanceAssetGroup
+		if constant.PrivateAssetUserMaxCount > 0 || constant.PrivateAssetUserMaxBytes > 0 {
+			// 各素材组先锁同一用户的首组，不同组并发创建也不能突破累计配额。
+			var guard SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("user_id = ?", asset.UserID).Order("id").First(&guard).Error; err != nil {
+				return err
+			}
+			if err := checkSeedanceAssetCapacity(tx, asset.UserID, asset.UploadBytes); err != nil {
+				return err
+			}
+		}
 		if err := lockForUpdate(tx).Where("user_id = ? AND group_id = ?", asset.UserID, asset.GroupID).First(&group).Error; err != nil {
 			return err
 		}
@@ -260,6 +311,11 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error
 		}
 		if err := tx.Create(asset).Error; err != nil {
 			return err
+		}
+		if asset.UploadBytes > 0 {
+			if err := tx.Create(&SeedanceAssetSize{AssetID: asset.ID, UserID: asset.UserID, Bytes: asset.UploadBytes}).Error; err != nil {
+				return err
+			}
 		}
 		if group.AssetCount == nil {
 			return nil
@@ -306,6 +362,11 @@ func DeleteSeedanceAssetWithCount(ctx context.Context, userID int, assetID uint,
 		}
 		if result.RowsAffected == 0 {
 			return nil
+		}
+		if asset.ObjectKey != "" {
+			if err := tx.Where("asset_id = ? AND user_id = ?", asset.ID, asset.UserID).Delete(&SeedanceAssetSize{}).Error; err != nil {
+				return err
+			}
 		}
 		return tx.Model(&SeedanceAssetGroup{}).
 			Where("user_id = ? AND group_id = ? AND asset_count IS NOT NULL", asset.UserID, asset.GroupID).

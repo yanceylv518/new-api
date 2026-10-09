@@ -572,6 +572,10 @@ func UploadSeedanceAsset(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := model.CheckSeedanceAssetCapacity(c.Request.Context(), c.GetInt("id"), fileHeader.Size); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	file, err := fileHeader.Open()
 	if err != nil {
 		common.ApiError(c, err)
@@ -600,6 +604,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 	}
 	asset := &model.SeedanceAsset{
 		UserID:             c.GetInt("id"),
+		UploadBytes:        upload.Size,
 		ChannelID:          group.ChannelID,
 		GroupID:            group.GroupID,
 		AssetID:            assetID,

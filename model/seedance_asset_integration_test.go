@@ -2,11 +2,15 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,14 +46,83 @@ func TestSeedanceAssetDatabaseLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			connection, err := db.DB()
 			require.NoError(t, err)
+			if engine == "sqlite" {
+				connection.SetMaxOpenConns(1)
+			}
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			common.SetDatabaseTypes(common.DatabaseType(engine), common.DatabaseType(engine))
+			t.Cleanup(func() { common.SetDatabaseTypes(previousMain, previousLog) })
 			previousDB := DB
 			DB = db
+			previousCount, previousBytes := constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes
+			constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = 1000, 1<<30
 			t.Cleanup(func() {
-				assert.NoError(t, db.Migrator().DropTable(&SeedanceAssetCleanupJob{}, &SeedanceAssetReplica{}, &SeedanceAsset{}, &SeedanceAssetGroupReplica{}, &SeedanceAssetGroup{}))
+				constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = previousCount, previousBytes
+			})
+			t.Cleanup(func() {
+				assert.NoError(t, db.Migrator().DropTable(&SeedanceAssetSize{}, &SeedanceAssetCleanupJob{}, &SeedanceAssetReplica{}, &SeedanceAsset{}, &SeedanceAssetGroupReplica{}, &SeedanceAssetGroup{}))
 				DB = previousDB
 				assert.NoError(t, connection.Close())
 			})
-			// 基线没有素材表；首次创建后插入真实记录，再重复迁移确认数据与约束保留。
+			// 先保存没有大小表的历史素材，再升级并重复迁移，确认已有记录仍可使用。
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}, &SeedanceAssetCleanupJob{}))
+			legacy := SeedanceAsset{UserID: 77, AssetID: "legacy-size-unknown", ObjectKey: "fixture/legacy.jpg", Status: "Active"}
+			require.NoError(t, db.Create(&legacy).Error)
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetSize{}))
+			require.NoError(t, db.AutoMigrate(&SeedanceAssetSize{}))
+			var legacyStored SeedanceAsset
+			require.NoError(t, db.First(&legacyStored, legacy.ID).Error)
+			assert.Equal(t, legacy.ObjectKey, legacyStored.ObjectKey)
+			limit := constant.PrivateAssetUserMaxBytes
+			constant.PrivateAssetUserMaxBytes = 49 << 20
+			require.Error(t, CheckSeedanceAssetCapacity(t.Context(), 77, 0))
+			constant.PrivateAssetUserMaxBytes = limit
+			t.Run("capacity_is_shared_across_groups_and_released_on_delete", func(t *testing.T) {
+				count, bytes := constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes
+				constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = 2, 100
+				defer func() { constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = count, bytes }()
+				for _, name := range []string{"quota-a", "quota-b"} {
+					require.NoError(t, db.Create(&SeedanceAssetGroup{UserID: 31, ChannelID: 7, GroupID: name, Name: name, KeyFingerprint: "account"}).Error)
+				}
+				results := make(chan error, 20)
+				var workers sync.WaitGroup
+				for index := range 20 {
+					workers.Go(func() {
+						group := "quota-a"
+						if index%2 == 1 {
+							group = "quota-b"
+						}
+						asset := &SeedanceAsset{UserID: 31, ChannelID: 7, GroupID: group, KeyFingerprint: "account", AssetID: fmt.Sprintf("quota-%d", index), Name: "fixture", AssetType: "Image", Status: "Active", ObjectKey: fmt.Sprintf("fixture/%d", index), UploadBytes: 40}
+						results <- CreateSeedanceAssetInGroup(t.Context(), asset)
+					})
+				}
+				workers.Wait()
+				close(results)
+				accepted := 0
+				for err := range results {
+					if err == nil {
+						accepted++
+					} else {
+						assert.Contains(t, err.Error(), "limit exceeded")
+					}
+				}
+				assert.Equal(t, 2, accepted)
+				var asset SeedanceAsset
+				require.NoError(t, db.Where("user_id = ?", 31).First(&asset).Error)
+				require.NoError(t, DeleteSeedanceAssetWithCount(t.Context(), 31, asset.ID, ""))
+				require.Error(t, CheckSeedanceAssetCapacity(t.Context(), 31, 61))
+				require.NoError(t, CheckSeedanceAssetCapacity(t.Context(), 31, 60))
+				var sizes int64
+				require.NoError(t, db.Model(&SeedanceAssetSize{}).Where("user_id = ?", 31).Count(&sizes).Error)
+				assert.EqualValues(t, 1, sizes)
+				// 禁用容量限制后删除也清理大小记录，再启用不会残留旧对象的占用。
+				constant.PrivateAssetUserMaxBytes = 0
+				asset = SeedanceAsset{}
+				require.NoError(t, db.Where("user_id = ?", 31).First(&asset).Error)
+				require.NoError(t, DeleteSeedanceAssetWithCount(t.Context(), 31, asset.ID, ""))
+				require.NoError(t, db.Model(&SeedanceAssetSize{}).Where("user_id = ?", 31).Count(&sizes).Error)
+				assert.Zero(t, sizes)
+			})
 			require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}, &SeedanceAssetGroupReplica{}, &SeedanceAsset{}, &SeedanceAssetReplica{}, &SeedanceAssetCleanupJob{}))
 			group := SeedanceAssetGroup{UserID: 11, ChannelID: 7, GroupID: "group-owned", Name: "素材组", KeyFingerprint: "bound-account"}
 			require.NoError(t, db.Create(&group).Error)
