@@ -7,6 +7,12 @@ Makefile
 docs
 .eslintcache
 .gocache
+.plans
+.local-tests
+.env
+*.tar
+*.tar.gz
+/bin
 /web/node_modules
 /web/dist
 !THIRD-PARTY-LICENSES.md
