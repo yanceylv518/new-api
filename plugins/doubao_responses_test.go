@@ -49,7 +49,7 @@ func TestDoubaoResolutionProfiles(t *testing.T) {
 	}
 }
 
-func TestDoubaoOpenAIImageProtocol(t *testing.T) {
+func TestDoubaoOpenAIImageTransport(t *testing.T) {
 	source, err := builtinplugins.Source("doubao")
 	require.NoError(t, err)
 	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
@@ -1426,7 +1426,7 @@ func TestDoubaoOpenAIImageProtocol(t *testing.T) {
 		}
 		value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_image", "render"}, map[string]any{"model": lite}, map[string]any{"task_id": "task_public", "status": "SUCCESS", "created_at": 1789733150, "data": body})
 		require.NoError(t, err)
-		assert.Equal(t, map[string]any{"created": float64(1789733150), "data": []any{map[string]any{"url": first}, map[string]any{"url": second}}}, alibabaObject(t, value))
+		assert.Equal(t, map[string]any{"created": float64(1789733150), "data": []any{map[string]any{"url": first}, map[string]any{"url": second}}, "metadata": map[string]any{"usage": map[string]any{"generated_images": float64(2)}}}, alibabaObject(t, value))
 	})
 }
 

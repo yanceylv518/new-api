@@ -78,7 +78,7 @@ func TestDoubaoSmartDurationRequestAndBillingBoundaries(t *testing.T) {
 			value, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
 			require.NoError(t, err)
 			facts := value.(map[string]any)
-			_, err = adaptor.validatedUsageRatios(facts, "doubao-seedance-2-0-oinone")
+			_, _, err = adaptor.validatedUsageRatios(facts, "doubao-seedance-2-0-oinone")
 			require.NoError(t, err)
 			assert.Greater(t, facts["tokens"].(float64), float64(0))
 			built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
@@ -87,7 +87,7 @@ func TestDoubaoSmartDurationRequestAndBillingBoundaries(t *testing.T) {
 		}
 		require.Error(t, adaptor.validateResolvedUsageRequest(map[string]any{field: -2}, ""))
 		require.NoError(t, adaptor.validateResolvedUsageRequest(map[string]any{"metadata": map[string]any{field: -1}}, ""))
-		_, err = adaptor.validatedUsageRatios(map[string]any{field: -1}, "")
+		_, _, err = adaptor.validatedUsageRatios(map[string]any{field: -1}, "")
 		require.Error(t, err)
 		_, err = adaptor.validatedCompletionUsageFacts(map[string]any{field: -1}, "")
 		require.Error(t, err)

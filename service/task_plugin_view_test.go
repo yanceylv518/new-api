@@ -89,6 +89,7 @@ func TestBuildTaskPluginViewOmitsPrivatePollState(t *testing.T) {
 func TestBuildTaskPluginViewEncodesKeysInMapOrder(t *testing.T) {
 	task := &model.Task{
 		TaskID:     "task_public_order",
+		Action:     "generate",
 		Platform:   "fixture",
 		Status:     model.TaskStatusSuccess,
 		Progress:   "100%",
@@ -105,7 +106,8 @@ func TestBuildTaskPluginViewEncodesKeysInMapOrder(t *testing.T) {
 	require.NoError(t, err)
 	var payload map[string]any
 	require.NoError(t, common.Unmarshal(encoded, &payload))
-	require.Len(t, payload, 9)
+	require.Len(t, payload, 10)
+	assert.Equal(t, "generate", payload["action"])
 	reencoded, err := common.Marshal(payload)
 	require.NoError(t, err)
 	assert.Equal(t, string(reencoded), string(encoded))
