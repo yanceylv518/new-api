@@ -353,6 +353,11 @@ existing address masking and also redact credential fields. No schema migration
 is required. Old readers can read new logs safely because credential redaction
 happens before insertion; old writers still produce their original masked text.
 
+Media Base64 in error-log content is replaced with `[BASE64_REDACTED]` before
+insertion and when reading existing errors. Data URLs and explicit Base64 fields
+are recognized at any length; unmarked standard or URL-safe Base64 strings are
+recognized only from 256 encoded characters. Existing stored rows are unchanged.
+
 </details>
 
 ### 🔧 Deployment Methods
