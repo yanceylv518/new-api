@@ -1020,11 +1020,7 @@ describe('user model pricing dialog', () => {
     )
     assert.ok(validity)
     await act(async () => validity.click())
-    const scheduled = [
-      ...document.querySelectorAll<HTMLElement>('[role="tab"]'),
-    ].find((tab) => tab.textContent === 'Temporary discounts')
-    assert.ok(scheduled)
-    await act(async () => scheduled.click())
+    expect(document.querySelector('[role="tab"]')).toBeNull()
     const add = [
       ...document.querySelectorAll<HTMLButtonElement>('button'),
     ].find((button) => button.textContent === 'Add temporary discount')

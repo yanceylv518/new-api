@@ -53,7 +53,9 @@ function renderSchedule(
     periods: [],
   }
 ) {
-  const onApply = vi.fn(() => null)
+  const onApply = vi.fn<
+    Parameters<typeof UserModelPricingScheduleDialog>[0]['onApply']
+  >(() => null)
   const onClose = vi.fn()
   render(
     <I18nextProvider i18n={i18n}>
@@ -68,12 +70,13 @@ function renderSchedule(
 }
 
 describe('permanent and temporary discount editors', () => {
-  test('blocks applying a permanent percentage with excess precision', () => {
-    const { onApply } = renderSchedule()
-    fireEvent.change(
-      screen.getByRole('spinbutton', { name: 'Permanent discount' }),
-      { target: { value: '80.001' } }
-    )
+  test('blocks applying when the external permanent percentage has excess precision', () => {
+    const { onApply } = renderSchedule({
+      model_name: 'test-model',
+      mode: 'layered',
+      discount_percent: 80.001,
+      periods: [],
+    })
     expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
     expect(onApply).not.toHaveBeenCalled()
   })
@@ -92,7 +95,6 @@ describe('permanent and temporary discount editors', () => {
         },
       ],
     })
-    fireEvent.click(screen.getByRole('tab', { name: /^Temporary discounts/ }))
     expect(screen.getByText('Not started')).toBeInTheDocument()
     act(() => {
       vi.advanceTimersByTime(1100)
@@ -123,9 +125,6 @@ describe('permanent and temporary discount editors', () => {
         },
       ],
     })
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
     expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled()
     const timeInput = screen.getByLabelText('Start time (Time)')
     fireEvent.change(timeInput, { target: { value: '11:00' } })
@@ -149,17 +148,15 @@ describe('permanent and temporary discount editors', () => {
         ],
       }
     )
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
     return result
   }
 
-  test('edits the permanent percentage directly and provides no permanent time conditions', () => {
+  test('opens temporary settings without tabs or a permanent editor', () => {
     renderSchedule()
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
     expect(
-      screen.getByRole('spinbutton', { name: 'Permanent discount' })
-    ).toHaveValue(80)
+      screen.queryByRole('spinbutton', { name: 'Permanent discount' })
+    ).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Add time rule' })
     ).not.toBeInTheDocument()
@@ -169,14 +166,8 @@ describe('permanent and temporary discount editors', () => {
     expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled()
   })
 
-  test('new temporary defaults follow permanent edits without rewriting matching discounts', async () => {
-    const { onApply } = renderSchedule()
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Add temporary discount' })
-    )
+  test('preserves matching temporary discounts after the permanent value changes externally', async () => {
+    const { onApply } = await temporary()
     expect(
       screen.getByRole('textbox', { name: 'Default discount' })
     ).toHaveValue('80%')
@@ -188,16 +179,11 @@ describe('permanent and temporary discount editors', () => {
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '60' } }
     )
-    await userEvent.click(
-      screen.getByRole('tab', { name: 'Permanent discount' })
-    )
-    fireEvent.change(
-      screen.getByRole('spinbutton', { name: 'Permanent discount' }),
-      { target: { value: '75' } }
-    )
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
+    await userEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    const applied = onApply.mock.calls.at(-1)?.[0]
+    if (!applied) throw new Error('Temporary discounts were not applied')
+    cleanup()
+    const reopened = renderSchedule({ ...applied, discount_percent: 75 })
     expect(
       screen.getByRole('textbox', { name: 'Default discount' })
     ).toHaveValue('75%')
@@ -205,21 +191,20 @@ describe('permanent and temporary discount editors', () => {
       screen.getByRole('spinbutton', { name: 'Discount when matched' })
     ).toHaveValue(60)
     await userEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    expect(onApply).toHaveBeenCalledWith(
+    expect(reopened.onApply).toHaveBeenCalledWith(
       expect.objectContaining({
         discount_percent: 75,
         periods: [
           expect.objectContaining({
             expression:
               '(weekday("Asia/Shanghai") != 0 && weekday("Asia/Shanghai") != 6) ? 0.6 : permanent_discount',
-            end_time: expect.any(Number),
           }),
         ],
       })
     )
   })
 
-  test('keeps an incomplete conditional percentage across tabs and blocks apply until corrected', async () => {
+  test('keeps an incomplete conditional percentage and blocks apply until corrected', async () => {
     await temporary()
     await userEvent.click(screen.getByRole('button', { name: 'Add time rule' }))
     fireEvent.change(
@@ -227,13 +212,7 @@ describe('permanent and temporary discount editors', () => {
       { target: { value: '' } }
     )
     expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
-    await userEvent.click(
-      screen.getByRole('tab', { name: 'Permanent discount' })
-    )
     expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
     expect(
       screen.getByRole('spinbutton', { name: 'Discount when matched' })
     ).toHaveValue(null)
@@ -289,7 +268,7 @@ describe('permanent and temporary discount editors', () => {
     )
   })
 
-  test('edits a minute condition and preserves it across tabs', async () => {
+  test('edits a minute condition and preserves it when applied', async () => {
     const { onApply } = await temporary()
     await userEvent.click(screen.getByRole('button', { name: 'Add time rule' }))
     await userEvent.click(
@@ -310,12 +289,6 @@ describe('permanent and temporary discount editors', () => {
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '29' } }
     )
-    await userEvent.click(
-      screen.getByRole('tab', { name: 'Permanent discount' })
-    )
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
     expect(
       screen.getByRole('combobox', { name: 'Minute within each hour' })
     ).toHaveTextContent('30')
@@ -332,7 +305,7 @@ describe('permanent and temporary discount editors', () => {
     )
   })
 
-  test('keeps existing permanent conditions until a fixed percentage is entered', async () => {
+  test('preserves existing permanent conditions without exposing a permanent editor', async () => {
     const source = '(hour("Asia/Shanghai") >= 9) ? 0.6 : 0.8'
     const { onApply } = renderSchedule({
       model_name: 'test-model',
@@ -342,23 +315,14 @@ describe('permanent and temporary discount editors', () => {
       periods: [],
     })
     expect(
-      screen.getByRole('spinbutton', { name: 'Permanent discount' })
-    ).toHaveValue(80)
+      screen.queryByRole('spinbutton', { name: 'Permanent discount' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Add temporary discount' })
+    ).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'Apply' }))
     expect(onApply).toHaveBeenLastCalledWith(
-      expect.objectContaining({ expression: source })
-    )
-    fireEvent.change(
-      screen.getByRole('spinbutton', { name: 'Permanent discount' }),
-      { target: { value: '75' } }
-    )
-    await userEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    expect(onApply).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        expression: '',
-        discount_percent: 75,
-        calculation_type: 'fixed',
-      })
+      expect.objectContaining({ expression: source, discount_percent: 80 })
     )
   })
 
@@ -501,7 +465,7 @@ describe('permanent and temporary discount editors', () => {
     )
   })
 
-  test('overlaps and missing ends block apply even on the permanent tab', async () => {
+  test('overlaps and missing ends block applying temporary discounts', async () => {
     renderSchedule({
       model_name: 'test-model',
       mode: 'layered',
@@ -516,9 +480,6 @@ describe('permanent and temporary discount editors', () => {
       ],
     })
     expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
-    await userEvent.click(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    )
     expect(
       screen.getAllByRole('button', { name: 'End time' })[0]
     ).toHaveAttribute('aria-invalid', 'true')
@@ -555,16 +516,10 @@ describe('permanent and temporary discount editors', () => {
     )
   })
 
-  test('supports keyboard tab switching and cancel without applying', async () => {
+  test('supports keyboard cancellation without applying', async () => {
     const { onApply, onClose } = renderSchedule()
-    await userEvent.click(
-      screen.getByRole('tab', { name: 'Permanent discount' })
-    )
-    await userEvent.keyboard('{ArrowRight}{Enter}')
-    expect(
-      screen.getByRole('tab', { name: /^Temporary discounts/ })
-    ).toHaveAttribute('aria-selected', 'true')
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    screen.getByRole('button', { name: 'Cancel' }).focus()
+    await userEvent.keyboard('{Enter}')
     expect(onApply).not.toHaveBeenCalled()
     expect(onClose).toHaveBeenCalledOnce()
   })
