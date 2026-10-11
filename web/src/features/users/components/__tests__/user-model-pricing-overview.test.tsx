@@ -18,7 +18,11 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
 
+import { screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterAll as after, afterEach, describe, test } from 'vitest'
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 
 // jsdom 未实现动画查询，Base UI 滚动区的异步清理需要这个浏览器 API。
 if (typeof HTMLElement.prototype.getAnimations !== 'function') {
@@ -68,32 +72,64 @@ const item = {
 }
 const originalAdapter = api.defaults.adapter
 const client = new QueryClient({
-  defaultOptions: { queries: { retry: false } },
+  defaultOptions: { queries: { retry: false, retryDelay: 0 } },
 })
 let requestedPages: number[] = []
 let requestedOverviewParams: Record<string, unknown> = {}
+let partialPageTest = false
+let failNextPage = false
+let nextPageAttempts = 0
 
 // 只替换网络边界，真实查询和组件负责展开后请求以及分页结果替换。
 api.defaults.adapter = async (config) => {
   const page = Number(config.params.p)
   requestedPages.push(page)
   requestedOverviewParams = config.params
+  if (partialPageTest && page === 2) {
+    nextPageAttempts++
+    if (failNextPage) throw new Error('temporary next-page failure')
+  }
   return {
     status: 200,
     statusText: 'OK',
     headers: {},
     config,
-    data: {
-      success: true,
-      data: {
-        items:
-          page === 1
-            ? item.rules
-            : [{ model_name: 'model-21', discount_bps: 7500 }],
-        total: 21,
-        page_size: 20,
-      },
-    },
+    data: config.url?.endsWith('/model-pricing/history')
+      ? {
+          success: true,
+          data: {
+            items: [
+              {
+                id: 1,
+                user_id: 42,
+                actor_id: 1,
+                model_name: 'history-permanent-only',
+                action: 'create',
+                revision: 2,
+                created_at: 100,
+                before: null,
+                after: {
+                  mode: 'layered',
+                  permanent: { discount_bps: 8000 },
+                  periods: null,
+                },
+              },
+            ],
+            total: 1,
+            page_size: 20,
+          },
+        }
+      : {
+          success: true,
+          data: {
+            items:
+              page === 1
+                ? item.rules
+                : [{ model_name: 'model-21', discount_bps: 7500 }],
+            total: partialPageTest && page === 2 ? 5 : 21,
+            page_size: 20,
+          },
+        },
   }
 }
 notifyManager.setScheduler(queueMicrotask)
@@ -137,6 +173,9 @@ afterEach(async () => {
   client.clear()
   requestedPages = []
   requestedOverviewParams = {}
+  partialPageTest = false
+  failNextPage = false
+  nextPageAttempts = 0
 })
 
 after(() => {
@@ -145,6 +184,124 @@ after(() => {
 })
 
 describe('user model pricing overview row', () => {
+  test('shows permanent-only history when the stored periods are null', async () => {
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => {
+      root?.render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <TestRowHarness onEdit={() => undefined} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show discounts for pricing-user' })
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Discount history' })
+    )
+    await waitFor(() => assert.ok(screen.getByText('history-permanent-only')))
+    const article = screen
+      .getByText('history-permanent-only')
+      .closest('article')
+    assert.ok(article)
+    assert.ok(article.textContent?.includes('Permanent discount: 80%'))
+  })
+  test('keeps loaded rules and stops automatic paging after failure until retry', async () => {
+    partialPageTest = true
+    failNextPage = true
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => {
+      root?.render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <TestRowHarness onEdit={() => undefined} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show discounts for pricing-user' })
+    )
+    await waitFor(() =>
+      assert.ok(document.body.textContent?.includes('model-04'))
+    )
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]'
+    )
+    assert.ok(viewport)
+    Object.defineProperties(viewport, {
+      clientHeight: { configurable: true, value: 480 },
+      scrollHeight: { configurable: true, value: 900 },
+      scrollTop: { configurable: true, value: 440 },
+    })
+    await act(async () => {
+      viewport.dispatchEvent(new Event('scroll'))
+    })
+    await waitFor(() =>
+      assert.ok(screen.getByRole('button', { name: 'Retry' }))
+    )
+    assert.equal(nextPageAttempts, 2)
+    assert.ok(document.body.textContent?.includes('model-04'))
+    await act(async () => {
+      viewport.dispatchEvent(new Event('scroll'))
+    })
+    assert.equal(nextPageAttempts, 2)
+    failNextPage = false
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      assert.ok(document.body.textContent?.includes('model-21'))
+    )
+    assert.equal(nextPageAttempts, 3)
+    assert.equal(screen.queryByRole('button', { name: 'Retry' }), null)
+  })
+  test('defaults detail requests to active and resets pagination when switching status', async () => {
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => {
+      root?.render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <TestRowHarness onEdit={() => undefined} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show discounts for pricing-user' })
+    )
+    await waitFor(() => assert.equal(requestedOverviewParams.status, 'active'))
+    for (const [label, status] of [
+      ['Not started', 'pending'],
+      ['Expired', 'expired'],
+      ['All statuses', undefined],
+    ] as const) {
+      await userEvent.click(
+        screen.getByRole('combobox', { name: 'Discount status' })
+      )
+      await userEvent.click(screen.getByRole('option', { name: label }))
+      await waitFor(() => assert.equal(requestedOverviewParams.status, status))
+      assert.equal(requestedOverviewParams.p, 1)
+      assert.equal(
+        screen.getByRole('combobox', { name: 'Discount status' }).textContent,
+        label
+      )
+    }
+    await userEvent.click(
+      screen.getByRole('combobox', { name: 'Discount status' })
+    )
+    await userEvent.click(screen.getByRole('option', { name: 'Active' }))
+    assert.equal(
+      screen.getByRole('combobox', { name: 'Discount status' }).textContent,
+      'Active'
+    )
+  })
   // 筛选器选择的值必须进入总览请求，后端才能同步过滤用户和统计数据。
   test('sends group and role filters to the overview request', async () => {
     await getUserModelPricingOverview({

@@ -157,8 +157,10 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 3, scheduledRevision)
 	require.Len(t, scheduledItems, 1)
-	assert.Equal(t, "scheduled", scheduledItems[0].Mode)
-	assert.Len(t, scheduledItems[0].Periods, 2)
+	assert.Equal(t, "layered", scheduledItems[0].Mode)
+	require.Len(t, scheduledItems[0].Periods, 1)
+	require.NotNil(t, scheduledItems[0].Permanent)
+	assert.Equal(t, 6000, scheduledItems[0].Permanent.DiscountBPS)
 	historyRequest := func() *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/history?user_id=%d&page_size=20", user.Id), nil))

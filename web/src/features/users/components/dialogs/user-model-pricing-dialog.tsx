@@ -28,7 +28,7 @@ import {
   Search,
   X,
 } from 'lucide-react'
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -63,15 +63,16 @@ import {
   createUserModelPricingFormSchema,
   countUserModelPricingPeriods,
   getPricingPeriodStatus,
+  getUserModelPricingFormPeriods,
   getUserModelPricingStatusOptions,
   userModelPricingFormItem,
+  userModelPricingDiscountPercentSchema,
   FULL_PRICE_DISCOUNT_BPS,
   normalizeUserModelPricingModelName,
   type UserModelPricingFormValues,
 } from '../../lib/user-model-pricing-form'
 import type { User } from '../../types'
 import {
-  PricingPeriodSummary,
   UserModelPricingScheduleDialog,
   UserModelPricingBatchTimeDialog,
 } from '../user-model-pricing-schedule'
@@ -175,7 +176,7 @@ function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
           onClick={props.onValidity}
         >
           <CalendarClock aria-hidden='true' />
-          {t('Validity')}
+          {t('Configure discount')}
         </Button>
         <Button
           type='button'
@@ -248,6 +249,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     collection: NonNullable<typeof collection>
     rows: ReturnType<typeof buildUserModelPricingRows>
   } | null>(null)
+  const [initializedSnapshot, setInitializedSnapshot] =
+    useState<typeof editorSnapshot>(null)
   // 仅在打开且初次查询完成时建立会话，条件更新在渲染提交前完成，避免 effect 连锁重置。
   if (!props.open && editorSnapshot) {
     setEditorSnapshot(null)
@@ -276,7 +279,12 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     const configuredModels = collection.items
       .filter(
         (item) =>
-          (item.mode === 'scheduled' ||
+          ((item.periods?.length ?? 0) > 0 ||
+            Boolean(item.permanent?.expression) ||
+            (item.permanent != null &&
+              item.permanent.discount_bps > 0 &&
+              item.permanent.discount_bps < FULL_PRICE_DISCOUNT_BPS) ||
+            Boolean(item.expression) ||
             (item.discount_bps > 0 &&
               item.discount_bps < FULL_PRICE_DISCOUNT_BPS)) &&
           normalizedEnabledNames.has(
@@ -301,14 +309,29 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     editorSnapshot.configuredOnly === configuredOnly
       ? editorSnapshot
       : null
+  const saveSessionRef = useRef(activeSnapshot)
+  useEffect(() => {
+    saveSessionRef.current = activeSnapshot
+    return () => {
+      saveSessionRef.current = null
+    }
+  }, [activeSnapshot])
+  // 模型目录先于 effect 回填表单，完成当前会话初始化前不得渲染或提交旧草稿。
+  const isDraftReady =
+    activeSnapshot !== null && initializedSnapshot === activeSnapshot
 
   const draftValidation = useMemo(
     () => formSchema.safeParse({ items: watchedItems ?? [] }),
     [formSchema, watchedItems]
   )
   const draftCanSave =
+    isDraftReady &&
     draftValidation.success &&
     (watchedItems?.length ?? 0) === (activeSnapshot?.rows.length ?? 0) &&
+    buildUserModelPricingPayload(
+      draftValidation.data,
+      activeSnapshot?.collection.items
+    ).items.length <= 1000 &&
     countUserModelPricingPeriods(
       buildUserModelPricingPayload(
         draftValidation.data,
@@ -339,6 +362,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         )
       ),
     })
+    setInitializedSnapshot(activeSnapshot)
   }, [activeSnapshot, form])
 
   const handleOpenChange = (open: boolean) => {
@@ -354,6 +378,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   }
 
   const mutation = useMutation({
+    onMutate: () => activeSnapshot,
     mutationFn: (values: UserModelPricingFormValues) =>
       replaceUserModelPricing(props.user.id, {
         ...buildUserModelPricingPayload(
@@ -362,7 +387,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         ),
         revision: activeSnapshot?.collection.revision ?? 0,
       }),
-    onSuccess: async (response) => {
+    onSuccess: async (response, _values, submittedSnapshot) => {
       if (!response.success) {
         toast.error(response.message || t('Failed to save model pricing'))
         return
@@ -378,17 +403,27 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         queryKey: ['user-model-pricing-history'],
       })
       await queryClient.invalidateQueries({
-        queryKey: ['user-model-pricing', props.user.id],
+        queryKey: [
+          'user-model-pricing',
+          submittedSnapshot?.userId ?? props.user.id,
+        ],
       })
       toast.success(t('Model pricing saved'))
+      // 旧保存结果只刷新数据，不能关闭后来打开的编辑会话。
+      if (!submittedSnapshot || saveSessionRef.current !== submittedSnapshot) {
+        return
+      }
       // 保存后刷新总览摘要和展开明细，避免继续展示旧折扣。
       await props.onSaved?.()
-      handleOpenChange(false)
+      if (saveSessionRef.current === submittedSnapshot) handleOpenChange(false)
     },
-    onError: async (error) => {
+    onError: async (error, _values, submittedSnapshot) => {
       if (axios.isAxiosError(error) && error.response?.status === 409) {
         await queryClient.invalidateQueries({
-          queryKey: ['user-model-pricing', props.user.id],
+          queryKey: [
+            'user-model-pricing',
+            submittedSnapshot?.userId ?? props.user.id,
+          ],
         })
         toast.error(
           t(
@@ -401,7 +436,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     },
   })
 
-  const isLoading = !activeSnapshot && (query.isLoading || query.isFetching)
+  const isLoading =
+    (!activeSnapshot && (query.isLoading || query.isFetching)) ||
+    (activeSnapshot !== null && !isDraftReady)
   const hasLoadError =
     !activeSnapshot &&
     (query.isError ||
@@ -414,7 +451,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       pricingRows.map((model, index) => ({
         model,
         index,
-        searchName: model.model_name.toLowerCase(),
+        searchName: [model.model_name, ...model.aliases]
+          .join('\n')
+          .toLowerCase(),
       })),
     [pricingRows]
   )
@@ -423,9 +462,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     if (!props.open) return
     const times = (watchedItems ?? [])
       .flatMap((item) =>
-        (item.mode === 'scheduled' ? (item.periods ?? []) : [item]).flatMap(
-          (period) => [period.start_time, period.end_time]
-        )
+        getUserModelPricingFormPeriods(item).flatMap((period) => [
+          period.start_time,
+          period.end_time,
+        ])
       )
       .filter(
         (value): value is number => typeof value === 'number' && value > now
@@ -463,11 +503,21 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       const item = watchedItems?.[index]
       if (
         !item ||
-        (item.mode !== 'scheduled' && item.discount_percent === 100)
+        (item.mode !== 'layered' &&
+          item.mode !== 'scheduled' &&
+          !item.expression &&
+          item.discount_percent === 100)
       ) {
         return false
       }
-      const periods = item.mode === 'scheduled' ? (item.periods ?? []) : [item]
+      if (
+        item.mode === 'layered' &&
+        statusFilter === 'active' &&
+        (item.expression || (item.discount_percent ?? 100) < 100)
+      ) {
+        return true
+      }
+      const periods = getUserModelPricingFormPeriods(item)
       return periods.some(
         (period) => getPricingPeriodStatus(period, now) === statusFilter
       )
@@ -500,10 +550,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
 
   const batchDiscountResult = useMemo(
     () =>
-      formSchema.shape.items.element.options[0].shape.discount_percent.safeParse(
+      userModelPricingDiscountPercentSchema(t).safeParse(
         batchDiscount.trim() === '' ? undefined : Number(batchDiscount)
       ),
-    [batchDiscount, formSchema]
+    [batchDiscount, t]
   )
   const selectedItems = useMemo(
     () =>
@@ -520,12 +570,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const selectedDiscountsMatchBatch =
     batchDiscountResult.success &&
     selectedItems.length === selectedModels.size &&
-    selectedItems.every((item) =>
-      item.mode === 'scheduled'
-        ? (item.periods ?? []).every(
-            (period) => period.discount_percent === batchDiscountResult.data
-          )
-        : item.discount_percent === batchDiscountResult.data
+    selectedItems.every(
+      (item) =>
+        !item.expression?.trim() &&
+        item.discount_percent === batchDiscountResult.data
     )
   const batchApplySatisfied =
     !requiresBatchApply ||
@@ -543,65 +591,71 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       setBatchError(result.error.issues[0].message)
       return
     }
-    const items = form.getValues('items').map((item) => {
-      if (!selectedModels.has(item.model_name)) return item
-      if (result.data === 100) {
-        return {
-          ...item,
-          mode: 'single' as const,
-          periods: undefined,
-          discount_percent: 100,
-        }
-      }
-      if (item.mode !== 'scheduled') {
-        return { ...item, discount_percent: result.data }
-      }
-      return {
-        ...item,
-        discount_percent: result.data,
-        periods: item.periods?.map((period) => ({
-          ...period,
-          discount_percent: result.data,
-        })),
-      }
-    })
+    const items = form.getValues('items').map((item) =>
+      selectedModels.has(item.model_name)
+        ? {
+            ...item,
+            mode: 'layered' as const,
+            discount_percent: result.data,
+            expression: '',
+            calculation_type: 'fixed' as const,
+          }
+        : item
+    )
+    const payload = buildUserModelPricingPayload(
+      { items },
+      activeSnapshot.collection.items
+    )
     if (
-      countUserModelPricingPeriods(
-        buildUserModelPricingPayload({ items }, activeSnapshot.collection.items)
-          .items
-      ) > 1000
+      payload.items.length > 1000 ||
+      countUserModelPricingPeriods(payload.items) > 1000
     ) {
       setBatchError(t('At most 1000 model pricing rules are allowed'))
       return
     }
-    const changedFields: `items.${number}.discount_percent`[] = []
-    items.forEach((item, index) => {
-      if (!selectedModels.has(item.model_name)) return
-      const name = `items.${index}.discount_percent` as const
-      form.setValue(`items.${index}`, item, {
-        shouldDirty: true,
-        shouldTouch: true,
-      })
-      changedFields.push(name)
-    })
+    // setValue 会递归通知数组子字段，整套回填才能避免千条规则被重复复制。
+    form.reset(
+      { items },
+      {
+        keepDefaultValues: true,
+        keepErrors: true,
+        keepTouched: true,
+        keepIsSubmitted: true,
+        keepSubmitCount: true,
+      }
+    )
     setBatchError(null)
     setAppliedBatchDiscount(result.data)
     // 批量写完再统一更新字段错误，避免每写一行就对完整表单重复校验。
-    void form.trigger(changedFields)
+    void form.trigger('items')
   }
   const applyBatchTimes = (changes: {
     start_time?: number
     end_time?: number | null
   }): string | null => {
-    const items = form.getValues('items').map((item) => {
-      if (!selectedModels.has(item.model_name)) return item
-      return item.mode === 'scheduled'
+    const selected = form
+      .getValues('items')
+      .filter((item) => selectedModels.has(item.model_name))
+    if (selected.some((item) => !item.periods?.length)) {
+      return t('Every selected model must have a temporary discount')
+    }
+    const items = form.getValues('items').map((item) =>
+      selectedModels.has(item.model_name)
         ? {
             ...item,
-            periods: item.periods?.map((period) => ({ ...period, ...changes })),
+            periods: item.periods?.map((period) => ({
+              ...period,
+              ...changes,
+              legacy_unbounded:
+                changes.end_time !== undefined ||
+                (changes.start_time !== undefined &&
+                  changes.start_time !== period.start_time)
+                  ? false
+                  : period.legacy_unbounded,
+            })),
           }
-        : { ...item, ...changes }
-    })
+        : item
+    )
     const result = formSchema.safeParse({ items })
     if (!result.success) return result.error.issues[0].message
     form.setValue('items', items, { shouldDirty: true, shouldTouch: true })
@@ -878,20 +932,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                               </span>
                             )}
                             <div className='mt-1 flex flex-wrap items-center gap-1'>
-                              {watchedItems?.[index]?.mode === 'scheduled' && (
+                              {(watchedItems?.[index]?.periods?.length ?? 0) >
+                                0 && (
                                 <span className='text-muted-foreground text-xs'>
-                                  {t('Multiple periods')} ·{' '}
-                                  {watchedItems[index].periods?.length ?? 0}
+                                  {t('Temporary discounts')} ·{' '}
+                                  {watchedItems?.[index]?.periods?.length ?? 0}
                                 </span>
                               )}
-                              {watchedItems?.[index]?.mode !== 'scheduled' &&
-                                watchedItems?.[index]?.discount_percent <
-                                  100 && (
-                                  <PricingPeriodSummary
-                                    period={watchedItems[index]}
-                                    now={now}
-                                  />
-                                )}
+
                               <Button
                                 type='button'
                                 variant='ghost'
@@ -905,7 +953,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                 })}
                               >
                                 <CalendarClock aria-hidden='true' />
-                                {t('Validity')}
+                                {t('Configure discount')}
                               </Button>
                             </div>
                           </div>
@@ -918,46 +966,55 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                 <FormLabel className='sr-only'>
                                   {t('Discount percentage')}
                                 </FormLabel>
-                                {watchedItems?.[index]?.mode === 'scheduled' ? (
-                                  <Button
-                                    type='button'
-                                    variant='outline'
-                                    className='w-full'
-                                    disabled={mutation.isPending}
-                                    onClick={() =>
-                                      setScheduleModel(model.model_name)
-                                    }
-                                  >
-                                    {t('Multiple periods')}
-                                  </Button>
-                                ) : (
-                                  <FormControl>
-                                    <div className='relative'>
-                                      <Input
-                                        disabled={mutation.isPending}
-                                        type='number'
-                                        min='0.01'
-                                        max='100'
-                                        step='0.01'
-                                        className='pr-7 font-mono'
-                                        value={field.value ?? ''}
-                                        onBlur={field.onBlur}
-                                        onChange={(event) => {
-                                          // RHF 受控字段不接受 undefined，空值使用 null 才能真正清除规则。
-                                          const nextValue =
-                                            event.target.valueAsNumber
-                                          field.onChange(
-                                            Number.isFinite(nextValue)
-                                              ? nextValue
-                                              : null
-                                          )
-                                        }}
-                                      />
-                                      <span className='text-muted-foreground pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-xs'>
-                                        %
-                                      </span>
-                                    </div>
-                                  </FormControl>
+                                <FormControl>
+                                  <div className='relative'>
+                                    <Input
+                                      disabled={mutation.isPending}
+                                      type='number'
+                                      min='0.01'
+                                      max='100'
+                                      step='0.01'
+                                      className='pr-7 font-mono'
+                                      value={field.value ?? ''}
+                                      onBlur={field.onBlur}
+                                      onChange={(event) => {
+                                        // RHF 受控字段不接受 undefined，空值使用 null 才能真正清除规则。
+                                        const nextValue =
+                                          event.target.valueAsNumber
+                                        field.onChange(
+                                          Number.isFinite(nextValue)
+                                            ? nextValue
+                                            : null
+                                        )
+                                        form.setValue(
+                                          `items.${index}.expression`,
+                                          '',
+                                          {
+                                            shouldDirty: true,
+                                            shouldValidate: true,
+                                          }
+                                        )
+                                        form.setValue(
+                                          `items.${index}.calculation_type`,
+                                          'fixed',
+                                          {
+                                            shouldDirty: true,
+                                            shouldValidate: true,
+                                          }
+                                        )
+                                      }}
+                                    />
+                                    <span className='text-muted-foreground pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-xs'>
+                                      %
+                                    </span>
+                                  </div>
+                                </FormControl>
+                                {watchedItems?.[index]?.expression && (
+                                  <p className='text-muted-foreground text-xs'>
+                                    {t(
+                                      'Enter a fixed permanent percentage to replace the existing permanent conditions. Temporary rules are preserved.'
+                                    )}
+                                  </p>
                                 )}
                                 <FormMessage />
                               </FormItem>

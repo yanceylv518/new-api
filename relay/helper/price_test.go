@@ -3,6 +3,7 @@ package helper
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTimeDiscountIgnoresUnrelatedRequestAmounts(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"seconds":-1,"n":2147483648}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	end := int64(300)
+	info := &relaycommon.RelayInfo{OriginModelName: "model", StartTime: time.Unix(199, 0), UserModelDiscountBPS: hosttypes.NewUserModelDiscountScheduleSnapshot(map[string]hosttypes.UserModelDiscountConfig{"model": {
+		Mode: hosttypes.UserModelPricingLayered, Permanent: &hosttypes.UserModelDiscountWindow{DiscountBPS: 8000},
+		Periods: []hosttypes.UserModelDiscountWindow{{StartTime: 100, EndTime: &end, Expression: `hour("Asia/Shanghai") >= 0 ? 0.6 : permanent_discount`}},
+	}})}
+	require.NoError(t, PrepareUserModelDiscount(ctx, info, 10, 10, map[string]any{"seconds": -1, "tokens": int64(2147483648)}))
+	require.NotNil(t, info.UserModelDiscountEvaluation)
+	assert.Equal(t, 6000, info.UserModelDiscountEvaluation.DiscountBPS)
+	assert.Zero(t, info.UserModelDiscountEvaluation.Context.Seconds)
+	assert.EqualValues(t, 1, info.UserModelDiscountEvaluation.Context.Count)
+	assert.Zero(t, info.UserModelDiscountEvaluation.Context.TaskTokens)
+}
 
 // 修饰符和基础名共享计费身份，渠道测试必须保持原价，不允许伪造请求倍率覆盖用户折扣。
 func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -54,6 +55,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	other.SetPublic("group_ratio", info.PriceData.GroupRatioInfo.GroupRatio)
 	other.SetPublic(types.UserModelDiscountRatioKey, info.PriceData.UserModelDiscountMultiplier())
 	info.PriceData.DiscountAmounts.AddToLog(other)
+	info.UserModelDiscountEvaluation.AddToLog(other)
 	if info.PriceData.DiscountAmounts != nil {
 		other.SetPublic("discount_cost_scope", "task_total")
 	}
@@ -112,6 +114,7 @@ func taskBillingOther(task *model.Task) *model.LogOther {
 			other.SetPublic("model_ratio", bc.ModelRatio)
 		}
 		other.SetPublic("group_ratio", bc.GroupRatio)
+		bc.UserDiscount.AddToLog(other)
 		if priceData := taskBillingContextPriceData(bc); priceData != nil {
 			for k, v := range priceData.OtherRatios() {
 				if !other.SetPublic(k, v) {
@@ -246,6 +249,10 @@ func RecalculateTaskQuotaWithAmounts(ctx context.Context, task *model.Task, actu
 
 // settleTaskQuotaWithSnapshot 在同一结算中保存可选的最终用量；只有事务确实更新时才记日志。
 func settleTaskQuotaWithSnapshot(ctx context.Context, task *model.Task, actualQuota int, amounts *types.DiscountAmounts, snapshot *billingexpr.BillingSnapshot, reason string, clamps ...*common.QuotaClamp) {
+	settleTaskQuotaWithDiscount(ctx, task, actualQuota, amounts, snapshot, nil, reason, clamps...)
+}
+
+func settleTaskQuotaWithDiscount(ctx context.Context, task *model.Task, actualQuota int, amounts *types.DiscountAmounts, snapshot *billingexpr.BillingSnapshot, discount *types.UserModelDiscountEvaluation, reason string, clamps ...*common.QuotaClamp) {
 	if actualQuota < 0 {
 		return
 	}
@@ -254,7 +261,7 @@ func settleTaskQuotaWithSnapshot(ctx context.Context, task *model.Task, actualQu
 		logger.LogError(ctx, fmt.Sprintf("任务金额快照与实际扣款不一致 task %s", task.TaskID))
 		return
 	}
-	result, err := model.CommitTaskSettlementWithSnapshot(ctx, task, actualQuota, amounts, snapshot)
+	result, err := model.CommitTaskSettlementWithSnapshot(ctx, task, actualQuota, amounts, snapshot, discount)
 	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("任务原子结算失败 task %s: %s", task.TaskID, err.Error()))
 		return
@@ -312,7 +319,7 @@ func settleTaskQuotaWithSnapshot(ctx context.Context, task *model.Task, actualQu
 // RecalculateTaskQuotaByTokens 根据实际 token 消耗重新计费（异步差额结算）。
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
-func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
+func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int, completionTokens ...int) bool {
 	if totalTokens <= 0 {
 		return false
 	}
@@ -356,7 +363,16 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	// 计算 OtherRatios 乘积（视频折扣、时长等）
 	otherMultiplier := 1.0
 	beforeMultiplier := 1.0
-	priceData := taskBillingContextPriceData(task.PrivateData.BillingContext)
+	input, output := float64(-1), float64(-1)
+	if len(completionTokens) > 0 && completionTokens[0] > 0 {
+		output = float64(completionTokens[0])
+		input = math.Max(0, float64(totalTokens)-output)
+	}
+	priceData, discount, discountErr := taskUserModelDiscount(task, map[string]any{"task_tokens": totalTokens}, input, output)
+	if discountErr != nil {
+		logger.LogError(ctx, discountErr.Error())
+		return true
+	}
 	if priceData != nil {
 		otherMultiplier = priceData.OtherRatioMultiplier()
 		beforeMultiplier = priceData.OtherRatioMultiplierBeforeDiscount()
@@ -394,6 +410,6 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	if clamp == nil {
 		clamp = originalClamp
 	}
-	RecalculateTaskQuotaWithAmounts(ctx, task, actualQuota, types.NewDiscountAmounts(originalQuota, actualQuota), reason, clamp)
+	settleTaskQuotaWithDiscount(ctx, task, actualQuota, types.NewDiscountAmounts(originalQuota, actualQuota), nil, discount, reason, clamp)
 	return true
 }

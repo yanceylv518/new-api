@@ -149,7 +149,9 @@ export interface ManageUserQuotaPayload {
 export interface UserModelPricingItem {
   model_name: string
   discount_bps: number
-  mode?: 'single' | 'scheduled'
+  mode?: 'single' | 'scheduled' | 'layered'
+  expression?: string
+  permanent?: UserModelPricingPeriod
   start_time?: number | null
   end_time?: number | null
   slot?: number
@@ -157,6 +159,8 @@ export interface UserModelPricingItem {
 }
 
 export interface UserModelPricingPeriod {
+  expression?: string
+  legacy_unbounded?: boolean
   discount_bps: number
   start_time?: number | null
   end_time?: number | null
@@ -172,12 +176,14 @@ export interface UserModelPricingHistoryItem {
   created_at: number
   user_deleted: boolean
   before: {
-    mode: 'single' | 'scheduled'
-    periods: UserModelPricingPeriod[]
+    mode: 'single' | 'scheduled' | 'layered'
+    permanent?: UserModelPricingPeriod
+    periods: UserModelPricingPeriod[] | null
   } | null
   after: {
-    mode: 'single' | 'scheduled'
-    periods: UserModelPricingPeriod[]
+    mode: 'single' | 'scheduled' | 'layered'
+    permanent?: UserModelPricingPeriod
+    periods: UserModelPricingPeriod[] | null
   } | null
 }
 

@@ -17,10 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Plus, Trash2 } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { ConfirmDialog } from '@/components/confirm-dialog'
 import { DateTimePicker } from '@/components/datetime-picker'
 import { Dialog } from '@/components/dialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -33,17 +32,8 @@ import {
   FieldGroup,
   FieldLabel,
 } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import dayjs from '@/lib/dayjs'
 
 import {
@@ -51,10 +41,13 @@ import {
   getPricingPeriodStatus,
   type UserModelPricingFormValues,
 } from '../lib/user-model-pricing-form'
+import {
+  DiscountPercentInput,
+  UserDiscountRuleEditor,
+} from './user-discount-rule-editor'
 
 type PricingDraft = UserModelPricingFormValues['items'][number]
 type PeriodDraft = NonNullable<PricingDraft['periods']>[number]
-type PeriodField = 'discount_percent' | 'start_time' | 'end_time'
 
 export function PricingPeriodStatusBadge(props: {
   period: { start_time?: number | null; end_time?: number | null }
@@ -94,16 +87,13 @@ export function PricingPeriodSummary(props: {
   now?: number
 }) {
   const { t } = useTranslation()
-  let startLabel = t('On save')
-  if (props.period.start_time === 0) startLabel = t('Existing rule')
-  else if (props.period.start_time) {
-    startLabel = dayjs.unix(props.period.start_time).format('YYYY-MM-DD HH:mm')
-  }
   return (
     <span className='flex flex-wrap items-center gap-1 text-xs'>
-      <PricingPeriodStatusBadge period={props.period} now={props.now} />
+      <PricingPeriodStatusBadge {...props} />
       <span className='text-muted-foreground'>
-        {startLabel}
+        {props.period.start_time
+          ? dayjs.unix(props.period.start_time).format('YYYY-MM-DD HH:mm')
+          : t('Permanent discount')}
         {' → '}
         {props.period.end_time == null
           ? t('Permanent')
@@ -119,437 +109,378 @@ export function UserModelPricingScheduleDialog(props: {
   onClose: () => void
 }) {
   const { t } = useTranslation()
-  const [draft, setDraft] = useState<PricingDraft>(() =>
-    props.value.mode === 'scheduled'
-      ? {
-          ...props.value,
-          periods: props.value.periods?.map((period) => ({
-            ...period,
-            start_time: period.start_time ?? Math.floor(Date.now() / 1000),
-          })),
-        }
-      : {
-          ...props.value,
-          start_time: props.value.start_time ?? Math.floor(Date.now() / 1000),
-        }
-  )
+  const [draft, setDraft] = useState<PricingDraft>(() => ({
+    ...props.value,
+    mode: 'layered',
+    periods: props.value.periods?.map((period) => ({ ...period })) ?? [],
+  }))
   const [error, setError] = useState<string | null>(null)
-  const [confirmSingle, setConfirmSingle] = useState(false)
-  const [keepIndex, setKeepIndex] = useState('0')
-  // 删除中间时间段时保留其余编辑器身份，避免复用被删段的日期选择器状态。
-  const [periodKeys, setPeriodKeys] = useState(() =>
-    Array.from(
-      {
-        length:
-          props.value.mode === 'scheduled'
-            ? (props.value.periods?.length ?? 0)
-            : 1,
-      },
-      (_, index) => index
-    )
+  const [clockTick, setClockTick] = useState(0)
+  useEffect(() => {
+    const now = Date.now() / 1000
+    const boundaries = (draft.periods ?? [])
+      .flatMap((period) => [period.start_time, period.end_time])
+      .filter(
+        (value): value is number => typeof value === 'number' && value > now
+      )
+    const refresh = () => setClockTick((tick) => tick + 1)
+    const timer = boundaries.length
+      ? setTimeout(
+          refresh,
+          Math.min(2147483647, (Math.min(...boundaries) - now) * 1000 + 100)
+        )
+      : undefined
+    const refreshVisible = () => {
+      if (document.visibilityState === 'visible') refresh()
+    }
+    document.addEventListener('visibilitychange', refreshVisible)
+    return () => {
+      if (timer !== undefined) clearTimeout(timer)
+      document.removeEventListener('visibilitychange', refreshVisible)
+    }
+  }, [draft.periods, clockTick])
+  const [keys, setKeys] = useState(() =>
+    (props.value.periods ?? []).map((_, index) => index)
   )
-  const nextPeriodKey = useRef(periodKeys.length)
+  const nextKey = useRef(keys.length)
   const schema = useMemo(() => createUserModelPricingFormSchema(t), [t])
-  const mode = draft.mode ?? 'single'
-  const periods: PeriodDraft[] =
-    draft.mode === 'scheduled' ? (draft.periods ?? []) : [draft]
-  const validation = useMemo(
-    () => schema.safeParse({ items: [draft] }),
-    [schema, draft]
-  )
-  const fieldErrors = new Map<number, Partial<Record<PeriodField, string>>>()
-  if (!validation.success) {
-    for (const issue of validation.error.issues) {
-      const periodIndex = issue.path[2] === 'periods' ? issue.path[3] : 0
-      const field = issue.path.at(-1)
+  const validation = schema.safeParse({ items: [draft] })
+  const issues = validation.success ? [] : validation.error.issues
+  const fieldErrors = (position?: number) => {
+    const errors: Record<string, string> = {}
+    for (const issue of issues) {
+      const isPeriod = issue.path[2] === 'periods'
       if (
-        typeof periodIndex !== 'number' ||
-        (field !== 'discount_percent' &&
-          field !== 'start_time' &&
-          field !== 'end_time')
+        (position === undefined && !isPeriod) ||
+        (position !== undefined && isPeriod && issue.path[3] === position)
       ) {
-        continue
+        errors[String(issue.path.at(-1))] = issue.message
       }
-      const errors = fieldErrors.get(periodIndex) ?? {}
-      errors[field] ??= issue.message
-      fieldErrors.set(periodIndex, errors)
     }
+    return errors
   }
-  const orderedPeriods = periods
-    .map((period, index) => ({
-      index,
-      start: period.start_time ?? Math.floor(Date.now() / 1000),
+  const update = (position: number, changes: Partial<PeriodDraft>) => {
+    setDraft((previous) => ({
+      ...previous,
+      periods: previous.periods?.map((period, index) =>
+        index === position
+          ? {
+              ...period,
+              ...changes,
+              legacy_unbounded:
+                changes.legacy_unbounded ??
+                ((changes.expression !== undefined &&
+                  changes.expression !== period.expression) ||
+                (changes.start_time !== undefined &&
+                  changes.start_time !== period.start_time) ||
+                (changes.discount_percent !== undefined &&
+                  changes.discount_percent !== period.discount_percent)
+                  ? false
+                  : period.legacy_unbounded),
+            }
+          : period
+      ),
     }))
-    .filter((period) => Number.isFinite(period.start))
-    .sort((a, b) => a.start - b.start)
-  const nextStarts = new Map<number, number>()
-  orderedPeriods.forEach((period, index) => {
-    const next = orderedPeriods[index + 1]
-    if (next && next.start > period.start) {
-      nextStarts.set(period.index, next.start)
-    }
-  })
-
-  const updatePeriod = (index: number, update: Partial<PeriodDraft>) => {
-    setDraft((previous) =>
-      previous.mode === 'scheduled'
-        ? {
-            ...previous,
-            periods: previous.periods?.map((period, position) =>
-              position === index ? { ...period, ...update } : period
-            ),
-          }
-        : { ...previous, ...update }
-    )
     setError(null)
   }
-
-  const selectSinglePeriod = (index: number) => {
-    const period = periods[index]
-    const key = periodKeys[index]
-    if (!period || key === undefined) return
-    setDraft({
-      model_name: draft.model_name,
-      mode: 'single',
-      ...period,
-      periods: undefined,
-    })
-    setPeriodKeys([key])
-    setConfirmSingle(false)
-    setError(null)
-  }
-
-  const apply = () => {
-    const result = schema.safeParse({ items: [draft] })
-    if (!result.success) {
-      setError(result.error.issues[0].message)
-      return
-    }
-    const applyError = props.onApply(result.data.items[0])
-    if (applyError) {
-      setError(applyError)
-      return
-    }
-    props.onClose()
-  }
-
+  const periods = draft.periods ?? []
+  const now = Math.floor(Date.now() / 1000)
+  const active = periods.find(
+    (period) => getPricingPeriodStatus(period, now) === 'active'
+  )
+  const permanentLabel = draft.expression
+    ? t('Conditional discount')
+    : `${String(draft.discount_percent ?? 100)}%`
   return (
     <Dialog
       open
       onOpenChange={(open) => {
         if (!open) props.onClose()
       }}
-      title={t('Discount validity')}
+      title={t('Model discount configuration')}
       description={draft.model_name}
-      contentClassName='sm:max-w-2xl'
+      contentClassName='sm:max-w-3xl'
       footer={
         <>
-          <Button variant='outline' onClick={props.onClose}>
+          <Button type='button' variant='outline' onClick={props.onClose}>
             {t('Cancel')}
           </Button>
           <Button
             type='button'
             disabled={!validation.success || Boolean(error)}
-            onClick={apply}
+            onClick={() => {
+              if (!validation.success) return
+              const result = props.onApply(validation.data.items[0])
+              if (result) {
+                setError(result)
+                return
+              }
+              props.onClose()
+            }}
           >
             {t('Apply')}
           </Button>
         </>
       }
     >
-      <div className='flex flex-col gap-4'>
-        <Tabs
-          value={mode}
-          onValueChange={(value) => {
-            if (value === 'scheduled') {
-              setDraft({
-                ...draft,
-                mode: 'scheduled',
-                periods: [
-                  {
-                    discount_percent: draft.discount_percent ?? Number.NaN,
-                    start_time: draft.start_time,
-                    end_time: draft.end_time,
-                  },
-                ],
-              })
-            } else if (value === 'single') {
-              if (periods.length > 1) {
-                setKeepIndex('0')
-                setConfirmSingle(true)
-              } else selectSinglePeriod(0)
-            }
-            setError(null)
-          }}
-        >
-          <TabsList>
-            <TabsTrigger value='single'>{t('Single period')}</TabsTrigger>
-            <TabsTrigger value='scheduled'>{t('Multiple periods')}</TabsTrigger>
-          </TabsList>
-        </Tabs>
-        <p className='text-muted-foreground text-xs'>
-          {t('Blank end time means permanent.')}
-        </p>
-        {mode === 'single' &&
-          draft.start_time != null &&
-          draft.start_time > Math.floor(Date.now() / 1000) && (
-            <Alert>
-              <AlertDescription>
-                {t(
-                  'Until this period starts, the model is charged at its normal price.'
-                )}
-              </AlertDescription>
-            </Alert>
-          )}
-        {periods.map((period, index) => {
-          const errors = fieldErrors.get(index) ?? {}
-          const fieldId = `pricing-period-${periodKeys[index]}`
-          return (
-            <div
-              key={periodKeys[index]}
-              className='flex flex-col gap-3 rounded-lg border p-3'
-            >
-              <div className='flex items-center justify-between gap-2'>
-                <span className='text-sm font-medium'>
-                  {t('Period {{n}}', { n: index + 1 })}
-                </span>
-                {mode === 'scheduled' && (
-                  <Button
-                    type='button'
-                    variant='ghost'
-                    size='icon-sm'
-                    aria-label={t('Remove period')}
-                    disabled={periods.length === 1}
-                    onClick={() => {
-                      setDraft({
-                        ...draft,
-                        mode: 'scheduled',
-                        periods: periods.filter(
-                          (_, position) => position !== index
-                        ),
-                      })
-                      setPeriodKeys((keys) =>
-                        keys.filter((_, position) => position !== index)
-                      )
-                      setError(null)
-                    }}
-                  >
-                    <Trash2 aria-hidden='true' />
-                  </Button>
-                )}
-              </div>
-              <FieldGroup className='gap-3'>
-                <Field data-invalid={Boolean(errors.discount_percent)}>
-                  <FieldLabel htmlFor={`pricing-period-${index}`}>
-                    {t('Discount percentage')}
-                  </FieldLabel>
-                  <div className='relative'>
-                    <Input
-                      id={`pricing-period-${index}`}
-                      type='number'
-                      min='0.01'
-                      max={mode === 'scheduled' ? '99.99' : '100'}
-                      step='0.01'
-                      aria-invalid={Boolean(errors.discount_percent)}
-                      aria-describedby={
-                        errors.discount_percent
-                          ? `${fieldId}-discount-error`
-                          : undefined
-                      }
-                      className='pr-7 font-mono'
-                      value={
-                        Number.isFinite(period.discount_percent)
-                          ? period.discount_percent
-                          : ''
-                      }
-                      onChange={(event) =>
-                        updatePeriod(index, {
-                          discount_percent: event.target.valueAsNumber,
-                        })
-                      }
-                    />
-                    <span
-                      className='text-muted-foreground pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-sm'
-                      aria-hidden='true'
-                    >
-                      %
-                    </span>
-                  </div>
-                  {errors.discount_percent && (
-                    <FieldError id={`${fieldId}-discount-error`}>
-                      {errors.discount_percent}
-                    </FieldError>
-                  )}
-                </Field>
-                <Field data-invalid={Boolean(errors.start_time)}>
-                  <FieldLabel htmlFor={`${fieldId}-start`}>
-                    {t('Start time')}
-                  </FieldLabel>
-                  <DateTimePicker
-                    id={`${fieldId}-start`}
-                    hideTimeWhenEmpty
-                    aria-label={t('Start time')}
-                    aria-invalid={Boolean(errors.start_time)}
-                    aria-describedby={
-                      errors.start_time ? `${fieldId}-start-error` : undefined
-                    }
-                    value={
-                      period.start_time != null && period.start_time !== 0
-                        ? new Date(period.start_time * 1000)
-                        : undefined
-                    }
-                    clearable={false}
-                    placeholder={
-                      period.start_time === 0
-                        ? t('Existing rule')
-                        : t('On save')
-                    }
-                    onChange={(value) => {
-                      if (value) {
-                        updatePeriod(index, {
-                          start_time: Math.floor(value.getTime() / 1000),
-                        })
-                      }
-                    }}
-                  />
-                  {errors.start_time && (
-                    <FieldError id={`${fieldId}-start-error`}>
-                      {errors.start_time}
-                    </FieldError>
-                  )}
-                </Field>
-                <Field data-invalid={Boolean(errors.end_time)}>
-                  <FieldLabel htmlFor={`${fieldId}-end`}>
-                    {t('End time')}
-                  </FieldLabel>
-                  <DateTimePicker
-                    id={`${fieldId}-end`}
-                    aria-label={t('End time')}
-                    aria-invalid={Boolean(errors.end_time)}
-                    aria-describedby={
-                      errors.end_time ? `${fieldId}-end-error` : undefined
-                    }
-                    hideTimeWhenEmpty
-                    value={
-                      period.end_time != null
-                        ? new Date(period.end_time * 1000)
-                        : undefined
-                    }
-                    placeholder={t('Permanent')}
-                    onChange={(value) =>
-                      updatePeriod(index, {
-                        end_time: value
-                          ? Math.floor(value.getTime() / 1000)
-                          : null,
-                      })
-                    }
-                  />
-                  {errors.end_time && (
-                    <FieldError id={`${fieldId}-end-error`}>
-                      {errors.end_time}
-                    </FieldError>
-                  )}
-                  {errors.end_time && nextStarts.has(index) && (
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='ghost'
-                      className='self-start'
-                      onClick={() =>
-                        updatePeriod(index, { end_time: nextStarts.get(index) })
-                      }
-                    >
-                      {t('End at next start')}
-                    </Button>
-                  )}
-                </Field>
-              </FieldGroup>
-              {Object.keys(errors).length === 0 && (
-                <PricingPeriodSummary period={period} />
-              )}
-            </div>
-          )
-        })}
-        {mode === 'scheduled' && (
-          <Button
-            variant='outline'
-            disabled={periods.length >= 1000}
-            onClick={() => {
-              const key = nextPeriodKey.current++
-              setPeriodKeys((keys) => [...keys, key])
-              setDraft({
-                ...draft,
-                mode: 'scheduled',
-                periods: [
-                  ...periods,
-                  {
-                    discount_percent: periods.at(-1)?.discount_percent ?? 99,
-                    start_time:
-                      periods.at(-1)?.end_time ??
-                      Math.max(
-                        Math.floor(Date.now() / 1000),
-                        (periods.at(-1)?.start_time ??
-                          Math.floor(Date.now() / 1000)) + 60
-                      ),
-                    end_time: null,
-                  },
-                ],
-              })
-              setError(null)
-            }}
+      <div className='flex flex-col gap-5'>
+        <Tabs defaultValue='permanent' className='gap-4'>
+          <TabsList
+            className='w-full'
+            aria-label={t('Model discount configuration')}
           >
-            <Plus aria-hidden='true' />
-            {t('Add period')}
-          </Button>
-        )}
-        {error && (
+            <TabsTrigger
+              value='permanent'
+              className={
+                issues.some((issue) => issue.path[2] !== 'periods')
+                  ? 'text-destructive'
+                  : undefined
+              }
+            >
+              {t('Permanent discount')}
+            </TabsTrigger>
+            <TabsTrigger
+              value='temporary'
+              className={
+                issues.some((issue) => issue.path[2] === 'periods')
+                  ? 'text-destructive'
+                  : undefined
+              }
+            >
+              {t('Temporary discounts')}
+              {periods.length > 0 && (
+                <Badge variant='secondary'>{periods.length}</Badge>
+              )}
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value='permanent' keepMounted>
+            <section className='flex flex-col gap-3 rounded-lg border p-4'>
+              <div>
+                <p className='text-muted-foreground text-xs'>
+                  {t(
+                    'Payment percentage used when no temporary discount matches.'
+                  )}
+                </p>
+              </div>
+              {draft.expression && (
+                <Alert>
+                  <AlertDescription>
+                    {t(
+                      'Enter a fixed permanent percentage to replace the existing permanent conditions. Temporary rules are preserved.'
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+              <DiscountPercentInput
+                id='permanent-discount'
+                label={t('Permanent discount')}
+                hideLabel
+                value={draft.discount_percent}
+                onChange={(discount_percent) => {
+                  setDraft((previous) => ({
+                    ...previous,
+                    discount_percent,
+                    expression: '',
+                    calculation_type: 'fixed',
+                  }))
+                  setError(null)
+                }}
+              />
+            </section>
+          </TabsContent>
+          <TabsContent value='temporary' keepMounted>
+            <section className='flex flex-col gap-3'>
+              <div className='flex items-center justify-between gap-2'>
+                <div>
+                  <p className='text-muted-foreground text-xs'>
+                    {t(
+                      'Temporary discounts take priority when conditions match within their validity period. Otherwise, the permanent discount applies.'
+                    )}
+                  </p>
+                </div>
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  disabled={
+                    periods.length >= 1000 ||
+                    Boolean(draft.expression) ||
+                    draft.discount_percent == null
+                  }
+                  onClick={() => {
+                    const start = Math.max(
+                      now,
+                      ...periods.map((period) => period.end_time ?? now)
+                    )
+                    setDraft((previous) => ({
+                      ...previous,
+                      periods: [
+                        ...(previous.periods ?? []),
+                        {
+                          discount_percent: previous.discount_percent ?? 100,
+                          expression: 'permanent_discount',
+                          calculation_type: 'expression',
+                          start_time: start,
+                          end_time: start + 86400,
+                        },
+                      ],
+                    }))
+                    setKeys((previous) => [...previous, nextKey.current++])
+                    setError(null)
+                  }}
+                >
+                  <Plus aria-hidden='true' />
+                  {t('Add temporary discount')}
+                </Button>
+              </div>
+              {draft.expression && (
+                <Alert>
+                  <AlertDescription>
+                    {t(
+                      'Set a fixed permanent discount before editing temporary discounts.'
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+              {periods.length === 0 && (
+                <p className='text-muted-foreground rounded-lg border border-dashed p-5 text-center text-sm'>
+                  {t('No temporary discounts. The permanent discount applies.')}
+                </p>
+              )}
+              {periods.map((period, index) => {
+                const id = `temporary-discount-${keys[index]}`
+                const errors = fieldErrors(index)
+                return (
+                  <section
+                    key={keys[index]}
+                    className='flex flex-col gap-3 rounded-lg border p-4'
+                  >
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='flex items-center gap-2 text-sm font-medium'>
+                        {t('Period {{n}}', { n: index + 1 })}
+                        <PricingPeriodStatusBadge period={period} />
+                      </span>
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        size='icon-sm'
+                        aria-label={t('Remove period')}
+                        onClick={() => {
+                          setDraft((previous) => ({
+                            ...previous,
+                            periods: previous.periods?.filter(
+                              (_, position) => position !== index
+                            ),
+                          }))
+                          setKeys((previous) =>
+                            previous.filter((_, position) => position !== index)
+                          )
+                          setError(null)
+                        }}
+                      >
+                        <Trash2 aria-hidden='true' />
+                      </Button>
+                    </div>
+                    <fieldset
+                      disabled={Boolean(draft.expression)}
+                      className='min-w-0 disabled:opacity-60'
+                    >
+                      <UserDiscountRuleEditor
+                        id={id}
+                        value={period}
+                        permanentPercent={draft.discount_percent}
+                        errors={errors}
+                        onChange={(changes) => update(index, changes)}
+                      />
+                    </fieldset>
+                    <FieldGroup className='gap-3'>
+                      <Field data-invalid={Boolean(errors.start_time)}>
+                        <FieldLabel htmlFor={`${id}-start`}>
+                          {t('Start time')}
+                        </FieldLabel>
+                        <DateTimePicker
+                          id={`${id}-start`}
+                          aria-label={t('Start time')}
+                          aria-invalid={Boolean(errors.start_time)}
+                          clearable={false}
+                          value={
+                            period.start_time != null
+                              ? new Date(period.start_time * 1000)
+                              : undefined
+                          }
+                          placeholder={t('On save')}
+                          onChange={(value) =>
+                            update(index, {
+                              start_time: value
+                                ? Math.floor(value.getTime() / 1000)
+                                : null,
+                            })
+                          }
+                        />
+                        {errors.start_time && (
+                          <FieldError>{errors.start_time}</FieldError>
+                        )}
+                      </Field>
+                      <Field data-invalid={Boolean(errors.end_time)}>
+                        <FieldLabel htmlFor={`${id}-end`}>
+                          {t('End time')}
+                        </FieldLabel>
+                        <DateTimePicker
+                          id={`${id}-end`}
+                          aria-label={t('End time')}
+                          aria-invalid={Boolean(errors.end_time)}
+                          hideTimeWhenEmpty
+                          value={
+                            period.end_time != null
+                              ? new Date(period.end_time * 1000)
+                              : undefined
+                          }
+                          placeholder={t('Select an end time')}
+                          onChange={(value) =>
+                            update(index, {
+                              end_time: value
+                                ? Math.floor(value.getTime() / 1000)
+                                : null,
+                              legacy_unbounded: false,
+                            })
+                          }
+                        />
+                        {errors.end_time && (
+                          <FieldError>{errors.end_time}</FieldError>
+                        )}
+                      </Field>
+                    </FieldGroup>
+                    {period.legacy_unbounded && (
+                      <p className='text-muted-foreground text-xs'>
+                        {t(
+                          'This existing rule has no end time. Set an end time before changing it.'
+                        )}
+                      </p>
+                    )}
+                  </section>
+                )
+              })}
+            </section>
+          </TabsContent>
+        </Tabs>
+        <Alert>
+          <AlertDescription>
+            {active
+              ? t(
+                  'Temporary period active. Unmatched conditions use the permanent discount: {{discount}}.',
+                  { discount: permanentLabel }
+                )
+              : t('Permanent discount: {{discount}}.', {
+                  discount: permanentLabel,
+                })}
+          </AlertDescription>
+        </Alert>
+        {(error || (!validation.success && issues.length > 0)) && (
           <Alert variant='destructive'>
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        {!validation.success && fieldErrors.size === 0 && (
-          <Alert variant='destructive'>
-            <AlertDescription>
-              {validation.error.issues[0].message}
-            </AlertDescription>
+            <AlertDescription>{error || issues[0]?.message}</AlertDescription>
           </Alert>
         )}
       </div>
-      <ConfirmDialog
-        open={confirmSingle}
-        onOpenChange={setConfirmSingle}
-        title={t('Switch to a single period')}
-        desc={t(
-          'Only the selected period will remain in the draft. Other periods are removed when you save.'
-        )}
-        confirmText={t('Keep selected period')}
-        handleConfirm={() => selectSinglePeriod(Number(keepIndex))}
-      >
-        <Select
-          value={keepIndex}
-          onValueChange={(value) => {
-            if (value !== null) setKeepIndex(value)
-          }}
-        >
-          <SelectTrigger aria-label={t('Period to keep')} className='w-full'>
-            <SelectValue>
-              {t('Period {{n}}', { n: Number(keepIndex) + 1 })}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              {periods.map((period, index) => (
-                <SelectItem key={periodKeys[index]} value={String(index)}>
-                  {index + 1}: {period.discount_percent}% ·{' '}
-                  {period.start_time
-                    ? dayjs.unix(period.start_time).format('YYYY-MM-DD HH:mm')
-                    : t('On save')}
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-      </ConfirmDialog>
     </Dialog>
   )
 }
@@ -567,16 +498,10 @@ export function UserModelPricingBatchTimeDialog(props: {
   const [start, setStart] = useState<Date | undefined>(() => new Date())
   const [end, setEnd] = useState<Date>()
   const [error, setError] = useState<string | null>(null)
-  const invalidStart =
-    changeStart && (!start || !Number.isFinite(start.getTime()))
-  const invalidEnd =
-    changeEnd && end !== undefined && !Number.isFinite(end.getTime())
-  const invalidRange =
-    changeStart &&
-    changeEnd &&
-    start !== undefined &&
-    end !== undefined &&
-    end <= start
+  const invalid =
+    (changeStart && (!start || !Number.isFinite(start.getTime()))) ||
+    (changeEnd && (!end || !Number.isFinite(end.getTime()))) ||
+    (changeStart && changeEnd && Boolean(start && end && end <= start))
   return (
     <Dialog
       open
@@ -585,32 +510,23 @@ export function UserModelPricingBatchTimeDialog(props: {
       }}
       title={t('Batch validity')}
       description={t(
-        'Only checked fields are applied to every selected period. Discounts are preserved.'
+        'Only temporary discounts are changed. Permanent discounts are preserved.'
       )}
       footer={
         <>
-          <Button variant='outline' onClick={props.onClose}>
+          <Button type='button' variant='outline' onClick={props.onClose}>
             {t('Cancel')}
           </Button>
           <Button
-            disabled={
-              (!changeStart && !changeEnd) ||
-              invalidStart ||
-              invalidEnd ||
-              invalidRange ||
-              Boolean(error)
-            }
+            type='button'
+            disabled={(!changeStart && !changeEnd) || invalid}
             onClick={() => {
-              if (changeStart && !start) {
-                setError(t('Select a start time'))
-                return
-              }
               const result = props.onApply({
                 ...(changeStart && start
                   ? { start_time: Math.floor(start.getTime() / 1000) }
                   : {}),
-                ...(changeEnd
-                  ? { end_time: end ? Math.floor(end.getTime() / 1000) : null }
+                ...(changeEnd && end
+                  ? { end_time: Math.floor(end.getTime() / 1000) }
                   : {}),
               })
               if (result) {
@@ -625,53 +541,43 @@ export function UserModelPricingBatchTimeDialog(props: {
         </>
       }
     >
-      <div className='flex flex-col gap-4'>
-        <div className='flex items-center gap-2'>
-          <Checkbox
-            id='batch-change-start'
-            checked={changeStart}
-            onCheckedChange={(checked) => {
-              setChangeStart(checked)
-              setError(null)
-            }}
+      <FieldGroup>
+        <Field>
+          <div className='flex items-center gap-2'>
+            <Checkbox
+              id='batch-start'
+              checked={changeStart}
+              onCheckedChange={setChangeStart}
+            />
+            <Label htmlFor='batch-start'>{t('Change start time')}</Label>
+          </div>
+          <DateTimePicker
+            aria-label={t('Start time')}
+            disabled={!changeStart}
+            clearable={false}
+            value={start}
+            onChange={setStart}
           />
-          <Label htmlFor='batch-change-start'>{t('Change start time')}</Label>
-        </div>
-        <DateTimePicker
-          aria-label={t('Start time')}
-          aria-invalid={invalidStart}
-          disabled={!changeStart}
-          value={start}
-          clearable={false}
-          onChange={(value) => {
-            setStart(value)
-            setError(null)
-          }}
-        />
-        <div className='flex items-center gap-2'>
-          <Checkbox
-            id='batch-change-end'
-            checked={changeEnd}
-            onCheckedChange={(checked) => {
-              setChangeEnd(checked)
-              setError(null)
-            }}
+        </Field>
+        <Field>
+          <div className='flex items-center gap-2'>
+            <Checkbox
+              id='batch-end'
+              checked={changeEnd}
+              onCheckedChange={setChangeEnd}
+            />
+            <Label htmlFor='batch-end'>{t('Change end time')}</Label>
+          </div>
+          <DateTimePicker
+            aria-label={t('End time')}
+            disabled={!changeEnd}
+            clearable={false}
+            value={end}
+            onChange={setEnd}
+            placeholder={t('Select an end time')}
           />
-          <Label htmlFor='batch-change-end'>{t('Change end time')}</Label>
-        </div>
-        <DateTimePicker
-          aria-label={t('End time')}
-          aria-invalid={invalidEnd || invalidRange}
-          hideTimeWhenEmpty
-          disabled={!changeEnd}
-          value={end}
-          placeholder={t('Permanent')}
-          onChange={(value) => {
-            setEnd(value)
-            setError(null)
-          }}
-        />
-        {invalidRange && (
+        </Field>
+        {invalid && (
           <FieldError>{t('End time must be after start time')}</FieldError>
         )}
         {error && (
@@ -679,7 +585,7 @@ export function UserModelPricingBatchTimeDialog(props: {
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
-      </div>
+      </FieldGroup>
     </Dialog>
   )
 }

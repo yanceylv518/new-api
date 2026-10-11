@@ -37,15 +37,19 @@ type TaskSettlementResult struct {
 // CommitTaskSettlementWithSnapshot 将最终用量、命中档位与金额一并提交。
 // snapshot 只提供最终用量和档位，冻结的价格参数取自 task；旧版本只能重试同一完整目标。
 // 返回成功后才同步调用方快照，失败不留下看似已结算的内存状态。
-func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target int, amounts *types.DiscountAmounts, snapshot *billingexpr.BillingSnapshot) (TaskSettlementResult, error) {
+func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target int, amounts *types.DiscountAmounts, snapshot *billingexpr.BillingSnapshot, discounts ...*types.UserModelDiscountEvaluation) (TaskSettlementResult, error) {
 	if task == nil || task.ID == 0 || target < 0 || target > common.MaxQuota || (amounts != nil && !amounts.ValidFor(target)) {
 		return TaskSettlementResult{}, errors.New("invalid persisted task settlement")
 	}
 	var expectedBilling, targetBilling []byte
 	var settledBilling TaskBillingContext
-	if snapshot != nil {
+	var discount *types.UserModelDiscountEvaluation
+	if len(discounts) > 0 {
+		discount = discounts[0]
+	}
+	if snapshot != nil || discount != nil {
 		bc := task.PrivateData.BillingContext
-		if bc == nil || bc.TieredSnapshot == nil {
+		if bc == nil || (snapshot != nil && bc.TieredSnapshot == nil) || (discount != nil && (bc.UserDiscount == nil || discount.DiscountBPS < 1 || discount.DiscountBPS > 10000)) {
 			return TaskSettlementResult{}, errors.New("missing task billing snapshot")
 		}
 		var err error
@@ -55,10 +59,30 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 		}
 		// 不修改共享快照；JSON 副本隔离用量 map，并统一重载后数字的比较语义。
 		settledBilling = *bc
-		settledSnapshot := *bc.TieredSnapshot
-		settledSnapshot.UsageFacts = snapshot.UsageFacts
-		settledSnapshot.EstimatedTier = snapshot.EstimatedTier
-		settledBilling.TieredSnapshot = &settledSnapshot
+		if snapshot != nil {
+			settledSnapshot := *bc.TieredSnapshot
+			settledSnapshot.UsageFacts = snapshot.UsageFacts
+			settledSnapshot.EstimatedTier = snapshot.EstimatedTier
+			settledBilling.TieredSnapshot = &settledSnapshot
+		}
+		if discount != nil {
+			settledDiscount := *bc.UserDiscount
+			settledDiscount.Context.InputTokens = discount.Context.InputTokens
+			settledDiscount.Context.OutputTokens = discount.Context.OutputTokens
+			settledDiscount.Context.TaskTokens = discount.Context.TaskTokens
+			settledDiscount.Context.CacheReadTokens = discount.Context.CacheReadTokens
+			settledDiscount.Context.Seconds = discount.Context.Seconds
+			settledDiscount.Context.Count = discount.Context.Count
+			settledDiscount.Context.Units = discount.Context.Units
+			settledDiscount.DiscountBPS = discount.DiscountBPS
+			settledDiscount.Error = discount.Error
+			settledBilling.UserDiscount = &settledDiscount
+			settledBilling.OtherRatios = make(map[string]float64, len(bc.OtherRatios)+1)
+			for key, value := range bc.OtherRatios {
+				settledBilling.OtherRatios[key] = value
+			}
+			settledBilling.OtherRatios[types.UserModelDiscountRatioKey] = float64(discount.DiscountBPS) / 10000
+		}
 		targetBilling, err = common.Marshal(&settledBilling)
 		if err != nil {
 			return TaskSettlementResult{}, fmt.Errorf("encode settled task billing: %w", err)
@@ -91,7 +115,7 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 		sameAmounts := sameTaskAmounts(amounts, committed.PrivateData.DiscountAmounts)
 		expectedState := committed.Quota == task.Quota && sameTaskAmounts(task.PrivateData.DiscountAmounts, committed.PrivateData.DiscountAmounts)
 		targetState := committed.Quota == target && sameAmounts
-		if snapshot != nil {
+		if snapshot != nil || discount != nil {
 			persistedBilling, err := common.Marshal(committed.PrivateData.BillingContext)
 			if err != nil {
 				return fmt.Errorf("encode persisted task billing: %w", err)
@@ -173,7 +197,7 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 		}
 		committed.Quota = target
 		committed.PrivateData.DiscountAmounts = amounts
-		if snapshot != nil {
+		if snapshot != nil || discount != nil {
 			committed.PrivateData.BillingContext = &settledBilling
 		}
 		if err := tx.Model(&Task{}).Where("id = ?", committed.ID).Updates(map[string]any{"quota": target, "private_data": committed.PrivateData}).Error; err != nil {

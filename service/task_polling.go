@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/discountexpr"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	hosttypes "github.com/QuantumNous/new-api/types"
@@ -666,6 +667,22 @@ func truncateBase64(s string) string {
 //
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
+	discountFacts := make(map[string]any, len(taskResult.UsageFacts)+3)
+	for key, value := range taskResult.UsageFacts {
+		discountFacts[key] = value
+	}
+	if taskResult.TotalTokens > 0 {
+		discountFacts["task_tokens"] = taskResult.TotalTokens
+	}
+	if taskResult.CompletionTokens > 0 {
+		discountFacts["output_tokens"] = taskResult.CompletionTokens
+		if taskResult.TotalTokens >= taskResult.CompletionTokens {
+			discountFacts["input_tokens"] = taskResult.TotalTokens - taskResult.CompletionTokens
+		}
+		if taskResult.TotalTokens == 0 {
+			discountFacts["task_tokens"] = taskResult.CompletionTokens
+		}
+	}
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
 		if task.Status == model.TaskStatusFailure {
@@ -692,7 +709,17 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		settledSnapshot.EstimatedTier = result.MatchedTier
 		// 终态表达式使用提交时折扣，折前和折后都从本次表达式结果计算。
 		before, after := result.ActualQuotaAfterGroup, result.ActualQuotaAfterGroup
-		if price := taskBillingContextPriceData(bc); price != nil && price.UserModelDiscountMultiplier() != 1 {
+		for key, value := range usageFacts {
+			if _, exists := discountFacts[key]; !exists {
+				discountFacts[key] = value
+			}
+		}
+		price, discount, discountErr := taskUserModelDiscount(task, discountFacts, -1, -1)
+		if discountErr != nil {
+			logger.LogWarn(ctx, discountErr.Error())
+			return true
+		}
+		if price != nil && price.UserModelDiscountMultiplier() != 1 {
 			beforeValue := decimal.NewFromFloat(result.ActualQuotaBeforeGroup).
 				Mul(decimal.NewFromFloat(bc.TieredSnapshot.GroupRatio))
 			var beforeClamp *common.QuotaClamp
@@ -709,11 +736,37 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 				after = 1
 			}
 		}
-		settleTaskQuotaWithSnapshot(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), &settledSnapshot, "任务用量表达式结算", result.Clamp)
+		settleTaskQuotaWithDiscount(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), &settledSnapshot, discount, "任务用量表达式结算", result.Clamp)
 		return true
 	}
 	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
+		// 时间和请求参数已在提交时冻结；只有依赖实际用量的折扣需要重算按次金额。
+		if task.Status == model.TaskStatusSuccess && bc.UserDiscount != nil && bc.UserDiscount.Rule.Expression != "" && discountexpr.DependsOnUsage(bc.UserDiscount.Rule.Expression) {
+			price, discount, err := taskUserModelDiscount(task, discountFacts, -1, -1)
+			if err != nil {
+				logger.LogWarn(ctx, err.Error())
+				return true
+			}
+			before := task.Quota
+			if task.PrivateData.DiscountAmounts != nil {
+				before = task.PrivateData.DiscountAmounts.Before
+			}
+			basis := decimal.NewFromInt(int64(before))
+			if bc.ModelPrice > 0 {
+				basis = price.ApplyOtherRatiosBeforeDiscount(decimal.NewFromFloat(bc.ModelPrice).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).Mul(decimal.NewFromFloat(bc.GroupRatio)))
+			}
+			before, originalClamp := common.QuotaFromDecimalChecked(basis)
+			after, clamp := common.QuotaDiscountDecimalChecked(basis, price.UserModelDiscountMultiplier())
+			if before > 0 && after == 0 {
+				after = 1
+			}
+			if clamp == nil {
+				clamp = originalClamp
+			}
+			settleTaskQuotaWithDiscount(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), nil, discount, "任务临时或永久折扣表达式结算", clamp)
+			return true
+		}
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 按次计费，跳过差额结算", task.TaskID))
 		return false
 	}
@@ -721,13 +774,18 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
 		before := actualQuota
 		var clamp *common.QuotaClamp
-		if price := taskBillingContextPriceData(task.PrivateData.BillingContext); price != nil {
+		price, discount, err := taskUserModelDiscount(task, discountFacts, -1, -1)
+		if err != nil {
+			logger.LogWarn(ctx, err.Error())
+			return true
+		}
+		if price != nil {
 			actualQuota, clamp = common.QuotaDiscountRoundedChecked(float64(before), price.UserModelDiscountMultiplier())
 			if before > 0 && actualQuota == 0 {
 				actualQuota = 1
 			}
 		}
-		RecalculateTaskQuotaWithAmounts(ctx, task, actualQuota, hosttypes.NewDiscountAmounts(before, actualQuota), "adaptor计费调整", clamp)
+		settleTaskQuotaWithDiscount(ctx, task, actualQuota, hosttypes.NewDiscountAmounts(before, actualQuota), nil, discount, "adaptor计费调整", clamp)
 		return true
 	}
 	// 回退到 token 重算。
@@ -736,7 +794,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		tokens = taskResult.CompletionTokens
 	}
 	if tokens > 0 {
-		return RecalculateTaskQuotaByTokens(ctx, task, tokens)
+		return RecalculateTaskQuotaByTokens(ctx, task, tokens, taskResult.CompletionTokens)
 	}
 	return false
 }

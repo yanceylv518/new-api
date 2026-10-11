@@ -2,6 +2,7 @@ package openai
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -22,6 +23,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	}
 
 	info.IsStream = true
+	expressionDiscount := info.UserModelDiscountEvaluation != nil && info.UserModelDiscountEvaluation.Rule.Expression != ""
+	var readers sync.WaitGroup
+	readers.Add(2)
 	clientConn := info.ClientWs
 	targetConn := info.TargetWs
 
@@ -36,6 +40,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	sumUsage := &dto.RealtimeUsage{}
 
 	gopool.Go(func() {
+		defer readers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
@@ -96,6 +101,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	})
 
 	gopool.Go(func() {
+		defer readers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
@@ -210,6 +216,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	case <-c.Done():
 	}
 
+	if expressionDiscount {
+		// 返回最终累计用量前终止并等待两侧读协程，防止结算与后续预留并发。
+		_ = clientConn.Close()
+		_ = targetConn.Close()
+		readers.Wait()
+	}
 	if usage.TotalTokens != 0 {
 		_ = preConsumeUsage(c, info, usage, sumUsage)
 	}
@@ -237,6 +249,10 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
 	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
 	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
+	billingUsage := usage
+	if info.UserModelDiscountEvaluation != nil && info.UserModelDiscountEvaluation.Rule.Expression != "" {
+		billingUsage = totalUsage
+	}
+	err := service.PreWssConsumeQuota(ctx, info, billingUsage)
 	return err
 }

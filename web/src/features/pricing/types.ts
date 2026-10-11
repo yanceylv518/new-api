@@ -78,6 +78,8 @@ export type PricingModel = {
   pricing_version?: string
   /** 已认证用户的折扣比例基点（8500 表示按原价的 85% 计费）。 */
   user_model_discount_bps?: number
+  user_model_discount_expression?: string
+  user_model_discount_source?: string
   /**
    * Optional model metadata fields reserved for backend-provided catalog data.
    * Keep them data-driven; do not synthesize display values on the client.

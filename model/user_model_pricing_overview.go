@@ -30,6 +30,9 @@ import (
 
 const userModelPricingOverviewPreviewRuleLimit = 3
 
+// 永久规则在临时规则生效时仅作为回退，不重复计入当前生效规则。
+const userModelPricingActiveCondition = "user_model_pricings.start_time <= ? AND (user_model_pricings.end_time IS NULL OR user_model_pricings.end_time > ?) AND (user_model_pricings.mode <> 'layered' OR user_model_pricings.slot >= 0 OR NOT EXISTS (SELECT 1 FROM user_model_pricings AS active_temporary WHERE active_temporary.user_id = user_model_pricings.user_id AND active_temporary.model_key = user_model_pricings.model_key AND active_temporary.mode = 'layered' AND active_temporary.slot >= 0 AND active_temporary.start_time <= ? AND (active_temporary.end_time IS NULL OR active_temporary.end_time > ?)))"
+
 // UserModelPricingOverviewUser 是折扣总览只读用户信息，避免把账号敏感字段带到管理页面。
 type UserModelPricingOverviewUser struct {
 	Id          int    `json:"id"`
@@ -49,6 +52,7 @@ type UserModelPricingOverviewRule struct {
 	Slot        int    `json:"slot"`
 	StartTime   int64  `json:"start_time"`
 	EndTime     *int64 `json:"end_time"`
+	Expression  string `json:"expression,omitempty"`
 }
 
 // UserModelPricingOverviewItem 按用户聚合规则；摘要模式只带少量预览规则，完整规则仍由抽屉分页接口获取。
@@ -108,7 +112,7 @@ func userModelPricingOverviewQuery(tx *gorm.DB, keyword string, requesterRole in
 	query := tx.Model(&UserModelPricing{}).
 		Joins("JOIN users ON users.id = user_model_pricings.user_id").
 		Where("users.deleted_at IS NULL").
-		Where("user_model_pricings.discount_bps > 0 AND user_model_pricings.discount_bps < ?", fullPriceDiscountBPS)
+		Where("(user_model_pricings.discount_bps > 0 AND user_model_pricings.discount_bps < ? OR user_model_pricings.expression <> '' OR (user_model_pricings.mode = ? AND user_model_pricings.slot >= 0 AND user_model_pricings.discount_bps = ?))", fullPriceDiscountBPS, "layered", fullPriceDiscountBPS)
 	if filters.modelKeys != nil {
 		if len(filters.modelKeys) == 0 {
 			return query.Where("1 = 0")
@@ -128,7 +132,7 @@ func userModelPricingOverviewQuery(tx *gorm.DB, keyword string, requesterRole in
 	case "pending":
 		query = query.Where("user_model_pricings.start_time > ?", filters.At)
 	case "active":
-		query = query.Where("user_model_pricings.start_time <= ? AND (user_model_pricings.end_time IS NULL OR user_model_pricings.end_time > ?)", filters.At, filters.At)
+		query = query.Where(userModelPricingActiveCondition, filters.At, filters.At, filters.At, filters.At)
 	case "expired":
 		query = query.Where("user_model_pricings.end_time <= ?", filters.At)
 	}
@@ -188,6 +192,9 @@ func getUserModelPricingOverviewPreview(tx *gorm.DB, userIDs []int, keyword stri
 func preferUserModelPricingPreview(candidate, current UserModelPricingOverviewRule, at int64) bool {
 	candidateActive := candidate.StartTime <= at && (candidate.EndTime == nil || *candidate.EndTime > at)
 	currentActive := current.StartTime <= at && (current.EndTime == nil || *current.EndTime > at)
+	if candidateActive && currentActive && candidate.Mode == "layered" && current.Mode == "layered" {
+		return candidate.Slot >= 0 && current.Slot == -1
+	}
 	if candidateActive || currentActive {
 		return candidateActive && !currentActive
 	}
@@ -259,7 +266,7 @@ func GetUserModelPricingOverview(ctx context.Context, keyword string, requesterR
 			ActiveRules  int64
 		}
 		modelCounts := userModelPricingOverviewQuery(tx, keyword, requesterRole, filters).
-			Select("user_model_pricings.user_id, user_model_pricings.model_key, COUNT(*) AS period_count, SUM(CASE WHEN start_time <= ? AND (end_time IS NULL OR end_time > ?) THEN 1 ELSE 0 END) AS active_rules", filters.At, filters.At).
+			Select("user_model_pricings.user_id, user_model_pricings.model_key, SUM(CASE WHEN user_model_pricings.mode = 'layered' AND user_model_pricings.slot = -1 THEN 0 ELSE 1 END) AS period_count, SUM(CASE WHEN "+userModelPricingActiveCondition+" THEN 1 ELSE 0 END) AS active_rules", filters.At, filters.At, filters.At, filters.At).
 			Group("user_model_pricings.user_id, user_model_pricings.model_key")
 		if err := tx.Table("(?) AS model_counts", modelCounts).
 			Select("COUNT(DISTINCT user_id) AS total_users, COUNT(*) AS total_rules, COUNT(DISTINCT model_key) AS total_models, COALESCE(SUM(period_count), 0) AS total_periods, COALESCE(SUM(active_rules), 0) AS active_rules").
@@ -309,7 +316,7 @@ func GetUserModelPricingOverview(ctx context.Context, keyword string, requesterR
 		summary := len(summaryOnly) > 0 && summaryOnly[0]
 		if summary {
 			// 列表仅传输每用户一条摘要，避免规则数放大数据库结果、JSON 和浏览器内存。
-			query = query.Select("user_model_pricings.user_id, COUNT(DISTINCT user_model_pricings.model_key) AS rule_count, COUNT(*) AS period_count, SUM(CASE WHEN start_time <= ? AND (end_time IS NULL OR end_time > ?) THEN 1 ELSE 0 END) AS active_rules, COALESCE(MIN(CASE WHEN start_time <= ? AND (end_time IS NULL OR end_time > ?) THEN discount_bps END), 0) AS min_discount_bps, COALESCE(MAX(CASE WHEN start_time <= ? AND (end_time IS NULL OR end_time > ?) THEN discount_bps END), 0) AS max_discount_bps", filters.At, filters.At, filters.At, filters.At, filters.At, filters.At).Group("user_model_pricings.user_id")
+			query = query.Select("user_model_pricings.user_id, COUNT(DISTINCT user_model_pricings.model_key) AS rule_count, SUM(CASE WHEN user_model_pricings.mode = 'layered' AND user_model_pricings.slot = -1 THEN 0 ELSE 1 END) AS period_count, SUM(CASE WHEN "+userModelPricingActiveCondition+" THEN 1 ELSE 0 END) AS active_rules, COALESCE(MIN(CASE WHEN "+userModelPricingActiveCondition+" THEN discount_bps END), 0) AS min_discount_bps, COALESCE(MAX(CASE WHEN "+userModelPricingActiveCondition+" THEN discount_bps END), 0) AS max_discount_bps", filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At, filters.At).Group("user_model_pricings.user_id")
 		} else {
 			query = query.Select("user_model_pricings.*").Order("user_model_pricings.user_id ASC, user_model_pricings.model_name ASC, user_model_pricings.slot ASC")
 		}
@@ -361,9 +368,18 @@ func GetUserModelPricingOverview(ctx context.Context, keyword string, requesterR
 				item.PeriodCount = value.PeriodCount
 			} else {
 				models := make(map[string]struct{}, len(rules))
+				activeTemporary := make(map[string]bool)
 				for _, rule := range rules {
+					if rule.Mode == "layered" && rule.Slot >= 0 && rule.StartTime <= filters.At && (rule.EndTime == nil || *rule.EndTime > filters.At) {
+						activeTemporary[rule.ModelName] = true
+					}
+				}
+				for _, rule := range rules {
+					if rule.Mode == "layered" && rule.Slot == -1 {
+						item.PeriodCount--
+					}
 					models[rule.ModelName] = struct{}{}
-					if rule.StartTime <= filters.At && (rule.EndTime == nil || *rule.EndTime > filters.At) {
+					if rule.StartTime <= filters.At && (rule.EndTime == nil || *rule.EndTime > filters.At) && !(rule.Mode == "layered" && rule.Slot == -1 && activeTemporary[rule.ModelName]) {
 						item.ActiveRules++
 						if item.MinDiscountBPS == 0 || rule.DiscountBPS < item.MinDiscountBPS {
 							item.MinDiscountBPS = rule.DiscountBPS
@@ -390,7 +406,7 @@ func GetUserModelPricingRulePage(ctx context.Context, userId, requesterRole int,
 	ctx, cancel := context.WithTimeout(ctx, userModelPricingQueryTimeout)
 	defer cancel()
 	// 每用户最多 1000 条规则，限制页码可避免无意义的超大 OFFSET。
-	if page < 1 || page > maxUserModelPricingRules/20+1 {
+	if page < 1 || page > (maxUserModelPricingRules*2)/20+1 {
 		return nil, 0, ErrUserModelPricingInvalid
 	}
 	activeModelKeys, err := getEnabledUserModelPricingModelKeys(ctx)

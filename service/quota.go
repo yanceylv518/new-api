@@ -126,6 +126,7 @@ func calculateAudioQuotaAmounts(info QuotaInfo) (int, int, *common.QuotaClamp) {
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.InputTokens), float64(usage.OutputTokens), float64(usage.InputTokenDetails.CachedTokens))
 	if relayInfo.UsePrice {
 		return nil
 	}
@@ -178,6 +179,23 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
 	noteQuotaClamp(relayInfo, clamp)
+	if evaluation := relayInfo.UserModelDiscountEvaluation; evaluation != nil && evaluation.Rule.Expression != "" {
+		// 表达式按连接累计用量求值，预留总额由 BillingSession 处理差额，避免重复扣除完整额度。
+		if evaluation.Error != "" {
+			return fmt.Errorf("realtime discount expression: %s", evaluation.Error)
+		}
+		if relayInfo.Billing == nil {
+			if apiError := PreConsumeBilling(ctx, quota, relayInfo); apiError != nil {
+				return apiError
+			}
+			return nil
+		}
+		if err := relayInfo.Billing.Reserve(quota); err != nil {
+			return err
+		}
+		relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+		return nil
+	}
 
 	if userQuota < quota {
 		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))
@@ -197,6 +215,7 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.InputTokens), float64(usage.OutputTokens), float64(usage.InputTokenDetails.CachedTokens))
 
 	var tieredResult *billingexpr.TieredResult
 	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
@@ -334,6 +353,7 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.PromptTokens), float64(usage.CompletionTokens), float64(usage.PromptTokensDetails.CachedTokens))
 
 	var tieredUsedVars map[string]bool
 	if snap := relayInfo.TieredBillingSnapshot; snap != nil {

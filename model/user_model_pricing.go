@@ -59,6 +59,7 @@ type UserModelPricing struct {
 	Mode        string `json:"mode" gorm:"size:16;not null;default:single"`
 	StartTime   int64  `json:"start_time" gorm:"type:bigint;not null;default:0"`
 	EndTime     *int64 `json:"end_time" gorm:"type:bigint"`
+	Expression  string `json:"expression,omitempty" gorm:"type:text"`
 }
 
 // userModelPricingModelKey 使用规范化模型名生成稳定键，查询时绕开数据库大小写和重音排序规则。

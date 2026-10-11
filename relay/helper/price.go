@@ -49,6 +49,9 @@ func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.Pric
 	}
 	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
 	discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(modelName, info.StartTime.Unix())
+	if info.UserModelDiscountEvaluation != nil {
+		discountBPS = info.UserModelDiscountEvaluation.DiscountBPS
+	}
 	if discountBPS < 1 || discountBPS >= 10000 {
 		return
 	}
@@ -91,6 +94,9 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 	}
 	billingModelName := info.GetBillingModelName()
+	if err := PrepareUserModelDiscount(c, info, float64(promptTokens), float64(meta.MaxTokens), nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	modelPrice, usePrice := ratio_setting.GetModelPrice(billingModelName, false)
 
 	groupRatioInfo := HandleGroupRatio(c, info)
@@ -138,8 +144,8 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
 		discountRatio := 1.0
-		if discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(ratio_setting.FormatMatchingModelName(billingModelName), info.StartTime.Unix()); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
-			discountRatio = float64(discountBPS) / 10000
+		if discountBPS := info.UserModelDiscountEvaluation; discountBPS != nil && discountBPS.DiscountBPS >= 1 && discountBPS.DiscountBPS < 10000 && !info.IsChannelTest {
+			discountRatio = float64(discountBPS.DiscountBPS) / 10000
 		}
 		ratio := modelRatio * groupRatioInfo.GroupRatio * discountRatio
 		preConsumeValue := float64(preConsumedTokens) * ratio
@@ -252,6 +258,9 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 // ModelPriceHelperPerCall 按次/按量计费的 PriceHelper (MJ、Task)
 func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hosttypes.PriceData, error) {
+	if err := PrepareUserModelDiscount(c, info, 0, 0, nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	groupRatioInfo := HandleGroupRatio(c, info)
 
 	modelPrice, success := ratio_setting.GetModelPrice(info.OriginModelName, true)

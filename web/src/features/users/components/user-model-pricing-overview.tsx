@@ -53,6 +53,7 @@ import { GroupBadge } from '@/components/group-badge'
 import { SectionPageLayout } from '@/components/layout'
 import { TableId } from '@/components/table-id'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -151,18 +152,13 @@ function getUserInitials(user: UserModelPricingOverviewUser): string {
 // 抽屉头部展示当前用户的折扣区间，主表使用模型预览避免信息过于抽象。
 function DiscountSummary({ item }: { item: UserModelPricingOverviewItem }) {
   const { t } = useTranslation()
-  if (item.active_rules === 0) {
-    return (
-      <span className='text-muted-foreground text-xs'>
-        {t('No active discount')}
-      </span>
-    )
-  }
   return (
-    <span className='text-info font-mono font-semibold tabular-nums'>
-      {formatDiscountRate(item.min_discount_bps ?? 10000)}
-      {item.max_discount_bps !== item.min_discount_bps &&
-        ` – ${formatDiscountRate(item.max_discount_bps ?? 10000)}`}
+    <span className='text-muted-foreground text-xs'>
+      {t(
+        item.active_rules === 0
+          ? 'No active discount'
+          : 'Permanent and temporary discounts'
+      )}
     </span>
   )
 }
@@ -173,6 +169,7 @@ function DiscountModelPreview({
 }: {
   item: UserModelPricingOverviewItem
 }) {
+  const { t } = useTranslation()
   const previewRules = (item.preview_rules ?? item.rules).slice(0, 3)
 
   if (previewRules.length === 0) {
@@ -185,13 +182,15 @@ function DiscountModelPreview({
         <span
           key={`${rule.model_name}:${rule.slot ?? 0}`}
           className='border-border/70 bg-muted/40 inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs'
-          title={`${rule.model_name} - ${formatDiscountRate(rule.discount_bps)}`}
+          title={`${rule.model_name} - ${rule.expression || formatDiscountRate(rule.discount_bps)}`}
         >
           <span className='min-w-0 truncate font-mono' translate='no'>
             {rule.model_name}
           </span>
           <span className='text-info shrink-0 font-mono font-semibold tabular-nums'>
-            {formatDiscountRate(rule.discount_bps)}
+            {rule.expression
+              ? t('Conditional discount')
+              : formatDiscountRate(rule.discount_bps)}
           </span>
         </span>
       ))}
@@ -262,6 +261,7 @@ function DiscountRuleList(props: {
   const loadNextPage = useCallback(() => {
     if (
       !hasNextPage ||
+      query.isError ||
       isFetchingNextPage ||
       fetchNextPageInFlightRef.current
     ) {
@@ -277,7 +277,7 @@ function DiscountRuleList(props: {
         fetchNextPageInFlightRef.current = false
       }
     )
-  }, [fetchNextPage, hasNextPage, isFetchingNextPage])
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage, query.isError])
 
   // 同时监听真实滚动距离和底部哨兵，兼容不同浏览器对自定义滚动根节点的处理。
   useEffect(() => {
@@ -344,10 +344,11 @@ function DiscountRuleList(props: {
           <Loader2 className='animate-spin' aria-label={t('Loading')} />
         </div>
       ) : null}
-      {query.isError && !query.data ? (
+      {query.isError ? (
         <OverviewError
           onRetry={() => {
-            void query.refetch()
+            if (query.isFetchNextPageError) void fetchNextPage()
+            else void query.refetch()
           }}
         />
       ) : null}
@@ -382,11 +383,14 @@ function DiscountRuleList(props: {
 export function UserModelPricingDetailsSheet(props: {
   item: UserModelPricingOverviewItem
   keyword: string
-  status?: string
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   const { t } = useTranslation()
+  const [detailStatus, setDetailStatus] = useState('active')
+  useEffect(() => {
+    if (props.open) setDetailStatus('active')
+  }, [props.open, props.item.user.id])
 
   return (
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
@@ -415,6 +419,40 @@ export function UserModelPricingDetailsSheet(props: {
             <RuleCount count={props.item.rule_count} />
             <DiscountSummary item={props.item} />
             <UserModelPricingHistoryButton userId={props.item.user.id} />
+            <Select
+              value={detailStatus}
+              items={[
+                { value: 'active', label: t('Active') },
+                { value: 'pending', label: t('Not started') },
+                { value: 'expired', label: t('Expired') },
+                { value: 'all', label: t('All statuses') },
+              ]}
+              onValueChange={(value) => {
+                if (
+                  value === 'active' ||
+                  value === 'pending' ||
+                  value === 'expired' ||
+                  value === 'all'
+                ) {
+                  setDetailStatus(value)
+                }
+              }}
+            >
+              <SelectTrigger
+                className='ml-auto w-36'
+                aria-label={t('Discount status')}
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value='active'>{t('Active')}</SelectItem>
+                  <SelectItem value='pending'>{t('Not started')}</SelectItem>
+                  <SelectItem value='expired'>{t('Expired')}</SelectItem>
+                  <SelectItem value='all'>{t('All statuses')}</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
           </div>
         </SheetHeader>
         <div
@@ -423,7 +461,8 @@ export function UserModelPricingDetailsSheet(props: {
           <DiscountRuleList
             userId={props.item.user.id}
             keyword={props.keyword}
-            status={props.status}
+            key={`${props.item.user.id}:${detailStatus}`}
+            status={detailStatus === 'all' ? undefined : detailStatus}
           />
         </div>
       </SheetContent>
@@ -464,15 +503,25 @@ function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
               </span>
             </TableCell>
             <TableCell className='text-info text-right font-mono font-semibold tabular-nums'>
-              {formatDiscountRate(rule.discount_bps)}
+              {rule.expression ? (
+                <span title={rule.expression}>{t('Conditional discount')}</span>
+              ) : (
+                formatDiscountRate(rule.discount_bps)
+              )}
             </TableCell>
             <TableCell>
-              <PricingPeriodStatusBadge period={rule} />
+              {rule.mode === 'layered' && rule.slot === -1 ? (
+                <Badge variant='outline'>{t('Permanent discount')}</Badge>
+              ) : (
+                <PricingPeriodStatusBadge period={rule} />
+              )}
             </TableCell>
             <TableCell className='text-muted-foreground font-mono'>
-              {rule.start_time
-                ? dayjs.unix(rule.start_time).format('YYYY-MM-DD HH:mm')
-                : t('Existing rule')}
+              {rule.mode === 'layered' && rule.slot === -1 && '—'}
+              {!(rule.mode === 'layered' && rule.slot === -1) &&
+                (rule.start_time
+                  ? dayjs.unix(rule.start_time).format('YYYY-MM-DD HH:mm')
+                  : t('Existing rule'))}
             </TableCell>
             <TableCell className='text-muted-foreground font-mono'>
               {rule.end_time == null
@@ -1232,7 +1281,6 @@ export function UserModelPricingOverview() {
           open
           item={selectedUser}
           keyword={globalFilter ?? ''}
-          status={statusFilter === 'all' ? undefined : statusFilter}
           onOpenChange={(open) => {
             if (!open) setSelectedUserId(null)
           }}

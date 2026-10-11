@@ -38,6 +38,11 @@ function HistoryConfiguration(props: {
   label: string
 }) {
   const { t } = useTranslation()
+  const modeLabels = {
+    single: t('Single period'),
+    scheduled: t('Multiple periods'),
+    layered: t('Permanent and temporary discounts'),
+  }
   return (
     <div className='min-w-0 flex-1 rounded-md border p-2 text-xs'>
       <p className='mb-1 font-medium'>{props.label}</p>
@@ -45,17 +50,22 @@ function HistoryConfiguration(props: {
         <span className='text-muted-foreground'>{t('No discount')}</span>
       ) : (
         <>
-          <p>
-            {props.value.mode === 'scheduled'
-              ? t('Multiple periods')
-              : t('Single period')}
-          </p>
-          {props.value.periods.map((period) => (
+          <p>{modeLabels[props.value.mode]}</p>
+          {props.value.mode === 'layered' && (
+            <p className='mt-1 font-mono break-words'>
+              {t('Permanent discount')}:{' '}
+              {props.value.permanent?.expression ||
+                `${String(
+                  (props.value.permanent?.discount_bps ?? 10000) / 100
+                )}%`}
+            </p>
+          )}
+          {(props.value.periods ?? []).map((period) => (
             <p
               key={period.start_time ?? 'initial'}
               className='mt-1 font-mono break-words'
             >
-              {period.discount_bps / 100}% ·{' '}
+              {period.expression || `${String(period.discount_bps / 100)}%`} ·{' '}
               {period.start_time
                 ? dayjs.unix(period.start_time).format('YYYY-MM-DD HH:mm')
                 : t('Existing rule')}

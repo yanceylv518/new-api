@@ -42,6 +42,20 @@ function formatDiscountPercent(value: number): string {
 /** 标记模型广场中已应用当前用户专属折扣的价格。 */
 export function UserPricingBadge(props: UserPricingBadgeProps) {
   const { t } = useTranslation()
+  if (props.model.user_model_discount_expression) {
+    return (
+      <Badge
+        variant='secondary'
+        className={props.className}
+        title={t(
+          'The displayed price is before discount. The final discount depends on the request.'
+        )}
+      >
+        <BadgePercent aria-hidden='true' />
+        {t('Conditional discount')}
+      </Badge>
+    )
+  }
   if (!hasUserModelDiscount(props.model)) return null
 
   const percent = formatDiscountPercent(

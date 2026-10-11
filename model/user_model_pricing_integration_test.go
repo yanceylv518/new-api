@@ -78,6 +78,7 @@ func TestUserModelPricingExternalDatabases(t *testing.T) {
 			}
 			assertUserModelPricingScheduleMigration(t, db)
 			assertUserModelPricingHistoryCapacityAndUpgrade(t, db)
+			assertUserModelPricingLayeredPersistence(t)
 			// 启用能力是总览判断模型是否仍存在的权威目录。
 			require.NoError(t, db.Create(&[]Ability{
 				{Group: "default", Model: "Model-A", ChannelId: 1, Enabled: true},

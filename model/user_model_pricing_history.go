@@ -42,10 +42,10 @@ type UserModelPricingHistoryItem struct {
 
 func newUserModelPricingHistory(userID, role, actorID int, name, action string, revision, now int64, before, after hosttypes.UserModelDiscountConfig) (UserModelPricingHistory, error) {
 	var beforeValue, afterValue *hosttypes.UserModelDiscountConfig
-	if len(before.Periods) > 0 {
+	if len(before.Periods) > 0 || before.Permanent != nil {
 		beforeValue = &before
 	}
-	if len(after.Periods) > 0 {
+	if len(after.Periods) > 0 || after.Permanent != nil {
 		afterValue = &after
 	}
 	beforeJSON, err := common.Marshal(beforeValue)

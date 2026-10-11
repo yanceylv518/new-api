@@ -83,6 +83,9 @@ func GetPricing(c *gin.Context) {
 	if exists {
 		for i := range pricing {
 			name := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(pricing[i].ModelName))
+			rule, source := modelDiscountBPS.RuleAt(name, now)
+			pricing[i].UserModelDiscountExpression = rule.Expression
+			pricing[i].UserModelDiscountSource = source
 			if boundary := modelDiscountBPS.NextChangeAt(name, now); boundary > 0 && (nextChange == 0 || boundary < nextChange) {
 				nextChange = boundary
 			}
