@@ -33,6 +33,7 @@ import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -213,6 +214,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const [statusFilter, setStatusFilter] = useState('all')
   const [scheduleModel, setScheduleModel] = useState<string | null>(null)
   const [batchTimeOpen, setBatchTimeOpen] = useState(false)
+  const [discardOpen, setDiscardOpen] = useState(false)
   const [clockTick, setClockTick] = useState(0)
   // 以规范化模型名保存选择，翻页和搜索不改变批量操作的目标。
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set())
@@ -365,7 +367,12 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     setInitializedSnapshot(activeSnapshot)
   }, [activeSnapshot, form])
 
-  const handleOpenChange = (open: boolean) => {
+  const handleOpenChange = (open: boolean, discard = false) => {
+    if (!open && mutation.isPending && !discard) return
+    if (!open && !discard && form.formState.isDirty) {
+      setDiscardOpen(true)
+      return
+    }
     if (!open) {
       // 关闭时清空搜索状态，下一次打开从当前入口对应的模型集第一页开始。
       setSearchTerm('')
@@ -415,7 +422,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       }
       // 保存后刷新总览摘要和展开明细，避免继续展示旧折扣。
       await props.onSaved?.()
-      if (saveSessionRef.current === submittedSnapshot) handleOpenChange(false)
+      if (saveSessionRef.current === submittedSnapshot) {
+        handleOpenChange(false, true)
+      }
     },
     onError: async (error, _values, submittedSnapshot) => {
       if (axios.isAxiosError(error) && error.response?.status === 409) {
@@ -669,7 +678,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   return (
     <Dialog
       open={props.open}
-      onOpenChange={handleOpenChange}
+      onOpenChange={(open) => handleOpenChange(open)}
       title={
         <span className='flex items-center gap-2'>
           <BadgePercent aria-hidden='true' />
@@ -693,6 +702,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       footerClassName='flex-row justify-end [&>button]:flex-1 sm:[&>button]:flex-none'
       footer={
         <>
+          {form.formState.isDirty && (
+            <span
+              className='text-warning mr-auto self-center text-xs'
+              role='status'
+            >
+              {t('Unsaved changes')}
+            </span>
+          )}
           <Button
             type='button'
             variant='outline'
@@ -1121,6 +1138,19 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
           }}
         />
       )}
+      <ConfirmDialog
+        open={discardOpen}
+        onOpenChange={setDiscardOpen}
+        title={t('Discard unsaved changes?')}
+        desc={t('Discount changes are saved only after you click Save.')}
+        confirmText={t('Discard changes')}
+        cancelBtnText={t('Keep editing')}
+        destructive
+        handleConfirm={() => {
+          setDiscardOpen(false)
+          handleOpenChange(false, true)
+        }}
+      />
       {props.open && batchTimeOpen && (
         <UserModelPricingBatchTimeDialog
           onClose={() => setBatchTimeOpen(false)}

@@ -47,7 +47,7 @@ export const FULL_PRICE_DISCOUNT_BPS = 10000
 export function getUserModelPricingStatusOptions(t: TFunction) {
   return [
     { value: 'all', label: t('All statuses') },
-    { value: 'active', label: t('Active') },
+    { value: 'active', label: t('Within validity period') },
     { value: 'pending', label: t('Not started') },
     { value: 'expired', label: t('Expired') },
   ]

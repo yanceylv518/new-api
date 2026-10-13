@@ -296,10 +296,12 @@ describe('user model pricing overview row', () => {
     await userEvent.click(
       screen.getByRole('combobox', { name: 'Discount status' })
     )
-    await userEvent.click(screen.getByRole('option', { name: 'Active' }))
+    await userEvent.click(
+      screen.getByRole('option', { name: 'Within validity period' })
+    )
     assert.equal(
       screen.getByRole('combobox', { name: 'Discount status' }).textContent,
-      'Active'
+      'Within validity period'
     )
   })
   // 筛选器选择的值必须进入总览请求，后端才能同步过滤用户和统计数据。

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { writeFileSync } from 'node:fs'
 
 import { describe, expect, test } from 'vitest'
 
@@ -11,6 +12,249 @@ import {
   parseDiscountExpression,
   type DiscountVisualConfig,
 } from '../user-discount-expression'
+import {
+  beijingTime,
+  matchesTimeBranch,
+  timeBranchDiagnostics,
+  type WeeklyDiscountSchedule,
+} from '../user-discount-time'
+
+describe('weekly time range discounts', () => {
+  test('exports real editor expressions with independent boundary expectations for backend verification', () => {
+    const branch = (
+      id: string,
+      percent: number,
+      schedule: WeeklyDiscountSchedule
+    ) => ({ id, percent, match: 'all' as const, conditions: [], schedule })
+    const fixtures = [
+      {
+        name: 'weekdays and weekend',
+        branches: [
+          branch('weekday', 70, {
+            days: [1, 2, 3, 4, 5],
+            start: '09:00',
+            end: '23:00',
+            allDay: false,
+          }),
+          branch('weekend', 60, {
+            days: [0, 6],
+            start: '09:00',
+            end: '18:00',
+            allDay: true,
+          }),
+        ],
+        cases: [
+          ['2026-10-12T08:59:59+08:00', 8000],
+          ['2026-10-12T09:00:00+08:00', 7000],
+          ['2026-10-16T22:59:59+08:00', 7000],
+          ['2026-10-16T23:00:00+08:00', 8000],
+          ['2026-10-17T00:00:00+08:00', 6000],
+          ['2026-10-18T23:59:59+08:00', 6000],
+        ],
+      },
+      {
+        name: 'Friday overnight',
+        branches: [
+          branch('night', 60, {
+            days: [5],
+            start: '23:00',
+            end: '07:00',
+            allDay: false,
+          }),
+        ],
+        cases: [
+          ['2026-10-16T06:59:59+08:00', 8000],
+          ['2026-10-16T22:59:59+08:00', 8000],
+          ['2026-10-16T23:00:00+08:00', 6000],
+          ['2026-10-17T06:59:59+08:00', 6000],
+          ['2026-10-17T07:00:00+08:00', 8000],
+        ],
+      },
+      {
+        name: 'minute precision',
+        branches: [
+          branch('minute', 29, {
+            days: [0, 1, 2, 3, 4, 5, 6],
+            start: '09:30',
+            end: '20:15',
+            allDay: false,
+          }),
+        ],
+        cases: [
+          ['2026-10-12T09:29:59+08:00', 8000],
+          ['2026-10-12T09:30:00+08:00', 2900],
+          ['2026-10-12T10:00:00+08:00', 2900],
+          ['2026-10-12T20:14:59+08:00', 2900],
+          ['2026-10-12T20:15:00+08:00', 8000],
+        ],
+      },
+      {
+        name: 'four complex overnight branches',
+        branches: Array.from({ length: 4 }, (_, index) =>
+          branch(`night-${index}`, 60 + index, {
+            days: [index, (index + 2) % 7, (index + 4) % 7],
+            start: `${20 + index}:15`,
+            end: `0${4 + index}:45`,
+            allDay: false,
+          })
+        ),
+        cases: [['2026-10-12T12:00:00+08:00', 8000]],
+      },
+      {
+        name: 'all day',
+        branches: [
+          branch('all', 60, {
+            days: [0, 1, 2, 3, 4, 5, 6],
+            start: '09:00',
+            end: '18:00',
+            allDay: true,
+          }),
+        ],
+        cases: [
+          ['2026-10-12T00:00:00+08:00', 6000],
+          ['2026-10-12T23:59:59+08:00', 6000],
+        ],
+      },
+    ].map((fixture) => {
+      const source = generateDiscountExpression({
+        percent: 80,
+        inheritPermanent: true,
+        branches: fixture.branches,
+      })
+      assert.ok(source)
+      assert.ok(parseDiscountExpression(source))
+      return {
+        name: fixture.name,
+        source,
+        cases: fixture.cases.map(([date, bps]) => ({
+          at: Date.parse(String(date)) / 1000,
+          bps,
+        })),
+      }
+    })
+    writeFileSync(
+      '../tools/pricing-load/results/20261012-weekly-fixtures.json',
+      JSON.stringify(fixtures, null, 2)
+    )
+  })
+  test.each([
+    { days: [1, 2, 3, 4, 5], start: '09:00', end: '23:00', allDay: false },
+    { days: [0, 6], start: '09:00', end: '18:00', allDay: true },
+    { days: [5], start: '23:00', end: '07:00', allDay: false },
+    { days: [0], start: '23:15', end: '00:30', allDay: false },
+    {
+      days: [0, 1, 2, 3, 4, 5, 6],
+      start: '09:30',
+      end: '20:15',
+      allDay: false,
+    },
+    { days: [1, 3, 5], start: '23:59', end: '00:01', allDay: false },
+  ] satisfies WeeklyDiscountSchedule[])(
+    'preserves $days $start–$end after saving and reopening',
+    (schedule) => {
+      const branch = {
+        id: 'weekly',
+        percent: 70,
+        match: 'all' as const,
+        conditions: [],
+        schedule,
+      }
+      const expression = generateDiscountExpression({
+        percent: 80,
+        inheritPermanent: true,
+        branches: [branch],
+      })
+      assert.ok(expression)
+      const parsed = parseDiscountExpression(expression)
+      assert.ok(parsed)
+      expect(generateDiscountExpression(parsed)).toBe(expression)
+      for (let day = 0; day < 7; day++) {
+        for (let minute = 0; minute < 1440; minute++) {
+          expect(matchesTimeBranch(parsed.branches[0], day, minute)).toBe(
+            matchesTimeBranch(branch, day, minute)
+          )
+        }
+      }
+    }
+  )
+  test('includes the starting weekday and the following morning for overnight ranges', () => {
+    const branch = {
+      id: 'night',
+      percent: 60,
+      match: 'all' as const,
+      conditions: [],
+      schedule: { days: [5], start: '23:00', end: '07:00', allDay: false },
+    }
+    expect(matchesTimeBranch(branch, 5, 1380)).toBe(true)
+    expect(matchesTimeBranch(branch, 6, 419)).toBe(true)
+    expect(matchesTimeBranch(branch, 6, 420)).toBe(false)
+    expect(matchesTimeBranch(branch, 5, 419)).toBe(false)
+  })
+  test('detects contradictions, complete shadowing and partial priority overlap', () => {
+    const condition = (operator: '>=' | '<', value: string) => ({
+      id: value,
+      field: 'hour("Asia/Shanghai")',
+      operator,
+      value,
+    })
+    const impossible = {
+      id: 'impossible',
+      percent: 70,
+      match: 'all' as const,
+      conditions: [condition('>=', '23'), condition('<', '7')],
+    }
+    const wide = {
+      id: 'wide',
+      percent: 70,
+      match: 'all' as const,
+      conditions: [condition('>=', '9')],
+    }
+    const narrower = {
+      ...wide,
+      id: 'narrower',
+      conditions: [condition('>=', '12')],
+    }
+    const partial = {
+      ...wide,
+      id: 'partial',
+      conditions: [condition('<', '12')],
+    }
+    expect(
+      timeBranchDiagnostics([impossible, wide, narrower, partial])
+    ).toEqual([
+      { impossible: true, shadowed: false, overlapping: false },
+      { impossible: false, shadowed: false, overlapping: false },
+      { impossible: false, shadowed: true, overlapping: false },
+      { impossible: false, shadowed: false, overlapping: true },
+    ])
+  })
+  test('interprets request time in Beijing regardless of the browser timezone', () => {
+    expect(beijingTime(Date.parse('2026-10-12T01:30:00Z') / 1000)).toEqual({
+      day: 1,
+      minute: 570,
+    })
+  })
+  test.each([
+    { days: [], start: '09:00', end: '18:00', allDay: false },
+    { days: [1], start: '09:00', end: '09:00', allDay: false },
+    { days: [1], start: '24:00', end: '09:00', allDay: false },
+  ])('rejects incomplete or empty weekly ranges', (schedule) => {
+    expect(
+      generateDiscountExpression({
+        percent: 80,
+        branches: [
+          {
+            id: 'invalid',
+            percent: 70,
+            match: 'all',
+            conditions: [],
+            schedule,
+          },
+        ],
+      })
+    ).toBeNull()
+  })
+})
 
 describe('discount expression visual conversion', () => {
   test('round trips a permanent fallback without baking in a percentage', () => {

@@ -17,18 +17,25 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { ArrowDown, ArrowUp, Clock3, Plus, Trash2 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Field,
-  FieldDescription,
-  FieldError,
-  FieldLabel,
-} from '@/components/ui/field'
+import { Field, FieldError, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from '@/components/ui/input-group'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTitle,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import {
   Select,
   SelectContent,
@@ -37,6 +44,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 
 import {
   DISCOUNT_COMPARISONS,
@@ -51,6 +60,13 @@ import {
   parseDiscountExpression,
   type DiscountVisualConfig,
 } from '../lib/user-discount-expression'
+import {
+  beijingTime,
+  describeTimeBranch,
+  matchesTimeBranch,
+  timeBranchDiagnostics,
+  timeToMinute,
+} from '../lib/user-discount-time'
 import type { UserModelPricingFormValues } from '../lib/user-model-pricing-form'
 
 type DiscountRule = NonNullable<
@@ -67,13 +83,21 @@ const WEEKDAYS = [
   'Saturday',
 ] as const
 const COMPARISON_LABELS = {
-  '==': 'Equals',
-  '!=': 'Does not equal',
-  '>=': 'At or after',
-  '>': 'Time is after',
-  '<=': 'At or before',
-  '<': 'Time is before',
+  '==': '=',
+  '!=': '≠',
+  '>=': '≥',
+  '>': '>',
+  '<=': '≤',
+  '<': '<',
 } as const
+const TIME_HOURS = Array.from({ length: 24 }, (_, hour) => {
+  const value = String(hour).padStart(2, '0')
+  return { value, label: value }
+})
+const TIME_MINUTES = Array.from({ length: 60 }, (_, minute) => {
+  const value = String(minute).padStart(2, '0')
+  return { value, label: value }
+})
 
 function DiscountChoice(props: {
   id: string
@@ -116,6 +140,65 @@ function DiscountChoice(props: {
         </SelectContent>
       </Select>
     </Field>
+  )
+}
+
+function DiscountTimeInput(props: {
+  id: string
+  label: string
+  value: string
+  onChange: (value: string) => void
+}) {
+  const { t } = useTranslation()
+  const [hour, minute] = props.value.split(':')
+
+  return (
+    <Popover>
+      <InputGroup>
+        <InputGroupInput
+          id={props.id}
+          type='time'
+          step={60}
+          value={props.value}
+          onChange={(event) => props.onChange(event.target.value)}
+          className='tabular-nums [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
+        />
+        <InputGroupAddon align='inline-end'>
+          <PopoverTrigger
+            render={
+              <InputGroupButton
+                size='icon-xs'
+                aria-label={`${props.label} (${t('Time')})`}
+              />
+            }
+          >
+            <Clock3 aria-hidden='true' />
+          </PopoverTrigger>
+        </InputGroupAddon>
+      </InputGroup>
+      <PopoverContent align='end' className='w-56'>
+        <PopoverTitle>{props.label}</PopoverTitle>
+        <div className='grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-end gap-2 tabular-nums'>
+          <DiscountChoice
+            id={`${props.id}-hour`}
+            label={t('Hour')}
+            value={hour ?? ''}
+            items={TIME_HOURS}
+            onChange={(value) => props.onChange(`${value}:${minute || '00'}`)}
+          />
+          <span aria-hidden='true' className='flex h-8 items-center'>
+            :
+          </span>
+          <DiscountChoice
+            id={`${props.id}-minute`}
+            label={t('Minute')}
+            value={minute ?? ''}
+            items={TIME_MINUTES}
+            onChange={(value) => props.onChange(`${hour || '00'}:${value}`)}
+          />
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }
 
@@ -180,9 +263,20 @@ export function UserDiscountRuleEditor(props: {
   id: string
   onChange: (changes: Partial<DiscountRule>) => void
   errors: Record<string, string>
+  onValidityChange?: (valid: boolean) => void
 }) {
   const { t } = useTranslation()
   const nextId = useRef(0)
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>
+    const tick = () => {
+      setNow(Math.floor(Date.now() / 1000))
+      timer = setTimeout(tick, 60000 - (Date.now() % 60000))
+    }
+    timer = setTimeout(tick, 60000 - (Date.now() % 60000))
+    return () => clearTimeout(timer)
+  }, [])
   const [initial] = useState(() => {
     const parsed = parseDiscountExpression(props.value.expression ?? '')
     const supported = parsed && isTimeDiscountConfig(parsed)
@@ -226,7 +320,23 @@ export function UserDiscountRuleEditor(props: {
   const [visual, setVisual] = useState<DiscountVisualConfig>(
     inheritPermanentDiscount(initial.visual)
   )
-  const visualValid = generateDiscountExpression(visual) !== null
+  const diagnostics = useMemo(
+    () => timeBranchDiagnostics(visual.branches),
+    [visual.branches]
+  )
+  const visualValid =
+    generateDiscountExpression(visual) !== null &&
+    !diagnostics.some((item) => item.impossible || item.shadowed)
+  const clock = beijingTime(now)
+  const currentBranch = visual.branches.findIndex((branch) =>
+    matchesTimeBranch(branch, clock.day, clock.minute)
+  )
+  const withinValidity =
+    (props.value.start_time == null || now >= props.value.start_time) &&
+    (props.value.end_time == null || now < props.value.end_time)
+  useEffect(() => {
+    props.onValidityChange?.(unsupported || visualValid)
+  }, [unsupported, visualValid, props])
   const changeVisual = (config: DiscountVisualConfig) => {
     setVisual(config)
     const expression = generateDiscountExpression({
@@ -250,7 +360,13 @@ export function UserDiscountRuleEditor(props: {
       ),
     })
   const addBranch = (
-    preset: 'custom' | 'weekdays' | 'weekends' | 'daytime'
+    preset:
+      | 'custom'
+      | 'weekdays'
+      | 'weekends'
+      | 'daytime'
+      | 'night'
+      | 'advanced'
   ) => {
     if (visual.branches.length >= MAX_DISCOUNT_BRANCHES) return
     const weekday = DISCOUNT_TIME_FIELDS[2].value
@@ -278,6 +394,9 @@ export function UserDiscountRuleEditor(props: {
         value: '18',
       })
     }
+    let days = [0, 1, 2, 3, 4, 5, 6]
+    if (preset === 'weekdays') days = [1, 2, 3, 4, 5]
+    if (preset === 'weekends') days = [6, 0]
     changeVisual({
       ...visual,
       branches: [
@@ -286,7 +405,17 @@ export function UserDiscountRuleEditor(props: {
           id: `draft-branch-${nextId.current++}`,
           match: preset === 'weekends' ? 'any' : 'all',
           percent: props.permanentPercent ?? 100,
-          conditions,
+          conditions: preset === 'advanced' ? conditions : [],
+          ...(preset === 'advanced'
+            ? {}
+            : {
+                schedule: {
+                  days,
+                  start: preset === 'night' ? '23:00' : '09:00',
+                  end: preset === 'night' ? '07:00' : '18:00',
+                  allDay: preset === 'weekends',
+                },
+              }),
         },
       ],
     })
@@ -321,23 +450,33 @@ export function UserDiscountRuleEditor(props: {
   }
   return (
     <div className='space-y-4'>
-      <Field>
+      <Field orientation='horizontal'>
         <FieldLabel htmlFor={`${props.id}-default`}>
           {t('Default discount')}
         </FieldLabel>
-        <Input
+        <output
           id={`${props.id}-default`}
-          readOnly
-          value={
-            props.permanentPercent == null ? '—' : `${props.permanentPercent}%`
-          }
-        />
-        <FieldDescription>
-          {t(
-            'Automatically follows the permanent discount when no time condition matches.'
-          )}
-        </FieldDescription>
+          className='font-mono text-lg font-semibold'
+        >
+          {props.permanentPercent == null ? '—' : `${props.permanentPercent}%`}
+        </output>
       </Field>
+      <p className='bg-muted/50 rounded-md px-3 py-2 text-sm' role='status'>
+        {t('Current billing')}:{' '}
+        <span className='font-mono font-semibold'>
+          {withinValidity && currentBranch >= 0
+            ? `${visual.branches[currentBranch].percent ?? '—'}%`
+            : `${props.permanentPercent ?? '—'}%`}
+        </span>
+        <span className='text-muted-foreground ml-2 text-xs'>
+          {t(
+            withinValidity && currentBranch >= 0
+              ? 'Time rule {{n}}'
+              : 'Permanent discount',
+            { n: currentBranch + 1 }
+          )}
+        </span>
+      </p>
       <div className='space-y-3 border-t pt-4'>
         <div className='flex flex-wrap items-center justify-between gap-2'>
           <span className='flex items-center gap-2 text-sm font-medium'>
@@ -357,12 +496,7 @@ export function UserDiscountRuleEditor(props: {
         </div>
         <p className='text-muted-foreground text-xs'>
           {t(
-            'Choose when a different discount applies. Rules use the request start time in Beijing time and repeat every week.'
-          )}
-        </p>
-        <p className='text-muted-foreground text-xs'>
-          {t(
-            'Hour conditions cover the whole hour. For example, 09:00–18:00 includes 09:00 and excludes 18:00.'
+            'Time ranges include the start and exclude the end. Overnight ranges belong to their starting weekday.'
           )}
         </p>
         <div className='flex flex-wrap items-center gap-2'>
@@ -371,9 +505,10 @@ export function UserDiscountRuleEditor(props: {
           </span>
           {(
             [
-              ['weekdays', 'Weekdays'],
-              ['weekends', 'Weekends'],
+              ['weekdays', 'Weekday daytime'],
+              ['weekends', 'Weekend all day'],
               ['daytime', 'Daily 09:00–18:00'],
+              ['night', 'Daily overnight'],
             ] as const
           ).map(([preset, label]) => (
             <Button
@@ -387,6 +522,15 @@ export function UserDiscountRuleEditor(props: {
               {t(label)}
             </Button>
           ))}
+          <Button
+            type='button'
+            variant='ghost'
+            size='sm'
+            disabled={visual.branches.length >= MAX_DISCOUNT_BRANCHES}
+            onClick={() => addBranch('advanced')}
+          >
+            {t('Advanced conditions')}
+          </Button>
         </div>
         {visual.branches.length === 0 && (
           <p className='text-muted-foreground rounded-lg border border-dashed p-3 text-sm'>
@@ -460,7 +604,101 @@ export function UserDiscountRuleEditor(props: {
               </Button>
             </div>
           </div>
-          {branch.conditions.length > 1 && (
+          {branch.schedule && (
+            <div className='space-y-3'>
+              <Field data-invalid={!branch.schedule.days.length}>
+                <FieldLabel>{t('Applicable weekdays')}</FieldLabel>
+                <ToggleGroup
+                  multiple
+                  value={branch.schedule.days.map(String)}
+                  variant='outline'
+                  spacing={1}
+                  className='w-full flex-wrap'
+                  aria-label={t('Applicable weekdays')}
+                  onValueChange={(values) => {
+                    if (branch.schedule) {
+                      updateBranch(index, {
+                        schedule: {
+                          ...branch.schedule,
+                          days: values.map(Number),
+                        },
+                      })
+                    }
+                  }}
+                >
+                  {[1, 2, 3, 4, 5, 6, 0].map((day) => (
+                    <ToggleGroupItem
+                      key={day}
+                      value={String(day)}
+                      aria-label={t(WEEKDAYS[day])}
+                      className='aria-pressed:border-primary aria-pressed:bg-primary aria-pressed:text-primary-foreground aria-pressed:hover:bg-primary/90 aria-pressed:hover:text-primary-foreground'
+                    >
+                      {t(WEEKDAYS[day])}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                {!branch.schedule.days.length && (
+                  <FieldError>{t('Select at least one weekday')}</FieldError>
+                )}
+              </Field>
+              <Field orientation='horizontal'>
+                <FieldLabel htmlFor={`${props.id}-${index}-all-day`}>
+                  {t('All day')}
+                </FieldLabel>
+                <Switch
+                  id={`${props.id}-${index}-all-day`}
+                  checked={branch.schedule.allDay}
+                  onCheckedChange={(allDay) => {
+                    if (branch.schedule) {
+                      updateBranch(index, {
+                        schedule: { ...branch.schedule, allDay },
+                      })
+                    }
+                  }}
+                />
+              </Field>
+              {!branch.schedule.allDay && (
+                <div className='grid grid-cols-2 gap-3'>
+                  {(['start', 'end'] as const).map((field) => (
+                    <Field key={field}>
+                      <FieldLabel htmlFor={`${props.id}-${index}-${field}`}>
+                        {t(field === 'start' ? 'Start time' : 'End time')}
+                        {field === 'end' &&
+                          (timeToMinute(branch.schedule?.start ?? '') ?? 0) >
+                            (timeToMinute(branch.schedule?.end ?? '') ?? 0) &&
+                          ` · ${t('Next day')}`}
+                      </FieldLabel>
+                      <DiscountTimeInput
+                        id={`${props.id}-${index}-${field}`}
+                        label={t(field === 'start' ? 'Start time' : 'End time')}
+                        value={branch.schedule?.[field] ?? ''}
+                        onChange={(value) => {
+                          if (branch.schedule) {
+                            updateBranch(index, {
+                              schedule: {
+                                ...branch.schedule,
+                                [field]: value,
+                              },
+                            })
+                          }
+                        }}
+                      />
+                    </Field>
+                  ))}
+                </div>
+              )}
+              {!branch.schedule.allDay &&
+                branch.schedule.start === branch.schedule.end && (
+                  <FieldError>
+                    {t('Start and end times must differ')}
+                  </FieldError>
+                )}
+              <p className='text-muted-foreground text-xs'>
+                {t('Beijing time')}
+              </p>
+            </div>
+          )}
+          {!branch.schedule && branch.conditions.length > 1 && (
             <DiscountChoice
               id={`${props.id}-${index}-match`}
               label={t('Apply when')}
@@ -544,7 +782,7 @@ export function UserDiscountRuleEditor(props: {
                   value={condition.operator}
                   items={operators.map((operator) => ({
                     value: operator,
-                    label: t(COMPARISON_LABELS[operator]),
+                    label: COMPARISON_LABELS[operator],
                   }))}
                   onChange={(operator) => {
                     const selected = operators.find((item) => item === operator)
@@ -578,28 +816,30 @@ export function UserDiscountRuleEditor(props: {
               </div>
             )
           })}
-          <Button
-            type='button'
-            variant='ghost'
-            size='sm'
-            disabled={branch.conditions.length >= MAX_DISCOUNT_CONDITIONS}
-            onClick={() =>
-              updateBranch(index, {
-                conditions: [
-                  ...branch.conditions,
-                  {
-                    id: `draft-condition-${nextId.current++}`,
-                    field: DISCOUNT_TIME_FIELDS[2].value,
-                    operator: '==',
-                    value: '1',
-                  },
-                ],
-              })
-            }
-          >
-            <Plus aria-hidden='true' />
-            {t('Add time condition')}
-          </Button>
+          {!branch.schedule && (
+            <Button
+              type='button'
+              variant='ghost'
+              size='sm'
+              disabled={branch.conditions.length >= MAX_DISCOUNT_CONDITIONS}
+              onClick={() =>
+                updateBranch(index, {
+                  conditions: [
+                    ...branch.conditions,
+                    {
+                      id: `draft-condition-${nextId.current++}`,
+                      field: DISCOUNT_TIME_FIELDS[2].value,
+                      operator: '==',
+                      value: '1',
+                    },
+                  ],
+                })
+              }
+            >
+              <Plus aria-hidden='true' />
+              {t('Add time condition')}
+            </Button>
+          )}
           <DiscountPercentInput
             id={`${props.id}-${index}-percent`}
             label={t('Discount when matched')}
@@ -607,26 +847,37 @@ export function UserDiscountRuleEditor(props: {
             onChange={(percent) => updateBranch(index, { percent })}
           />
           <p className='bg-muted/50 text-muted-foreground rounded-md p-2 text-xs'>
-            {branch.conditions
-              .map((condition) => {
-                const field = DISCOUNT_TIME_FIELDS.find(
-                  (item) => item.value === condition.field
-                )
-                let value = condition.value.padStart(2, '0')
-                if (field?.value === DISCOUNT_TIME_FIELDS[0].value) {
-                  value += ':00'
-                }
-                if (field?.value === DISCOUNT_TIME_FIELDS[2].value) {
-                  value = t(WEEKDAYS[Number(condition.value)])
-                }
-                return `${t(field?.label ?? 'Time condition')} ${t(COMPARISON_LABELS[condition.operator])} ${value}`
-              })
-              .join(branch.match === 'all' ? t(' · and · ') : t(' · or · '))}
+            {describeTimeBranch(branch, t)}
             {' → '}
             {t('Apply {{percent}}% discount', {
               percent: branch.percent ?? '—',
             })}
           </p>
+          {(diagnostics[index]?.impossible ||
+            diagnostics[index]?.shadowed ||
+            diagnostics[index]?.overlapping) && (
+            <p
+              role='status'
+              className={
+                diagnostics[index]?.overlapping
+                  ? 'text-warning text-xs'
+                  : 'text-destructive text-xs'
+              }
+            >
+              {diagnostics[index]?.impossible &&
+                t(
+                  'These conditions can never match. Adjust the weekdays, time range, or condition relation.'
+                )}
+              {diagnostics[index]?.shadowed &&
+                t(
+                  'Earlier rules cover this entire rule. Move it up or narrow the earlier rules.'
+                )}
+              {diagnostics[index]?.overlapping &&
+                t(
+                  'This rule overlaps earlier rules. Earlier matching rules take priority.'
+                )}
+            </p>
+          )}
         </section>
       ))}
       {!visualValid && (

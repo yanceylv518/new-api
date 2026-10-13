@@ -70,6 +70,11 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Select,
@@ -111,6 +116,15 @@ import {
   getUserModelPricingRulePage,
 } from '../api'
 import { getUserRoleOptions, USER_ROLES } from '../constants'
+import {
+  isTimeDiscountConfig,
+  parseDiscountExpression,
+} from '../lib/user-discount-expression'
+import {
+  beijingTime,
+  describeTimeBranch,
+  matchesTimeBranch,
+} from '../lib/user-discount-time'
 import { getUserModelPricingStatusOptions } from '../lib/user-model-pricing-form'
 import type {
   UserModelPricingItem,
@@ -144,6 +158,120 @@ function formatDiscountRate(discountBPS: number): string {
   return `${formatDiscountNumber(discountBPS)}%`
 }
 
+function DiscountRate(props: { rule: UserModelPricingItem }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [, setClockTick] = useState(0)
+  useEffect(() => {
+    if (!open) return
+    let timer: ReturnType<typeof setTimeout>
+    const tick = () => {
+      setClockTick((value) => value + 1)
+      timer = setTimeout(tick, 60000 - (Date.now() % 60000))
+    }
+    timer = setTimeout(tick, 60000 - (Date.now() % 60000))
+    return () => clearTimeout(timer)
+  }, [open])
+  const config = useMemo(
+    () => parseDiscountExpression(props.rule.expression ?? ''),
+    [props.rule.expression]
+  )
+  const percentages = useMemo(() => {
+    if (!config) return []
+    const values = config.branches.length
+      ? config.branches.map((branch) => branch.percent)
+      : [config.percent]
+    return [...new Set(values)].filter(
+      (value): value is number => value !== null
+    )
+  }, [config])
+
+  if (!props.rule.expression) {
+    return <>{formatDiscountRate(props.rule.discount_bps)}</>
+  }
+
+  if (percentages.length === 0) {
+    return <span title={props.rule.expression}>—</span>
+  }
+
+  const at = Math.floor(Date.now() / 1000)
+  const clock = beijingTime(at)
+  const timeOnly = config && isTimeDiscountConfig(config)
+  const current =
+    (timeOnly
+      ? config?.branches.findIndex((branch) =>
+          matchesTimeBranch(branch, clock.day, clock.minute)
+        )
+      : -1) ?? -1
+  const valid =
+    (props.rule.start_time == null || at >= props.rule.start_time) &&
+    (props.rule.end_time == null || at < props.rule.end_time)
+  let currentPercent: number | null = null
+  if (valid && config) {
+    if (current >= 0) currentPercent = config.branches[current].percent
+    else if (!config.inheritPermanent) currentPercent = config.percent
+  }
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        render={
+          <Button
+            type='button'
+            variant='link'
+            className='text-info h-auto max-w-full flex-wrap justify-start gap-x-1.5 gap-y-1 p-0 text-left font-mono font-semibold'
+            aria-label={t('View time conditions for {{model}}', {
+              model: props.rule.model_name,
+            })}
+          />
+        }
+      >
+        {percentages.map((percent) => (
+          <span key={percent} className='whitespace-nowrap'>
+            {formatDiscountRate(Math.round(percent * 100))}
+          </span>
+        ))}
+      </PopoverTrigger>
+      <PopoverContent className='w-80 space-y-3' align='end'>
+        <p className='text-sm font-medium'>
+          {t('Time-based discounts')} · {t('Beijing time')}
+        </p>
+        {timeOnly &&
+          config?.branches.map((branch, index) => (
+            <div
+              key={branch.id}
+              className='flex justify-between gap-3 border-b pb-2 text-xs'
+            >
+              <span>
+                {describeTimeBranch(branch, t)}
+                {valid && index === current && (
+                  <Badge className='ml-1' variant='outline'>
+                    {t('Matching now')}
+                  </Badge>
+                )}
+              </span>
+              <span className='shrink-0 font-mono'>{branch.percent}%</span>
+            </div>
+          ))}
+        {!timeOnly && (
+          <p className='text-muted-foreground text-xs'>
+            {t('This saved rule uses conditions outside the time editor.')}
+          </p>
+        )}
+        {timeOnly && (
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              currentPercent !== null
+                ? 'Current billing: {{percent}}%'
+                : 'Currently using the permanent discount',
+              { percent: currentPercent }
+            )}
+          </p>
+        )}
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 function getUserInitials(user: UserModelPricingOverviewUser): string {
   const source = (user.display_name || user.username).trim()
   return source.slice(0, 2).toUpperCase()
@@ -169,7 +297,6 @@ function DiscountModelPreview({
 }: {
   item: UserModelPricingOverviewItem
 }) {
-  const { t } = useTranslation()
   const previewRules = (item.preview_rules ?? item.rules).slice(0, 3)
 
   if (previewRules.length === 0) {
@@ -182,15 +309,17 @@ function DiscountModelPreview({
         <span
           key={`${rule.model_name}:${rule.slot ?? 0}`}
           className='border-border/70 bg-muted/40 inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs'
-          title={`${rule.model_name} - ${rule.expression || formatDiscountRate(rule.discount_bps)}`}
+          title={
+            rule.expression
+              ? rule.model_name
+              : `${rule.model_name} - ${formatDiscountRate(rule.discount_bps)}`
+          }
         >
           <span className='min-w-0 truncate font-mono' translate='no'>
             {rule.model_name}
           </span>
-          <span className='text-info shrink-0 font-mono font-semibold tabular-nums'>
-            {rule.expression
-              ? t('Conditional discount')
-              : formatDiscountRate(rule.discount_bps)}
+          <span className='text-info max-w-full shrink-0 font-mono font-semibold tabular-nums'>
+            <DiscountRate rule={rule} />
           </span>
         </span>
       ))}
@@ -422,7 +551,7 @@ export function UserModelPricingDetailsSheet(props: {
             <Select
               value={detailStatus}
               items={[
-                { value: 'active', label: t('Active') },
+                { value: 'active', label: t('Within validity period') },
                 { value: 'pending', label: t('Not started') },
                 { value: 'expired', label: t('Expired') },
                 { value: 'all', label: t('All statuses') },
@@ -446,7 +575,9 @@ export function UserModelPricingDetailsSheet(props: {
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value='active'>{t('Active')}</SelectItem>
+                  <SelectItem value='active'>
+                    {t('Within validity period')}
+                  </SelectItem>
                   <SelectItem value='pending'>{t('Not started')}</SelectItem>
                   <SelectItem value='expired'>{t('Expired')}</SelectItem>
                   <SelectItem value='all'>{t('All statuses')}</SelectItem>
@@ -481,8 +612,8 @@ function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
     >
       <TableHeader>
         <TableRow>
-          <TableHead className='w-[34%]'>{t('Model')}</TableHead>
-          <TableHead className='w-[10%] text-right [overflow-wrap:anywhere] whitespace-normal'>
+          <TableHead className='w-[28%]'>{t('Model')}</TableHead>
+          <TableHead className='w-[16%] text-left [overflow-wrap:anywhere] whitespace-normal'>
             {t('Discount percentage')}
           </TableHead>
           <TableHead className='w-[12%]'>{t('Status')}</TableHead>
@@ -502,12 +633,8 @@ function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
                 {rule.model_name}
               </span>
             </TableCell>
-            <TableCell className='text-info text-right font-mono font-semibold tabular-nums'>
-              {rule.expression ? (
-                <span title={rule.expression}>{t('Conditional discount')}</span>
-              ) : (
-                formatDiscountRate(rule.discount_bps)
-              )}
+            <TableCell className='text-info text-left font-mono font-semibold whitespace-normal tabular-nums'>
+              <DiscountRate rule={rule} />
             </TableCell>
             <TableCell>
               {rule.mode === 'layered' && rule.slot === -1 ? (
@@ -1213,7 +1340,9 @@ export function UserModelPricingOverview() {
                 <SelectContent>
                   <SelectGroup>
                     <SelectItem value='all'>{t('All statuses')}</SelectItem>
-                    <SelectItem value='active'>{t('Active')}</SelectItem>
+                    <SelectItem value='active'>
+                      {t('Within validity period')}
+                    </SelectItem>
                     <SelectItem value='pending'>{t('Not started')}</SelectItem>
                     <SelectItem value='expired'>{t('Expired')}</SelectItem>
                   </SelectGroup>

@@ -1030,10 +1030,10 @@ describe('user model pricing dialog', () => {
       '#temporary-discount-0-default'
     )
     assert.ok(defaultInput)
-    expect(defaultInput.readOnly).toBe(true)
+    expect(defaultInput.tagName).toBe('OUTPUT')
     const addCondition = [
       ...document.querySelectorAll<HTMLButtonElement>('button'),
-    ].find((button) => button.textContent === 'Add time rule')
+    ].find((button) => button.textContent === 'Advanced conditions')
     assert.ok(addCondition)
     await act(async () => addCondition.click())
     const periodInput = document.querySelector<HTMLInputElement>(
@@ -1043,7 +1043,7 @@ describe('user model pricing dialog', () => {
     await changeInput(periodInput, '75')
     const apply = [
       ...document.querySelectorAll<HTMLButtonElement>('button'),
-    ].find((button) => button.textContent === 'Apply')
+    ].find((button) => button.textContent === 'Apply to draft')
     assert.ok(apply)
     await act(async () => apply.click())
     expect(document.querySelector('#temporary-discount-0-default')).toBeNull()

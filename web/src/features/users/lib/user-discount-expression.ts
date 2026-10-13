@@ -16,6 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import {
+  MINUTE_OF_DAY,
+  predicateWeeklySchedule,
+  weeklySchedulePredicate,
+  type DiscountPredicate,
+  type WeeklyDiscountSchedule,
+} from './user-discount-time'
+
 export const DISCOUNT_TIME_FIELDS = [
   { value: 'hour("Asia/Shanghai")', label: 'Daily hour', max: 23 },
   {
@@ -69,6 +77,7 @@ export interface DiscountBranch {
   conditions: DiscountCondition[]
   match: 'all' | 'any'
   percent: number | null
+  schedule?: WeeklyDiscountSchedule
 }
 
 export interface DiscountVisualConfig {
@@ -79,18 +88,20 @@ export interface DiscountVisualConfig {
 
 export function isTimeDiscountConfig(config: DiscountVisualConfig): boolean {
   return config.branches.every((branch) =>
-    branch.conditions.every((condition) => {
-      const field = DISCOUNT_TIME_FIELDS.find(
-        (item) => item.value === condition.field
-      )
-      return Boolean(
-        field &&
-        discountConditionLiteral(condition) !== null &&
-        (field.value !== DISCOUNT_TIME_FIELDS[2].value ||
-          condition.operator === '==' ||
-          condition.operator === '!=')
-      )
-    })
+    branch.schedule
+      ? weeklySchedulePredicate(branch.schedule) !== null
+      : branch.conditions.every((condition) => {
+          const field = DISCOUNT_TIME_FIELDS.find(
+            (item) => item.value === condition.field
+          )
+          return Boolean(
+            field &&
+            discountConditionLiteral(condition) !== null &&
+            (field.value !== DISCOUNT_TIME_FIELDS[2].value ||
+              condition.operator === '==' ||
+              condition.operator === '!=')
+          )
+        })
   )
 }
 
@@ -180,6 +191,12 @@ export function generateDiscountExpression(
   }
   for (const branch of [...config.branches].reverse()) {
     const ratio = discountPercentLiteral(branch.percent)
+    if (branch.schedule) {
+      const predicate = weeklySchedulePredicate(branch.schedule)
+      if (ratio === null || predicate === null) return null
+      source = `(${predicate}) ? ${ratio} : ${source}`
+      continue
+    }
     if (
       ratio === null ||
       branch.conditions.length === 0 ||
@@ -210,7 +227,7 @@ export function parseDiscountExpression(
   const source = expression.trim()
   if (!source || source.length > 4096) return null
   const tokenizer =
-    /\s*("(?:\\.|[^"\\])*"|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|>=|<=|==|!=|&&|\|\||[()?:,<>])/gy
+    /\s*("(?:\\.|[^"\\])*"|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|>=|<=|==|!=|&&|\|\||[()?:,<>*+])/gy
   const tokens: string[] = []
   let offset = 0
   while (offset < source.length) {
@@ -230,6 +247,32 @@ export function parseDiscountExpression(
       : Math.round(percent * 100) / 100
   }
   const readField = (): string | null => {
+    if (
+      tokens[position] === '(' &&
+      tokens[position + 1] === 'hour' &&
+      tokens[position + 5] === '*'
+    ) {
+      const expected = [
+        '(',
+        'hour',
+        '(',
+        '"Asia/Shanghai"',
+        ')',
+        '*',
+        '60',
+        '+',
+        'minute',
+        '(',
+        '"Asia/Shanghai"',
+        ')',
+        ')',
+      ]
+      if (expected.some((token, index) => tokens[position + index] !== token)) {
+        return null
+      }
+      position += expected.length
+      return MINUTE_OF_DAY
+    }
     let field = tokens[position++]
     if (!field) return null
     if (tokens[position] === '(') {
@@ -246,7 +289,7 @@ export function parseDiscountExpression(
   }
   const readCondition = (): DiscountCondition | null => {
     const id = `condition-${position}`
-    const guarded = tokens[position] === '('
+    const guarded = tokens[position] === '(' && tokens[position + 1] === 'param'
     if (guarded) position++
     const field = readField()
     if (!field) return null
@@ -278,7 +321,10 @@ export function parseDiscountExpression(
       }
     }
     const condition = { id, field, operator: comparison, value }
-    const definition = DISCOUNT_FIELDS.find((item) => item.value === field)
+    const definition =
+      field === MINUTE_OF_DAY
+        ? { type: 'number' as const }
+        : DISCOUNT_FIELDS.find((item) => item.value === field)
     if (
       !definition ||
       (definition.type === 'string' && !token.startsWith('"')) ||
@@ -287,7 +333,48 @@ export function parseDiscountExpression(
       return null
     }
     if (guarded && tokens[position++] !== ')') return null
+    if (field === MINUTE_OF_DAY) {
+      return /^\d+$/.test(value) && Number(value) <= 1440 ? condition : null
+    }
     return discountConditionLiteral(condition) === null ? null : condition
+  }
+  const readPrimary = (depth: number): DiscountPredicate | null => {
+    if (depth > 20) return null
+    if (
+      tokens[position] === '(' &&
+      tokens[position + 1] !== 'param' &&
+      !(tokens[position + 1] === 'hour' && tokens[position + 5] === '*')
+    ) {
+      position++
+      const predicate = readOr(depth + 1)
+      return predicate && tokens[position++] === ')' ? predicate : null
+    }
+    const condition = readCondition()
+    return condition ? { condition } : null
+  }
+  const readAnd = (depth: number): DiscountPredicate | null => {
+    const first = readPrimary(depth)
+    if (!first) return null
+    const parts = [first]
+    while (tokens[position] === '&&') {
+      position++
+      const next = readPrimary(depth)
+      if (!next) return null
+      parts.push(next)
+    }
+    return parts.length === 1 ? first : { match: 'all', parts }
+  }
+  const readOr = (depth: number): DiscountPredicate | null => {
+    const first = readAnd(depth)
+    if (!first) return null
+    const parts = [first]
+    while (tokens[position] === '||') {
+      position++
+      const next = readAnd(depth)
+      if (!next) return null
+      parts.push(next)
+    }
+    return parts.length === 1 ? first : { match: 'any', parts }
   }
   const branches: DiscountBranch[] = []
   while (
@@ -296,34 +383,30 @@ export function parseDiscountExpression(
     tokens[position] !== 'permanent_discount'
   ) {
     if (branches.length >= MAX_DISCOUNT_BRANCHES) return null
-    const grouped = tokens[position] === '('
-    if (grouped) position++
-    const first = readCondition()
-    if (!first) return null
-    const conditions = [first]
-    let join: string | undefined
-    while (tokens[position] === '&&' || tokens[position] === '||') {
-      const nextJoin = tokens[position++]
-      if (
-        (join && join !== nextJoin) ||
-        conditions.length >= MAX_DISCOUNT_CONDITIONS
-      ) {
-        return null
-      }
-      join = nextJoin
-      const condition = readCondition()
-      if (!condition) return null
-      conditions.push(condition)
+    const predicate = readOr(0)
+    if (!predicate) return null
+    const schedule = predicateWeeklySchedule(predicate)
+    const match = 'match' in predicate ? predicate.match : 'all'
+    const parts = 'parts' in predicate ? predicate.parts : [predicate]
+    const conditions = parts.flatMap((part) =>
+      'condition' in part ? [part.condition] : []
+    )
+    if (
+      !schedule &&
+      (conditions.length !== parts.length ||
+        conditions.length > MAX_DISCOUNT_CONDITIONS)
+    ) {
+      return null
     }
-    if (grouped && tokens[position++] !== ')') return null
     if (tokens[position++] !== '?') return null
     const percent = readPercent()
     if (percent === null || tokens[position++] !== ':') return null
     branches.push({
       id: `branch-${branches.length}`,
       conditions,
-      match: join === '||' ? 'any' : 'all',
+      match,
       percent,
+      ...(schedule ? { schedule, conditions: [] } : {}),
     })
   }
   if (tokens[position] === 'permanent_discount') {
