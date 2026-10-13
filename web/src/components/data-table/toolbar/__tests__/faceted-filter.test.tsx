@@ -16,19 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import {
-  getCoreRowModel,
-  getFacetedRowModel,
-  getFacetedUniqueValues,
-  getFilteredRowModel,
-  useReactTable,
-  type ColumnFiltersState,
-} from '@tanstack/react-table'
+import type { ColumnFiltersState } from '@tanstack/react-table'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
+import { useDataTable } from '../../hooks/use-data-table'
 import { DataTableToolbar } from '../toolbar'
 
 const groupOptions = [
@@ -37,17 +31,15 @@ const groupOptions = [
 ]
 
 // 使用稳定的分组选项模拟用户折扣页，确保筛选值变化仍会刷新记忆化组件。
-function FilterHarness() {
+function FilterHarness(props: { controlled?: boolean }) {
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
-  const table = useReactTable({
+  const { table } = useDataTable({
     data: [{ group: 'vip' }],
     columns: [{ id: 'group', accessorKey: 'group' }],
-    state: { columnFilters, globalFilter: '' },
-    onColumnFiltersChange: setColumnFilters,
-    getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getFacetedRowModel: getFacetedRowModel(),
-    getFacetedUniqueValues: getFacetedUniqueValues(),
+    globalFilter: '',
+    columnFilters: props.controlled === false ? undefined : columnFilters,
+    onColumnFiltersChange:
+      props.controlled === false ? undefined : setColumnFilters,
   })
 
   return (
@@ -65,6 +57,25 @@ function FilterHarness() {
   )
 }
 
+function SearchWithoutColumnFiltersHarness() {
+  const [globalFilter, setGlobalFilter] = useState('')
+  const { table } = useDataTable({
+    data: [{ group: 'vip' }],
+    columns: [{ id: 'group', accessorKey: 'group' }],
+    manualFiltering: true,
+    globalFilter,
+    onGlobalFilterChange: setGlobalFilter,
+  })
+
+  return (
+    <DataTableToolbar
+      table={table}
+      searchPlaceholder='Search users'
+      hideViewOptions
+    />
+  )
+}
+
 describe('DataTableFacetedFilter', () => {
   it('updates the selected badge when a stable-options filter changes', async () => {
     const user = userEvent.setup()
@@ -78,5 +89,34 @@ describe('DataTableFacetedFilter', () => {
     await user.click(screen.getByRole('option', { name: /^default/ }))
     expect(within(trigger).getByText('default')).toBeVisible()
     expect(within(trigger).queryByText('vip')).not.toBeInTheDocument()
+  })
+
+  it('selects and clears a filter when column filter state is not supplied', async () => {
+    const user = userEvent.setup()
+    render(<FilterHarness controlled={false} />)
+
+    const trigger = screen.getByRole('button', { name: 'Group' })
+    await user.click(trigger)
+    await user.click(screen.getByRole('option', { name: /^vip/ }))
+    expect(within(trigger).getByText('vip')).toBeVisible()
+
+    await user.click(trigger)
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    expect(within(trigger).queryByText('vip')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset' })).toBeNull()
+  })
+
+  it('searches and resets a toolbar after column filters are removed', async () => {
+    const user = userEvent.setup()
+    render(<SearchWithoutColumnFiltersHarness />)
+
+    const search = screen.getByPlaceholderText('Search users')
+    expect(search).toHaveValue('')
+    await user.type(search, 'pricing-user')
+    expect(search).toHaveValue('pricing-user')
+
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    expect(search).toHaveValue('')
+    expect(screen.queryByRole('button', { name: 'Reset' })).toBeNull()
   })
 })
