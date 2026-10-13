@@ -1,6 +1,10 @@
 package kitutil
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestMaskCredentialsCookieHeaders(t *testing.T) {
 	tests := []struct {
@@ -48,15 +52,39 @@ func TestMaskCredentialsCookieHeaders(t *testing.T) {
 			input: `{"message":"headers: {\"Cookie\":\"first=one; sessionid=session-value\"}"}`,
 			want:  `{"message":"headers: {\"Cookie\":\"***\"}"}`,
 		},
+		{
+			name:  "cookie header inside JSON retains diagnostics",
+			input: `{"message":"Cookie: first=one; sessionid=session-value\r\nX-Debug: trace-value","code":"upstream_rejected"}`,
+			want:  `{"message":"Cookie: ***\r\nX-Debug: trace-value","code":"upstream_rejected"}`,
+		},
+		{
+			name:  "cookie header before JSON string end",
+			input: `{"message":"Cookie: first=one; sessionid=session-value","code":"upstream_rejected"}`,
+			want:  `{"message":"Cookie: ***","code":"upstream_rejected"}`,
+		},
+		{
+			name:  "quoted cookie inside JSON message",
+			input: `{"message":"Cookie: first=\"one\"; sessionid=session-value\nX-Debug: trace-value","code":"upstream_rejected"}`,
+			want:  `{"message":"Cookie: ***\nX-Debug: trace-value","code":"upstream_rejected"}`,
+		},
+		{
+			name:  "nested JSON cookie header",
+			input: `{"message":"headers: {\"error\":\"Cookie: first=one; sessionid=session-value\",\"code\":\"upstream_rejected\"}"}`,
+			want:  `{"message":"headers: {\"error\":\"Cookie: ***\",\"code\":\"upstream_rejected\"}"}`,
+		},
+		{
+			name:  "multiple JSON cookie header messages",
+			input: `{"first":"Cookie: sessionid=first-value","second":"Set-Cookie: sessionid=second-value; Secure","code":"upstream_rejected"}`,
+			want:  `{"first":"Cookie: ***","second":"Set-Cookie: ***","code":"upstream_rejected"}`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := MaskCredentials(test.input)
-			if got != test.want {
-				t.Errorf("MaskCredentials() = %q, want %q", got, test.want)
-			}
-			if again := MaskCredentials(got); again != got {
-				t.Errorf("second redaction = %q, want %q", again, got)
+			require.Equal(t, test.want, got)
+			require.Equal(t, got, MaskCredentials(got))
+			if len(test.input) > 0 && test.input[0] == '{' {
+				require.True(t, Valid([]byte(got)))
 			}
 		})
 	}
