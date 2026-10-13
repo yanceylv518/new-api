@@ -24,13 +24,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type {
   ColumnDef,
-  ColumnFiltersState,
   OnChangeFn,
   PaginationState,
   Row,
 } from '@tanstack/react-table'
 import {
+  Activity,
   BadgePercent,
+  CalendarClock,
   Layers3,
   List,
   ListChecks,
@@ -107,15 +108,13 @@ import {
 import { useMediaQuery } from '@/hooks'
 import { useServerBoundaryRefresh } from '@/hooks/use-server-boundary-refresh'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
-import dayjs from '@/lib/dayjs'
 import { cn } from '@/lib/utils'
 
 import {
-  getGroups,
   getUserModelPricingOverview,
   getUserModelPricingRulePage,
 } from '../api'
-import { getUserRoleOptions, USER_ROLES } from '../constants'
+import { USER_ROLES } from '../constants'
 import {
   isTimeDiscountConfig,
   parseDiscountExpression,
@@ -126,6 +125,10 @@ import {
   matchesTimeBranch,
 } from '../lib/user-discount-time'
 import { getUserModelPricingStatusOptions } from '../lib/user-model-pricing-form'
+import {
+  describeTemporaryDiscountRules,
+  formatValidityRange,
+} from '../lib/user-temporary-discount'
 import type {
   UserModelPricingItem,
   UserModelPricingOverviewData,
@@ -156,6 +159,12 @@ function formatDiscountNumber(discountBPS: number): string {
 
 function formatDiscountRate(discountBPS: number): string {
   return `${formatDiscountNumber(discountBPS)}%`
+}
+
+// 分层配置用 slot 区分永久与临时；旧配置没有结束时间的规则等同永久折扣。
+function isTemporaryDiscountRule(rule: UserModelPricingItem): boolean {
+  if (rule.mode === 'layered') return (rule.slot ?? 0) >= 0
+  return rule.end_time != null
 }
 
 function DiscountRate(props: { rule: UserModelPricingItem }) {
@@ -277,16 +286,13 @@ function getUserInitials(user: UserModelPricingOverviewUser): string {
   return source.slice(0, 2).toUpperCase()
 }
 
-// 抽屉头部展示当前用户的折扣区间，主表使用模型预览避免信息过于抽象。
+// 抽屉头部只在没有任何折扣生效时提示，正常情况由列表本身说明。
 function DiscountSummary({ item }: { item: UserModelPricingOverviewItem }) {
   const { t } = useTranslation()
+  if (item.active_rules !== 0) return null
   return (
     <span className='text-muted-foreground text-xs'>
-      {t(
-        item.active_rules === 0
-          ? 'No active discount'
-          : 'Permanent and temporary discounts'
-      )}
+      {t('No active discount')}
     </span>
   )
 }
@@ -297,6 +303,7 @@ function DiscountModelPreview({
 }: {
   item: UserModelPricingOverviewItem
 }) {
+  const { t } = useTranslation()
   const previewRules = (item.preview_rules ?? item.rules).slice(0, 3)
 
   if (previewRules.length === 0) {
@@ -315,6 +322,13 @@ function DiscountModelPreview({
               : `${rule.model_name} - ${formatDiscountRate(rule.discount_bps)}`
           }
         >
+          {isTemporaryDiscountRule(rule) && (
+            <CalendarClock
+              role='img'
+              aria-label={t('Temporary')}
+              className='text-muted-foreground size-3 shrink-0'
+            />
+          )}
           <span className='min-w-0 truncate font-mono' translate='no'>
             {rule.model_name}
           </span>
@@ -601,6 +615,39 @@ export function UserModelPricingDetailsSheet(props: {
   )
 }
 
+/** 临时折扣的生效时间：有效期一行，星期和时段条件另起一行。 */
+function DiscountRuleEffectiveTime(props: { rule: UserModelPricingItem }) {
+  const { t } = useTranslation()
+  const conditions = useMemo(() => {
+    if (!props.rule.expression) return []
+    const described = describeTemporaryDiscountRules(
+      { expression: props.rule.expression },
+      null,
+      t
+    )
+    if (described.unsupported) return [t('Custom conditions')]
+    return described.rules.map((rule) =>
+      described.rules.length > 1 ? `${rule.when} → ${rule.percent}%` : rule.when
+    )
+  }, [props.rule.expression, t])
+
+  return (
+    <div className='flex flex-col gap-0.5 text-xs whitespace-normal'>
+      <span className='font-mono'>
+        {formatValidityRange(props.rule, {
+          start: t('Existing rule'),
+          end: t('Permanent'),
+        })}
+      </span>
+      {conditions.map((condition) => (
+        <span key={condition} className='text-muted-foreground'>
+          {condition}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
   const { t } = useTranslation()
 
@@ -613,50 +660,55 @@ function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
       <TableHeader>
         <TableRow>
           <TableHead className='w-[28%]'>{t('Model')}</TableHead>
-          <TableHead className='w-[16%] text-left [overflow-wrap:anywhere] whitespace-normal'>
+          <TableHead className='w-[12%]'>{t('Type')}</TableHead>
+          <TableHead className='w-[14%] text-left [overflow-wrap:anywhere] whitespace-normal'>
             {t('Discount percentage')}
           </TableHead>
-          <TableHead className='w-[12%]'>{t('Status')}</TableHead>
-          <TableHead className='w-[22%]'>{t('Start time')}</TableHead>
-          <TableHead className='w-[22%]'>{t('End time')}</TableHead>
+          <TableHead className='w-[32%]'>{t('Effective time')}</TableHead>
+          <TableHead className='w-[14%]'>{t('Status')}</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
-        {rules.map((rule) => (
-          <TableRow key={`${rule.model_name}:${rule.slot ?? 0}`}>
-            <TableCell className='whitespace-normal'>
-              <span
-                className='font-mono text-sm leading-relaxed [overflow-wrap:anywhere]'
-                title={rule.model_name}
-                translate='no'
-              >
-                {rule.model_name}
-              </span>
-            </TableCell>
-            <TableCell className='text-info text-left font-mono font-semibold whitespace-normal tabular-nums'>
-              <DiscountRate rule={rule} />
-            </TableCell>
-            <TableCell>
-              {rule.mode === 'layered' && rule.slot === -1 ? (
-                <Badge variant='outline'>{t('Permanent discount')}</Badge>
-              ) : (
-                <PricingPeriodStatusBadge period={rule} />
-              )}
-            </TableCell>
-            <TableCell className='text-muted-foreground font-mono'>
-              {rule.mode === 'layered' && rule.slot === -1 && '—'}
-              {!(rule.mode === 'layered' && rule.slot === -1) &&
-                (rule.start_time
-                  ? dayjs.unix(rule.start_time).format('YYYY-MM-DD HH:mm')
-                  : t('Existing rule'))}
-            </TableCell>
-            <TableCell className='text-muted-foreground font-mono'>
-              {rule.end_time == null
-                ? t('Permanent')
-                : dayjs.unix(rule.end_time).format('YYYY-MM-DD HH:mm')}
-            </TableCell>
-          </TableRow>
-        ))}
+        {rules.map((rule) => {
+          const temporary = isTemporaryDiscountRule(rule)
+          return (
+            <TableRow key={`${rule.model_name}:${rule.slot ?? 0}`}>
+              <TableCell className='whitespace-normal'>
+                <span
+                  className='font-mono text-sm leading-relaxed [overflow-wrap:anywhere]'
+                  title={rule.model_name}
+                  translate='no'
+                >
+                  {rule.model_name}
+                </span>
+              </TableCell>
+              <TableCell>
+                <Badge variant={temporary ? 'secondary' : 'outline'}>
+                  {temporary ? t('Temporary') : t('Permanent')}
+                </Badge>
+              </TableCell>
+              <TableCell className='text-info text-left font-mono font-semibold whitespace-normal tabular-nums'>
+                <DiscountRate rule={rule} />
+              </TableCell>
+              <TableCell>
+                {rule.mode === 'layered' && !temporary ? (
+                  <span className='text-muted-foreground text-xs'>
+                    {t('Always')}
+                  </span>
+                ) : (
+                  <DiscountRuleEffectiveTime rule={rule} />
+                )}
+              </TableCell>
+              <TableCell>
+                {rule.mode === 'layered' && !temporary ? (
+                  <span className='text-muted-foreground'>—</span>
+                ) : (
+                  <PricingPeriodStatusBadge period={rule} />
+                )}
+              </TableCell>
+            </TableRow>
+          )
+        })}
       </TableBody>
     </Table>
   )
@@ -957,7 +1009,7 @@ function OverviewStats({
       iconClassName: 'text-info bg-info/10',
     },
     {
-      label: t('Configured models'),
+      label: t('Model discounts'),
       value: data.total_rules,
       icon: ListChecks,
       iconClassName: 'text-warning bg-warning/10',
@@ -968,10 +1020,16 @@ function OverviewStats({
       icon: Layers3,
       iconClassName: 'text-success bg-success/10',
     },
+    {
+      label: t('Within validity period'),
+      value: data.active_rules ?? 0,
+      icon: Activity,
+      iconClassName: 'text-primary bg-primary/10',
+    },
   ] as const
 
   return (
-    <div className='grid shrink-0 grid-cols-3 gap-2 sm:gap-3'>
+    <div className='grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3'>
       {stats.map((stat) => (
         <div
           key={stat.label}
@@ -1052,8 +1110,6 @@ export function UserModelPricingOverview() {
   const {
     globalFilter,
     onGlobalFilterChange,
-    columnFilters,
-    onColumnFiltersChange,
     pagination,
     onPaginationChange,
     ensurePageInRange,
@@ -1065,33 +1121,7 @@ export function UserModelPricingOverview() {
       defaultPageSize: isMobile ? 10 : 20,
     },
     globalFilter: { enabled: true, key: 'filter' },
-    columnFilters: [
-      { columnId: 'group', searchKey: 'group', type: 'array' },
-      { columnId: 'role', searchKey: 'role', type: 'array' },
-    ],
   })
-
-  const groupFilter =
-    (columnFilters.find((filter) => filter.id === 'group')?.value as
-      | string[]
-      | undefined) ?? []
-  const roleFilter =
-    (columnFilters.find((filter) => filter.id === 'role')?.value as
-      | string[]
-      | undefined) ?? []
-
-  const { data: groupsData } = useQuery({
-    queryKey: ['groups'],
-    queryFn: getGroups,
-  })
-  const groupOptions = useMemo(
-    () =>
-      (groupsData?.data || []).map((group) => ({
-        label: group,
-        value: group,
-      })),
-    [groupsData]
-  )
 
   const query = useQuery({
     queryKey: [
@@ -1099,16 +1129,12 @@ export function UserModelPricingOverview() {
       pagination.pageIndex + 1,
       pagination.pageSize,
       globalFilter,
-      groupFilter,
-      roleFilter,
       statusFilter,
     ],
     queryFn: async ({ signal }) => {
       const response = await getUserModelPricingOverview(
         {
           keyword: globalFilter,
-          group: groupFilter.length > 0 ? groupFilter[0] : undefined,
-          role: roleFilter.length > 0 ? roleFilter[0] : undefined,
           p: pagination.pageIndex + 1,
           page_size: pagination.pageSize,
           status: statusFilter === 'all' ? undefined : statusFilter,
@@ -1126,9 +1152,8 @@ export function UserModelPricingOverview() {
 
   const overview = query.data ?? EMPTY_OVERVIEW
   const items = overview.items
-  const hasSearch = Boolean(
-    globalFilter?.trim() || groupFilter.length > 0 || roleFilter.length > 0
-  )
+  const statusOptions = useMemo(() => getUserModelPricingStatusOptions(t), [t])
+  const hasSearch = Boolean(globalFilter?.trim())
   const selectedUser =
     items.find((item) => item.user.id === selectedUserId) ?? null
 
@@ -1181,13 +1206,6 @@ export function UserModelPricingOverview() {
       onPaginationChange(updater)
     },
     [onPaginationChange]
-  )
-  const handleColumnFiltersChange: OnChangeFn<ColumnFiltersState> = useCallback(
-    (updater) => {
-      setSelectedUserId(null)
-      onColumnFiltersChange(updater)
-    },
-    [onColumnFiltersChange]
   )
 
   const columns = useMemo<ColumnDef<UserModelPricingOverviewItem>[]>(
@@ -1255,8 +1273,6 @@ export function UserModelPricingOverview() {
     onPaginationChange: handlePaginationChange,
     manualPagination: true,
     manualFiltering: true,
-    columnFilters,
-    onColumnFiltersChange: handleColumnFiltersChange,
     globalFilter,
     onGlobalFilterChange: handleGlobalFilterChange,
     totalCount: overview.total,
@@ -1269,7 +1285,6 @@ export function UserModelPricingOverview() {
         <SectionPageLayout.Breadcrumb>
           <OverviewBreadcrumb />
         </SectionPageLayout.Breadcrumb>
-        <SectionPageLayout.Title>{t('User Discounts')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
           <UserModelPricingHistoryButton />
           <Button
@@ -1299,7 +1314,6 @@ export function UserModelPricingOverview() {
         <SectionPageLayout.Breadcrumb>
           <OverviewBreadcrumb />
         </SectionPageLayout.Breadcrumb>
-        <SectionPageLayout.Title>{t('User Discounts')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
           <UserModelPricingHistoryButton />
           <Button
@@ -1319,36 +1333,6 @@ export function UserModelPricingOverview() {
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-3 sm:gap-4'>
             <OverviewStats data={overview} isLoading={query.isLoading} />
-            <div className='flex flex-wrap items-center justify-between gap-2'>
-              <span className='text-muted-foreground text-sm'>
-                {t('{{n}} active period(s)', { n: overview.active_rules ?? 0 })}
-              </span>
-              <Select
-                value={statusFilter}
-                items={getUserModelPricingStatusOptions(t)}
-                onValueChange={(value) => {
-                  if (value) {
-                    setStatusFilter(value)
-                    setSelectedUserId(null)
-                    onPaginationChange({ ...pagination, pageIndex: 0 })
-                  }
-                }}
-              >
-                <SelectTrigger aria-label={t('Discount status')}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value='all'>{t('All statuses')}</SelectItem>
-                    <SelectItem value='active'>
-                      {t('Within validity period')}
-                    </SelectItem>
-                    <SelectItem value='pending'>{t('Not started')}</SelectItem>
-                    <SelectItem value='expired'>{t('Expired')}</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </div>
             {query.isError && query.data ? (
               <OverviewRefreshError onRetry={refreshOverview} />
             ) : null}
@@ -1384,20 +1368,34 @@ export function UserModelPricingOverview() {
                   searchPlaceholder: t('Search users or models...'),
                   searchDebounceMs: 400,
                   hideViewOptions: true,
-                  filters: [
-                    {
-                      columnId: 'group',
-                      title: t('Group'),
-                      options: groupOptions,
-                      singleSelect: true,
-                    },
-                    {
-                      columnId: 'role',
-                      title: t('Role'),
-                      options: getUserRoleOptions(t),
-                      singleSelect: true,
-                    },
-                  ],
+                  hasAdditionalFilters: statusFilter !== 'all',
+                  onReset: () => setStatusFilter('all'),
+                  additionalSearch: (
+                    <Select
+                      value={statusFilter}
+                      items={statusOptions}
+                      onValueChange={(value) => {
+                        if (value) {
+                          setStatusFilter(value)
+                          setSelectedUserId(null)
+                          onPaginationChange({ ...pagination, pageIndex: 0 })
+                        }
+                      }}
+                    >
+                      <SelectTrigger aria-label={t('Discount status')}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {statusOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  ),
                 }}
               />
             </div>

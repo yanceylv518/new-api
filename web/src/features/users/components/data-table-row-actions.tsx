@@ -208,7 +208,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           }}
           disabled={isRoot}
         >
-          {t('User model pricing')}
+          {t('Model discounts')}
           <DropdownMenuShortcut>
             <BadgePercent size={16} />
           </DropdownMenuShortcut>

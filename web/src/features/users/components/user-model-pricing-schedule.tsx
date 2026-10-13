@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Plus, Trash2 } from 'lucide-react'
+import { ChevronRight, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -32,20 +32,21 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
-import {
-  Field,
-  FieldError,
-  FieldGroup,
-  FieldLabel,
-} from '@/components/ui/field'
+import { Field, FieldError, FieldGroup } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
 import dayjs from '@/lib/dayjs'
+import { cn } from '@/lib/utils'
 
 import {
   createUserModelPricingFormSchema,
   getPricingPeriodStatus,
   type UserModelPricingFormValues,
 } from '../lib/user-model-pricing-form'
+import {
+  describeTemporaryDiscountRules,
+  formatValidityRange,
+  isLocalDayStart,
+} from '../lib/user-temporary-discount'
 import { UserDiscountRuleEditor } from './user-discount-rule-editor'
 
 type PricingDraft = UserModelPricingFormValues['items'][number]
@@ -84,25 +85,60 @@ export function PricingPeriodStatusBadge(props: {
   )
 }
 
-export function PricingPeriodSummary(props: {
-  period: { start_time?: number | null; end_time?: number | null }
-  now?: number
+/** 一行摘要：有效期、生效时段和折扣比例，供编辑弹窗和模型列表共用。 */
+export function TemporaryDiscountSummary(props: {
+  period: PeriodDraft
+  permanentPercent: number | null | undefined
+  className?: string
 }) {
   const { t } = useTranslation()
+  const { unsupported, rules } = describeTemporaryDiscountRules(
+    props.period,
+    props.permanentPercent,
+    t
+  )
+  let detail = t('{{n}} time rules', { n: rules.length })
+  if (unsupported) {
+    detail = t('Custom conditions')
+  } else if (
+    rules.length === 0 ||
+    (rules.length === 1 && rules[0].percent == null)
+  ) {
+    detail = t('No discount set')
+  } else if (rules.length === 1) {
+    detail = `${rules[0].when} · ${rules[0].percent}%`
+  }
   return (
-    <span className='flex flex-wrap items-center gap-1 text-xs'>
-      <PricingPeriodStatusBadge {...props} />
-      <span className='text-muted-foreground'>
-        {props.period.start_time
-          ? dayjs.unix(props.period.start_time).format('YYYY-MM-DD HH:mm')
-          : t('Permanent discount')}
-        {' → '}
-        {props.period.end_time == null
-          ? t('Permanent')
-          : dayjs.unix(props.period.end_time).format('YYYY-MM-DD HH:mm')}
-      </span>
+    <span className={cn('min-w-0 truncate', props.className)}>
+      {formatValidityRange(props.period, {
+        start: t('On save'),
+        end: t('Permanent'),
+      })}
+      {' · '}
+      {detail}
     </span>
   )
+}
+
+// 新临时折扣默认从今天起按整天生效七天；已有临时折扣时接在最后一段之后。
+function newTemporaryDiscount(
+  periods: readonly PeriodDraft[],
+  permanentPercent: number | null | undefined
+): PeriodDraft {
+  const lastEnd = Math.max(0, ...periods.map((period) => period.end_time ?? 0))
+  let start = dayjs().startOf('day')
+  if (lastEnd > start.unix()) {
+    start = isLocalDayStart(lastEnd)
+      ? dayjs.unix(lastEnd)
+      : dayjs.unix(lastEnd).startOf('day').add(1, 'day')
+  }
+  return {
+    discount_percent: permanentPercent ?? 100,
+    expression: 'permanent_discount',
+    calculation_type: 'expression',
+    start_time: start.unix(),
+    end_time: start.add(7, 'day').unix(),
+  }
 }
 
 export function UserModelPricingScheduleDialog(props: {
@@ -111,11 +147,18 @@ export function UserModelPricingScheduleDialog(props: {
   onClose: () => void
 }) {
   const { t } = useTranslation()
-  const [draft, setDraft] = useState<PricingDraft>(() => ({
-    ...props.value,
-    mode: 'layered',
-    periods: props.value.periods?.map((period) => ({ ...period })) ?? [],
-  }))
+  const [draft, setDraft] = useState<PricingDraft>(() => {
+    const periods = props.value.periods?.map((period) => ({ ...period })) ?? []
+    // 首次配置时直接给出一条待填写的临时折扣，省去先点“添加”再填写的空步骤。
+    if (
+      periods.length === 0 &&
+      !props.value.expression &&
+      props.value.discount_percent != null
+    ) {
+      periods.push(newTemporaryDiscount([], props.value.discount_percent))
+    }
+    return { ...props.value, mode: 'layered', periods }
+  })
   const [error, setError] = useState<string | null>(null)
   const [originalDraft] = useState(() => JSON.stringify(draft))
   const [discardOpen, setDiscardOpen] = useState(false)
@@ -123,12 +166,8 @@ export function UserModelPricingScheduleDialog(props: {
     {}
   )
   const requestClose = () => {
-    if (
-      JSON.stringify(draft) !== originalDraft ||
-      Object.values(invalidEditors).some(Boolean)
-    ) {
-      setDiscardOpen(true)
-    } else props.onClose()
+    if (JSON.stringify(draft) !== originalDraft) setDiscardOpen(true)
+    else props.onClose()
   }
   const [clockTick, setClockTick] = useState(0)
   useEffect(() => {
@@ -155,26 +194,28 @@ export function UserModelPricingScheduleDialog(props: {
     }
   }, [draft.periods, clockTick])
   const [keys, setKeys] = useState(() =>
-    (props.value.periods ?? []).map((_, index) => index)
+    (draft.periods ?? []).map((_, index) => index)
   )
   const [visited, setVisited] = useState(() => new Set(keys.slice(-1)))
   const nextKey = useRef(keys.length)
   const schema = useMemo(() => createUserModelPricingFormSchema(t), [t])
   const validation = schema.safeParse({ items: [draft] })
   const issues = validation.success ? [] : validation.error.issues
-  const fieldErrors = (position?: number) => {
+  const fieldErrors = (position: number) => {
     const errors: Record<string, string> = {}
     for (const issue of issues) {
-      const isPeriod = issue.path[2] === 'periods'
-      if (
-        (position === undefined && !isPeriod) ||
-        (position !== undefined && isPeriod && issue.path[3] === position)
-      ) {
+      if (issue.path[2] === 'periods' && issue.path[3] === position) {
         errors[String(issue.path.at(-1))] = issue.message
       }
     }
     return errors
   }
+  // 折扣比例和时间规则的错误在各自的输入框旁提示，这里只汇总有效期等其余问题。
+  const summaryIssue = issues.find(
+    (issue) =>
+      issue.path[2] !== 'periods' ||
+      !['expression', 'discount_percent'].includes(String(issue.path.at(-1)))
+  )
   const update = (position: number, changes: Partial<PeriodDraft>) => {
     const key = keys[position]
     setVisited((previous) =>
@@ -204,13 +245,6 @@ export function UserModelPricingScheduleDialog(props: {
     setError(null)
   }
   const periods = draft.periods ?? []
-  const now = Math.floor(Date.now() / 1000)
-  const active = periods.find(
-    (period) => getPricingPeriodStatus(period, now) === 'active'
-  )
-  const permanentLabel = draft.expression
-    ? t('Conditional discount')
-    : `${String(draft.discount_percent ?? 100)}%`
   return (
     <>
       <Dialog
@@ -219,7 +253,19 @@ export function UserModelPricingScheduleDialog(props: {
           if (!open) requestClose()
         }}
         title={t('Temporary discounts')}
-        description={draft.model_name}
+        description={
+          <span className='flex flex-wrap items-center gap-x-2 gap-y-1'>
+            <span className='font-mono' translate='no'>
+              {draft.model_name}
+            </span>
+            <span>
+              {t('Permanent discount')}:{' '}
+              {draft.expression
+                ? t('Conditional discount')
+                : `${String(draft.discount_percent ?? 100)}%`}
+            </span>
+          </span>
+        }
         contentClassName='sm:max-w-3xl'
         footer={
           <>
@@ -248,248 +294,148 @@ export function UserModelPricingScheduleDialog(props: {
           </>
         }
       >
-        <div className='flex flex-col gap-5'>
-          <section className='flex flex-col gap-3'>
-            <div className='flex items-center justify-between gap-2'>
-              <div>
-                <p className='text-muted-foreground text-xs'>
-                  {t(
-                    'Temporary discounts take priority when conditions match within their validity period. Otherwise, the permanent discount applies.'
-                  )}
-                </p>
-              </div>
-              <Button
-                type='button'
-                variant='outline'
-                size='sm'
-                disabled={
-                  periods.length >= 1000 ||
-                  Boolean(draft.expression) ||
-                  draft.discount_percent == null
+        <div className='flex flex-col gap-4'>
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'Temporary discounts take priority when conditions match within their validity period. Otherwise, the permanent discount applies.'
+            )}
+          </p>
+          {draft.expression && (
+            <Alert>
+              <AlertDescription>
+                {t(
+                  'Set a fixed permanent discount before editing temporary discounts.'
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
+          {periods.length === 0 && (
+            <p className='text-muted-foreground rounded-lg border border-dashed p-5 text-center text-sm'>
+              {t('No temporary discounts. The permanent discount applies.')}
+            </p>
+          )}
+          {periods.map((period, index) => {
+            const errors = fieldErrors(index)
+            const invalid =
+              Object.keys(errors).length > 0 || invalidEditors[keys[index]]
+            return (
+              <Collapsible
+                key={keys[index]}
+                className='rounded-lg border'
+                defaultOpen={
+                  index === periods.length - 1 || Object.keys(errors).length > 0
                 }
-                onClick={() => {
-                  const key = nextKey.current++
-                  const start = Math.max(
-                    now,
-                    ...periods.map((period) => period.end_time ?? now)
-                  )
-                  setDraft((previous) => ({
-                    ...previous,
-                    periods: [
-                      ...(previous.periods ?? []),
-                      {
-                        discount_percent: previous.discount_percent ?? 100,
-                        expression: 'permanent_discount',
-                        calculation_type: 'expression',
-                        start_time: start,
-                        end_time: start + 7 * 86400,
-                      },
-                    ],
-                  }))
-                  setVisited((previous) => new Set([...previous, key]))
-                  setKeys((previous) => [...previous, key])
-                  setError(null)
+                onOpenChange={(open) => {
+                  if (open) {
+                    setVisited(
+                      (previous) => new Set([...previous, keys[index]])
+                    )
+                  }
                 }}
               >
-                <Plus aria-hidden='true' />
-                {t('Add temporary discount')}
-              </Button>
-            </div>
-            {draft.expression && (
-              <Alert>
-                <AlertDescription>
-                  {t(
-                    'Set a fixed permanent discount before editing temporary discounts.'
-                  )}
-                </AlertDescription>
-              </Alert>
-            )}
-            {periods.length === 0 && (
-              <p className='text-muted-foreground rounded-lg border border-dashed p-5 text-center text-sm'>
-                {t('No temporary discounts. The permanent discount applies.')}
-              </p>
-            )}
-            {periods.map((period, index) => {
-              const id = `temporary-discount-${keys[index]}`
-              const errors = fieldErrors(index)
-              return (
-                <Collapsible
-                  key={keys[index]}
-                  className='flex flex-col gap-3 rounded-lg border p-4'
-                  defaultOpen={
-                    index === periods.length - 1 ||
-                    Object.keys(errors).length > 0
-                  }
-                  onOpenChange={(open) => {
-                    if (open) {
-                      setVisited(
-                        (previous) => new Set([...previous, keys[index]])
-                      )
-                    }
-                  }}
-                >
-                  <div className='flex items-center justify-between gap-2'>
-                    <CollapsibleTrigger
-                      aria-invalid={
-                        Object.keys(errors).length > 0 ||
-                        invalidEditors[keys[index]]
-                      }
-                      className='aria-invalid:text-destructive flex items-center gap-2 text-left text-sm font-medium hover:underline'
-                    >
-                      {t('Period {{n}}', { n: index + 1 })}
-                    </CollapsibleTrigger>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      size='icon-sm'
-                      aria-label={t('Remove period')}
-                      onClick={() => {
-                        setDraft((previous) => ({
-                          ...previous,
-                          periods: previous.periods?.filter(
-                            (_, position) => position !== index
-                          ),
-                        }))
-                        setKeys((previous) =>
-                          previous.filter((_, position) => position !== index)
-                        )
-                        setError(null)
-                      }}
-                    >
-                      <Trash2 aria-hidden='true' />
-                    </Button>
-                  </div>
-                  <PricingPeriodSummary period={period} />
-                  <CollapsibleContent
-                    keepMounted={visited.has(keys[index])}
-                    className='flex flex-col gap-3'
+                <div className='flex items-center gap-2 px-3 py-2'>
+                  <CollapsibleTrigger
+                    aria-invalid={invalid}
+                    className='group aria-invalid:text-destructive flex min-w-0 flex-1 items-center gap-2 text-left text-sm'
                   >
-                    <fieldset
-                      disabled={Boolean(draft.expression)}
-                      className='min-w-0 disabled:opacity-60'
-                    >
-                      <UserDiscountRuleEditor
-                        id={id}
-                        value={period}
-                        permanentPercent={draft.discount_percent}
-                        errors={errors}
-                        onChange={(changes) => update(index, changes)}
-                        onValidityChange={(valid) =>
-                          setInvalidEditors((previous) =>
-                            previous[keys[index]] === !valid
-                              ? previous
-                              : { ...previous, [keys[index]]: !valid }
-                          )
-                        }
-                      />
-                    </fieldset>
-                    <div className='flex flex-wrap items-center gap-2 border-t pt-3'>
-                      <span className='text-muted-foreground text-xs'>
-                        {t('Validity period (local time)')} ·{' '}
-                        {Intl.DateTimeFormat().resolvedOptions().timeZone}
-                      </span>
-                      {([7, 30] as const).map((days) => (
-                        <Button
-                          type='button'
-                          key={days}
-                          size='sm'
-                          variant='outline'
-                          onClick={() =>
-                            update(index, {
-                              end_time:
-                                (period.start_time ?? now) + days * 86400,
-                              legacy_unbounded: false,
-                            })
-                          }
-                        >
-                          {t('For {{days}} days', { days })}
-                        </Button>
-                      ))}
-                    </div>
-                    <FieldGroup className='gap-3'>
-                      <Field data-invalid={Boolean(errors.start_time)}>
-                        <FieldLabel htmlFor={`${id}-start`}>
-                          {t('Start time')}
-                        </FieldLabel>
-                        <DateTimePicker
-                          id={`${id}-start`}
-                          aria-label={t('Start time')}
-                          aria-invalid={Boolean(errors.start_time)}
-                          clearable={false}
-                          value={
-                            period.start_time != null
-                              ? new Date(period.start_time * 1000)
-                              : undefined
-                          }
-                          placeholder={t('On save')}
-                          onChange={(value) =>
-                            update(index, {
-                              start_time: value
-                                ? Math.floor(value.getTime() / 1000)
-                                : null,
-                            })
-                          }
-                        />
-                        {errors.start_time && (
-                          <FieldError>{errors.start_time}</FieldError>
-                        )}
-                      </Field>
-                      <Field data-invalid={Boolean(errors.end_time)}>
-                        <FieldLabel htmlFor={`${id}-end`}>
-                          {t('End time')}
-                        </FieldLabel>
-                        <DateTimePicker
-                          id={`${id}-end`}
-                          aria-label={t('End time')}
-                          aria-invalid={Boolean(errors.end_time)}
-                          hideTimeWhenEmpty
-                          value={
-                            period.end_time != null
-                              ? new Date(period.end_time * 1000)
-                              : undefined
-                          }
-                          placeholder={t('Select an end time')}
-                          onChange={(value) =>
-                            update(index, {
-                              end_time: value
-                                ? Math.floor(value.getTime() / 1000)
-                                : null,
-                              legacy_unbounded: false,
-                            })
-                          }
-                        />
-                        {errors.end_time && (
-                          <FieldError>{errors.end_time}</FieldError>
-                        )}
-                      </Field>
-                    </FieldGroup>
-                    {period.legacy_unbounded && (
-                      <p className='text-muted-foreground text-xs'>
-                        {t(
-                          'This existing rule has no end time. Set an end time before changing it.'
-                        )}
-                      </p>
-                    )}
-                  </CollapsibleContent>
-                </Collapsible>
-              )
-            })}
-          </section>
-          <Alert>
-            <AlertDescription>
-              {active
-                ? t(
-                    'Temporary period active. Unmatched conditions use the permanent discount: {{discount}}.',
-                    { discount: permanentLabel }
-                  )
-                : t('Permanent discount: {{discount}}.', {
-                    discount: permanentLabel,
-                  })}
-            </AlertDescription>
-          </Alert>
-          {(error || (!validation.success && issues.length > 0)) && (
+                    <ChevronRight
+                      className='size-4 shrink-0 transition-transform group-data-[panel-open]:rotate-90'
+                      aria-hidden='true'
+                    />
+                    <span className='sr-only'>
+                      {t('Temporary discount {{n}}', { n: index + 1 })}
+                    </span>{' '}
+                    <TemporaryDiscountSummary
+                      period={period}
+                      permanentPercent={draft.discount_percent}
+                    />
+                  </CollapsibleTrigger>
+                  <PricingPeriodStatusBadge period={period} />
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='icon-sm'
+                    aria-label={t('Remove temporary discount {{n}}', {
+                      n: index + 1,
+                    })}
+                    onClick={() => {
+                      setDraft((previous) => ({
+                        ...previous,
+                        periods: previous.periods?.filter(
+                          (_, position) => position !== index
+                        ),
+                      }))
+                      setKeys((previous) =>
+                        previous.filter((_, position) => position !== index)
+                      )
+                      setError(null)
+                    }}
+                  >
+                    <Trash2 aria-hidden='true' />
+                  </Button>
+                </div>
+                <CollapsibleContent
+                  keepMounted={visited.has(keys[index])}
+                  className='border-t p-3 sm:p-4'
+                >
+                  <fieldset
+                    disabled={Boolean(draft.expression)}
+                    className='min-w-0 disabled:opacity-60'
+                  >
+                    <UserDiscountRuleEditor
+                      id={`temporary-discount-${keys[index]}`}
+                      value={period}
+                      permanentPercent={draft.discount_percent}
+                      errors={errors}
+                      onChange={(changes) => update(index, changes)}
+                      onValidityChange={(valid) =>
+                        setInvalidEditors((previous) =>
+                          previous[keys[index]] === !valid
+                            ? previous
+                            : { ...previous, [keys[index]]: !valid }
+                        )
+                      }
+                    />
+                  </fieldset>
+                </CollapsibleContent>
+              </Collapsible>
+            )
+          })}
+          <Button
+            type='button'
+            variant='outline'
+            size='sm'
+            className='self-start'
+            disabled={
+              periods.length >= 1000 ||
+              Boolean(draft.expression) ||
+              draft.discount_percent == null
+            }
+            onClick={() => {
+              const key = nextKey.current++
+              setDraft((previous) => ({
+                ...previous,
+                periods: [
+                  ...(previous.periods ?? []),
+                  newTemporaryDiscount(
+                    previous.periods ?? [],
+                    previous.discount_percent
+                  ),
+                ],
+              }))
+              setVisited((previous) => new Set([...previous, key]))
+              setKeys((previous) => [...previous, key])
+              setError(null)
+            }}
+          >
+            <Plus aria-hidden='true' />
+            {t('Add temporary discount')}
+          </Button>
+          {(error || summaryIssue) && (
             <Alert variant='destructive'>
-              <AlertDescription>{error || issues[0]?.message}</AlertDescription>
+              <AlertDescription>
+                {error || summaryIssue?.message}
+              </AlertDescription>
             </Alert>
           )}
         </div>

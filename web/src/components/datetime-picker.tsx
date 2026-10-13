@@ -49,6 +49,8 @@ interface DateTimePickerProps {
   disabled?: boolean
   clearable?: boolean
   hideTimeWhenEmpty?: boolean
+  // 只按日期选择时隐藏时间输入，选中的日期沿用 value 中的时刻。
+  hideTime?: boolean
   id?: string
   'aria-label'?: string
   'aria-invalid'?: boolean
@@ -63,6 +65,7 @@ export function DateTimePicker({
   disabled = false,
   clearable = true,
   hideTimeWhenEmpty = false,
+  hideTime = false,
   id,
   'aria-label': ariaLabel,
   'aria-invalid': ariaInvalid,
@@ -171,7 +174,7 @@ export function DateTimePicker({
           />
         </PopoverContent>
       </Popover>
-      {(!hideTimeWhenEmpty || date) && (
+      {!hideTime && (!hideTimeWhenEmpty || date) && (
         <Input
           id={id ? `${id}-time` : undefined}
           type='time'

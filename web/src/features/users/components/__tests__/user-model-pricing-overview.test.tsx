@@ -79,6 +79,8 @@ let requestedOverviewParams: Record<string, unknown> = {}
 let partialPageTest = false
 let failNextPage = false
 let nextPageAttempts = 0
+// 覆盖抽屉第一页返回的规则，用于验证永久与临时折扣的展示。
+let detailRules: Record<string, unknown>[] | null = null
 
 // 只替换网络边界，真实查询和组件负责展开后请求以及分页结果替换。
 api.defaults.adapter = async (config) => {
@@ -124,9 +126,10 @@ api.defaults.adapter = async (config) => {
           data: {
             items:
               page === 1
-                ? item.rules
+                ? (detailRules ?? item.rules)
                 : [{ model_name: 'model-21', discount_bps: 7500 }],
-            total: partialPageTest && page === 2 ? 5 : 21,
+            total:
+              detailRules?.length ?? (partialPageTest && page === 2 ? 5 : 21),
             page_size: 20,
           },
         },
@@ -176,6 +179,7 @@ afterEach(async () => {
   partialPageTest = false
   failNextPage = false
   nextPageAttempts = 0
+  detailRules = null
 })
 
 after(() => {
@@ -346,6 +350,96 @@ describe('user model pricing overview row', () => {
     const content = document.body.textContent ?? ''
     assert.equal(content.includes('Admin'), true)
     assert.equal(content.includes('Enabled'), false)
+  })
+
+  // 抽屉直接说明每条折扣的类型、有效期和生效时段，不需要再点开百分比。
+  test('lists permanent and temporary discounts with their effective time', async () => {
+    const start = new Date(2030, 9, 8).getTime() / 1000
+    const end = new Date(2030, 9, 15).getTime() / 1000
+    detailRules = [
+      { model_name: 'model-01', mode: 'layered', slot: -1, discount_bps: 4500 },
+      {
+        model_name: 'model-02',
+        mode: 'layered',
+        slot: 0,
+        discount_bps: 10000,
+        start_time: start,
+        end_time: end,
+        expression:
+          '((weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 1380) || (weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) < 420)) ? 0.68 : permanent_discount',
+      },
+    ]
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => {
+      root?.render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <TestRowHarness onEdit={() => undefined} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show discounts for pricing-user' })
+    )
+    const permanent = await screen.findByRole('row', { name: /model-01/ })
+    assert.equal(permanent.textContent?.includes('Permanent'), true)
+    assert.equal(permanent.textContent?.includes('45%'), true)
+    assert.equal(permanent.textContent?.includes('Always'), true)
+    const temporary = screen.getByRole('row', { name: /model-02/ })
+    assert.equal(temporary.textContent?.includes('Temporary'), true)
+    assert.equal(temporary.textContent?.includes('68%'), true)
+    assert.equal(
+      temporary.textContent?.includes('2030-10-08 → 2030-10-14'),
+      true
+    )
+    assert.equal(
+      temporary.textContent?.includes('Every day · 23:00–Next day 07:00'),
+      true
+    )
+  })
+
+  // 主表预览用图标区分临时折扣，避免和永久折扣混在一起。
+  test('marks temporary discounts in the model preview', async () => {
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    const layeredItem = {
+      ...item,
+      rules: [
+        {
+          model_name: 'model-01',
+          mode: 'layered' as const,
+          slot: -1,
+          discount_bps: 4500,
+        },
+        {
+          model_name: 'model-02',
+          mode: 'layered' as const,
+          slot: 0,
+          discount_bps: 6800,
+          start_time: 100,
+          end_time: 200,
+        },
+      ],
+    }
+
+    await act(async () => {
+      root?.render(
+        <I18nextProvider i18n={i18n}>
+          <UserModelPricingMobileRow
+            item={layeredItem}
+            selected={false}
+            onOpen={() => undefined}
+            onEdit={() => undefined}
+          />
+        </I18nextProvider>
+      )
+    })
+
+    assert.equal(screen.getAllByRole('img', { name: 'Temporary' }).length, 1)
   })
 
   // 收起时不读取明细，打开抽屉后自动追加下一批并保持主表编辑入口可用。

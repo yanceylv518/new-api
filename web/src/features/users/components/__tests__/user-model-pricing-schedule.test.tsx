@@ -29,6 +29,8 @@ import i18n from 'i18next'
 import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
+import dayjs from '@/lib/dayjs'
+
 import { parseDiscountExpression } from '../../lib/user-discount-expression'
 import {
   PricingPeriodStatusBadge,
@@ -37,6 +39,11 @@ import {
 
 const firstStart = new Date('2030-10-08T10:00:00+08:00').getTime() / 1000
 const secondStart = firstStart + 3600
+// 简单表单按浏览器本地时间的整天编辑，测试用本地零点保证与运行时区无关。
+const dayStart = new Date(2030, 9, 8).getTime() / 1000
+const dayEnd = new Date(2030, 9, 15).getTime() / 1000
+const allDayExpression = (ratio: string) =>
+  `((weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 0)) ? ${ratio} : permanent_discount`
 
 beforeEach(async () => {
   await i18n.changeLanguage('en')
@@ -83,7 +90,7 @@ describe('permanent and temporary discount editors', () => {
     ).toBeDisabled()
     expect(onApply).not.toHaveBeenCalled()
   })
-  test('updates draft status and fallback summary at natural time boundaries', () => {
+  test('updates draft status at natural time boundaries', () => {
     vi.useFakeTimers()
     vi.setSystemTime(firstStart * 1000 - 1000)
     renderSchedule({
@@ -103,16 +110,11 @@ describe('permanent and temporary discount editors', () => {
       vi.advanceTimersByTime(1100)
     })
     expect(screen.getByText('Within validity period')).toBeInTheDocument()
-    expect(
-      screen.getByText(
-        'Temporary period active. Unmatched conditions use the permanent discount: 80%.'
-      )
-    ).toBeInTheDocument()
     act(() => {
       vi.advanceTimersByTime(1000)
     })
     expect(screen.getByText('Expired')).toBeInTheDocument()
-    expect(screen.getByText('Permanent discount: 80%.')).toBeInTheDocument()
+    expect(screen.getByText('Permanent discount: 80%')).toBeInTheDocument()
   })
   test('requires an end time after modifying the start of a legacy unbounded period', async () => {
     renderSchedule({
@@ -129,7 +131,10 @@ describe('permanent and temporary discount editors', () => {
       ],
     })
     expect(screen.getByRole('button', { name: 'Apply to draft' })).toBeEnabled()
-    const timeInput = screen.getByLabelText('Start time (Time)')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Advanced customization' })
+    )
+    const timeInput = screen.getByLabelText('Validity starts (Time)')
     fireEvent.change(timeInput, { target: { value: '11:00' } })
     expect(
       screen.getByRole('button', { name: 'Apply to draft' })
@@ -153,34 +158,193 @@ describe('permanent and temporary discount editors', () => {
         ],
       }
     )
+    const advanced = screen.queryByRole('button', {
+      name: 'Advanced customization',
+    })
+    if (advanced) await userEvent.click(advanced)
     return result
   }
 
-  test('opens temporary settings without tabs or a permanent editor', () => {
-    renderSchedule()
+  async function addTimeRule(preset: string) {
+    await userEvent.click(screen.getByRole('button', { name: 'Add time rule' }))
+    await userEvent.click(screen.getByRole('menuitem', { name: preset }))
+  }
+
+  test('starts a first temporary discount as an all-day form that requires a percentage', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2030, 9, 8, 14, 17))
+    const { onApply } = renderSchedule()
     expect(screen.queryByRole('tab')).not.toBeInTheDocument()
-    expect(
-      screen.queryByRole('spinbutton', { name: 'Permanent discount' })
-    ).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Advanced conditions' })
     ).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Start date (Time)')).not.toBeInTheDocument()
+    const percent = screen.getByRole('spinbutton', {
+      name: 'Temporary discount percentage',
+    })
+    expect(percent).toHaveValue(null)
+    expect(percent).not.toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByRole('switch', { name: 'All day' })).toBeChecked()
     expect(
-      screen.queryByRole('tab', { name: 'Expression editor' })
+      screen.getByRole('button', { name: 'Apply to draft' })
+    ).toBeDisabled()
+
+    fireEvent.change(percent, { target: { value: '80' } })
+    expect(
+      screen.getByText(
+        'Same as the permanent discount, so this temporary discount changes nothing.'
+      )
+    ).toBeInTheDocument()
+    fireEvent.change(percent, { target: { value: '50' } })
+    expect(
+      screen.queryByText(
+        'Same as the permanent discount, so this temporary discount changes nothing.'
+      )
     ).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Apply to draft' })).toBeEnabled()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Apply to draft' })
+    )
+    expect(onApply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        periods: [
+          expect.objectContaining({
+            expression: allDayExpression('0.5'),
+            start_time: dayStart,
+            end_time: dayEnd,
+          }),
+        ],
+      })
+    )
+  })
+
+  test('shows the percentage error once the empty field loses focus', () => {
+    renderSchedule()
+    const percent = screen.getByRole('spinbutton', {
+      name: 'Temporary discount percentage',
+    })
+    fireEvent.blur(percent)
+    expect(percent).toHaveAttribute('aria-invalid', 'true')
+    expect(
+      screen.getByText(
+        'Enter a percentage from 0.01 to 100, with up to two decimal places.'
+      )
+    ).toBeInTheDocument()
+  })
+
+  test('limits an every-day discount to overnight hours from the simple form', async () => {
+    const { onApply } = renderSchedule({
+      model_name: 'test-model',
+      mode: 'layered',
+      discount_percent: 80,
+      periods: [
+        {
+          expression: allDayExpression('0.5'),
+          start_time: dayStart,
+          end_time: dayEnd,
+        },
+      ],
+    })
+    expect(
+      screen.getByRole('spinbutton', { name: 'Temporary discount percentage' })
+    ).toHaveValue(50)
+    await userEvent.click(screen.getByRole('switch', { name: 'All day' }))
+    fireEvent.change(screen.getByLabelText('End time'), {
+      target: { value: '07:00' },
+    })
+    fireEvent.change(screen.getByLabelText('Start time'), {
+      target: { value: '23:00' },
+    })
+    expect(screen.getByLabelText('End time · Next day')).toHaveValue('07:00')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Apply to draft' })
+    )
+    const parsed = parseDiscountExpression(
+      onApply.mock.calls.at(-1)?.[0].periods?.[0].expression ?? ''
+    )
+    expect(parsed?.inheritPermanent).toBe(true)
+    expect(parsed?.branches).toHaveLength(1)
+    expect(parsed?.branches[0]).toMatchObject({
+      percent: 50,
+      schedule: {
+        days: [0, 1, 2, 3, 4, 5, 6],
+        start: '23:00',
+        end: '07:00',
+        allDay: false,
+      },
+    })
+  })
+
+  test('extends whole-day validity with the quick range and summarizes inclusive dates', async () => {
+    const { onApply } = renderSchedule({
+      model_name: 'test-model',
+      mode: 'layered',
+      discount_percent: 80,
+      periods: [
+        {
+          expression: allDayExpression('0.5'),
+          start_time: dayStart,
+          end_time: dayEnd,
+        },
+      ],
+    })
+    expect(
+      screen.getByRole('button', {
+        name: 'Temporary discount 1 2030-10-08 → 2030-10-14 · Every day · All day · 50%',
+      })
+    ).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'For 30 days' }))
+    expect(
+      screen.getByRole('button', {
+        name: 'Temporary discount 1 2030-10-08 → 2030-11-06 · Every day · All day · 50%',
+      })
+    ).toBeInTheDocument()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Apply to draft' })
+    )
+    expect(onApply.mock.calls.at(-1)?.[0].periods?.[0]).toMatchObject({
+      start_time: dayStart,
+      end_time: dayjs.unix(dayStart).add(30, 'day').unix(),
+    })
+  })
+
+  test('opens weekday-limited rules in advanced customization and keeps them there', async () => {
+    renderSchedule({
+      model_name: 'test-model',
+      mode: 'layered',
+      discount_percent: 80,
+      periods: [
+        {
+          expression:
+            '((weekday("Asia/Shanghai") == 0 || weekday("Asia/Shanghai") == 6) && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 0) ? 0.6 : permanent_discount',
+          start_time: dayStart,
+          end_time: dayEnd,
+        },
+      ],
+    })
+    expect(
+      screen.getByRole('region', { name: 'Time rule 1' })
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Back to simple settings' })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Monday' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Tuesday' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Wednesday' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Thursday' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Friday' }))
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Back to simple settings' })
+    )
+    expect(
+      screen.getByRole('spinbutton', { name: 'Temporary discount percentage' })
+    ).toHaveValue(60)
+    expect(screen.getByRole('switch', { name: 'All day' })).toBeChecked()
   })
 
   test('preserves matching temporary discounts after the permanent value changes externally', async () => {
     const { onApply } = await temporary()
-    expect(screen.getByLabelText('Default discount')).toHaveTextContent('80%')
-    expect(screen.getByLabelText('Default discount')).toHaveProperty(
-      'tagName',
-      'OUTPUT'
-    )
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Weekday daytime' })
-    )
+    expect(screen.getByText('Permanent discount: 80%')).toBeInTheDocument()
+    await addTimeRule('Weekday daytime')
     fireEvent.change(
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '60' } }
@@ -192,7 +356,7 @@ describe('permanent and temporary discount editors', () => {
     if (!applied) throw new Error('Temporary discounts were not applied')
     cleanup()
     const reopened = renderSchedule({ ...applied, discount_percent: 75 })
-    expect(screen.getByLabelText('Default discount')).toHaveTextContent('75%')
+    expect(screen.getByText('Permanent discount: 75%')).toBeInTheDocument()
     expect(
       screen.getByRole('spinbutton', { name: 'Discount when matched' })
     ).toHaveValue(60)
@@ -214,9 +378,7 @@ describe('permanent and temporary discount editors', () => {
 
   test('keeps an incomplete conditional percentage and blocks apply until corrected', async () => {
     await temporary()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Advanced conditions' })
-    )
+    await addTimeRule('Custom conditions')
     fireEvent.change(
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '' } }
@@ -242,9 +404,7 @@ describe('permanent and temporary discount editors', () => {
     expect(
       screen.queryByRole('textbox', { name: 'Discount expression' })
     ).not.toBeInTheDocument()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Advanced conditions' })
-    )
+    await addTimeRule('Custom conditions')
     await userEvent.click(
       screen.getByRole('combobox', { name: 'Time condition' })
     )
@@ -264,9 +424,7 @@ describe('permanent and temporary discount editors', () => {
 
   test('reselecting the current time field preserves comparison and value', async () => {
     const { onApply } = await temporary()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Advanced conditions' })
-    )
+    await addTimeRule('Custom conditions')
     await userEvent.click(
       screen.getAllByRole('combobox', { name: 'Time condition' })[0]
     )
@@ -288,9 +446,7 @@ describe('permanent and temporary discount editors', () => {
 
   test('edits a minute condition and preserves it when applied', async () => {
     const { onApply } = await temporary()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Advanced conditions' })
-    )
+    await addTimeRule('Custom conditions')
     await userEvent.click(
       screen.getByRole('combobox', { name: 'Time condition' })
     )
@@ -403,7 +559,7 @@ describe('permanent and temporary discount editors', () => {
     'saves the %s preset with an inherited fallback',
     async (preset, schedule) => {
       const { onApply } = await temporary()
-      await userEvent.click(screen.getByRole('button', { name: preset }))
+      await addTimeRule(preset)
       fireEvent.change(
         screen.getByRole('spinbutton', { name: 'Discount when matched' }),
         { target: { value: '60' } }
@@ -420,22 +576,18 @@ describe('permanent and temporary discount editors', () => {
 
   test('reorders and removes rules without changing their matching discounts', async () => {
     const { onApply } = await temporary()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Weekday daytime' })
-    )
+    await addTimeRule('Weekday daytime')
     fireEvent.change(
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '60' } }
     )
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Daily 09:00–18:00' })
-    )
+    await addTimeRule('Daily 09:00–18:00')
     const second = within(screen.getByRole('region', { name: 'Time rule 2' }))
     fireEvent.change(
       second.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '50' } }
     )
-    await userEvent.click(second.getByRole('button', { name: 'Move up' }))
+    await userEvent.click(second.getByRole('button', { name: /^Move up/ }))
     expect(
       within(screen.getByRole('region', { name: 'Time rule 1' })).getByRole(
         'spinbutton',
@@ -445,7 +597,7 @@ describe('permanent and temporary discount editors', () => {
     await userEvent.click(
       within(screen.getByRole('region', { name: 'Time rule 2' })).getByRole(
         'button',
-        { name: 'Remove time rule' }
+        { name: /^Remove time rule/ }
       )
     )
     await userEvent.click(
@@ -466,14 +618,11 @@ describe('permanent and temporary discount editors', () => {
   test('enforces rule and condition limits and returns to permanent after removing all conditions', async () => {
     const { onApply } = await temporary()
     for (let i = 0; i < 4; i++) {
-      await userEvent.click(
-        screen.getByRole('button', { name: 'Advanced conditions' })
-      )
+      await addTimeRule('Custom conditions')
     }
-    expect(
-      screen.getByRole('button', { name: 'Advanced conditions' })
-    ).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Add time rule' })).toBeDisabled()
     const first = within(screen.getByRole('region', { name: 'Time rule 1' }))
+    await userEvent.click(first.getByRole('button', { name: /^Time rule 1/ }))
     for (let i = 1; i < 4; i++) {
       await userEvent.click(
         first.getByRole('button', { name: 'Add time condition' })
@@ -490,7 +639,7 @@ describe('permanent and temporary discount editors', () => {
     ).toBeEnabled()
     for (let i = 0; i < 4; i++) {
       await userEvent.click(
-        screen.getAllByRole('button', { name: 'Remove time rule' })[0]
+        screen.getAllByRole('button', { name: /^Remove time rule/ })[0]
       )
     }
     await userEvent.click(
@@ -523,19 +672,19 @@ describe('permanent and temporary discount editors', () => {
       screen.getByRole('button', { name: 'Apply to draft' })
     ).toBeDisabled()
     expect(
-      screen.getAllByRole('button', { name: 'End time' })[0]
+      screen.getAllByRole('button', { name: 'End date' })[0]
     ).toHaveAttribute('aria-invalid', 'true')
     expect(
-      screen.getAllByRole('button', { name: 'End time' })[1]
+      screen.getAllByRole('button', { name: 'End date' })[1]
     ).toHaveAttribute('aria-invalid', 'true')
     await userEvent.click(
-      screen.getAllByRole('button', { name: 'Remove period' })[1]
+      screen.getByRole('button', { name: 'Remove temporary discount 2' })
     )
     expect(screen.getByRole('button', { name: 'Apply to draft' })).toBeEnabled()
   })
 
   test('retains a fixed full-price temporary override', async () => {
-    const { onApply } = await temporary({
+    const { onApply } = renderSchedule({
       model_name: 'test-model',
       mode: 'layered',
       discount_percent: 80,
@@ -548,7 +697,7 @@ describe('permanent and temporary discount editors', () => {
       ],
     })
     expect(
-      screen.getByRole('spinbutton', { name: 'Discount when matched' })
+      screen.getByRole('spinbutton', { name: 'Temporary discount percentage' })
     ).toHaveValue(100)
     await userEvent.click(
       screen.getByRole('button', { name: 'Apply to draft' })
@@ -562,11 +711,13 @@ describe('permanent and temporary discount editors', () => {
 
   test('sets weekdays and a minute-precision range without boolean condition controls', async () => {
     const { onApply } = await temporary()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Weekday daytime' })
-    )
+    await addTimeRule('Weekday daytime')
     const first = within(screen.getByRole('region', { name: 'Time rule 1' }))
     expect(first.queryByRole('combobox', { name: 'Comparison' })).toBeNull()
+    expect(first.getByRole('button', { name: 'Weekdays' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
     fireEvent.change(first.getByLabelText('Start time'), {
       target: { value: '09:30' },
     })
@@ -577,10 +728,15 @@ describe('permanent and temporary discount editors', () => {
       first.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '70' } }
     )
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Weekend all day' })
-    )
+    await addTimeRule('Weekend all day')
     const second = within(screen.getByRole('region', { name: 'Time rule 2' }))
+    expect(second.getByRole('button', { name: 'Weekends' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+    expect(
+      first.queryByRole('spinbutton', { name: 'Discount when matched' })
+    ).toBeNull()
     fireEvent.change(
       second.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '60' } }
@@ -602,13 +758,17 @@ describe('permanent and temporary discount editors', () => {
 
   test('keeps incomplete edits when a period is collapsed and confirms discarding them', async () => {
     const { onClose } = await temporary()
-    await userEvent.click(screen.getByRole('button', { name: 'Add time rule' }))
+    await addTimeRule('Custom conditions')
     fireEvent.change(
       screen.getByRole('spinbutton', { name: 'Discount when matched' }),
       { target: { value: '' } }
     )
-    await userEvent.click(screen.getByRole('button', { name: 'Period 1' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Period 1' }))
+    await userEvent.click(
+      screen.getByRole('button', { name: /^Temporary discount 1/ })
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: /^Temporary discount 1/ })
+    )
     expect(
       screen.getByRole('spinbutton', { name: 'Discount when matched' })
     ).toHaveValue(null)

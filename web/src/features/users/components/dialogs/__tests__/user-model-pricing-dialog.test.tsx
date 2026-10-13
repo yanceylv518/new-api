@@ -298,7 +298,7 @@ describe('user model pricing dialog', () => {
       ...document.querySelectorAll<HTMLButtonElement>(
         '[data-slot="model-pricing-batch"] button'
       ),
-    ].find((button) => button.textContent === 'Configure discount')
+    ].find((button) => button.textContent === 'Batch validity')
     assert.ok(configure)
     await act(async () => configure.click())
     const changeStart = document.querySelector<HTMLElement>('#batch-start')
@@ -606,7 +606,7 @@ describe('user model pricing dialog', () => {
     const toolbar = clear.parentElement
     assert.ok(toolbar)
     const validity = [...toolbar.querySelectorAll('button')].find(
-      (button) => button.textContent === 'Configure discount'
+      (button) => button.textContent === 'Batch validity'
     )
     assert.ok(validity)
     expect(
@@ -992,7 +992,7 @@ describe('user model pricing dialog', () => {
         browserNow + 7200
       )
       await renderDialog(1, true)
-      expect(document.body.textContent).toContain('Temporary discounts')
+      expect(document.body.textContent).toContain('Edit temporary discounts')
       const filter = document.querySelector<HTMLElement>(
         '[aria-label="Discount status"]'
       )
@@ -1015,29 +1015,16 @@ describe('user model pricing dialog', () => {
     ])
     await renderDialog(1, true)
     await changeInput(getModelInput('model-01'), '100')
-    const validity = document.querySelector<HTMLElement>(
-      '[aria-label="Edit validity for model-01"]'
+    const edit = document.querySelector<HTMLElement>(
+      '[aria-label="Edit temporary discounts for model-01"]'
     )
-    assert.ok(validity)
-    await act(async () => validity.click())
+    assert.ok(edit)
+    expect(edit.textContent).toBe('Add temporary discount')
+    await act(async () => edit.click())
     expect(document.querySelector('[role="tab"]')).toBeNull()
-    const add = [
-      ...document.querySelectorAll<HTMLButtonElement>('button'),
-    ].find((button) => button.textContent === 'Add temporary discount')
-    assert.ok(add)
-    await act(async () => add.click())
-    const defaultInput = document.querySelector<HTMLInputElement>(
-      '#temporary-discount-0-default'
-    )
-    assert.ok(defaultInput)
-    expect(defaultInput.tagName).toBe('OUTPUT')
-    const addCondition = [
-      ...document.querySelectorAll<HTMLButtonElement>('button'),
-    ].find((button) => button.textContent === 'Advanced conditions')
-    assert.ok(addCondition)
-    await act(async () => addCondition.click())
+    // 首次配置直接给出一条待填写的全天临时折扣，不需要再点一次添加。
     const periodInput = document.querySelector<HTMLInputElement>(
-      '#temporary-discount-0-0-percent'
+      '#temporary-discount-0-percent'
     )
     assert.ok(periodInput)
     await changeInput(periodInput, '75')
@@ -1046,7 +1033,16 @@ describe('user model pricing dialog', () => {
     ].find((button) => button.textContent === 'Apply to draft')
     assert.ok(apply)
     await act(async () => apply.click())
-    expect(document.querySelector('#temporary-discount-0-default')).toBeNull()
+    expect(document.querySelector('#temporary-discount-0-percent')).toBeNull()
+    expect(
+      document.querySelector('[data-slot="model-temporary-discount"]')
+        ?.textContent
+    ).toContain('Every day · All day · 75%')
+    expect(
+      document.querySelector(
+        '[aria-label="Edit temporary discounts for model-01"]'
+      )?.textContent
+    ).toBe('Edit temporary discounts')
     let submitted: unknown
     apiClient.put = async (_url, payload) => {
       submitted = payload
@@ -1071,7 +1067,7 @@ describe('user model pricing dialog', () => {
             {
               discount_bps: 10000,
               expression:
-                '(hour("Asia/Shanghai") >= 9) ? 0.75 : permanent_discount',
+                '((weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 0)) ? 0.75 : permanent_discount',
             },
           ],
         },

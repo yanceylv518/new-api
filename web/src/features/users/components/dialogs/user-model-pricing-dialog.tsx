@@ -25,6 +25,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
+  Plus,
   Search,
   X,
 } from 'lucide-react'
@@ -74,6 +75,8 @@ import {
 } from '../../lib/user-model-pricing-form'
 import type { User } from '../../types'
 import {
+  PricingPeriodStatusBadge,
+  TemporaryDiscountSummary,
   UserModelPricingScheduleDialog,
   UserModelPricingBatchTimeDialog,
 } from '../user-model-pricing-schedule'
@@ -92,6 +95,9 @@ const MODEL_PAGE_SIZE = 25
 // 批量折扣输入的默认值；只有偏离该值时才要求显式应用后保存。
 const DEFAULT_BATCH_DISCOUNT_VALUE = FULL_PRICE_DISCOUNT_BPS / 100
 const DEFAULT_BATCH_DISCOUNT = String(DEFAULT_BATCH_DISCOUNT_VALUE)
+
+// 模型行内最多直接展示的临时折扣条数，其余折叠为数量提示。
+const ROW_TEMPORARY_DISCOUNT_PREVIEW = 2
 
 // 表头与数据行共用同一套列模板和水平内边距，确保复选框、模型名和折扣输入严格对齐。
 const MODEL_PRICING_GRID_CLASS =
@@ -177,7 +183,7 @@ function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
           onClick={props.onValidity}
         >
           <CalendarClock aria-hidden='true' />
-          {t('Configure discount')}
+          {t('Batch validity')}
         </Button>
         <Button
           type='button'
@@ -200,6 +206,42 @@ function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
           </p>
         )}
       </div>
+    </div>
+  )
+}
+
+type ModelTemporaryDiscountsProps = {
+  periods: NonNullable<UserModelPricingFormValues['items'][number]['periods']>
+  permanentPercent: number | null | undefined
+  now: number
+}
+
+function ModelTemporaryDiscounts(props: ModelTemporaryDiscountsProps) {
+  const { t } = useTranslation()
+  if (props.periods.length === 0) return null
+  const hidden = props.periods.length - ROW_TEMPORARY_DISCOUNT_PREVIEW
+
+  return (
+    <div className='mt-1 flex flex-col items-start gap-1'>
+      {props.periods.slice(0, ROW_TEMPORARY_DISCOUNT_PREVIEW).map((period) => (
+        <span
+          // 同一模型的临时折扣有效期互不重叠，起止时间足以区分各行。
+          key={`${period.start_time ?? ''}:${period.end_time ?? ''}`}
+          data-slot='model-temporary-discount'
+          className='text-muted-foreground flex max-w-full items-center gap-1.5 text-xs'
+        >
+          <PricingPeriodStatusBadge period={period} now={props.now} />
+          <TemporaryDiscountSummary
+            period={period}
+            permanentPercent={props.permanentPercent}
+          />
+        </span>
+      ))}
+      {hidden > 0 && (
+        <span className='text-muted-foreground text-xs'>
+          {t('{{n}} more temporary discount(s)', { n: hidden })}
+        </span>
+      )}
     </div>
   )
 }
@@ -682,7 +724,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       title={
         <span className='flex items-center gap-2'>
           <BadgePercent aria-hidden='true' />
-          {t('User model pricing')}
+          {t('Model discounts')}
         </span>
       }
       description={t(
@@ -819,12 +861,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      <SelectItem value='all'>{t('All statuses')}</SelectItem>
-                      <SelectItem value='active'>{t('Active')}</SelectItem>
-                      <SelectItem value='pending'>
-                        {t('Not started')}
-                      </SelectItem>
-                      <SelectItem value='expired'>{t('Expired')}</SelectItem>
+                      {getUserModelPricingStatusOptions(t).map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
@@ -867,7 +908,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               />
               <span>{t('Model')}</span>
               <span className='min-w-0 truncate'>
-                {t('Discount percentage')}
+                {t('Permanent discount')}
               </span>
             </div>
 
@@ -933,46 +974,55 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                             }}
                           />
                           <div className='min-w-0 py-2.5'>
-                            <span
-                              className='block truncate font-mono text-sm'
-                              title={
-                                model.aliases.length > 0
-                                  ? model.aliases.join(', ')
-                                  : model.model_name
-                              }
-                            >
-                              {model.model_name}
-                            </span>
+                            <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+                              <span
+                                className='max-w-full min-w-0 truncate font-mono text-sm'
+                                title={
+                                  model.aliases.length > 0
+                                    ? model.aliases.join(', ')
+                                    : model.model_name
+                                }
+                              >
+                                {model.model_name}
+                              </span>
+                              <Button
+                                type='button'
+                                variant='ghost'
+                                size='sm'
+                                className='shrink-0'
+                                disabled={mutation.isPending}
+                                onClick={() =>
+                                  setScheduleModel(model.model_name)
+                                }
+                                aria-label={t(
+                                  'Edit temporary discounts for {{model}}',
+                                  { model: model.model_name }
+                                )}
+                              >
+                                {(watchedItems?.[index]?.periods?.length ?? 0) >
+                                0 ? (
+                                  <CalendarClock aria-hidden='true' />
+                                ) : (
+                                  <Plus aria-hidden='true' />
+                                )}
+                                {(watchedItems?.[index]?.periods?.length ?? 0) >
+                                0
+                                  ? t('Edit temporary discounts')
+                                  : t('Add temporary discount')}
+                              </Button>
+                            </div>
                             {model.aliases.length > 0 && (
                               <span className='text-muted-foreground block truncate text-xs'>
                                 {model.aliases.join(', ')}
                               </span>
                             )}
-                            <div className='mt-1 flex flex-wrap items-center gap-1'>
-                              {(watchedItems?.[index]?.periods?.length ?? 0) >
-                                0 && (
-                                <span className='text-muted-foreground text-xs'>
-                                  {t('Temporary discounts')} ·{' '}
-                                  {watchedItems?.[index]?.periods?.length ?? 0}
-                                </span>
-                              )}
-
-                              <Button
-                                type='button'
-                                variant='ghost'
-                                size='sm'
-                                disabled={mutation.isPending}
-                                onClick={() =>
-                                  setScheduleModel(model.model_name)
-                                }
-                                aria-label={t('Edit validity for {{model}}', {
-                                  model: model.model_name,
-                                })}
-                              >
-                                <CalendarClock aria-hidden='true' />
-                                {t('Configure discount')}
-                              </Button>
-                            </div>
+                            <ModelTemporaryDiscounts
+                              periods={watchedItems?.[index]?.periods ?? []}
+                              permanentPercent={
+                                watchedItems?.[index]?.discount_percent
+                              }
+                              now={now}
+                            />
                           </div>
 
                           <FormField
