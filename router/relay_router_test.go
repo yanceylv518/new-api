@@ -584,7 +584,19 @@ func TestTokenResourceBodyPoliciesAndFailures(t *testing.T) {
 	token := setupTokenResourceBodyTest(t)
 	engine := gin.New()
 	engine.Use(middleware.DecompressRequestMiddleware(), middleware.BodyStorageCleanup(), middleware.TokenAuth(), middleware.TokenResourceLimits())
-	engine.POST("/test", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	var received string
+	engine.POST("/test", func(c *gin.Context) {
+		storage, err := common.GetBodyStorage(c)
+		if common.IsRequestBodyTooLargeError(err) {
+			c.Status(http.StatusRequestEntityTooLarge)
+			return
+		}
+		require.NoError(t, err)
+		data, err := io.ReadAll(storage)
+		require.NoError(t, err)
+		received = string(data)
+		c.Status(http.StatusNoContent)
+	})
 	request := func(body string) int {
 		req := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token.Key)
@@ -615,13 +627,24 @@ func TestTokenResourceBodyPoliciesAndFailures(t *testing.T) {
 	assert.Equal(t, 204, request(body), "updated defaults take effect without a restart")
 
 	require.NoError(t, model.DB.Migrator().DropTable(&model.TokenResourcePolicy{}))
-	assert.Equal(t, 503, request(body), "an unavailable policy table must not silently allow a request")
+	require.NoError(t, model.UpdateOption(setting.TokenResourceDefaultMaxRequestBodyBytesKey, "64"))
+	require.NoError(t, model.UpdateOption(setting.TokenResourceDefaultMaxConcurrentRequestsKey, "1"))
+	assert.Equal(t, 204, request(body), "a policy read failure bypasses both key limits, including defaults, without requiring Redis")
+	assert.Equal(t, body, received, "the downstream handler receives the original body")
+	assert.Equal(t, 413, request(strings.Repeat("x", (1<<20)+1)), "the system body ceiling still applies during policy failure")
+	unauthorized := httptest.NewRecorder()
+	engine.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(body)))
+	assert.Equal(t, http.StatusUnauthorized, unauthorized.Code, "policy failures do not bypass authentication")
 	require.NoError(t, model.UpdateOption(setting.TokenResourceLimitsEnabledKey, "false"))
 	assert.Equal(t, 204, request(body), "disabled mode must not query the missing policy table")
 	common.OptionMapRWMutex.Lock()
 	delete(common.OptionMap, setting.TokenResourceLimitsEnabledKey)
 	common.OptionMapRWMutex.Unlock()
 	assert.Equal(t, 204, request(body), "an old configuration defaults to disabled")
+	require.NoError(t, model.DB.AutoMigrate(&model.TokenResourcePolicy{}))
+	require.NoError(t, model.UpdateOption(setting.TokenResourceLimitsEnabledKey, "true"))
+	require.NoError(t, model.UpdateOption(setting.TokenResourceDefaultMaxConcurrentRequestsKey, "0"))
+	assert.Equal(t, 413, request(body), "limits resume on the next request after policy storage recovers")
 }
 
 func TestTokenResourceBodyRouteCoverage(t *testing.T) {

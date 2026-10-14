@@ -36,8 +36,10 @@ func TokenResourceLimits() gin.HandlerFunc {
 		}
 		policy, err := model.GetTokenResourcePolicy(c.Request.Context(), common.GetContextKeyInt(c, constant.ContextKeyTokenId))
 		if err != nil {
-			common.SysError("failed to load token resource policy: " + err.Error())
-			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Resource policy is temporarily unavailable.", "resource_policy_unavailable")
+			// Policy storage failures must not block otherwise valid requests.
+			// Skip both per-key limits; downstream system limits still apply.
+			common.SysError("failed to load token resource policy; bypassing per-key resource limits: " + err.Error())
+			c.Next()
 			return
 		}
 		limits := policy.Resolve(model.TokenResourceLimits{

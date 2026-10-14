@@ -57,7 +57,8 @@ func (policy *TokenResourcePolicy) Resolve(defaults TokenResourceLimits) TokenRe
 }
 
 // GetTokenResourcePolicy returns nil only when no override exists. Database
-// failures, including an unprepared schema, must not silently disable limits.
+// failures, including an unprepared schema, are returned to the caller. Relay
+// middleware logs and bypasses limits; admin callers still report read errors.
 func GetTokenResourcePolicy(ctx context.Context, tokenID int) (*TokenResourcePolicy, error) {
 	if tokenID <= 0 {
 		return nil, fmt.Errorf("%w: token_id must be positive", ErrInvalidTokenResourcePolicy)
