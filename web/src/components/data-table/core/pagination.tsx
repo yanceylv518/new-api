@@ -38,6 +38,8 @@ import { cn, getPageNumbers } from '@/lib/utils'
 
 type DataTablePaginationProps<TData> = {
   table: Table<TData>
+  // 窄弹窗仅保留当前页码，为总数、每页数量和翻页按钮留出空间。
+  compact?: boolean
 }
 
 const PAGE_SIZE_OPTIONS = [10, 20, 30, 40, 50, 100] as const
@@ -48,6 +50,7 @@ const PAGE_SIZE_SELECT_ITEMS = PAGE_SIZE_OPTIONS.map((pageSize) => ({
 
 export function DataTablePagination<TData>({
   table,
+  compact = false,
 }: DataTablePaginationProps<TData>) {
   const { t } = useTranslation()
   const pagination = table.getState().pagination
@@ -119,7 +122,15 @@ export function DataTablePagination<TData>({
           </Button>
 
           {pageNumbers.map((pageNumber, index) => (
-            <div key={`${pageNumber}-${index}`} className='flex items-center'>
+            <div
+              key={`${pageNumber}-${index}`}
+              className={cn(
+                'flex items-center',
+                compact &&
+                  pageNumber !== currentPage &&
+                  '@max-lg/pagination:hidden'
+              )}
+            >
               {pageNumber === '...' ? (
                 <span className='text-muted-foreground/60 px-0.5 text-sm @lg/pagination:px-1'>
                   ...

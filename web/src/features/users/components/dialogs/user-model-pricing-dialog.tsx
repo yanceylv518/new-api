@@ -87,6 +87,8 @@ interface UserModelPricingDialogProps {
   user: Pick<User, 'id' | 'username'>
   // 总览页编辑时只展示已经保存专属折扣的模型，用户管理页默认展示全部启用模型。
   configuredOnly?: boolean
+  // 只展示已配置模型时，提供切换到完整模型目录的入口，用于给该用户的其他模型添加折扣。
+  onShowAllModels?: () => void
   onSaved?: () => void | Promise<void>
 }
 
@@ -870,12 +872,28 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                   </SelectContent>
                 </Select>
               </div>
-              {totalModels > 0 && (
-                <span className='text-muted-foreground shrink-0 text-xs'>
-                  {t('Showing')} {displayStart}-{displayEnd} {t('of')}{' '}
-                  {totalFilteredModels} {t('models')}
-                </span>
-              )}
+              <div className='flex min-h-7 items-center justify-between gap-2'>
+                {totalModels > 0 && (
+                  <span className='text-muted-foreground shrink-0 text-xs'>
+                    {t('Showing')} {displayStart}-{displayEnd} {t('of')}{' '}
+                    {totalFilteredModels} {t('models')}
+                  </span>
+                )}
+                {configuredOnly && props.onShowAllModels && (
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='sm'
+                    className='ml-auto'
+                    // 切换模型目录会重建草稿，有未保存修改时先保存或放弃。
+                    disabled={form.formState.isDirty || mutation.isPending}
+                    onClick={props.onShowAllModels}
+                  >
+                    <Plus aria-hidden='true' />
+                    {t('Add other models')}
+                  </Button>
+                )}
+              </div>
             </div>
 
             <div

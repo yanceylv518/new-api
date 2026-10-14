@@ -212,7 +212,11 @@ function HistoryContent(props: { userId?: number }) {
   )
 }
 
-export function UserModelPricingHistoryButton(props: { userId?: number }) {
+export function UserModelPricingHistoryButton(props: {
+  userId?: number
+  // 表格工具栏使用默认高度，与搜索框和筛选器对齐。
+  size?: 'sm' | 'default'
+}) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   return (
@@ -220,7 +224,7 @@ export function UserModelPricingHistoryButton(props: { userId?: number }) {
       <Button
         type='button'
         variant='outline'
-        size='sm'
+        size={props.size ?? 'sm'}
         onClick={() => setOpen(true)}
       >
         <History aria-hidden='true' />

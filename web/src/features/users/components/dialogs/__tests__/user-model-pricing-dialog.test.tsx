@@ -121,7 +121,8 @@ async function waitForCondition(
 async function renderDialog(
   expectedInputCount = 25,
   configuredOnly = false,
-  onOpenChange: (open: boolean) => void = () => undefined
+  onOpenChange: (open: boolean) => void = () => undefined,
+  onShowAllModels?: () => void
 ) {
   const host = document.createElement('div')
   document.body.append(host)
@@ -145,6 +146,7 @@ async function renderDialog(
               onOpenChange={onOpenChange}
               user={{ id: 42, username: 'pricing-user' }}
               configuredOnly={configuredOnly}
+              onShowAllModels={onShowAllModels}
             />
           </I18nextProvider>
         </QueryClientProvider>
@@ -962,6 +964,24 @@ describe('user model pricing dialog', () => {
   })
 
   // 编辑入口只展示当前用户已配置且仍启用的模型，不再把未改模型混入列表。
+  test('offers the full model catalog from the configured view until edits are pending', async () => {
+    installApiFixtures(models.slice(0, 2), [
+      { model_name: 'model-01', discount_bps: 8000 },
+    ])
+    let requested = 0
+    await renderDialog(1, true, undefined, () => requested++)
+    const showAll = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Add other models')
+    assert.ok(showAll)
+    expect(showAll.disabled).toBe(false)
+    await act(async () => showAll.click())
+    expect(requested).toBe(1)
+    // 切换目录会重建草稿，存在未保存修改时不允许切换。
+    await changeInput(getModelInput('model-01'), '70')
+    expect(showAll.disabled).toBe(true)
+  })
+
   test('shows only configured enabled models in the edit dialog', async () => {
     installApiFixtures()
     await renderDialog(1, true)

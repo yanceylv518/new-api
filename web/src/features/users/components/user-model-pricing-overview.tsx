@@ -37,6 +37,7 @@ import {
   ListChecks,
   Loader2,
   Pencil,
+  Plus,
   RefreshCw,
   TriangleAlert,
   Users,
@@ -114,7 +115,6 @@ import {
   getUserModelPricingOverview,
   getUserModelPricingRulePage,
 } from '../api'
-import { USER_ROLES } from '../constants'
 import {
   isTimeDiscountConfig,
   parseDiscountExpression,
@@ -136,7 +136,9 @@ import type {
   UserModelPricingOverviewUser,
 } from '../types'
 import { UserModelPricingDialog } from './dialogs/user-model-pricing-dialog'
+import { UserModelPricingUserPicker } from './dialogs/user-model-pricing-user-picker'
 import { UserModelPricingHistoryButton } from './user-model-pricing-history'
+import { UserIdentity, UserRole } from './user-model-pricing-identity'
 import { PricingPeriodStatusBadge } from './user-model-pricing-schedule'
 
 const route = getRouteApi('/_authenticated/users/model-pricing')
@@ -279,11 +281,6 @@ function DiscountRate(props: { rule: UserModelPricingItem }) {
       </PopoverContent>
     </Popover>
   )
-}
-
-function getUserInitials(user: UserModelPricingOverviewUser): string {
-  const source = (user.display_name || user.username).trim()
-  return source.slice(0, 2).toUpperCase()
 }
 
 // 抽屉头部只在没有任何折扣生效时提示，正常情况由列表本身说明。
@@ -714,50 +711,6 @@ function DiscountRuleTable({ rules }: { rules: UserModelPricingItem[] }) {
   )
 }
 
-function UserIdentity({ user }: { user: UserModelPricingOverviewUser }) {
-  return (
-    <div className='flex min-w-0 items-center gap-2.5'>
-      <div
-        aria-hidden='true'
-        className='bg-primary/10 text-primary flex size-8 shrink-0 items-center justify-center rounded-lg text-xs font-semibold uppercase'
-      >
-        {getUserInitials(user)}
-      </div>
-      <div className='min-w-0'>
-        <div className='flex min-w-0 items-center gap-2'>
-          <span className='min-w-0 truncate font-medium' title={user.username}>
-            {user.username}
-          </span>
-          <TableId value={`#${user.id}`} className='shrink-0 text-xs' />
-        </div>
-        {(user.display_name && user.display_name !== user.username) ||
-        user.email ? (
-          <p className='text-muted-foreground mt-0.5 max-w-[260px] truncate text-xs'>
-            {user.display_name && user.display_name !== user.username
-              ? user.display_name
-              : user.email}
-          </p>
-        ) : null}
-      </div>
-    </div>
-  )
-}
-
-// 用户折扣总览仅展示角色，账号启用状态不属于该页面的筛选和比较维度。
-function UserRole({ user }: { user: UserModelPricingOverviewUser }) {
-  const { t } = useTranslation()
-  const role = USER_ROLES[user.role as keyof typeof USER_ROLES]
-
-  if (!role) return null
-
-  return (
-    <span className='text-muted-foreground inline-flex items-center gap-1 text-xs'>
-      <role.icon aria-hidden='true' className='size-3.5' />
-      {t(role.labelKey)}
-    </span>
-  )
-}
-
 function ViewDiscountsButton({
   open,
   username,
@@ -1104,8 +1057,12 @@ export function UserModelPricingOverview() {
   const isMobile = useMediaQuery('(max-width: 640px)')
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
   const [statusFilter, setStatusFilter] = useState('all')
-  const [editingUser, setEditingUser] =
-    useState<UserModelPricingOverviewUser | null>(null)
+  // 行内编辑只看已配置的模型；“添加折扣”进入完整模型目录，与用户管理页一致。
+  const [editing, setEditing] = useState<{
+    user: { id: number; username: string }
+    configuredOnly: boolean
+  } | null>(null)
+  const [pickerOpen, setPickerOpen] = useState(false)
 
   const {
     globalFilter,
@@ -1165,7 +1122,10 @@ export function UserModelPricingOverview() {
 
   const editUser = useCallback((user: UserModelPricingOverviewUser) => {
     setSelectedUserId(null)
-    setEditingUser(user)
+    setEditing({
+      user: { id: user.id, username: user.username },
+      configuredOnly: true,
+    })
   }, [])
 
   const refreshOverview = useCallback(() => {
@@ -1308,28 +1268,27 @@ export function UserModelPricingOverview() {
     )
   }
 
+  const editingDialog = editing ? (
+    <UserModelPricingDialog
+      open
+      configuredOnly={editing.configuredOnly}
+      onShowAllModels={() =>
+        setEditing({ user: editing.user, configuredOnly: false })
+      }
+      onOpenChange={(open) => {
+        if (!open) setEditing(null)
+      }}
+      user={editing.user}
+      onSaved={handleSaved}
+    />
+  ) : null
+
   return (
     <>
       <SectionPageLayout fixedContent>
         <SectionPageLayout.Breadcrumb>
           <OverviewBreadcrumb />
         </SectionPageLayout.Breadcrumb>
-        <SectionPageLayout.Actions>
-          <UserModelPricingHistoryButton />
-          <Button
-            variant='outline'
-            size='sm'
-            onClick={refreshOverview}
-            disabled={query.isFetching}
-          >
-            {query.isFetching ? (
-              <Loader2 aria-hidden='true' className='animate-spin' />
-            ) : (
-              <RefreshCw aria-hidden='true' />
-            )}
-            {t('Refresh')}
-          </Button>
-        </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-3 sm:gap-4'>
             <OverviewStats data={overview} isLoading={query.isLoading} />
@@ -1370,6 +1329,30 @@ export function UserModelPricingOverview() {
                   hideViewOptions: true,
                   hasAdditionalFilters: statusFilter !== 'all',
                   onReset: () => setStatusFilter('all'),
+                  preActions: (
+                    <>
+                      <UserModelPricingHistoryButton size='default' />
+                      <Button onClick={() => setPickerOpen(true)}>
+                        <Plus aria-hidden='true' />
+                        {t('Add discount')}
+                      </Button>
+                      <Button
+                        variant='outline'
+                        onClick={refreshOverview}
+                        disabled={query.isFetching}
+                      >
+                        {query.isFetching ? (
+                          <Loader2
+                            aria-hidden='true'
+                            className='animate-spin'
+                          />
+                        ) : (
+                          <RefreshCw aria-hidden='true' />
+                        )}
+                        {t('Refresh')}
+                      </Button>
+                    </>
+                  ),
                   additionalSearch: (
                     <Select
                       value={statusFilter}
@@ -1414,17 +1397,20 @@ export function UserModelPricingOverview() {
         />
       ) : null}
 
-      {editingUser ? (
-        <UserModelPricingDialog
+      {pickerOpen ? (
+        <UserModelPricingUserPicker
           open
-          configuredOnly
-          onOpenChange={(open) => {
-            if (!open) setEditingUser(null)
+          onOpenChange={setPickerOpen}
+          onSelect={(user) => {
+            setSelectedUserId(null)
+            setEditing({ user, configuredOnly: false })
           }}
-          user={{ id: editingUser.id, username: editingUser.username }}
-          onSaved={handleSaved}
-        />
-      ) : null}
+        >
+          {editingDialog}
+        </UserModelPricingUserPicker>
+      ) : (
+        editingDialog
+      )}
     </>
   )
 }
