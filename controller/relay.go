@@ -196,6 +196,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		if service.TokenConcurrencyLimited(c.Request.Context()) && c.Request.Context().Err() != nil {
+			newAPIError = types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			break
+		}
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -235,6 +239,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError == nil {
 			relayInfo.LastError = nil
 			return
+		}
+		// A local cancellation is not a provider failure and must not trigger
+		// channel disabling or another upstream attempt under a lost lease.
+		if service.TokenConcurrencyLimited(c.Request.Context()) && c.Request.Context().Err() != nil {
+			newAPIError = types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			break
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
@@ -335,6 +345,9 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
 	if info.ChannelMeta == nil {
+		if bodyErr := service.CheckChannelRequestBodySize(c, c.GetInt("channel_id")); bodyErr != nil {
+			return nil, bodyErr
+		}
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		if !autoBan {
@@ -349,6 +362,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
 	if err != nil {
+		if errors.Is(err, model.ErrChannelRequestBodyTooLarge) {
+			return nil, service.ChannelBodyTooLargeError()
+		}
 		return nil, types.NewError(fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
@@ -460,6 +476,10 @@ func RelayMidjourney(c *gin.Context) {
 	//err = relayMidjourneySubmit(c, relayMode)
 	log.Println(mjErr)
 	if mjErr != nil {
+		if mjErr.Description == string(service.ChannelBodyTooLargeCode) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"description": model.ErrChannelRequestBodyTooLarge.Error(), "type": "invalid_request_error", "code": service.ChannelBodyTooLargeCode})
+			return
+		}
 		statusCode := http.StatusBadRequest
 		if mjErr.Code == 30 {
 			mjErr.Result = "当前分组负载已饱和，请稍后再试，或升级账户以提升服务质量。"
@@ -636,6 +656,10 @@ func executeTaskSubmissionWith(
 
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
+			if bodyErr := service.CheckChannelRequestBodySize(c, channel.Id); bodyErr != nil {
+				taskErr = service.TaskErrorWrapperLocal(bodyErr.Err, string(service.ChannelBodyTooLargeCode), bodyErr.StatusCode)
+				break
+			}
 			if retryParam.GetRetry() > 0 {
 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
@@ -646,6 +670,10 @@ func executeTaskSubmissionWith(
 			var channelErr *types.NewAPIError
 			channel, channelErr = getChannel(c, relayInfo, retryParam)
 			if channelErr != nil {
+				if channelErr.GetErrorCode() == service.ChannelBodyTooLargeCode {
+					taskErr = service.TaskErrorWrapperLocal(channelErr.Err, string(service.ChannelBodyTooLargeCode), channelErr.StatusCode)
+					break
+				}
 				logger.LogError(c, channelErr.Error())
 				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", http.StatusInternalServerError)
 				break

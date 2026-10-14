@@ -42,8 +42,25 @@ func Distribute() func(c *gin.Context) {
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
+			if common.IsRequestBodyTooLargeError(err) {
+				abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, err.Error(), types.ErrorCodeReadRequestBodyFailed)
+				return
+			}
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
+		}
+		if c.Request.Method == http.MethodPost && (shouldSelectChannel || c.GetInt("relay_mode") == relayconstant.RelayModeVideoSubmit) {
+			storage, bodyErr := common.GetBodyStorage(c)
+			if bodyErr != nil {
+				status := http.StatusBadRequest
+				if common.IsRequestBodyTooLargeError(bodyErr) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				abortWithOpenAiMessage(c, status, bodyErr.Error(), types.ErrorCodeReadRequestBodyFailed)
+				return
+			}
+			c.Request.Body = io.NopCloser(storage)
+			constraints.AddFilter(taskdto.ChannelFilter{Kind: taskdto.FilterRequestBodySize, RequestBodyBytes: c.GetInt64(common.KeyOriginalRequestBodySize)})
 		}
 		if pin, found, overridden := constraints.ResolvedPin(); found {
 			for _, lost := range overridden {
@@ -70,6 +87,10 @@ func Distribute() func(c *gin.Context) {
 				return
 			}
 			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
+				if kind == taskdto.FilterRequestBodySize {
+					abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, model.ErrChannelRequestBodyTooLarge.Error(), service.ChannelBodyTooLargeCode)
+					return
+				}
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
@@ -127,8 +148,9 @@ func Distribute() func(c *gin.Context) {
 					affinityUsable := false
 					preferred, err := model.CacheGetChannel(preferredChannelID)
 					affinitySatisfied := false
+					var affinityRejectedBy taskdto.ChannelFilterKind
 					if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled {
-						affinitySatisfied, _ = model.ChannelSatisfiesFilters(preferred, modelRequest.Model, constraints.Filters)
+						affinitySatisfied, affinityRejectedBy = model.ChannelSatisfiesFilters(preferred, modelRequest.Model, constraints.Filters)
 					}
 					if affinitySatisfied {
 						if usingGroup == "auto" {
@@ -151,7 +173,9 @@ func Distribute() func(c *gin.Context) {
 							service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 						}
 					}
-					if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
+					if affinityRejectedBy == taskdto.FilterRequestBodySize {
+						service.BypassChannelAffinityForBodySize(c)
+					} else if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
 					}
 				}
@@ -165,6 +189,10 @@ func Distribute() func(c *gin.Context) {
 						Retry:       common.GetPointer(0),
 					})
 					if err != nil {
+						if errors.Is(err, model.ErrChannelRequestBodyTooLarge) {
+							abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, err.Error(), service.ChannelBodyTooLargeCode)
+							return
+						}
 						showGroup := usingGroup
 						if usingGroup == "auto" {
 							showGroup = fmt.Sprintf("auto(%s)", selectGroup)
@@ -187,6 +215,10 @@ func Distribute() func(c *gin.Context) {
 		}
 		if channel != nil {
 			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
+				if kind == taskdto.FilterRequestBodySize {
+					abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, model.ErrChannelRequestBodyTooLarge.Error(), service.ChannelBodyTooLargeCode)
+					return
+				}
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}

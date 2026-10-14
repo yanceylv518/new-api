@@ -48,6 +48,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { UserSubscriptionsDialog } from '@/features/subscriptions/components/dialogs/user-subscriptions-dialog'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { manageUser, resetUserPasskey, resetUserTwoFA } from '../api'
 import {
@@ -60,6 +61,7 @@ import { getUserActionMessage } from '../lib'
 import type { User, ManageUserAction } from '../types'
 import { UserBindingDialog } from './dialogs/user-binding-dialog'
 import { UserModelPricingDialog } from './dialogs/user-model-pricing-dialog'
+import { UserTokenResourceDialog } from './dialogs/user-token-resource-dialog'
 import { useUsers } from './users-provider'
 
 interface DataTableRowActionsProps {
@@ -75,6 +77,11 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const [bindingDialogOpen, setBindingDialogOpen] = useState(false)
   const [subscriptionsDialogOpen, setSubscriptionsDialogOpen] = useState(false)
   const [modelPricingDialogOpen, setModelPricingDialogOpen] = useState(false)
+  const [resourceDialogOpen, setResourceDialogOpen] = useState(false)
+  const actorRole = useAuthStore((s) => s.auth.user?.role ?? 0)
+  const canManageResources =
+    actorRole >= USER_ROLE.ADMIN &&
+    (actorRole === USER_ROLE.ROOT || actorRole > user.role)
 
   const handleEdit = () => {
     setCurrentRow(user)
@@ -201,6 +208,17 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
         )}
 
+        {canManageResources && (
+          <DropdownMenuItem
+            onSelect={(event) => {
+              event.preventDefault()
+              setResourceDialogOpen(true)
+            }}
+          >
+            {t('Key resource limits')}
+          </DropdownMenuItem>
+        )}
+
         <DropdownMenuItem
           onSelect={(event) => {
             event.preventDefault()
@@ -319,6 +337,13 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
       />
 
       {/* 对话框自行加载数据，关闭时用户列表行无需承担查询开销。 */}
+      {canManageResources && (
+        <UserTokenResourceDialog
+          open={resourceDialogOpen}
+          onOpenChange={setResourceDialogOpen}
+          user={{ id: user.id, username: user.username }}
+        />
+      )}
       <UserModelPricingDialog
         open={modelPricingDialogOpen}
         onOpenChange={setModelPricingDialogOpen}

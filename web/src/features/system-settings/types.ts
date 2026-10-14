@@ -372,6 +372,9 @@ export type OperationsSettings = {
 }
 
 export type SecuritySettings = {
+  TokenResourceLimitsEnabled: boolean
+  TokenResourceDefaultMaxRequestBodyBytes: number
+  TokenResourceDefaultMaxConcurrentRequests: number
   ModelRequestRateLimitEnabled: boolean
   ModelRequestRateLimitCount: number
   ModelRequestRateLimitSuccessCount: number

@@ -38,6 +38,7 @@ type ChannelFilterKind string
 const (
 	FilterRequestPath        ChannelFilterKind = "request_path"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
+	FilterRequestBodySize    ChannelFilterKind = "request_body_size"
 )
 
 type ChannelFilter struct {
@@ -45,6 +46,9 @@ type ChannelFilter struct {
 	RequestPath            string
 	TaskPluginKey          string
 	TaskPluginChannelTypes []int
+	RequestBodyBytes       int64
+	// Prepared only for the current candidate set; nil means not loaded yet.
+	ChannelBodyLimits map[int]int64
 }
 
 type ChannelConstraints struct {

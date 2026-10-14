@@ -711,7 +711,16 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, other *model.LogOther) {
 	other.SetAdmin("channel_affinity", anyInfo)
 }
 
+// A large request may use another channel without changing the small-request binding.
+func BypassChannelAffinityForBodySize(c *gin.Context) {
+	c.Set("channel_affinity_body_size_bypass", true)
+	c.Set(ginKeyChannelAffinitySkipRetry, false)
+}
+
 func RecordChannelAffinity(c *gin.Context, channelID int) {
+	if c != nil && c.GetBool("channel_affinity_body_size_bypass") {
+		return
+	}
 	if channelID <= 0 {
 		return
 	}

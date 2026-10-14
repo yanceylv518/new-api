@@ -116,7 +116,10 @@ func GetChannel(
 	if err != nil {
 		return nil, err
 	}
-	abilities = filterAbilitiesByConstraints(abilities, model, filters)
+	abilities, err = filterAbilitiesByConstraints(abilities, model, filters)
+	if err != nil {
+		return nil, err
+	}
 	if len(abilities) > 0 {
 		priorities := make([]int64, 0)
 		seen := make(map[int64]bool)
@@ -166,9 +169,9 @@ func GetChannel(
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
 // closed when a task-plugin identity is required and fails open otherwise.
-func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
+func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) ([]Ability, error) {
 	if len(abilities) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	channelIds := make([]int, 0, len(abilities))
@@ -184,9 +187,9 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 	var channels []*Channel
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
 		if identityFilterRequiresKey(filters) {
-			return nil
+			return nil, nil
 		}
-		return abilities
+		return abilities, nil
 	}
 
 	channelsByID := make(map[int]*Channel, len(channels))
@@ -195,13 +198,20 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 	}
 
 	filtered := make([]Ability, 0, len(abilities))
+	filters = prepareChannelBodyLimits(channelIds, filters)
+	bodyRejected := false
 	for _, ability := range abilities {
 		channel := channelsByID[ability.ChannelId]
-		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
+		if ok, kind := ChannelSatisfiesFilters(channel, modelName, filters); ok {
 			filtered = append(filtered, ability)
+		} else if kind == dto.FilterRequestBodySize {
+			bodyRejected = true
 		}
 	}
-	return filtered
+	if len(filtered) == 0 && bodyRejected {
+		return nil, ErrChannelRequestBodyTooLarge
+	}
+	return filtered, nil
 }
 
 func identityFilterRequiresKey(filters []dto.ChannelFilter) bool {

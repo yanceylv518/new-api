@@ -50,6 +50,48 @@ const channelActionConfig = (
 
 export type TaskPluginOption = { key: string; name: string; models: string[] }
 
+export type ChannelResourcePolicy = {
+  channel_id: number
+  max_request_body_bytes: number
+}
+
+export async function getChannelResourcePolicy(
+  id: number,
+  signal?: AbortSignal
+) {
+  const response = await api.get<{
+    success: boolean
+    message?: string
+    data: ChannelResourcePolicy
+  }>(`/api/channel/${id}/resource-policy`, { signal, ...channelActionConfig() })
+  const policy = response.data.data
+  if (
+    !response.data.success ||
+    policy?.channel_id !== id ||
+    !Number.isSafeInteger(policy.max_request_body_bytes) ||
+    policy.max_request_body_bytes < 0
+  ) {
+    throw new Error(
+      response.data.message || 'Unable to load channel request body limit.'
+    )
+  }
+  return policy
+}
+
+export async function updateChannelResourcePolicy(id: number, bytes: number) {
+  const response = await api.put<{
+    success: boolean
+    message?: string
+    data: ChannelResourcePolicy
+  }>(
+    `/api/channel/${id}/resource-policy`,
+    { max_request_body_bytes: bytes },
+    channelActionConfig()
+  )
+  if (!response.data.success) throw new Error(response.data.message)
+  return response.data.data
+}
+
 export async function getTaskPluginOptions(): Promise<TaskPluginOption[]> {
   const response = await api.get<{
     success: boolean

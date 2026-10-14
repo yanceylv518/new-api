@@ -35,6 +35,51 @@ import type {
   UserModelPricingOverviewParams,
 } from './types'
 
+export type TokenResourcePolicy = {
+  token_id: number
+  name: string
+  max_request_body_bytes: number | null
+  max_concurrent_requests: number | null
+}
+
+export type TokenResourcePolicyPage = {
+  items: TokenResourcePolicy[]
+  total: number
+  // Optional during rolling upgrades with older admin API instances.
+  defaults?: {
+    enabled: boolean
+    max_request_body_bytes: number
+    max_concurrent_requests: number
+  }
+}
+
+export async function getUserTokenResourcePolicies(
+  userId: number,
+  page: number
+) {
+  const result = await api.get<ApiResponse<TokenResourcePolicyPage>>(
+    `/api/user/${userId}/token-resource-policies`,
+    { params: { p: page, page_size: 10 } }
+  )
+  if (!result.data.success) throw new Error(result.data.message)
+  return result.data.data
+}
+
+export async function updateUserTokenResourcePolicy(
+  userId: number,
+  tokenId: number,
+  values: Pick<
+    TokenResourcePolicy,
+    'max_request_body_bytes' | 'max_concurrent_requests'
+  >
+) {
+  const result = await api.put<ApiResponse<TokenResourcePolicy>>(
+    `/api/user/${userId}/token-resource-policies/${tokenId}`,
+    values
+  )
+  if (!result.data.success) throw new Error(result.data.message)
+  return result.data.data
+}
 // ============================================================================
 // User Management APIs
 // ============================================================================

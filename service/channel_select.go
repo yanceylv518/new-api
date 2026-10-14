@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -9,8 +10,29 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
+
+const ChannelBodyTooLargeCode types.ErrorCode = "channel_request_body_too_large"
+
+func ChannelBodyTooLargeError() *types.NewAPIError {
+	return types.NewErrorWithStatusCode(model.ErrChannelRequestBodyTooLarge, ChannelBodyTooLargeCode, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
+}
+
+// Check only the body constraint when a task or retry reuses a fixed channel.
+// Maintenance calls have no request-body filter and remain unaffected.
+func CheckChannelRequestBodySize(c *gin.Context, channelID int) *types.NewAPIError {
+	for _, filter := range GetChannelConstraints(c).Filters {
+		if filter.Kind != dto.FilterRequestBodySize {
+			continue
+		}
+		if ok, _ := model.ChannelSatisfiesFilters(&model.Channel{Id: channelID}, "", []dto.ChannelFilter{filter}); !ok {
+			return ChannelBodyTooLargeError()
+		}
+	}
+	return nil
+}
 
 func GetChannelConstraints(c *gin.Context) *dto.ChannelConstraints {
 	if c == nil {
@@ -129,6 +151,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 		}
 
+		var selectionErr error
 		for i := startGroupIndex; i < len(autoGroups); i++ {
 			autoGroup := autoGroups[i]
 			// Calculate priorityRetry for current group
@@ -141,12 +164,15 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(
+			channel, err = model.GetRandomSatisfiedChannel(
 				autoGroup,
 				param.ModelName,
 				priorityRetry,
 				filters,
 			)
+			if err != nil && (selectionErr == nil || !errors.Is(err, model.ErrChannelRequestBodyTooLarge)) {
+				selectionErr = err
+			}
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -182,6 +208,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i)
 			}
 			break
+		}
+		if channel == nil && selectionErr != nil {
+			return nil, selectGroup, selectionErr
 		}
 	} else {
 		channel, err = model.GetRandomSatisfiedChannel(

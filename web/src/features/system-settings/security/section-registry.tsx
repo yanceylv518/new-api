@@ -20,10 +20,26 @@ import { RateLimitSection } from '../request-limits/rate-limit-section'
 import { SensitiveWordsSection } from '../request-limits/sensitive-words-section'
 import { SSRFSection } from '../request-limits/ssrf-section'
 import { TokenLimitSection } from '../request-limits/token-limit-section'
+import { TokenResourceLimitSection } from '../request-limits/token-resource-limit-section'
 import type { SecuritySettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
 
 const SECURITY_SECTIONS = [
+  {
+    id: 'token-resource-limits',
+    titleKey: 'Key resource limits',
+    build: (settings: SecuritySettings) => (
+      <TokenResourceLimitSection
+        defaultValues={{
+          TokenResourceLimitsEnabled: settings.TokenResourceLimitsEnabled,
+          TokenResourceDefaultMaxRequestBodyBytes:
+            settings.TokenResourceDefaultMaxRequestBodyBytes,
+          TokenResourceDefaultMaxConcurrentRequests:
+            settings.TokenResourceDefaultMaxConcurrentRequests,
+        }}
+      />
+    ),
+  },
   {
     id: 'rate-limit',
     titleKey: 'Rate Limiting',

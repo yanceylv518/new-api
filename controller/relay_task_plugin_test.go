@@ -148,6 +148,35 @@ func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	assert.False(t, c.Writer.Written())
 }
 
+func TestExecuteTaskSubmissionBodyLimitRefundsWithoutUpstreamAttempt(t *testing.T) {
+	for _, locked := range []bool{true, false} {
+		t.Run(map[bool]string{true: "locked origin", false: "initial selection"}[locked], func(t *testing.T) {
+			events := []string{}
+			billing := &taskSubmissionTestBilling{events: &events}
+			c := taskSubmissionTestContext()
+			info := taskSubmissionRelayInfo(billing)
+			if !locked {
+				info.LockedChannel = nil
+				info.ChannelMeta = nil
+				c.Set("channel_id", 1)
+			}
+			service.GetChannelConstraints(c).AddFilter(dto.ChannelFilter{Kind: dto.FilterRequestBodySize, RequestBodyBytes: 513, ChannelBodyLimits: map[int]int64{1: 512}})
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				t.Fatal("an oversized request must never reach the upstream")
+				return nil, nil
+			})
+			assert.Nil(t, outcome)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, taskErr.StatusCode)
+			assert.Equal(t, string(service.ChannelBodyTooLargeCode), taskErr.Code)
+			assert.Equal(t, []string{"refund"}, events)
+			assert.Equal(t, 1, billing.refunds)
+			assert.False(t, c.Writer.Written())
+			assert.False(t, shouldRetry(c, service.ChannelBodyTooLargeError(), 3))
+		})
+	}
+}
+
 func TestExecuteTaskSubmissionSettlementFailureStaysDurableAndWritesNothing(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)

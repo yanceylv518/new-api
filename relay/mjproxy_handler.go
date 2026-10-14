@@ -502,6 +502,9 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			if channel.Status != common.ChannelStatusEnabled {
 				return service.MidjourneyErrorWrapper(constant.MjRequestError, "该任务所属渠道已被禁用")
 			}
+			if bodyErr := service.CheckChannelRequestBodySize(c, channel.Id); bodyErr != nil {
+				return service.MidjourneyErrorWrapper(constant.MjRequestError, string(service.ChannelBodyTooLargeCode))
+			}
 			c.Set("base_url", channel.GetBaseURL())
 			c.Set("channel_id", originTask.ChannelId)
 			c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))

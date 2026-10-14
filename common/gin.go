@@ -19,6 +19,7 @@ import (
 
 const KeyRequestBody = "key_request_body"
 const KeyBodyStorage = "key_body_storage"
+const KeyOriginalRequestBodySize = "original_request_body_size"
 
 var ErrRequestBodyTooLarge = errors.New("request body too large")
 
@@ -91,6 +92,10 @@ func GetBodyStorage(c *gin.Context) (BodyStorage, error) {
 	bs, ok := seeker.(BodyStorage)
 	if !ok {
 		return nil, errors.New("unexpected body storage type")
+	}
+	// Keep the decoded inbound size even when a plugin replaces the body later.
+	if _, recorded := c.Get(KeyOriginalRequestBodySize); !recorded {
+		c.Set(KeyOriginalRequestBodySize, bs.Size())
 	}
 	return bs, nil
 }

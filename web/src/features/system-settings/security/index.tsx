@@ -25,6 +25,9 @@ import {
 } from './section-registry.tsx'
 
 const defaultSecuritySettings: SecuritySettings = {
+  TokenResourceLimitsEnabled: false,
+  TokenResourceDefaultMaxRequestBodyBytes: 0,
+  TokenResourceDefaultMaxConcurrentRequests: 0,
   ModelRequestRateLimitEnabled: false,
   ModelRequestRateLimitCount: 0,
   ModelRequestRateLimitSuccessCount: 1000,

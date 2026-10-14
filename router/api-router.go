@@ -152,6 +152,8 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.DELETE("/:id/oauth/bindings/:provider_id", controller.UnbindCustomOAuthByAdmin)
 				adminRoute.DELETE("/:id/bindings/:binding_type", controller.AdminClearUserBinding)
 				adminRoute.GET("/:id", controller.GetUser)
+				adminRoute.GET("/:id/token-resource-policies", middleware.DisableCache(), controller.GetUserTokenResourcePolicies)
+				adminRoute.PUT("/:id/token-resource-policies/:token_id", middleware.DisableCache(), controller.UpdateUserTokenResourcePolicy)
 				adminRoute.GET("/:id/model-pricing", middleware.DisableCache(), controller.GetUserModelPricing)
 				adminRoute.GET("/model-pricing", middleware.DisableCache(), controller.GetUserModelPricingOverview)
 				adminRoute.GET("/:id/model-pricing/rules", middleware.DisableCache(), controller.GetUserModelPricingRulePage)

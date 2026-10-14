@@ -3,16 +3,120 @@ package channel
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDoRequestPropagatesTokenConcurrencyCancellation(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "waiting_for_headers"
+		if stream {
+			name = "streaming_body"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { _ = client.Close() })
+			parent, cancel := context.WithCancel(context.Background())
+			lease, err := service.AcquireTokenConcurrency(parent, client, 42, 1)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = lease.Close() })
+			entered, canceled := make(chan struct{}), make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: started\n\n")
+					w.(http.Flusher).Flush()
+				}
+				close(entered)
+				<-r.Context().Done()
+				close(canceled)
+			}))
+			t.Cleanup(upstream.Close)
+			t.Cleanup(cancel)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewBufferString("{}")).WithContext(lease.Context())
+			// Deliberately start with a detached request, as legacy adaptors do.
+			req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewBufferString("{}"))
+			require.NoError(t, err)
+			result := make(chan error, 1)
+			go func() {
+				resp, err := doRequest(c, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+				if err == nil {
+					_, err = io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+				}
+				result <- err
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream request did not start")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				assert.Error(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream I/O did not stop")
+			}
+			select {
+			case <-canceled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream connection remained open")
+			}
+		})
+	}
+}
+
+func TestDoRequestKeepsTokenConcurrencyLeaseAcrossAttempts(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	lease, err := service.AcquireTokenConcurrency(context.Background(), client, 42, 1)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lease.Close() })
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/first" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewBufferString("{}")).WithContext(lease.Context())
+	for _, attempt := range []struct {
+		path   string
+		status int
+	}{{"/first", 502}, {"/second", 200}} {
+		req, err := http.NewRequest(http.MethodPost, upstream.URL+attempt.path, bytes.NewBufferString("{}"))
+		require.NoError(t, err)
+		resp, err := doRequest(c, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+		require.NoError(t, err)
+		assert.Equal(t, attempt.status, resp.StatusCode)
+		require.NoError(t, resp.Body.Close())
+		_, err = service.AcquireTokenConcurrency(context.Background(), client, 42, 1)
+		assert.ErrorIs(t, err, service.ErrTokenConcurrencyExceeded, "intermediate attempts must not release the slot")
+	}
+	require.NoError(t, lease.Close())
+	next, err := service.AcquireTokenConcurrency(context.Background(), client, 42, 1)
+	require.NoError(t, err)
+	require.NoError(t, next.Close())
+}
 
 func TestDoRequestCapturesPreferredUpstreamRequestID(t *testing.T) {
 	service.InitHttpClient()

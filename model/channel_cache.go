@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -30,6 +31,9 @@ func InitChannelCache() {
 		rebuildTaskAliasView()
 		return
 	}
+	// Policy refresh failures retain the last snapshot and must not interrupt
+	// ordinary channel refreshes. The policy loader logs failures at a bounded rate.
+	_ = RefreshChannelResourcePolicyCache(context.Background())
 	newChannelId2channel := make(map[int]*Channel)
 	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
 	var channels []*Channel
@@ -129,15 +133,20 @@ func GetRandomSatisfiedChannel(
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
-	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
+	channels, emptiedBy := filterCandidateIDs(group2model2channels[group][model], model, filters)
+	bodyRejected := emptiedBy == dto.FilterRequestBodySize
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
-		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		channels, emptiedBy = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		bodyRejected = bodyRejected || emptiedBy == dto.FilterRequestBodySize
 	}
 
 	if len(channels) == 0 {
+		if bodyRejected {
+			return nil, ErrChannelRequestBodyTooLarge
+		}
 		return nil, nil
 	}
 

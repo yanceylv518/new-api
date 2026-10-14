@@ -488,6 +488,11 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	// A protected request must stop upstream I/O when its client disconnects
+	// or its Redis lease is lost. Preserve legacy behavior for other traffic.
+	if service.TokenConcurrencyLimited(c.Request.Context()) {
+		req = req.WithContext(c.Request.Context())
+	}
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)

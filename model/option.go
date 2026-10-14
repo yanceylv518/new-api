@@ -176,6 +176,9 @@ func InitOptionMap() {
 	common.OptionMap["DemoSiteEnabled"] = strconv.FormatBool(operation_setting.DemoSiteEnabled)
 	common.OptionMap["SelfUseModeEnabled"] = strconv.FormatBool(operation_setting.SelfUseModeEnabled)
 	common.OptionMap["ModelRequestRateLimitEnabled"] = strconv.FormatBool(setting.ModelRequestRateLimitEnabled)
+	common.OptionMap[setting.TokenResourceLimitsEnabledKey] = "false"
+	common.OptionMap[setting.TokenResourceDefaultMaxRequestBodyBytesKey] = "0"
+	common.OptionMap[setting.TokenResourceDefaultMaxConcurrentRequestsKey] = "0"
 	common.OptionMap["CheckSensitiveOnPromptEnabled"] = strconv.FormatBool(setting.CheckSensitiveOnPromptEnabled)
 	common.OptionMap["StopOnSensitiveEnabled"] = strconv.FormatBool(setting.StopOnSensitiveEnabled)
 	common.OptionMap["SensitiveWords"] = setting.SensitiveWordsToString()
@@ -214,6 +217,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == setting.TokenResourceLimitsEnabledKey || key == setting.TokenResourceDefaultMaxRequestBodyBytesKey || key == setting.TokenResourceDefaultMaxConcurrentRequestsKey {
+		return setting.ValidateTokenResourceLimitOption(key, value)
+	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
@@ -227,6 +233,11 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	// Resource policy changes must not report success or update the local
+	// snapshot when persistence failed. Reuse the checked transaction path.
+	if key == setting.TokenResourceLimitsEnabledKey || key == setting.TokenResourceDefaultMaxRequestBodyBytesKey || key == setting.TokenResourceDefaultMaxConcurrentRequestsKey {
+		return UpdateOptionsBulk(map[string]string{key: value})
+	}
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
 	}

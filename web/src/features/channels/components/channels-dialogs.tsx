@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useChannels } from './channels-provider'
 import { BalanceQueryDialog } from './dialogs/balance-query-dialog'
+import { ChannelResourcePolicyDialog } from './dialogs/channel-resource-policy-dialog'
 import { ChannelTestDialog } from './dialogs/channel-test-dialog'
 import { CopyChannelDialog } from './dialogs/copy-channel-dialog'
 import { EditTagDialog } from './dialogs/edit-tag-dialog'
@@ -33,6 +34,13 @@ export function ChannelsDialogs() {
 
   return (
     <>
+      {currentRow && (
+        <ChannelResourcePolicyDialog
+          open={open === 'resource-policy'}
+          onOpenChange={(v) => !v && setOpen(null)}
+          channel={currentRow}
+        />
+      )}
       {/* Channel Create/Update Drawer */}
       <ChannelMutateDrawer
         open={open === 'create-channel' || open === 'update-channel'}

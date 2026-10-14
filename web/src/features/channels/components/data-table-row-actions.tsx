@@ -68,6 +68,7 @@ import {
   isChannelEnabled,
   isMultiKeyChannel,
 } from '../lib'
+import { canManageChannelResourcePolicy } from '../lib/channel-resource-policy'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
@@ -264,6 +265,16 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           <span className='sr-only'>{t('Open menu')}</span>
         </DropdownMenuTrigger>
         <DropdownMenuContent align='end' className='w-48'>
+          {canManageChannelResourcePolicy(currentUser) && (
+            <DropdownMenuItem
+              onClick={() => {
+                setCurrentRow(channel)
+                setOpen('resource-policy')
+              }}
+            >
+              {t('Channel request body limit')}
+            </DropdownMenuItem>
+          )}
           {layout === 'card' && (
             <DropdownMenuItem onClick={handleEdit}>
               {t('Edit')}

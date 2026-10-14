@@ -480,26 +480,37 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	// 使用事务 分批删除channel表和abilities表
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return 0, tx.Error
+	channelResourcePolicyUpdateMu.Lock()
+	defer channelResourcePolicyUpdateMu.Unlock()
+	var deletedCount int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		deletedCount, err = deleteChannelRecords(tx, ids)
+		return err
+	})
+	if err != nil {
+		return 0, err
 	}
+	removeChannelResourcePoliciesFromCache(ids)
+	return deletedCount, nil
+}
+
+// deleteChannelRecords must run inside a transaction. Delete channel rows
+// first: their row locks also serialize against concurrent policy saves.
+func deleteChannelRecords(tx *gorm.DB, ids []int) (int64, error) {
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
 		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
 		if result.Error != nil {
-			tx.Rollback()
 			return 0, result.Error
 		}
 		deletedCount += result.RowsAffected
 		if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
-			tx.Rollback()
 			return 0, err
 		}
-	}
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
+		if err := tx.Where("channel_id in (?)", chunk).Delete(&ChannelResourcePolicy{}).Error; err != nil {
+			return 0, err
+		}
 	}
 	return deletedCount, nil
 }
@@ -623,12 +634,10 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
+	if channel.Id == 0 {
+		return gorm.ErrMissingWhereClause
 	}
-	err = channel.DeleteAbilities()
+	_, err := BatchDeleteChannels([]int{channel.Id})
 	return err
 }
 
@@ -899,13 +908,33 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatuses([]int64{status})
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatuses([]int64{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled})
+}
+
+func deleteChannelsByStatuses(statuses []int64) (int64, error) {
+	channelResourcePolicyUpdateMu.Lock()
+	defer channelResourcePolicyUpdateMu.Unlock()
+	var ids []int
+	var deletedCount int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		// Select and lock inside the same transaction so a status change cannot
+		// make the policy cleanup target differ from the deleted channel set.
+		if err := lockForUpdate(tx).Model(&Channel{}).Where("status IN ?", statuses).Order("id").Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		var err error
+		deletedCount, err = deleteChannelRecords(tx, ids)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	removeChannelResourcePoliciesFromCache(ids)
+	return deletedCount, nil
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {
