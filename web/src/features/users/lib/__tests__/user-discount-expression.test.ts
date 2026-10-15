@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
 
 import { describe, expect, test } from 'vitest'
 
@@ -20,7 +19,8 @@ import {
 } from '../user-discount-time'
 
 describe('weekly time range discounts', () => {
-  test('exports real editor expressions with independent boundary expectations for backend verification', () => {
+  test('matches the independent weekly boundary expectations after parsing editor expressions', () => {
+    const permanentPercent = 80
     const branch = (
       id: string,
       percent: number,
@@ -117,7 +117,7 @@ describe('weekly time range discounts', () => {
       },
     ].map((fixture) => {
       const source = generateDiscountExpression({
-        percent: 80,
+        percent: permanentPercent,
         inheritPermanent: true,
         branches: fixture.branches,
       })
@@ -132,10 +132,24 @@ describe('weekly time range discounts', () => {
         })),
       }
     })
-    writeFileSync(
-      '../tools/pricing-load/results/20261012-weekly-fixtures.json',
-      JSON.stringify(fixtures, null, 2)
-    )
+    for (const fixture of fixtures) {
+      const parsed = parseDiscountExpression(fixture.source)
+      assert.ok(parsed)
+      for (const boundary of fixture.cases) {
+        const { day, minute } = beijingTime(boundary.at)
+        const matched: DiscountVisualConfig['branches'][number] | undefined =
+          parsed.branches.find((candidate) =>
+            matchesTimeBranch(candidate, day, minute)
+          )
+        const percent: number | null =
+          matched?.percent ??
+          (parsed.inheritPermanent ? permanentPercent : parsed.percent)
+        assert.ok(percent !== null, fixture.name)
+        expect(percent * 100, `${fixture.name} at ${boundary.at}`).toBe(
+          boundary.bps
+        )
+      }
+    }
   })
   test.each([
     { days: [1, 2, 3, 4, 5], start: '09:00', end: '23:00', allDay: false },
