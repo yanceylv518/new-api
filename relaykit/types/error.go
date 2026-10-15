@@ -89,6 +89,7 @@ const (
 
 type NewAPIError struct {
 	Err            error
+	logErr         error
 	RelayError     any
 	skipRetry      bool
 	recordErrorLog *bool
@@ -143,6 +144,23 @@ func (e *NewAPIError) ErrorWithStatusCode() string {
 		return fmt.Sprintf("status_code=%d", e.StatusCode)
 	}
 	return fmt.Sprintf("status_code=%d, %s", e.StatusCode, msg)
+}
+
+// SetLogError 保存仅用于内部错误日志的正文，不改变协议错误响应。
+func (e *NewAPIError) SetLogError(err error) {
+	if e != nil {
+		e.logErr = err
+	}
+}
+
+func (e *NewAPIError) LogErrorWithStatusCode() string {
+	if e == nil || e.logErr == nil {
+		return e.ErrorWithStatusCode()
+	}
+	if e.StatusCode == 0 {
+		return e.logErr.Error()
+	}
+	return fmt.Sprintf("status_code=%d, %s", e.StatusCode, e.logErr.Error())
 }
 
 func (e *NewAPIError) MaskSensitiveError() string {

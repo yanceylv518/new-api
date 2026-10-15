@@ -3,17 +3,74 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type failingErrorBody struct {
+	*strings.Reader
+	closed bool
+}
+
+func (b *failingErrorBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func (b *failingErrorBody) Close() error { b.closed = true; return nil }
+
+func TestRelayErrorHandlerPersistsInternalDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, diagnostic string
+		readFailure            bool
+	}{
+		{"unstructured", "gateway overloaded; request=fixture-42", "gateway overloaded", false},
+		{"partial", `upstream denied; {"Cookie":["PHPSESSID=fixture-session"`, "upstream denied", true},
+		{"structured", `{"error":{"message":"denied","type":"upstream_error"},"url":"https://upstream.example/?model=x\u0026session_id=fixture-session","b64_json":"aGVsbG8="}`, "denied", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 76, 10000)
+			var body io.ReadCloser = io.NopCloser(strings.NewReader(tc.body))
+			if tc.readFailure {
+				body = &failingErrorBody{Reader: strings.NewReader(tc.body)}
+			}
+			apiErr := RelayErrorHandler(t.Context(), &http.Response{StatusCode: 502, Body: body}, false)
+			require.NotNil(t, apiErr)
+			if failed, ok := body.(*failingErrorBody); ok {
+				require.True(t, failed.closed)
+				require.True(t, errors.Is(apiErr, io.ErrUnexpectedEOF))
+				require.Contains(t, apiErr.LogErrorWithStatusCode(), "unexpected EOF")
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			model.RecordErrorLog(ctx, 76, 0, "test-model", "", apiErr.LogErrorWithStatusCode(), 0, 0, false, "default", model.NewLogOther())
+			entry := getLastLog(t)
+			require.NotNil(t, entry)
+			require.Contains(t, entry.Content, tc.diagnostic)
+			require.NotContains(t, entry.Content, "fixture-session")
+			require.NotContains(t, entry.Content, "aGVsbG8=")
+			if tc.name == "structured" {
+				require.Contains(t, entry.Content, "[BASE64_REDACTED]")
+				require.Equal(t, "denied", apiErr.ToOpenAIError().Message)
+			}
+		})
+	}
+}
 
 func TestResetStatusCode(t *testing.T) {
 	t.Parallel()
