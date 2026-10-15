@@ -197,6 +197,7 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	})
 	billing := &taskSubmissionTestBilling{events: &events}
 	info := taskSubmissionRelayInfo(billing)
+	info.PriceData.TaskQuotaBeforeDiscount = "10.8"
 
 	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 		return &relay.TaskSubmitResult{
@@ -225,6 +226,8 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	require.NotNil(t, stored.PrivateData.Execution.TaskPlugin.Author)
 	assert.Equal(t, "Community Author", stored.PrivateData.Execution.TaskPlugin.Author.Name)
 	assert.Equal(t, "upstream-private", stored.PrivateData.UpstreamTaskID)
+	require.NotNil(t, stored.PrivateData.BillingContext)
+	assert.Equal(t, "10.8", stored.PrivateData.BillingContext.QuotaBeforeDiscount)
 }
 
 func TestExecuteTaskSubmissionRefundsCancellationBeforeDurableBarrier(t *testing.T) {

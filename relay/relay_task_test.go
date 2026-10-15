@@ -1,9 +1,12 @@
 package relay
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -14,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -68,7 +72,7 @@ func newTaskSubmitContext(t *testing.T, originalModel, mapping string) (*gin.Con
 		c.Set("model_mapping", mapping)
 	}
 	c.Set("task_request", map[string]any{"prompt": "p"})
-	return c, &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	return c, &relaycommon.RelayInfo{StartTime: time.Unix(199, 0), TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 }
 
 func TestRelayTaskSubmitMapsBeforeValidateWhenOriginSet(t *testing.T) {
@@ -235,6 +239,62 @@ func TestRelayTaskSubmitAliasBillingIdentityAndExprFallback(t *testing.T) {
 				assert.Nil(t, info.TieredBillingSnapshot)
 				assert.Equal(t, "model_price_error", taskErr.Code)
 			}
+		})
+	}
+}
+
+func TestRelayTaskSubmitFreezesActualPricingBasis(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(server.Close)
+	service.InitHttpClient()
+	oldPrices, oldPatches := ratio_setting.ModelPrice2JSONString(), constant.TaskPricePatches
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices))
+		constant.TaskPricePatches = oldPatches
+	})
+	for _, tc := range []struct {
+		name, basis        string
+		base, bps, want    int
+		size, adjustedSize float64
+		patched            bool
+	}{
+		{"fixed_price_ignores_size", "100", 100, 8000, 80, 2, 0, true},
+		{"fractional_request_ratio", "10.8", 10, 8000, 9, 1.08, 0, false},
+		{"undiscounted_request_ratio", "10.8", 10, 10000, 10, 1.08, 0, false},
+		{"adjusted_ratio", "13.5", 10, 8000, 11, 1.08, 1.35, false},
+		{"undiscounted_adjusted_ratio", "13.5", 10, 10000, 13, 1.08, 1.35, false},
+		{"fixed_price_adapter_adjustment", "300", 100, 8000, 240, 2, 3, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prices, err := common.Marshal(map[string]float64{"declared-model": float64(tc.base) / common.QuotaPerUnit})
+			require.NoError(t, err)
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(prices)))
+			constant.TaskPricePatches = nil
+			if tc.patched {
+				constant.TaskPricePatches = []string{"declared-model"}
+			}
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			c.Set("group", "default")
+			info.OriginModelName, info.UserGroup, info.UsingGroup = "declared-model", "default", "default"
+			info.Billing = &service.BillingSession{}
+			info.UserModelDiscountBPS = hosttypes.NewUserModelDiscountSnapshot(map[string]int{"declared-model": tc.bps})
+			adjustedUsage := "null"
+			if tc.adjustedSize > 0 {
+				adjustedUsage = fmt.Sprintf("{size:%g}", tc.adjustedSize)
+			}
+			pinMappingOrderPlugin(t, c, billingFallbackPlugin+fmt.Sprintf(`
+export function extractUsage(){return {size:%g};}
+export function extractUsageOnSubmit(){return %s;}
+`, tc.size, adjustedUsage))
+			result, taskErr := RelayTaskSubmit(c, info)
+			require.Nil(t, taskErr)
+			require.NotNil(t, result)
+			assert.Equal(t, tc.want, result.Quota)
+			assert.Equal(t, tc.basis, info.PriceData.TaskQuotaBeforeDiscount)
 		})
 	}
 }

@@ -169,6 +169,8 @@ type TaskBillingContext struct {
 	PerCallBilling  bool                                   `json:"per_call_billing,omitempty"`  // 按次计费：跳过轮询阶段的差额结算
 	TieredSnapshot  *billingexpr.BillingSnapshot           `json:"tiered_snapshot,omitempty"`
 	UserDiscount    *hosttypes.UserModelDiscountEvaluation `json:"user_discount,omitempty"`
+	// 十进制字符串保留提交计价的小数，已包含当时实际应用的请求倍率。
+	QuotaBeforeDiscount string `json:"quota_before_discount,omitempty"`
 }
 
 // GetUpstreamTaskID 获取上游真实 task ID（用于与 provider 通信）

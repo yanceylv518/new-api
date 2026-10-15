@@ -373,6 +373,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			}
 			original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
 			quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
+			info.PriceData.TaskQuotaBeforeDiscount = beforeValue.String()
 		} else {
 			before := base
 			if !common.StringsContains(constant.TaskPricePatches, modelName) {
@@ -380,6 +381,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			}
 			original, originalClamp = common.QuotaFromFloatChecked(before)
 			quota, clamp = common.QuotaFromFloatChecked(before)
+			basis := decimal.NewFromInt(int64(original))
+			if originalClamp == nil {
+				basis = decimal.NewFromFloat(before)
+			}
+			info.PriceData.TaskQuotaBeforeDiscount = basis.String()
 		}
 		if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() != 1 {
 			quota = 1
@@ -503,10 +509,17 @@ func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float6
 		beforeValue := adjustedPriceData.ApplyOtherRatiosBeforeDiscount(decimal.NewFromInt(int64(baseQuota)))
 		quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
 		original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+		info.PriceData.TaskQuotaBeforeDiscount = beforeValue.String()
 	} else {
 		result := info.PriceData.ApplyOtherRatiosToFloat(baseQuota)
 		quota, clamp = common.QuotaFromFloatChecked(result)
-		original, originalClamp = common.QuotaFromFloatChecked(baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount())
+		before := baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount()
+		original, originalClamp = common.QuotaFromFloatChecked(before)
+		basis := decimal.NewFromInt(int64(original))
+		if originalClamp == nil {
+			basis = decimal.NewFromFloat(before)
+		}
+		info.PriceData.TaskQuotaBeforeDiscount = basis.String()
 	}
 	noteTaskQuotaClamp(info, clamp)
 	noteTaskQuotaClamp(info, originalClamp)

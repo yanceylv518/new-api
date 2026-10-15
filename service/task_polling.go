@@ -753,16 +753,36 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 				before = task.PrivateData.DiscountAmounts.Before
 			}
 			basis := decimal.NewFromInt(int64(before))
-			if bc.ModelPrice > 0 {
-				basis = price.ApplyOtherRatiosBeforeDiscount(decimal.NewFromFloat(bc.ModelPrice).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).Mul(decimal.NewFromFloat(bc.GroupRatio)))
+			// 旧任务沿用已保存的折前整数，不能根据当前配置重新推断倍率是否参与计价。
+			if bc.QuotaBeforeDiscount != "" {
+				basis, err = decimal.NewFromString(bc.QuotaBeforeDiscount)
+				if err != nil {
+					logger.LogWarn(ctx, fmt.Sprintf("任务 %s 折前计价快照解析失败，保留预扣额度: %v", task.TaskID, err))
+					return true
+				}
+				if basis.IsNegative() {
+					logger.LogWarn(ctx, fmt.Sprintf("任务 %s 折前计价快照为负，保留预扣额度", task.TaskID))
+					return true
+				}
 			}
-			before, originalClamp := common.QuotaFromDecimalChecked(basis)
-			after, clamp := common.QuotaDiscountDecimalChecked(basis, price.UserModelDiscountMultiplier())
-			if before > 0 && after == 0 {
-				after = 1
-			}
-			if clamp == nil {
-				clamp = originalClamp
+			after := task.Quota
+			var clamp *common.QuotaClamp
+			if discount.DiscountBPS != bc.UserDiscount.DiscountBPS {
+				if price.UserModelDiscountMultiplier() == 1 {
+					// 原价沿用提交时的截断契约；有折扣时仍使用统一的十进制舍入。
+					before, clamp = common.QuotaFromDecimalChecked(basis.Truncate(0))
+					after = before
+				} else {
+					var originalClamp *common.QuotaClamp
+					before, originalClamp = common.QuotaFromDecimalChecked(basis)
+					after, clamp = common.QuotaDiscountDecimalChecked(basis, price.UserModelDiscountMultiplier())
+					if before > 0 && after == 0 {
+						after = 1
+					}
+					if clamp == nil {
+						clamp = originalClamp
+					}
+				}
 			}
 			settleTaskQuotaWithDiscount(ctx, task, after, hosttypes.NewDiscountAmounts(before, after), nil, discount, "任务临时或永久折扣表达式结算", clamp)
 			return true
