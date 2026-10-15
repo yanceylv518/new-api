@@ -22,11 +22,27 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 func TestMain(m *testing.M) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	var dialect gorm.Dialector = sqlite.Open(":memory:")
+	databaseType := common.DatabaseTypeSQLite
+	// 外部验证只允许专用 Compose 的回环地址，且拒绝使用已有表的数据库。
+	switch os.Getenv("TASK_BILLING_TEST_DATABASE") {
+	case "", "sqlite":
+	case "mysql":
+		dialect = mysql.Open("root@tcp(127.0.0.1:13326)/pricing_review?charset=utf8mb4&parseTime=true&timeout=5s")
+		databaseType = common.DatabaseTypeMySQL
+	case "postgres":
+		dialect = postgres.Open("postgres://postgres@127.0.0.1:15427/pricing_review?sslmode=disable&connect_timeout=5")
+		databaseType = common.DatabaseTypePostgreSQL
+	default:
+		panic("unsupported TASK_BILLING_TEST_DATABASE")
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{})
 	if err != nil {
 		panic("failed to open test db: " + err.Error())
 	}
@@ -35,11 +51,18 @@ func TestMain(m *testing.M) {
 		panic("failed to get sql.DB: " + err.Error())
 	}
 	sqlDB.SetMaxOpenConns(1)
+	if databaseType != common.DatabaseTypeSQLite {
+		sqlDB.SetMaxOpenConns(8)
+		tables, err := db.Migrator().GetTables()
+		if err != nil || len(tables) != 0 {
+			panic("task billing tests require an empty isolated database")
+		}
+	}
 
 	model.DB = db
 	model.LOG_DB = db
 
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.SetDatabaseTypes(databaseType, databaseType)
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
@@ -58,8 +81,15 @@ func TestMain(m *testing.M) {
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		panic("failed to repeat task migration: " + err.Error())
+	}
 
-	os.Exit(m.Run())
+	exitCode := m.Run()
+	if err := sqlDB.Close(); err != nil && exitCode == 0 {
+		exitCode = 1
+	}
+	os.Exit(exitCode)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +223,27 @@ func TestPriceDataOtherRatiosFilterAndSnapshot(t *testing.T) {
 	nextSnapshot := priceData.OtherRatios()
 	assert.Equal(t, 2.5, nextSnapshot["positive"])
 	assert.NotContains(t, nextSnapshot, "new")
+}
+
+func TestTaskBillingRetryMigration(t *testing.T) {
+	const table = "task_billing_upgrade"
+	db := model.DB.Table(table).Session(&gorm.Session{})
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(table)) })
+	index := "idx_task_billing_upgrade_billing_retry_at"
+	require.NoError(t, db.Migrator().DropIndex(&model.Task{}, index))
+	require.NoError(t, db.Migrator().DropColumn(&model.Task{}, "BillingRetryAt"))
+	legacyData := model.TaskPrivateData{DiscountAmounts: types.NewDiscountAmounts(100, 80)}
+	require.NoError(t, db.Create(map[string]any{"id": 1, "task_id": "legacy-billing", "status": model.TaskStatusSuccess, "quota": 80, "private_data": legacyData}).Error)
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&model.Task{}))
+	}
+	var restored model.Task
+	require.NoError(t, db.First(&restored, 1).Error)
+	assert.Equal(t, 80, restored.Quota)
+	assert.Equal(t, legacyData.DiscountAmounts, restored.PrivateData.DiscountAmounts)
+	assert.Zero(t, restored.BillingRetryAt)
+	assert.True(t, db.Migrator().HasIndex(&model.Task{}, index))
 }
 
 func TestPriceDataReplaceAndApplyOtherRatios(t *testing.T) {

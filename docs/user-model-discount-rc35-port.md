@@ -18,6 +18,14 @@
 
 `f1b690c35` 已统一有折扣路径的十进制舍入，并保留原价路径的截断契约；`41c154418` 后加的实际用量折扣分支遗漏了原价分支。本轮补齐：最终比例未变时保持已保存金额，恢复 100% 时沿用原价截断，实际折扣仍按精确基数舍入。
 
+终态轮询同时持久化必要用量及 `tasks.billing_retry_at`（新增可空整数列与索引，0/NULL 表示无待处理结算）。资金事务成功时原子清除标记；失败任务保留终态，调度器每轮优先恢复已到期的结算，失败后至少间隔一分钟重试。已冻结的用量和适配器金额让恢复无需重新请求上游。确定性表达式/快照错误仍按原契约保留预扣并记录告警。历史终态任务未带标记时不自动补扣或退款；原有主库与独立日志库间的日志交付边界保持不变。
+
+部署时先完成新增列和索引迁移，再更新所有轮询节点。回滚到旧程序后应保留该列和 JSON 数据；旧程序不会恢复待结算任务，需保留新版恢复节点或在回滚前处理完待结算任务。
+
+本轮验证（2026-10-15）：SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 17.11 均通过，外部两库连接池上限为 8。设置 `GOWORK=off`，分别设置 `TASK_BILLING_TEST_DATABASE=mysql` / `postgres`，执行 `go test -race ./service -run '^(TestPendingTaskBilling|TestTaskBillingRetryMigration|TestUserModelDiscountPerCall|TestTaskSettlement|TestRelayErrorHandlerPersistsInternalDiagnostics)' -count=1 -timeout=180s`，结果分别为 16.437s、14.741s。SQLite 默认夹具执行 `go test -race ./service -run '^(TestUserModelDiscount|TestDiscount|TestTaskSettlement|TestPendingTaskBilling|TestTaskBillingRetryMigration|TestRelayErrorHandler|TestUpdateVideoSingleTaskPollClassification|TestUpdateBatchTasks|TestUpdateSunoTasksStalePolls|TestRunTaskPollingOnce|TestSweepTimedOutTasks|TestSettle_|TestRefundTaskQuota)' -count=1 -timeout=180s`，14.452s 通过。覆盖旧表加列及重复迁移、旧任务数据保留、7 种恢复/并发路径、4 种取整边界和原始错误内容脱敏入库；测试数据库容器、卷及网络均已清理。
+
+凭证脱敏 28 个场景及 common/model/controller 相关回归通过 `-race`；受影响后端包与 `relaykit` 独立构建通过，格式检查通过。本轮未执行仓库全量测试或部署。
+
 本轮 P2 验收补齐固定／批量百分比的两位小数限制、原模型别名搜索、永久规则空排期历史、抽屉后续页错误与显式重试、旧无限期临时规则修改起点时的结束时间校验、配置弹窗自然边界状态更新，以及保存回调的编辑会话归属。时间条件不再读取无关请求时长／数量，任务完成用量也不注入时间条件上下文；实际用量条件保持原有求值路径。旧无限期段仅原样保留，修改起点、折扣或条件必须先补齐结束时间，单条和批量行为一致。
 
 本节优先于旧版“单个时间窗／多段排期”的管理方式。

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -15,13 +16,129 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/discountexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestPendingTaskBillingRecoversThroughScheduler(t *testing.T) {
+	oldLimit := constant.TaskQueryLimit
+	constant.TaskQueryLimit = 100
+	t.Cleanup(func() { constant.TaskQueryLimit = oldLimit })
+	for _, path := range []string{"single_success", "batch_success", "single_failure", "poll_failure", "timeout", "crash_before_billing", "concurrent_recovery"} {
+		t.Run(path, func(t *testing.T) {
+			truncate(t)
+			const id = 83
+			seedUser(t, id, 9920)
+			seedToken(t, id, id, "pending-billing-test", 9920)
+			seedChannel(t, id)
+			seedChargedAccounting(t, id, id, id, 80, 1)
+			require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", id).Update("used_quota", 100).Error)
+			task := makeTask(id, id, 80, id, BillingSourceWallet, 0)
+			task.SubmitTime = time.Now().Add(-2 * time.Hour).Unix()
+			task.PrivateData.DiscountAmounts = hosttypes.NewDiscountAmounts(100, 80)
+			bc := task.PrivateData.BillingContext
+			bc.PerCallBilling, bc.QuotaBeforeDiscount = true, "100"
+			bc.UserDiscount = &hosttypes.UserModelDiscountEvaluation{
+				Rule:        hosttypes.UserModelDiscountWindow{Expression: "task_tokens >= 5000 ? 0.5 : 0.8"},
+				DiscountBPS: 8000, Context: discountexpr.Context{At: 199},
+			}
+			require.NoError(t, model.DB.Create(task).Error)
+			result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, TotalTokens: 5000}
+			wantQuota := 50
+			if path == "single_failure" || path == "poll_failure" || path == "timeout" {
+				result.Status = model.TaskStatusFailure
+				wantQuota = 0
+			}
+			const hook = "test:pending-billing-failure"
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(hook, func(tx *gorm.DB) {
+				if values, ok := tx.Statement.Dest.(map[string]any); ok && tx.Statement.Table == "tasks" && values["billing_retry_at"] == 0 {
+					tx.AddError(errors.New("injected billing transaction failure"))
+				}
+			}))
+			t.Cleanup(func() {
+				if model.DB.Callback().Update().Get(hook) != nil {
+					require.NoError(t, model.DB.Callback().Update().Remove(hook))
+				}
+			})
+			adaptor := &scriptedPollingAdaptor{parse: result}
+			channel := &model.Channel{Id: id}
+			tasks := map[string]*model.Task{task.TaskID: task}
+			switch path {
+			case "single_success", "single_failure":
+				require.Error(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.TaskID, tasks))
+			case "batch_success":
+				batch := &scriptedBatchPollingAdaptor{results: map[string]*BatchTaskResult{task.TaskID: {TaskInfo: *result}}}
+				require.NoError(t, UpdateBatchTasks(t.Context(), batch, map[int][]string{id: {task.TaskID}}, tasks))
+			case "poll_failure":
+				require.Error(t, failTaskFromPoll(t.Context(), adaptor, task, task.Status, "upstream failure"))
+			case "timeout":
+				oldTimeout := constant.TaskTimeoutMinutes
+				constant.TaskTimeoutMinutes = 1
+				t.Cleanup(func() { constant.TaskTimeoutMinutes = oldTimeout })
+				sweepTimedOutTasks(t.Context())
+			case "crash_before_billing", "concurrent_recovery":
+				oldStatus := task.Status
+				task.Status, task.Progress = model.TaskStatusSuccess, "100%"
+				prepareTaskBilling(task, result, adaptor)
+				won, err := task.UpdateWithStatus(oldStatus)
+				require.NoError(t, err)
+				require.True(t, won)
+			}
+			require.NoError(t, model.DB.Callback().Update().Remove(hook))
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			assert.Equal(t, model.TaskStatus(result.Status), stored.Status)
+			assert.Equal(t, 80, stored.Quota)
+			require.Positive(t, stored.BillingRetryAt)
+			require.NotNil(t, stored.PrivateData.BillingResult)
+			assert.Equal(t, 9920, getUserQuota(t, id))
+			assert.Zero(t, countLogs(t))
+			// 推进重试时间并移除适配器，模拟新进程只凭持久化用量恢复结算。
+			require.NoError(t, model.DB.Model(&stored).Update("billing_retry_at", 1).Error)
+			oldFactory := GetTaskAdaptorFunc
+			GetTaskAdaptorFunc = nil
+			t.Cleanup(func() { GetTaskAdaptorFunc = oldFactory })
+			require.True(t, model.HasUnfinishedSyncTasks())
+			if path == "concurrent_recovery" {
+				copies := make([]model.Task, 2)
+				for i := range copies {
+					require.NoError(t, model.DB.First(&copies[i], task.ID).Error)
+				}
+				start := make(chan struct{})
+				results := make(chan error, len(copies))
+				for i := range copies {
+					go func() {
+						<-start
+						results <- finishPendingTaskBilling(t.Context(), &copies[i])
+					}()
+				}
+				close(start)
+				for range copies {
+					assert.NoError(t, <-results)
+				}
+			} else {
+				summary := RunTaskPollingOnce(t.Context(), nil)
+				assert.Equal(t, 1, summary.RecoveredBillings)
+			}
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			assert.Equal(t, wantQuota, stored.Quota)
+			assert.Zero(t, stored.BillingRetryAt)
+			assert.Nil(t, stored.PrivateData.BillingResult)
+			assert.Equal(t, 10000-wantQuota, getUserQuota(t, id))
+			assert.Equal(t, 10000-wantQuota, getTokenRemainQuota(t, id))
+			assert.EqualValues(t, 1, countLogs(t))
+			assert.False(t, model.HasUnfinishedSyncTasks())
+			assert.Zero(t, RunTaskPollingOnce(t.Context(), nil).PendingBillings)
+			assert.EqualValues(t, 1, countLogs(t))
+		})
+	}
+}
 
 type taskPollingFetchAdaptor struct {
 	mu           sync.Mutex

@@ -71,6 +71,9 @@ type Task struct {
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
+
+	// 零值兼容历史任务；正值表示待结算及最早重试时间。
+	BillingRetryAt int64 `json:"-" gorm:"index"`
 }
 
 func (t *Task) SetData(data any) {
@@ -111,6 +114,7 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
+	BillingResult *TaskBillingResult `json:"billing_result,omitempty"`
 	// 当前任务总费用，不是本次补扣或退款流水。
 	DiscountAmounts *hosttypes.DiscountAmounts `json:"discount_amounts,omitempty"`
 	Key             string                     `json:"key,omitempty"`
@@ -135,6 +139,14 @@ type TaskPrivateData struct {
 	PluginState json.RawMessage `json:"plugin_state,omitempty"`
 	// PollFailures counts consecutive unrecognized or transient poll outcomes.
 	PollFailures int `json:"poll_failures,omitempty"`
+}
+
+// TaskBillingResult 只冻结恢复结算所需的用量和适配器金额，不保存响应正文或媒体。
+type TaskBillingResult struct {
+	TotalTokens      int            `json:"total_tokens,omitempty"`
+	CompletionTokens int            `json:"completion_tokens,omitempty"`
+	UsageFacts       map[string]any `json:"usage_facts,omitempty"`
+	AdjustedQuota    int            `json:"adjusted_quota,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -378,19 +390,52 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	return tasks
 }
 
-// HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is
-// still in progress. It is a cheap existence check (LIMIT 1) used to decide
-// whether the async_task_poll system task needs to run; when no task is pending
-// the scheduler skips creating a row entirely.
+// HasUnfinishedSyncTasks 让未完成任务或到期的待结算任务都能唤醒现有轮询调度。
 func HasUnfinishedSyncTasks() bool {
 	var id int64
 	err := DB.Model(&Task{}).
-		Where("progress != ?", "100%").
-		Where("status != ?", TaskStatusFailure).
-		Where("status != ?", TaskStatusSuccess).
+		Where("(progress != ? AND status NOT IN ?) OR (billing_retry_at > 0 AND billing_retry_at <= ?)", "100%", []TaskStatus{TaskStatusFailure, TaskStatusSuccess}, time.Now().Unix()).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+func GetPendingTaskBilling(ctx context.Context, limit int) ([]*Task, error) {
+	var tasks []*Task
+	err := DB.WithContext(ctx).Where("billing_retry_at > 0 AND billing_retry_at <= ?", time.Now().Unix()).
+		Order("billing_retry_at, id").Limit(limit).Find(&tasks).Error
+	return tasks, err
+}
+
+// CompleteTaskBilling 结束无需资金调整的结算，行锁保护并发更新后的私有数据。
+func CompleteTaskBilling(ctx context.Context, task *Task) error {
+	if task.BillingRetryAt == 0 {
+		return nil
+	}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			if err := tx.Model(&Task{}).Where("id = ?", task.ID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+				return err
+			}
+		}
+		if err := lockForUpdate(tx).First(&stored, task.ID).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.BillingResult = nil
+		return tx.Model(&stored).Updates(map[string]any{"billing_retry_at": 0, "private_data": stored.PrivateData}).Error
+	})
+	if err == nil {
+		task.BillingRetryAt = 0
+		task.PrivateData.BillingResult = nil
+	}
+	return err
+}
+
+func DelayTaskBilling(ctx context.Context, task *Task) error {
+	// 未知提交结果时，已被资金事务清除的标记不能再次恢复。
+	return DB.WithContext(ctx).Model(&Task{}).Where("id = ? AND billing_retry_at = ?", task.ID, task.BillingRetryAt).
+		Update("billing_retry_at", time.Now().Add(time.Minute).Unix()).Error
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {

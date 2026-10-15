@@ -134,6 +134,12 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 		}
 		// 已持久化同一目标不再触碰资金和统计，也不生成第二笔日志。
 		if targetState {
+			if committed.BillingRetryAt > 0 {
+				committed.BillingRetryAt = 0
+				committed.PrivateData.BillingResult = nil
+				return tx.Model(&Task{}).Where("id = ?", committed.ID).
+					Updates(map[string]any{"billing_retry_at": 0, "private_data": committed.PrivateData}).Error
+			}
 			return nil
 		}
 		if delta != 0 {
@@ -196,11 +202,13 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 			}
 		}
 		committed.Quota = target
+		committed.BillingRetryAt = 0
+		committed.PrivateData.BillingResult = nil
 		committed.PrivateData.DiscountAmounts = amounts
 		if snapshot != nil || discount != nil {
 			committed.PrivateData.BillingContext = &settledBilling
 		}
-		if err := tx.Model(&Task{}).Where("id = ?", committed.ID).Updates(map[string]any{"quota": target, "private_data": committed.PrivateData}).Error; err != nil {
+		if err := tx.Model(&Task{}).Where("id = ?", committed.ID).Updates(map[string]any{"quota": target, "private_data": committed.PrivateData, "billing_retry_at": 0}).Error; err != nil {
 			return err
 		}
 		updated = true
@@ -226,5 +234,7 @@ func CommitTaskSettlementWithSnapshot(ctx context.Context, task *Task, target in
 	task.Quota = committed.Quota
 	task.PrivateData.DiscountAmounts = committed.PrivateData.DiscountAmounts
 	task.PrivateData.BillingContext = committed.PrivateData.BillingContext
+	task.BillingRetryAt = committed.BillingRetryAt
+	task.PrivateData.BillingResult = committed.PrivateData.BillingResult
 	return TaskSettlementResult{QuotaDelta: delta, Updated: updated}, nil
 }

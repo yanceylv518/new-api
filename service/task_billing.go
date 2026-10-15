@@ -371,6 +371,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	priceData, discount, discountErr := taskUserModelDiscount(task, map[string]any{"task_tokens": totalTokens}, input, output)
 	if discountErr != nil {
 		logger.LogError(ctx, discountErr.Error())
+		keepTaskPrecharge(ctx, task)
 		return true
 	}
 	if priceData != nil {
