@@ -29,16 +29,16 @@ import {
   FieldLabel,
 } from '@/components/ui/field'
 import { Switch } from '@/components/ui/switch'
-import dayjs from '@/lib/dayjs'
+import { shanghaiTime } from '@/lib/dayjs'
 
 import type { DiscountBranch } from '../lib/user-discount-expression'
 import { timeToMinute } from '../lib/user-discount-time'
 import type { UserModelPricingFormValues } from '../lib/user-model-pricing-form'
 import {
   ALL_DAY_EVERY_DAY,
-  isLocalDayStart,
-  localDayEnd,
-  localDayStart,
+  discountDayEnd,
+  discountDayStart,
+  isDiscountDayStart,
   validityEndDate,
 } from '../lib/user-temporary-discount'
 import { DiscountPercentInput, DiscountTimeInput } from './user-discount-inputs'
@@ -46,8 +46,6 @@ import { DiscountPercentInput, DiscountTimeInput } from './user-discount-inputs'
 export type TemporaryDiscountRule = NonNullable<
   UserModelPricingFormValues['items'][number]['periods']
 >[number]
-
-const BEIJING_UTC_OFFSET_MINUTES = 480
 
 /** 默认表单：折扣比例、按天的有效期和每天的生效时段。 */
 export function TemporaryDiscountSimpleFields(props: {
@@ -83,8 +81,8 @@ export function TemporaryDiscountSimpleFields(props: {
     }
   }
   const preciseValidity =
-    (start != null && !isLocalDayStart(start)) ||
-    (end != null && !isLocalDayStart(end))
+    (start != null && !isDiscountDayStart(start)) ||
+    (end != null && !isDiscountDayStart(end))
   const dateError = props.errors.start_time || props.errors.end_time
 
   return (
@@ -119,13 +117,15 @@ export function TemporaryDiscountSimpleFields(props: {
             clearable={false}
             value={
               start != null
-                ? dayjs.unix(start).startOf('day').toDate()
+                ? shanghaiTime(start * 1000)
+                    .startOf('day')
+                    .toDate()
                 : undefined
             }
             placeholder={t('On save')}
             onChange={(value) =>
               props.onChange({
-                start_time: value ? localDayStart(value) : null,
+                start_time: value ? discountDayStart(value) : null,
               })
             }
           />
@@ -142,7 +142,7 @@ export function TemporaryDiscountSimpleFields(props: {
             value={end != null ? validityEndDate(end) : undefined}
             onChange={(value) =>
               props.onChange({
-                end_time: value ? localDayEnd(value) : null,
+                end_time: value ? discountDayEnd(value) : null,
                 legacy_unbounded: false,
               })
             }
@@ -155,8 +155,9 @@ export function TemporaryDiscountSimpleFields(props: {
               variant='outline'
               onClick={() =>
                 props.onChange({
-                  end_time: dayjs
-                    .unix(start ?? Math.floor(Date.now() / 1000))
+                  end_time: shanghaiTime(
+                    (start ?? Math.floor(Date.now() / 1000)) * 1000
+                  )
                     .startOf('day')
                     .add(days, 'day')
                     .unix(),
@@ -239,14 +240,6 @@ export function TemporaryDiscountSimpleFields(props: {
         {timeError && (
           <FieldError id={`${props.id}-daily-error`}>{timeError}</FieldError>
         )}
-        {dayjs().utcOffset() !== BEIJING_UTC_OFFSET_MINUTES && (
-          <FieldDescription>
-            {t(
-              'Dates follow your local time zone ({{zone}}). Daily hours follow Beijing time.',
-              { zone: Intl.DateTimeFormat().resolvedOptions().timeZone }
-            )}
-          </FieldDescription>
-        )}
       </Field>
     </FieldGroup>
   )
@@ -265,30 +258,24 @@ export function TemporaryDiscountValidityFields(props: {
 
   return (
     <div className='flex flex-col gap-3 border-b pb-4'>
-      <div className='flex flex-wrap items-center justify-between gap-2'>
-        <span className='text-muted-foreground text-xs'>
-          {t('Validity period (local time)')} ·{' '}
-          {Intl.DateTimeFormat().resolvedOptions().timeZone}
-        </span>
-        <div className='flex items-center gap-2'>
-          {([7, 30] as const).map((days) => (
-            <Button
-              type='button'
-              key={days}
-              size='sm'
-              variant='outline'
-              onClick={() =>
-                props.onChange({
-                  end_time:
-                    (start ?? Math.floor(Date.now() / 1000)) + days * 86400,
-                  legacy_unbounded: false,
-                })
-              }
-            >
-              {t('For {{days}} days', { days })}
-            </Button>
-          ))}
-        </div>
+      <div className='flex flex-wrap justify-end gap-2'>
+        {([7, 30] as const).map((days) => (
+          <Button
+            type='button'
+            key={days}
+            size='sm'
+            variant='outline'
+            onClick={() =>
+              props.onChange({
+                end_time:
+                  (start ?? Math.floor(Date.now() / 1000)) + days * 86400,
+                legacy_unbounded: false,
+              })
+            }
+          >
+            {t('For {{days}} days', { days })}
+          </Button>
+        ))}
       </div>
       <FieldGroup className='grid gap-3 md:grid-cols-2'>
         <Field data-invalid={Boolean(props.errors.start_time)}>

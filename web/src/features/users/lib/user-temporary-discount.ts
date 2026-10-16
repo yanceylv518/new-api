@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { TFunction } from 'i18next'
 
-import dayjs from '@/lib/dayjs'
+import { shanghaiTime } from '@/lib/dayjs'
 
 import {
   DISCOUNT_TIME_FIELDS,
@@ -127,24 +127,28 @@ export function isSimpleTemporaryDiscount(
   return Boolean(schedule && new Set(schedule.days).size === 7)
 }
 
-export function isLocalDayStart(timestamp: number): boolean {
-  return dayjs.unix(timestamp).startOf('day').unix() === timestamp
+export function isDiscountDayStart(timestamp: number): boolean {
+  return (
+    shanghaiTime(timestamp * 1000)
+      .startOf('day')
+      .unix() === timestamp
+  )
 }
 
-export function localDayStart(date: Date): number {
-  return dayjs(date).startOf('day').unix()
+export function discountDayStart(date: Date): number {
+  return shanghaiTime(date).startOf('day').unix()
 }
 
 /** 有效期不包含结束时刻，所选结束日期的整天都在有效期内。 */
-export function localDayEnd(date: Date): number {
-  return dayjs(date).startOf('day').add(1, 'day').unix()
+export function discountDayEnd(date: Date): number {
+  return shanghaiTime(date).startOf('day').add(1, 'day').unix()
 }
 
 /** 结束于零点时展示前一天，否则展示结束时刻所在日期。 */
 export function validityEndDate(end: number): Date {
-  const time = dayjs.unix(end)
+  const time = shanghaiTime(end * 1000)
   return (
-    isLocalDayStart(end) ? time.subtract(1, 'day') : time.startOf('day')
+    isDiscountDayStart(end) ? time.subtract(1, 'day') : time.startOf('day')
   ).toDate()
 }
 
@@ -155,17 +159,15 @@ export function formatValidityRange(
 ): string {
   let start = labels.start
   if (period.start_time) {
-    start = dayjs
-      .unix(period.start_time)
-      .format(
-        isLocalDayStart(period.start_time) ? 'YYYY-MM-DD' : 'YYYY-MM-DD HH:mm'
-      )
+    start = shanghaiTime(period.start_time * 1000).format(
+      isDiscountDayStart(period.start_time) ? 'YYYY-MM-DD' : 'YYYY-MM-DD HH:mm'
+    )
   }
   let end = labels.end
   if (period.end_time != null) {
-    end = isLocalDayStart(period.end_time)
-      ? dayjs(validityEndDate(period.end_time)).format('YYYY-MM-DD')
-      : dayjs.unix(period.end_time).format('YYYY-MM-DD HH:mm')
+    end = isDiscountDayStart(period.end_time)
+      ? shanghaiTime(validityEndDate(period.end_time)).format('YYYY-MM-DD')
+      : shanghaiTime(period.end_time * 1000).format('YYYY-MM-DD HH:mm')
   }
   return `${start} → ${end}`
 }

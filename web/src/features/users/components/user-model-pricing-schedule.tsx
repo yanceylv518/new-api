@@ -34,7 +34,7 @@ import {
 } from '@/components/ui/collapsible'
 import { Field, FieldError, FieldGroup } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
-import dayjs from '@/lib/dayjs'
+import { shanghaiTime } from '@/lib/dayjs'
 import { cn } from '@/lib/utils'
 
 import {
@@ -45,7 +45,7 @@ import {
 import {
   describeTemporaryDiscountRules,
   formatValidityRange,
-  isLocalDayStart,
+  isDiscountDayStart,
 } from '../lib/user-temporary-discount'
 import { UserDiscountRuleEditor } from './user-discount-rule-editor'
 
@@ -126,11 +126,13 @@ function newTemporaryDiscount(
   permanentPercent: number | null | undefined
 ): PeriodDraft {
   const lastEnd = Math.max(0, ...periods.map((period) => period.end_time ?? 0))
-  let start = dayjs().startOf('day')
+  let start = shanghaiTime().startOf('day')
   if (lastEnd > start.unix()) {
-    start = isLocalDayStart(lastEnd)
-      ? dayjs.unix(lastEnd)
-      : dayjs.unix(lastEnd).startOf('day').add(1, 'day')
+    start = isDiscountDayStart(lastEnd)
+      ? shanghaiTime(lastEnd * 1000)
+      : shanghaiTime(lastEnd * 1000)
+          .startOf('day')
+          .add(1, 'day')
   }
   return {
     discount_percent: permanentPercent ?? 100,

@@ -354,8 +354,8 @@ describe('user model pricing overview row', () => {
 
   // 抽屉直接说明每条折扣的类型、有效期和生效时段，不需要再点开百分比。
   test('lists permanent and temporary discounts with their effective time', async () => {
-    const start = new Date(2030, 9, 8).getTime() / 1000
-    const end = new Date(2030, 9, 15).getTime() / 1000
+    const start = new Date('2030-10-08T00:00:00+08:00').getTime() / 1000
+    const end = new Date('2030-10-15T00:00:00+08:00').getTime() / 1000
     detailRules = [
       { model_name: 'model-01', mode: 'layered', slot: -1, discount_bps: 4500 },
       {

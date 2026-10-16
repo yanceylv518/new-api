@@ -21,31 +21,31 @@ import { describe, expect, test } from 'vitest'
 import {
   formatValidityRange,
   isSimpleTemporaryDiscount,
-  localDayEnd,
-  localDayStart,
+  discountDayEnd,
+  discountDayStart,
   temporaryDiscountVisual,
   validityEndDate,
 } from '../user-temporary-discount'
 
-// 用本地时间构造日期，断言与运行测试的时区无关。
+// 用明确的 UTC+8 构造期望时刻，不依赖测试进程的时区。
 const timestamp = (...parts: [number, number, number, number?, number?]) =>
-  new Date(...parts).getTime() / 1000
+  (Date.UTC(...parts) - 8 * 3600 * 1000) / 1000
 const labels = { start: 'on save', end: 'no end' }
 const everyDay = [0, 1, 2, 3, 4, 5, 6]
 
 describe('temporary discount validity', () => {
   test('a selected end date keeps the whole day inside the validity period', () => {
-    const end = localDayEnd(new Date(2030, 9, 14, 15, 30))
+    const end = discountDayEnd(new Date('2030-10-14T15:30:00+08:00'))
     expect(end).toBe(timestamp(2030, 9, 15))
-    expect(validityEndDate(end)).toEqual(new Date(2030, 9, 14))
-    expect(localDayStart(new Date(2030, 9, 8, 15, 30))).toBe(
+    expect(validityEndDate(end)).toEqual(new Date('2030-10-14T00:00:00+08:00'))
+    expect(discountDayStart(new Date('2030-10-08T15:30:00+08:00'))).toBe(
       timestamp(2030, 9, 8)
     )
   })
 
   test('a minute-precision end stays on its own date', () => {
     expect(validityEndDate(timestamp(2030, 9, 15, 14, 17))).toEqual(
-      new Date(2030, 9, 15)
+      new Date('2030-10-15T00:00:00+08:00')
     )
   })
 

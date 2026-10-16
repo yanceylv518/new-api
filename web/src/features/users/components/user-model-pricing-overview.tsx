@@ -243,9 +243,7 @@ function DiscountRate(props: { rule: UserModelPricingItem }) {
         ))}
       </PopoverTrigger>
       <PopoverContent className='w-80 space-y-3' align='end'>
-        <p className='text-sm font-medium'>
-          {t('Time-based discounts')} · {t('Beijing time')}
-        </p>
+        <p className='text-sm font-medium'>{t('Time-based discounts')}</p>
         {timeOnly &&
           config?.branches.map((branch, index) => (
             <div

@@ -287,9 +287,6 @@ export function UserDiscountRuleEditor(props: {
           <span className='flex items-center gap-2 text-sm font-medium'>
             <Clock3 className='size-4' aria-hidden='true' />
             {t('Time-based discounts')}
-            <span className='text-muted-foreground text-xs font-normal'>
-              {t('Beijing time')}
-            </span>
           </span>
           <DropdownMenu>
             <DropdownMenuTrigger

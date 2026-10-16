@@ -28,7 +28,7 @@ import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import dayjs from '@/lib/dayjs'
+import { shanghaiTime } from '@/lib/dayjs'
 
 import { getUserModelPricingHistory } from '../api'
 import type { UserModelPricingHistoryItem } from '../types'
@@ -67,12 +67,16 @@ function HistoryConfiguration(props: {
             >
               {period.expression || `${String(period.discount_bps / 100)}%`} ·{' '}
               {period.start_time
-                ? dayjs.unix(period.start_time).format('YYYY-MM-DD HH:mm')
+                ? shanghaiTime(period.start_time * 1000).format(
+                    'YYYY-MM-DD HH:mm'
+                  )
                 : t('Existing rule')}
               {' → '}
               {period.end_time == null
                 ? t('Permanent')
-                : dayjs.unix(period.end_time).format('YYYY-MM-DD HH:mm')}
+                : shanghaiTime(period.end_time * 1000).format(
+                    'YYYY-MM-DD HH:mm'
+                  )}
             </p>
           ))}
         </>
@@ -178,7 +182,10 @@ function HistoryContent(props: { userId?: number }) {
             <p className='text-muted-foreground text-xs'>
               {t('User ID')}: {item.user_id} · {t('Operator ID')}:{' '}
               {item.actor_id || t('System')} · {t('Revision')}: {item.revision}{' '}
-              · {dayjs.unix(item.created_at).format('YYYY-MM-DD HH:mm:ss')}
+              ·{' '}
+              {shanghaiTime(item.created_at * 1000).format(
+                'YYYY-MM-DD HH:mm:ss'
+              )}
             </p>
             <div className='flex flex-col gap-2 sm:flex-row'>
               <HistoryConfiguration label={t('Before')} value={item.before} />

@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { ChevronDownIcon } from 'lucide-react'
 import * as React from 'react'
+import { TZDate } from 'react-day-picker'
 import { enUS, fr, ja, ru, vi, zhCN } from 'react-day-picker/locale'
 import { useTranslation } from 'react-i18next'
 
@@ -29,7 +30,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import dayjs from '@/lib/dayjs'
+import { SHANGHAI_TIME_ZONE, shanghaiTime } from '@/lib/dayjs'
 import { cn } from '@/lib/utils'
 
 const calendarLocales = {
@@ -75,7 +76,7 @@ export function DateTimePicker({
   const placeholderText = placeholder ?? t('Select date')
   const calendarLocale =
     calendarLocales[i18n.language as keyof typeof calendarLocales] ?? enUS
-  const currentYear = new Date().getFullYear()
+  const currentYear = shanghaiTime().year()
   const [open, setOpen] = React.useState(false)
   const [date, setDate] = React.useState<Date | undefined>(value)
   const [month, setMonth] = React.useState<Date | undefined>(value)
@@ -89,9 +90,7 @@ export function DateTimePicker({
     setDate(value)
     setMonth(value)
     if (value) {
-      const hours = value.getHours().toString().padStart(2, '0')
-      const minutes = value.getMinutes().toString().padStart(2, '0')
-      setTime(`${hours}:${minutes}`)
+      setTime(shanghaiTime(value).format('HH:mm'))
     }
   }, [value])
 
@@ -100,7 +99,7 @@ export function DateTimePicker({
       const selectedTime = time || '00:00'
       const [hours, minutes] = selectedTime.split(':').map(Number)
       setTime(selectedTime)
-      const newDate = new Date(selectedDate)
+      const newDate = new TZDate(selectedDate, SHANGHAI_TIME_ZONE)
       newDate.setHours(hours, minutes, 0, 0)
       setDate(newDate)
       setMonth(newDate)
@@ -123,7 +122,7 @@ export function DateTimePicker({
         return
       }
       const [hours, minutes] = newTime.split(':').map(Number)
-      const newDate = new Date(date)
+      const newDate = new TZDate(date, SHANGHAI_TIME_ZONE)
       newDate.setHours(hours, minutes, 0, 0)
       setDate(newDate)
       onChange?.(newDate)
@@ -157,20 +156,21 @@ export function DateTimePicker({
             />
           }
         >
-          {date ? dayjs(date).format('YYYY-MM-DD') : placeholderText}
+          {date ? shanghaiTime(date).format('YYYY-MM-DD') : placeholderText}
           <ChevronDownIcon className='h-4 w-4 opacity-50' />
         </PopoverTrigger>
         <PopoverContent className='w-auto overflow-hidden p-0' align='start'>
           <Calendar
             mode='single'
+            timeZone={SHANGHAI_TIME_ZONE}
             selected={date}
             month={month}
             onMonthChange={setMonth}
             captionLayout='dropdown'
             onSelect={handleDateSelect}
             locale={calendarLocale}
-            startMonth={new Date(currentYear - 100, 0)}
-            endMonth={new Date(currentYear + 100, 11)}
+            startMonth={new TZDate(currentYear - 100, 0, SHANGHAI_TIME_ZONE)}
+            endMonth={new TZDate(currentYear + 100, 11, SHANGHAI_TIME_ZONE)}
           />
         </PopoverContent>
       </Popover>

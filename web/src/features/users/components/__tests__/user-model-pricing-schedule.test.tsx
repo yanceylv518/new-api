@@ -29,8 +29,6 @@ import i18n from 'i18next'
 import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
-import dayjs from '@/lib/dayjs'
-
 import { parseDiscountExpression } from '../../lib/user-discount-expression'
 import {
   PricingPeriodStatusBadge,
@@ -39,9 +37,8 @@ import {
 
 const firstStart = new Date('2030-10-08T10:00:00+08:00').getTime() / 1000
 const secondStart = firstStart + 3600
-// 简单表单按浏览器本地时间的整天编辑，测试用本地零点保证与运行时区无关。
-const dayStart = new Date(2030, 9, 8).getTime() / 1000
-const dayEnd = new Date(2030, 9, 15).getTime() / 1000
+const dayStart = new Date('2030-10-08T00:00:00+08:00').getTime() / 1000
+const dayEnd = new Date('2030-10-15T00:00:00+08:00').getTime() / 1000
 const allDayExpression = (ratio: string) =>
   `((weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 0)) ? ${ratio} : permanent_discount`
 
@@ -172,7 +169,7 @@ describe('permanent and temporary discount editors', () => {
 
   test('starts a first temporary discount as an all-day form that requires a percentage', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(new Date(2030, 9, 8, 14, 17))
+    vi.setSystemTime(new Date('2030-10-08T14:17:00+08:00'))
     const { onApply } = renderSchedule()
     expect(screen.queryByRole('tab')).not.toBeInTheDocument()
     expect(
@@ -303,7 +300,7 @@ describe('permanent and temporary discount editors', () => {
     )
     expect(onApply.mock.calls.at(-1)?.[0].periods?.[0]).toMatchObject({
       start_time: dayStart,
-      end_time: dayjs.unix(dayStart).add(30, 'day').unix(),
+      end_time: dayStart + 30 * 86400,
     })
   })
 
