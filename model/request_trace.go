@@ -11,6 +11,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const requestTraceTableName = "request_trace_timeline"
+
 // RequestTrace 的列集合固定；新增采集内容只扩展带版本的 TraceData。
 type RequestTrace struct {
 	Id                            int64   `json:"id" gorm:"primaryKey;autoIncrement;index:idx_request_traces_started,priority:2;index:idx_request_traces_user_started,priority:3"`
@@ -36,6 +38,10 @@ type RequestTrace struct {
 	TraceData                     string  `json:"-" gorm:"not null"`
 }
 
+func (RequestTrace) TableName() string {
+	return requestTraceTableName
+}
+
 var requestTraceColumns = [...]string{
 	"id", "request_id", "user_id", "token_id", "model_name", "group_name", "final_channel_id",
 	"request_kind", "is_stream", "http_status", "outcome", "started_at_us", "finished_at_us", "duration_us",
@@ -57,7 +63,7 @@ func MigrateRequestTraces() error {
 		return err
 	}
 	if len(statement.Schema.DBNames) != len(requestTraceColumns) {
-		return errors.New("request_traces model column contract mismatch")
+		return errors.New("request_trace_timeline model column contract mismatch")
 	}
 	modelColumns := make(map[string]bool, len(requestTraceColumns))
 	for _, name := range statement.Schema.DBNames {
@@ -65,11 +71,38 @@ func MigrateRequestTraces() error {
 	}
 	for _, name := range requestTraceColumns {
 		if !modelColumns[name] {
-			return fmt.Errorf("request_traces model is missing required column %s", name)
+			return fmt.Errorf("request_trace_timeline model is missing required column %s", name)
+		}
+	}
+	if LOG_DB.Migrator().HasTable("request_traces") {
+		columns, err := LOG_DB.Migrator().ColumnTypes("request_traces")
+		if err != nil {
+			return fmt.Errorf("inspect legacy request_traces table: %w", err)
+		}
+		legacyTimeline := len(columns) == len(requestTraceColumns)
+		for _, column := range columns {
+			if !modelColumns[column.Name()] {
+				legacyTimeline = false
+				break
+			}
+		}
+		// 同名六列表属于请求形状追踪，只有完整匹配 21 列的旧时间线表才改名。
+		if legacyTimeline {
+			if LOG_DB.Migrator().HasTable(&RequestTrace{}) {
+				return errors.New("legacy request_traces timeline and request_trace_timeline both exist; resolve the table conflict before startup")
+			}
+			if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+				err = LOG_DB.Exec("RENAME TABLE ? TO ?", clause.Table{Name: "request_traces"}, clause.Table{Name: requestTraceTableName}).Error
+			} else {
+				err = LOG_DB.Migrator().RenameTable("request_traces", requestTraceTableName)
+			}
+			if err != nil {
+				return fmt.Errorf("rename legacy timeline table to request_trace_timeline: %w", err)
+			}
 		}
 	}
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		if err := LOG_DB.Exec(`CREATE TABLE IF NOT EXISTS request_traces (
+		if err := LOG_DB.Exec(`CREATE TABLE IF NOT EXISTS request_trace_timeline (
 			id Int64 DEFAULT 0, request_id String, user_id Nullable(Int64), token_id Nullable(Int64),
 			model_name Nullable(String), group_name Nullable(String), final_channel_id Nullable(Int64),
 			request_kind String, is_stream Nullable(UInt8), http_status Nullable(Int32), outcome String,
@@ -81,7 +114,7 @@ func MigrateRequestTraces() error {
 		ORDER BY (request_id)`).Error; err != nil {
 			return err
 		}
-		if err := LOG_DB.Exec(fmt.Sprintf("ALTER TABLE request_traces MODIFY TTL toDateTime(intDiv(started_at_us, 1000000)) + INTERVAL %d DAY", RequestTraceRetentionDays())).Error; err != nil {
+		if err := LOG_DB.Exec(fmt.Sprintf("ALTER TABLE request_trace_timeline MODIFY TTL toDateTime(intDiv(started_at_us, 1000000)) + INTERVAL %d DAY", RequestTraceRetentionDays())).Error; err != nil {
 			return err
 		}
 	} else if !LOG_DB.Migrator().HasTable(&RequestTrace{}) {
@@ -103,22 +136,22 @@ func MigrateRequestTraces() error {
 		actual[column.Name()] = true
 	}
 	if len(actual) != len(requestTraceColumns) {
-		return errors.New("request_traces column contract mismatch")
+		return errors.New("request_trace_timeline column contract mismatch")
 	}
 	for _, name := range requestTraceColumns {
 		if !actual[name] {
-			return fmt.Errorf("request_traces is missing required column %s", name)
+			return fmt.Errorf("request_trace_timeline is missing required column %s", name)
 		}
 	}
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		var compressionCodec string
-		if err := LOG_DB.Raw("SELECT compression_codec FROM system.columns WHERE database = currentDatabase() AND table = 'request_traces' AND name = 'trace_data'").Row().Scan(&compressionCodec); err != nil {
-			return fmt.Errorf("read request_traces compression codec: %w", err)
+		if err := LOG_DB.Raw("SELECT compression_codec FROM system.columns WHERE database = currentDatabase() AND table = ? AND name = 'trace_data'", requestTraceTableName).Row().Scan(&compressionCodec); err != nil {
+			return fmt.Errorf("read request_trace_timeline compression codec: %w", err)
 		}
 		if compressionCodec != "CODEC(ZSTD(1))" {
 			// 只修改列压缩元数据，已有数据块随正常合并采用新 codec。
-			if err := LOG_DB.Exec("ALTER TABLE request_traces MODIFY COLUMN trace_data CODEC(ZSTD(1))").Error; err != nil {
-				return fmt.Errorf("configure request_traces compression codec: %w", err)
+			if err := LOG_DB.Exec("ALTER TABLE request_trace_timeline MODIFY COLUMN trace_data CODEC(ZSTD(1))").Error; err != nil {
+				return fmt.Errorf("configure request_trace_timeline compression codec: %w", err)
 			}
 		}
 	} else {
@@ -160,7 +193,7 @@ func InsertRequestTraces(ctx context.Context, entries []*RequestTrace) error {
 				rows[i].HTTPStatus = &status
 			}
 		}
-		return db.Table("request_traces").Create(&rows).Error
+		return db.Table(requestTraceTableName).Create(&rows).Error
 	}
 	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
 		// 无关联写入，显式保证整批为单条 INSERT，由 InnoDB 保证语句原子性。
@@ -182,7 +215,7 @@ func findRequestTrace(ctx context.Context, requestID string, userID int, include
 	query := LOG_DB.WithContext(ctx).Model(&RequestTrace{})
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		// 显式别名避免 GORM 把 FINAL 识别为表别名。
-		query = query.Table("request_traces AS request_trace FINAL")
+		query = query.Table(requestTraceTableName + " AS request_trace FINAL")
 	}
 	query = query.Where("request_id = ?", requestID)
 	if userID > 0 {

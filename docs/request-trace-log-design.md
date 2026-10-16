@@ -2,6 +2,14 @@
 
 原稿日期：2026-10-09。原稿基线为 `custom/rc35-user-model-discount` 的 `3cf493fbe`。
 
+## 2026-10-16：时间线表命名
+
+时间线表统一使用 `request_trace_timeline`，通过显式 GORM `TableName` 固定名称，建表、写入、查询、清理及 ClickHouse 的 TTL/列压缩路径均使用该名称。固定 21 列、既有索引名称、载荷版本及压缩格式保持不变，表改名复用原索引，不额外创建等价索引。
+
+master 启动迁移会检查旧 `request_traces`：只有列集合完整匹配现有 21 列合同且新表不存在时，才将旧时间线表原地改名，历史数据无需复制或重新编码。另一套请求形状追踪的六列表不改名，直接独立创建新时间线表。旧时间线表和新表同时存在时停止迁移并报告冲突，不自动合并或覆盖任何表。迁移中途失败后，重启会根据实际表名继续执行列及索引检查。
+
+旧版节点仍访问旧表名，升级时先停止旧版节点，再由新版 master 完成改名后启动其他新版节点；回滚需要恢复对应表名，不支持两种表名的节点混跑。本次仅修改实现和说明，未在现有数据库执行改名，也未运行新的数据库或行为测试。
+
 ## 2026-10-16：撤回 MySQL 驱动升级
 
 MySQL 驱动已恢复为 `go-sql-driver/mysql v1.7.0`，移除升级引入的 `filippo.io/edwards25519 v1.2.0` 依赖及对应校验和。此前的时间线编码、批量写入、清理和查询优化继续保留，固定 21 列、采集内容、微秒精度与 JSON＋Zstd＋Base64 存储合同不变。
@@ -35,7 +43,7 @@ MySQL 驱动已恢复为 `go-sql-driver/mysql v1.7.0`，移除升级引入的 `f
 
 默认部署继续使用 PostgreSQL，也支持沿用 MySQL。`LOG_SQL_DSN` 未配置时，日志与请求时间线跟随主库；需要独立日志库时显式配置 PostgreSQL/MySQL 的 `LOG_SQL_DSN`。ClickHouse 仅保留显式配置的兼容支持，不作为默认选项，也不自动切换现有部署的数据库。
 
-PostgreSQL/MySQL 的 `request_traces.trace_data` 沿用逐条 Zstd 压缩、标准 Base64 与 JSON 封装，默认快速档 `fastest`，管理员可在系统设置选择其他三档。只有完整封装小于原始 JSON 时才保存压缩形式，短记录保持原文；读取端兼容历史原文和所有压缩档位。固定 21 列及按 `request_id` 查询的合同不变。
+PostgreSQL/MySQL 的 `request_trace_timeline.trace_data` 沿用逐条 Zstd 压缩、标准 Base64 与 JSON 封装，默认快速档 `fastest`，管理员可在系统设置选择其他三档。只有完整封装小于原始 JSON 时才保存压缩形式，短记录保持原文；读取端兼容历史原文和所有压缩档位。固定 21 列及按 `request_id` 查询的合同不变。
 
 本次核对确认数据库路由和压缩默认值已符合上述选择，仅补充默认方案及环境配置说明。下文保留 ClickHouse 的实现和对照实验，作为显式选用时的技术依据；压缩收益不作为默认切换数据库的理由。
 
@@ -83,7 +91,7 @@ PostgreSQL/MySQL 的 `request_traces.trace_data` 沿用逐条 Zstd 压缩、标�
 
 ClickHouse 日志库的新时间线直接保存原始 JSON；异步写入协程按启动时确定的日志库类型跳过逐条 Zstd、Base64 封装和应用压缩档位读取，不创建应用编码器。请求采集、64 KiB 原文上限、批次字节上限、重试及队列计数沿用现有行为。
 
-新表显式声明 `trace_data String CODEC(ZSTD(1))`。已有表通过固定 21 列检查后，从 system.columns 读取 compression_codec；只有与 CODEC(ZSTD(1)) 不同时执行 `ALTER TABLE request_traces MODIFY COLUMN trace_data CODEC(ZSTD(1))`。此操作只更新列压缩元数据，不增加或删除字段，不改变 String 类型及载荷版本。启动时不强制 OPTIMIZE、不全量重写历史 JSON；旧数据块保留其原来的物理编码，后续正常合并采用新 codec。
+新表显式声明 `trace_data String CODEC(ZSTD(1))`。已有表通过固定 21 列检查后，从 system.columns 读取 compression_codec；只有与 CODEC(ZSTD(1)) 不同时执行 `ALTER TABLE request_trace_timeline MODIFY COLUMN trace_data CODEC(ZSTD(1))`。此操作只更新列压缩元数据，不增加或删除字段，不改变 String 类型及载荷版本。启动时不强制 OPTIMIZE、不全量重写历史 JSON；旧数据块保留其原来的物理编码，后续正常合并采用新 codec。
 
 历史 Zstd/Base64 封装继续由既有读取器自动识别，和新原文记录混合查询；原有摘要权限、解压上限及无效数据降级不变。已有记录的应用压缩封装内容不会因列 codec 修改而自动变回原文。
 
@@ -133,7 +141,7 @@ ClickHouse 写入在模型边界使用临时投影，将 `is_stream` 的可空�
 
 ### 固定字段合同
 
-`request_traces` 使用独立日志库 `LOG_DB`；未单独配置日志库时与主库共用数据库。每个入站中转请求形成一条逻辑终态记录，通过 `request_id` 关联零到多条现有日志，不设置跨表外键，不向 `logs.other` 写入追踪数据。
+`request_trace_timeline` 使用独立日志库 `LOG_DB`；未单独配置日志库时与主库共用数据库。每个入站中转请求形成一条逻辑终态记录，通过 `request_id` 关联零到多条现有日志，不设置跨表外键，不向 `logs.other` 写入追踪数据。
 
 列集合固定为以下 21 项，后续不得通过新增或删除列扩展采集内容：
 
