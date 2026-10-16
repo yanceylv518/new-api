@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"mime/multipart"
@@ -592,6 +593,83 @@ export function buildContentRequest(ctx) { return {url:"https://cdn.example/vide
 	require.NotNil(t, descriptor)
 	assert.True(t, descriptor.Credentialless)
 	assert.Equal(t, "https://cdn.example/video.mp4", descriptor.URL)
+}
+
+func TestViduArtifactsMatchPersistedUpstreamTask(t *testing.T) {
+	source, err := plugins.Source("vidu")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{Key: "vidu"})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}})
+
+	for _, tc := range []struct {
+		name       string
+		upstreamID string
+		data       string
+		wantURLs   []string
+	}{
+		{
+			name: "multiple tasks and creations", upstreamID: "upstream-target",
+			data:     `{"tasks":[{"id":"other-task","state":"success","creations":[{"url":"https://cdn.example/other.mp4"}]},{"id":"upstream-target","state":"success","creations":[{"url":"https://cdn.example/target.mp4"},{"watermarked_url":"https://cdn.example/target-wm.mp4"}]}]}`,
+			wantURLs: []string{"https://cdn.example/target.mp4", "https://cdn.example/target-wm.mp4"},
+		},
+		{
+			name: "single unrelated task", upstreamID: "upstream-target",
+			data: `{"tasks":[{"id":"other-task","state":"success","creations":[{"url":"https://cdn.example/other.mp4"}]}]}`,
+		},
+		{
+			name: "unrelated task object", upstreamID: "upstream-target",
+			data: `{"id":"other-task","state":"success","creations":[{"url":"https://cdn.example/other.mp4"}]}`,
+		},
+		{
+			name: "nested task result", upstreamID: "upstream-target",
+			data:     `{"data":{"task":{"task_id":"upstream-target","state":"success","creations":[{"url":"https://cdn.example/target.mp4"}]}}}`,
+			wantURLs: []string{"https://cdn.example/target.mp4"},
+		},
+		{
+			name:     "legacy task without private ID",
+			data:     `{"tasks":[{"id":"other-task","state":"success","creations":[{"url":"https://cdn.example/other.mp4"}]},{"id":"public-task","state":"success","creations":[{"url":"https://cdn.example/target.mp4"}]}]}`,
+			wantURLs: []string{"https://cdn.example/target.mp4"},
+		},
+		{
+			name: "legacy result without record ID", upstreamID: "upstream-target",
+			data:     `{"creations":[{"url":"https://cdn.example/target.mp4"}]}`,
+			wantURLs: []string{"https://cdn.example/target.mp4"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &model.Task{
+				TaskID: "public-task", Status: model.TaskStatusSuccess, Data: []byte(tc.data),
+				PrivateData: model.TaskPrivateData{
+					UpstreamTaskID: tc.upstreamID,
+					Execution:      &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Version: "1.1.0"}},
+				},
+			}
+			artifacts, err := adaptor.ListArtifacts(task)
+			require.NoError(t, err)
+			require.Len(t, artifacts, len(tc.wantURLs))
+			if len(tc.wantURLs) == 0 {
+				_, err = adaptor.BuildContentRequest(task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
+				require.ErrorContains(t, err, "artifact_not_found")
+				return
+			}
+			for i, url := range tc.wantURLs {
+				key := "video"
+				if i > 0 {
+					key = fmt.Sprintf("video-%d", i+1)
+				}
+				assert.Equal(t, channel.TaskArtifact{Key: key, Type: "video", MimeType: "video/mp4"}, artifacts[i])
+				descriptor, err := adaptor.BuildContentRequest(task, key, channel.TaskArtifactClientRequest{Method: http.MethodGet})
+				require.NoError(t, err)
+				require.NotNil(t, descriptor)
+				assert.Equal(t, url, descriptor.URL)
+				assert.Equal(t, http.MethodGet, descriptor.Method)
+				assert.True(t, descriptor.Credentialless)
+			}
+			assert.JSONEq(t, tc.data, string(task.Data))
+		})
+	}
 }
 
 func TestTaskAdaptorMapsJSContract(t *testing.T) {

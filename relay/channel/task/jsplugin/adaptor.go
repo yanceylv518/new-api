@@ -989,7 +989,6 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 	if err != nil {
 		return nil, err
 	}
-	ctx["upstreamTaskId"] = task.GetUpstreamTaskID()
 	ctx["artifactKey"] = artifactKey
 	ctx["baseUrl"] = a.info.ChannelBaseUrl
 	ctx["clientRequest"] = jsonValue(clientRequest)
@@ -1068,6 +1067,7 @@ func taskArtifactContext(task *model.Task) (map[string]any, error) {
 	}
 	return map[string]any{
 		"taskId":          task.TaskID,
+		"upstreamTaskId":  task.GetUpstreamTaskID(),
 		"status":          string(task.Status),
 		"action":          task.Action,
 		"data":            data,

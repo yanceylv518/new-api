@@ -55,7 +55,7 @@ export const meta = {
     en: "Shengshu Vidu video generation and template workflows",
     zh: "生数 Vidu 视频生成及模板工作流",
   },
-  version: "1.1.0",
+  version: "1.1.1",
   author: { name: "QuantumNous" },
   channelTypes: [52],
   upstreams: ["vendor", "new_api"],
@@ -443,7 +443,12 @@ export function parseTaskResult(ctx, body) {
 
 function artifactData(ctx) {
   const data = (ctx && ctx.data) || {};
-  return viduTaskRecord(data, ctx && (ctx.taskId || ctx.task_id)) || data;
+  const upstreamTaskId = trimmed(ctx && ctx.upstreamTaskId);
+  const record = viduTaskRecord(data, upstreamTaskId || (ctx && (ctx.taskId || ctx.task_id))) || data;
+  // 单条结果的旧版回退也不能选中其他任务的制品。
+  if (upstreamTaskId && (trimmed(record.id) || trimmed(record.task_id)) &&
+      trimmed(record.id) !== upstreamTaskId && trimmed(record.task_id) !== upstreamTaskId) return {};
+  return record;
 }
 
 function artifactEntries(ctx) {
