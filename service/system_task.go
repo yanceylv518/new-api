@@ -350,6 +350,16 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 	}
 
 	state := LogCleanupState{}
+	for {
+		deleted, err := model.DeleteOldRequestTraces(ctx, payload.TargetTimestamp, payload.BatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		if deleted == 0 {
+			break
+		}
+	}
 	if err := task.DecodeState(&state); err != nil {
 		failSystemTask(task, runnerID, err)
 		return

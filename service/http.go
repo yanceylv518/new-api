@@ -24,18 +24,18 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 }
 
 // ShouldCopyUpstreamHeader 不复制 Content-Length 和上游的 X-Oneapi-Request-Id。
-// 记录上游请求 ID 时，X-Oneapi-Request-Id 优先于 X-Request-Id。
+// 公共发送入口已按配置选取请求 ID；其他响应路径沿用默认响应头的优先级。
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 	if strings.EqualFold(k, "Content-Length") {
 		return false
 	}
 	if strings.EqualFold(k, common.RequestIdKey) {
-		if c != nil && len(v) > 0 && v[0] != "" {
+		if c != nil && !c.GetBool(common.UpstreamRequestIDCapturedContextKey) && len(v) > 0 && v[0] != "" {
 			c.Set(common.UpstreamRequestIdKey, v[0])
 		}
 		return false
 	}
-	if strings.EqualFold(k, "X-Request-Id") && c != nil && c.GetString(common.UpstreamRequestIdKey) == "" && len(v) > 0 && v[0] != "" {
+	if strings.EqualFold(k, "X-Request-Id") && c != nil && !c.GetBool(common.UpstreamRequestIDCapturedContextKey) && c.GetString(common.UpstreamRequestIdKey) == "" && len(v) > 0 && v[0] != "" {
 		c.Set(common.UpstreamRequestIdKey, v[0])
 	}
 	return true

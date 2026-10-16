@@ -329,6 +329,10 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	err := createLog(log)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
+	} else if trace := common.GetRequestTrace(c); trace != nil {
+		trace.Lock()
+		trace.ErrorLogged = true
+		trace.Unlock()
 	}
 }
 

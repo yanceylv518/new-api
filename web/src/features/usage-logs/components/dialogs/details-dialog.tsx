@@ -50,7 +50,7 @@ import {
   Info,
   LogIn,
 } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
@@ -67,6 +67,10 @@ import { cn } from '@/lib/utils'
 
 import { AuditDetailFields } from '../../audit/components/audit-detail-fields'
 import type { UsageLog } from '../../data/schema'
+import {
+  formatTraceTime,
+  useRequestTraces,
+} from '../../hooks/use-request-traces'
 import {
   parseLogOther,
   getParamOverrideActionLabel,
@@ -91,6 +95,7 @@ import {
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
+import { RequestTraceDetails } from './request-trace-details'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
 // to its i18n label key for display in the audit details.
@@ -475,10 +480,17 @@ interface DetailsDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-export function DetailsDialog(props: DetailsDialogProps) {
+export const DetailsDialog = memo(function DetailsDialog(
+  props: DetailsDialogProps
+) {
+  if (!props.open) return null
+  return <OpenLogDetailsDialog {...props} />
+})
+
+function OpenLogDetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
-  const other = parseLogOther(props.log.other)
+  const other = useMemo(() => parseLogOther(props.log.other), [props.log.other])
   const discountAmounts = getRecordedDiscountAmounts(other)
   const typeConfig = getLogTypeConfig(props.log.type)
 
@@ -499,6 +511,16 @@ export function DetailsDialog(props: DetailsDialogProps) {
   )?.billing_usage_schema
   const hasAudioTokens = other?.ws || other?.audio
   const showTiming = isTimingLogType(props.log.type)
+  const traceQuery = useRequestTraces(
+    props.log.request_id,
+    props.open && (props.log.type === 2 || props.log.type === 5)
+  )
+  const finalTrace = traceQuery.data?.at(-1)
+  const responseMilliseconds = finalTrace?.trace.ms
+  const responseSeconds =
+    responseMilliseconds !== undefined
+      ? responseMilliseconds / 1000
+      : props.log.use_time
   const showAdminIp =
     !!props.log.ip && (showTiming || (props.isAdmin && isTopup))
   const adminInfo = other?.admin_info
@@ -645,6 +667,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
       descriptionClassName='sr-only'
       contentHeight='min(72dvh, 720px)'
       bodyClassName='pr-2 sm:pr-4'
+      backdropBlur={false}
     >
       <div className='w-full max-w-full min-w-0 space-y-2.5 overflow-x-hidden py-1 sm:space-y-3'>
         {/* Overview section - key identifiers */}
@@ -711,69 +734,49 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
 
-          {showTiming && props.log.use_time > 0 && (
-            <DetailRow
-              label={t('Response Time')}
-              value={
-                <span
-                  className={cn(
-                    'font-medium',
-                    timingTextColorClass(
-                      getResponseTimeColor(
-                        props.log.use_time,
-                        props.log.completion_tokens
+          {showTiming &&
+            (responseMilliseconds !== undefined || props.log.use_time > 0) && (
+              <DetailRow
+                label={t('Response Time')}
+                value={
+                  <span
+                    className={cn(
+                      'font-medium',
+                      timingTextColorClass(
+                        getResponseTimeColor(
+                          responseSeconds,
+                          props.log.completion_tokens
+                        )
                       )
-                    )
-                  )}
-                >
-                  {formatUseTime(props.log.use_time)}
-                  {props.log.is_stream &&
-                    other?.frt != null &&
-                    other.frt > 0 && (
-                      <span
-                        className={cn(
-                          'font-normal',
-                          timingTextColorClass(
-                            getFirstResponseTimeColor(other.frt / 1000)
-                          )
-                        )}
-                      >
-                        {' '}
-                        (FRT: {formatUseTime(other.frt / 1000)})
-                      </span>
                     )}
-                </span>
-              }
-            />
-          )}
+                  >
+                    {responseMilliseconds !== undefined
+                      ? formatTraceTime(responseMilliseconds)
+                      : formatUseTime(props.log.use_time)}
+                    {props.log.is_stream &&
+                      other?.frt != null &&
+                      other.frt > 0 && (
+                        <span
+                          className={cn(
+                            'font-normal',
+                            timingTextColorClass(
+                              getFirstResponseTimeColor(other.frt / 1000)
+                            )
+                          )}
+                        >
+                          {' '}
+                          (FRT:{' '}
+                          {responseMilliseconds !== undefined
+                            ? formatTraceTime(other.frt)
+                            : formatUseTime(other.frt / 1000)}
+                          )
+                        </span>
+                      )}
+                  </span>
+                }
+              />
+            )}
         </div>
-
-        {/* 金额来自本次日志快照；任务差额流水明确展示任务总费用。 */}
-        {(isConsume || isRefund) && discountAmounts && (
-          <DetailSection
-            label={
-              other?.discount_cost_scope === 'task_total'
-                ? t('Task total')
-                : t('Cost breakdown')
-            }
-          >
-            <DetailRow
-              label={t('Before discount')}
-              value={formatLogQuota(discountAmounts.before)}
-              mono
-            />
-            <DetailRow
-              label={t('After discount')}
-              value={formatLogQuota(discountAmounts.after)}
-              mono
-            />
-            <DetailRow
-              label={t('Discount savings')}
-              value={formatLogQuota(discountAmounts.savings)}
-              mono
-            />
-          </DetailSection>
-        )}
 
         {/* Request conversion (admin only, not for refund) */}
         {showConversion && (
@@ -812,6 +815,41 @@ export function DetailsDialog(props: DetailsDialogProps) {
                 </div>
               </div>
             </div>
+          </DetailSection>
+        )}
+
+        {props.open && (props.log.type === 2 || props.log.type === 5) && (
+          <RequestTraceDetails
+            query={traceQuery}
+            log={props.log}
+            isAdmin={props.isAdmin}
+          />
+        )}
+
+        {/* 金额来自本次日志快照；任务差额流水明确展示任务总费用。 */}
+        {(isConsume || isRefund) && discountAmounts && (
+          <DetailSection
+            label={
+              other?.discount_cost_scope === 'task_total'
+                ? t('Task total')
+                : t('Cost breakdown')
+            }
+          >
+            <DetailRow
+              label={t('Before discount')}
+              value={formatLogQuota(discountAmounts.before)}
+              mono
+            />
+            <DetailRow
+              label={t('After discount')}
+              value={formatLogQuota(discountAmounts.after)}
+              mono
+            />
+            <DetailRow
+              label={t('Discount savings')}
+              value={formatLogQuota(discountAmounts.savings)}
+              mono
+            />
           </DetailSection>
         )}
 

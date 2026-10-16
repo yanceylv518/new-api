@@ -1,13 +1,139 @@
 package model
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm/logger"
 )
+
+func TestRequestTraceDatabaseMatrix(t *testing.T) {
+	cases := []struct{ name, dsn string }{{"sqlite", "local"}}
+	if os.Getenv("REQUEST_TRACE_EXTERNAL_TESTS") == "1" {
+		cases = append(cases, struct{ name, dsn string }{"mysql", "root@tcp(127.0.0.1:13327)/request_trace_review?charset=utf8mb4&parseTime=true&timeout=5s"}, struct{ name, dsn string }{"postgres", "postgres://postgres@127.0.0.1:15428/request_trace_review?sslmode=disable&connect_timeout=5"}, struct{ name, dsn string }{"clickhouse", "clickhouse://default@127.0.0.1:19000/request_trace_review?dial_timeout=5s"})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			previousDB, previousLog := DB, LOG_DB
+			previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousPath := common.SQLitePath
+			common.SQLitePath = filepath.Join(t.TempDir(), "matrix.sqlite")
+			t.Setenv("REQUEST_TRACE_MATRIX_DSN", tc.dsn)
+			db, dbType, err := chooseDB("REQUEST_TRACE_MATRIX_DSN", true)
+			require.NoError(t, err)
+			db.Logger = logger.Default.LogMode(logger.Silent)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			DB, LOG_DB = db, db
+			common.SetDatabaseTypes(dbType, dbType)
+			initCol()
+			require.False(t, db.Migrator().HasTable(&RequestTrace{}), "isolated target must be empty")
+			t.Cleanup(func() {
+				if dbType != common.DatabaseTypeClickHouse {
+					assert.NoError(t, db.Migrator().DropTable(&RequestTrace{}, &Log{}, &AuditLog{}))
+				} else {
+					for _, table := range []string{"request_traces", "logs", "audit_logs"} {
+						assert.NoError(t, db.Exec("DROP TABLE IF EXISTS "+table).Error)
+					}
+				}
+				assert.NoError(t, sqlDB.Close())
+				DB, LOG_DB = previousDB, previousLog
+				common.SetDatabaseTypes(previousMainType, previousLogType)
+				common.SQLitePath = previousPath
+				initCol()
+			})
+			var version string
+			query := "SELECT version()"
+			if dbType == common.DatabaseTypeSQLite {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(query).Scan(&version).Error)
+			t.Logf("engine=%s version=%s", tc.name, version)
+			// 先安装新表两次，再验证保留旧 logs.other 的升级路径。
+			for range 2 {
+				require.NoError(t, migrateRequestTraces())
+			}
+			if dbType != common.DatabaseTypeClickHouse {
+				require.True(t, db.Migrator().HasIndex(&RequestTrace{}, "idx_request_trace_attempt"))
+				require.True(t, db.Migrator().HasIndex(&RequestTrace{}, "idx_request_traces_created_at"))
+				require.NoError(t, db.Migrator().DropTable(&RequestTrace{}))
+				require.NoError(t, db.AutoMigrate(&Log{}))
+			} else {
+				require.NoError(t, db.Exec("DROP TABLE request_traces").Error)
+				require.NoError(t, migrateClickHouseLogDB())
+			}
+			legacyOther := `{"model_price":0.01,"admin_info":{"use_channel":["7"]}}`
+			require.NoError(t, createLog(&Log{UserId: 11, Type: LogTypeConsume, CreatedAt: 100, RequestId: "matrix-legacy", Other: legacyOther}))
+			for range 2 {
+				require.NoError(t, migrateLOGDB())
+			}
+			var legacy Log
+			require.NoError(t, db.Where("request_id = ?", "matrix-legacy").First(&legacy).Error)
+			assert.Equal(t, legacyOther, legacy.Other)
+			data := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 200}, AdminInfo: &common.RequestTraceAdmin{ChannelID: 7}})
+			rows := []RequestTrace{{RequestId: "matrix-owned", Attempt: 0, UserId: 11, CreatedAt: 100, Data: data}, {RequestId: "matrix-owned", Attempt: 1, UserId: 11, CreatedAt: 200, Data: data}}
+			for range 2 {
+				require.NoError(t, RecordRequestTraces(t.Context(), rows))
+			}
+			admin, err := GetRequestTraces(t.Context(), "matrix-owned", 0, true)
+			require.NoError(t, err)
+			require.Len(t, admin, 2)
+			assert.Equal(t, 0, admin[0].Attempt)
+			assert.NotNil(t, admin[0].AdminInfo)
+			user, err := GetRequestTraces(t.Context(), "matrix-owned", 11, false)
+			require.NoError(t, err)
+			require.Len(t, user, 1)
+			assert.Equal(t, 1, user[0].Attempt)
+			assert.Nil(t, user[0].AdminInfo)
+			other, err := GetRequestTraces(t.Context(), "matrix-owned", 12, false)
+			require.NoError(t, err)
+			assert.Empty(t, other)
+			single := []RequestTrace{{RequestId: "matrix-single", Attempt: 0, UserId: 11, CreatedAt: 200, Data: data}}
+			for range 2 {
+				require.NoError(t, RecordRequestTraces(t.Context(), single))
+			}
+			unique, err := GetRequestTraces(t.Context(), "matrix-single", 11, false)
+			require.NoError(t, err)
+			require.Len(t, unique, 1)
+			assert.Equal(t, 200, int(unique[0].CreatedAt))
+			for index := range 37 {
+				require.NoError(t, RecordRequestTraces(t.Context(), []RequestTrace{{RequestId: fmt.Sprintf("matrix-old-%d", index), Attempt: 0, UserId: 11, CreatedAt: 100, Data: data}}))
+			}
+			var deleted int64
+			for {
+				n, err := DeleteOldRequestTraces(t.Context(), 150, 7)
+				require.NoError(t, err)
+				deleted += n
+				if n == 0 {
+					break
+				}
+			}
+			assert.EqualValues(t, 38, deleted)
+			admin, err = GetRequestTraces(t.Context(), "matrix-owned", 0, true)
+			require.NoError(t, err)
+			require.Len(t, admin, 1)
+			assert.Equal(t, 1, admin[0].Attempt)
+			if dbType == common.DatabaseTypeClickHouse {
+				t.Setenv("LOG_SQL_CLICKHOUSE_TTL_DAYS", "7")
+				require.NoError(t, migrateRequestTraces())
+				var definition string
+				require.NoError(t, db.Raw("SHOW CREATE TABLE request_traces").Scan(&definition).Error)
+				assert.Contains(t, definition, "TTL")
+				t.Setenv("LOG_SQL_CLICKHOUSE_TTL_DAYS", "0")
+				require.NoError(t, migrateRequestTraces())
+				require.NoError(t, db.Raw("SHOW CREATE TABLE request_traces").Scan(&definition).Error)
+				assert.NotContains(t, definition, "TTL ")
+			}
+		})
+	}
+}
 
 // TestFormatUserLogsStripsQuotaSaturation verifies the admin-only quota
 // saturation marker (nested under other.admin_info) is removed for non-admin

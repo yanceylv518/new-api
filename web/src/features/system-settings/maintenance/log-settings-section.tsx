@@ -42,6 +42,7 @@ import {
   FormControl,
   FormDescription,
   FormField,
+  FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
@@ -58,6 +59,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { api } from '@/lib/api'
 import dayjs from '@/lib/dayjs'
 import { formatTimestampToDate } from '@/lib/format'
@@ -78,14 +80,57 @@ import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
 import type { LogCleanupTask } from '../types'
 
+const requestTraceCompressionLevelSchema = z.enum([
+  'fast',
+  'standard',
+  'high',
+  'best',
+])
+
+const requestTraceConfigSchema = z.object({
+  level: z.enum(['off', 'errors', 'all']),
+  pre_channel_errors_enabled: z.boolean(),
+  anonymous_errors_enabled: z.boolean(),
+  upstream_request_id_headers: z.array(z.string()).optional().default([]),
+  compression_level: requestTraceCompressionLevelSchema
+    .optional()
+    .default('fast'),
+})
+
+const defaultRequestTraceConfig: z.infer<typeof requestTraceConfigSchema> = {
+  level: 'errors',
+  pre_channel_errors_enabled: true,
+  anonymous_errors_enabled: false,
+  upstream_request_id_headers: [],
+  compression_level: 'fast',
+}
+
+const MAX_REQUEST_ID_HEADERS = 16
+const MAX_REQUEST_ID_HEADER_LENGTH = 128
+
+const upstreamRequestIDHeadersSchema = z
+  .array(
+    z
+      .string()
+      .max(MAX_REQUEST_ID_HEADER_LENGTH)
+      .regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/)
+  )
+  .max(MAX_REQUEST_ID_HEADERS)
+
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTraceLevel: z.enum(['off', 'errors', 'all']),
+  RequestTracePreChannelErrorsEnabled: z.boolean(),
+  RequestTraceAnonymousErrorsEnabled: z.boolean(),
+  RequestTraceUpstreamRequestIdHeaders: z.string(),
+  RequestTraceCompressionLevel: requestTraceCompressionLevelSchema,
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultTraceConfig?: string
 }
 
 type ServerLogInfo = {
@@ -141,13 +186,32 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
 
 export function LogSettingsSection({
   defaultEnabled,
+  defaultTraceConfig: encodedTraceConfig,
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
+  const defaultTraceConfig = useMemo(() => {
+    try {
+      const result = requestTraceConfigSchema.safeParse(
+        JSON.parse(encodedTraceConfig ?? '')
+      )
+      return result.success ? result.data : defaultRequestTraceConfig
+    } catch {
+      return defaultRequestTraceConfig
+    }
+  }, [encodedTraceConfig])
   const updateOption = useUpdateOption()
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
+      RequestTraceLevel: defaultTraceConfig?.level ?? 'errors',
+      RequestTracePreChannelErrorsEnabled:
+        defaultTraceConfig?.pre_channel_errors_enabled ?? true,
+      RequestTraceAnonymousErrorsEnabled:
+        defaultTraceConfig?.anonymous_errors_enabled ?? false,
+      RequestTraceUpstreamRequestIdHeaders:
+        defaultTraceConfig.upstream_request_id_headers.join('\n'),
+      RequestTraceCompressionLevel: defaultTraceConfig.compression_level,
     },
   })
 
@@ -174,8 +238,18 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    form.reset({
+      LogConsumeEnabled: defaultEnabled,
+      RequestTraceLevel: defaultTraceConfig?.level ?? 'errors',
+      RequestTracePreChannelErrorsEnabled:
+        defaultTraceConfig?.pre_channel_errors_enabled ?? true,
+      RequestTraceAnonymousErrorsEnabled:
+        defaultTraceConfig?.anonymous_errors_enabled ?? false,
+      RequestTraceUpstreamRequestIdHeaders:
+        defaultTraceConfig.upstream_request_id_headers.join('\n'),
+      RequestTraceCompressionLevel: defaultTraceConfig.compression_level,
+    })
+  }, [defaultEnabled, defaultTraceConfig, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -257,11 +331,62 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    const headerNames = values.RequestTraceUpstreamRequestIdHeaders.split(
+      /\r?\n/
+    )
+      .map((name) => name.trim())
+      .filter(Boolean)
+    const headers = upstreamRequestIDHeadersSchema.safeParse(headerNames)
+    if (!headers.success) {
+      form.setError(
+        'RequestTraceUpstreamRequestIdHeaders',
+        {
+          type: 'validate',
+          message: t(
+            'Enter up to 16 valid response header names, each at most 128 characters.'
+          ),
+        },
+        { shouldFocus: true }
+      )
+      return
+    }
+    try {
+      if (values.LogConsumeEnabled !== defaultEnabled) {
+        const response = await updateOption.mutateAsync({
+          key: 'LogConsumeEnabled',
+          value: values.LogConsumeEnabled,
+        })
+        if (!response.success) return
+      }
+      const config = {
+        level: values.RequestTraceLevel,
+        pre_channel_errors_enabled: values.RequestTracePreChannelErrorsEnabled,
+        anonymous_errors_enabled: values.RequestTraceAnonymousErrorsEnabled,
+        upstream_request_id_headers: [
+          ...new Map(
+            headers.data.map((name) => [name.toLowerCase(), name])
+          ).values(),
+        ],
+        compression_level: values.RequestTraceCompressionLevel,
+      }
+      if (
+        config.level !== (defaultTraceConfig?.level ?? 'errors') ||
+        config.compression_level !== defaultTraceConfig.compression_level ||
+        config.pre_channel_errors_enabled !==
+          (defaultTraceConfig?.pre_channel_errors_enabled ?? true) ||
+        config.anonymous_errors_enabled !==
+          (defaultTraceConfig?.anonymous_errors_enabled ?? false) ||
+        JSON.stringify(config.upstream_request_id_headers) !==
+          JSON.stringify(defaultTraceConfig.upstream_request_id_headers)
+      ) {
+        await updateOption.mutateAsync({
+          key: 'RequestTraceConfig',
+          value: JSON.stringify(config),
+        })
+      }
+    } catch {
+      // useUpdateOption 统一展示保存错误，保留输入以便重试。
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -367,6 +492,192 @@ export function LogSettingsSection({
             )}
           />
 
+          <SettingsControlGroup className='space-y-3'>
+            <FormField
+              control={form.control}
+              name='RequestTraceLevel'
+              render={({ field }) => (
+                <FormItem className='space-y-2'>
+                  <FormLabel>{t('Request trace level')}</FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Store request and response metadata separately. Message bodies and response text are never stored.'
+                    )}
+                  </FormDescription>
+                  <Select
+                    items={[
+                      { value: 'off', label: t('Off') },
+                      { value: 'errors', label: t('Detailed failures only') },
+                      { value: 'all', label: t('All requests in detail') },
+                    ]}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                    disabled={updateOption.isPending}
+                  >
+                    <FormControl>
+                      <SelectTrigger className='w-full sm:w-56'>
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value='off'>{t('Off')}</SelectItem>
+                        <SelectItem value='errors'>
+                          {t('Detailed failures only')}
+                        </SelectItem>
+                        <SelectItem value='all'>
+                          {t('All requests in detail')}
+                        </SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name='RequestTraceCompressionLevel'
+              render={({ field }) => (
+                <FormItem className='space-y-2'>
+                  <FormLabel>{t('Compression level')}</FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Applies to new request trace metadata in relational databases. Higher compression uses more CPU.'
+                    )}
+                  </FormDescription>
+                  <Select
+                    items={[
+                      { value: 'fast', label: t('Fast (recommended)') },
+                      { value: 'standard', label: t('Standard compression') },
+                      { value: 'high', label: t('Higher compression') },
+                      { value: 'best', label: t('Maximum compression') },
+                    ]}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                    disabled={updateOption.isPending}
+                  >
+                    <FormControl>
+                      <SelectTrigger className='w-full sm:w-56'>
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value='fast'>
+                          {t('Fast (recommended)')}
+                        </SelectItem>
+                        <SelectItem value='standard'>
+                          {t('Standard compression')}
+                        </SelectItem>
+                        <SelectItem value='high'>
+                          {t('Higher compression')}
+                        </SelectItem>
+                        <SelectItem value='best'>
+                          {t('Maximum compression')}
+                        </SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name='RequestTracePreChannelErrorsEnabled'
+              render={({ field }) => (
+                <SettingsSwitchItem>
+                  <SettingsSwitchContent>
+                    <FormLabel>
+                      {t('Record failures before upstream dispatch')}
+                    </FormLabel>
+                    <FormDescription>
+                      {t(
+                        'Record validation, rate limit and channel selection failures attributed to an authenticated user.'
+                      )}
+                    </FormDescription>
+                  </SettingsSwitchContent>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      disabled={
+                        form.watch('RequestTraceLevel') === 'off' ||
+                        updateOption.isPending
+                      }
+                    />
+                  </FormControl>
+                </SettingsSwitchItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name='RequestTraceAnonymousErrorsEnabled'
+              render={({ field }) => (
+                <SettingsSwitchItem>
+                  <SettingsSwitchContent>
+                    <FormLabel>
+                      {t('Record unauthenticated failures')}
+                    </FormLabel>
+                    <FormDescription>
+                      {t(
+                        'These records have no user owner and are visible only to administrators.'
+                      )}
+                    </FormDescription>
+                  </SettingsSwitchContent>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      disabled={
+                        form.watch('RequestTraceLevel') === 'off' ||
+                        updateOption.isPending
+                      }
+                    />
+                  </FormControl>
+                </SettingsSwitchItem>
+              )}
+            />
+          </SettingsControlGroup>
+          <SettingsControlGroup>
+            <FormField
+              control={form.control}
+              name='RequestTraceUpstreamRequestIdHeaders'
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    {t('Upstream request ID response headers')}
+                  </FormLabel>
+                  <FormDescription>
+                    {t(
+                      'One header name per line, in priority order. Custom headers take precedence over defaults. Leave blank to use defaults. Applies even when request tracing is off.'
+                    )}
+                    <span className='mt-1 block'>
+                      {t('Default response headers: {{headers}}', {
+                        headers:
+                          'X-Oneapi-Request-Id, X-Request-Id, Request-Id, X-Amzn-RequestId, X-Goog-Request-Id',
+                      })}
+                    </span>
+                  </FormDescription>
+                  <FormControl>
+                    <Textarea
+                      {...field}
+                      placeholder={'X-Custom-Request-Id\nX-Trace-Id'}
+                      className='font-mono text-xs'
+                      maxLength={
+                        MAX_REQUEST_ID_HEADERS *
+                        (MAX_REQUEST_ID_HEADER_LENGTH + 1)
+                      }
+                      rows={3}
+                      disabled={updateOption.isPending}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </SettingsControlGroup>
           <SettingsControlGroup className='space-y-3'>
             <div>
               <h4 className='text-sm font-medium'>{t('Clean history logs')}</h4>
