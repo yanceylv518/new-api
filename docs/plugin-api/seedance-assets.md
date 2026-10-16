@@ -4,6 +4,77 @@
 素材管理 API，不是上游厂商 Action 接口的原样透传。
 后台 `/api/user/seedance` 接口继续使用后台凭证；两者读取相同的用户数据。
 
+## 素材管理 Action 兼容入口
+
+也可通过 `POST /doubao/v2/assets?Action=<Action>&Version=2024-01-01` 管理
+同一素材库。鉴权仍使用平台的 `Authorization: Bearer sk-...`，不接受火山 IAM
+AK/SK 签名。这是官方风格的协议适配，不是整个上游账号的素材接口透传。
+
+| Action | JSON 请求主要字段 |
+| --- | --- |
+| `CreateAssetGroup` | 必填 `Name`；可选 `Description`、`GroupType: "AIGC"`、扩展字段 `model` |
+| `ListAssetGroups` | `PageNumber`、`PageSize`、`Filter.Name`、`Filter.GroupType`、`SortBy`、`SortOrder` |
+| `GetAssetGroup` | `Id`，公开字符串组 ID |
+| `UpdateAssetGroup` | `Id`；至少提供 `Name`、`Description` 之一 |
+| `DeleteAssetGroup` | `Id` |
+| `CreateAsset` | `GroupId`、`URL`、`AssetType`；可选 `Name` |
+| `ListAssets` | `PageNumber`、`PageSize`、`Filter.GroupId`、`Filter.Name`、`Filter.AssetType`、`Filter.Statuses`、`SortBy`、`SortOrder` |
+| `GetAsset` | `Id`，公开字符串素材 ID |
+| `UpdateAsset` | `Id`、`Name` |
+| `DeleteAsset` | `Id` |
+
+`CreateVisualValidateSession`、`GetVisualValidateResult` 仍使用该入口，调用方式见下文。
+普通建组只接受缺省或 `AIGC` 类型；`LivenessFace` 必须完成真人认证，不能绕过认证建组。
+Action 建组未传 `model` 时，在当前 Key 的模型、分组及渠道权限内选择一个豆包渠道；
+传入 `model` 可明确选择建组模型。原 REST 建组接口仍要求 API Key 调用方提供 `model`。
+
+请求体为 JSON 对象，字段区分大小写。未知字段、错误类型和显式 `null` 会被拒绝，
+不接受指定用户、渠道或替换已有素材的 URL、类型、所属组。`Name` 为 1–64 字符，
+组 `Description` 最多 256 字符。`CreateAsset` 的 `URL` 必须为可访问的公网地址，
+沿用网关的 SSRF 检查；本地文件继续通过 `/v1/seedance/assets/upload` 上传。
+组描述和素材名称是平台素材库的元数据，不会批量修改既有跨账号副本的展示信息。
+外部 URL 登记不会自动把原件复制到 OSS，后续跨账号导入仍依赖原 URL 有效。
+
+分页默认第 1 页、每页 10 项，每页最多 100 项；页码上限 21474836。超出末页返回
+空 `Items`，不会自动回到末页。`SortBy` 支持 `CreateTime`、`UpdateTime`、`Name`，
+默认 `CreateTime`；`SortOrder` 为 `Asc` 或 `Desc`，默认 `Desc`。时间相同时按本地
+ID 保持稳定顺序。`Filter.Name` 只匹配名称，`%`、`_`、`#` 作为普通字符。
+组列表默认筛选 `AIGC`，可通过 `Filter.GroupType: "LivenessFace"` 查询已认证组。
+`Filter.Statuses` 支持 `Processing`、`Active`、`Failed` 及平台扩展的 `Deleting`，
+同一字段多值取并集，不同筛选条件取交集。
+
+成功响应使用 `ResponseMetadata` 与 `Result`。创建和更新返回 `Result.Id`；
+列表返回 `Result.TotalCount`、`PageNumber`、`PageSize`、`Items`。组详情返回
+`Id`、`Name`、`Description`、`GroupType`、`Status`、`CreateTime`、`UpdateTime`；
+素材详情返回 `Id`、`Name`、`GroupId`、`AssetType`、`Status`、`URL`、`CreateTime`、
+`UpdateTime`。时间使用 UTC RFC3339，素材 `URL` 仅在 `Active` 时返回。
+没有可靠保存的上游项目和审核详情不伪造为 `ProjectName` 或 `Moderation`。
+
+创建素材返回 HTTP 200 只表示已登记，后台继续审核，需查询至 `Active` 后才能引用。
+`GetAsset` 和列表读取本地同步状态，不为每次查询额外发起上游请求；预览链接按需签名。
+删除返回 HTTP 202 和 `Result.Status: "Deleting"`，表示删除已持久化受理；
+`DeleteAssetGroup` 还返回 `Result.Id`。后台重试清理全部副本及 OSS 原件，最终移除记录。
+不能把 HTTP 202 当作所有上游资源已经删除。错误使用 `ResponseMetadata.Error`，
+其他用户和不存在的资源均返回 HTTP 404、`ResourceNotFound`。
+认证和限流在业务入口前执行，失败仍沿用平台中间件的响应格式。
+
+```bash
+curl "$BASE_URL/doubao/v2/assets?Action=CreateAssetGroup&Version=2024-01-01" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"Name":"参考素材","GroupType":"AIGC","model":"doubao-seedance-2-0-fast-260128"}'
+
+curl "$BASE_URL/doubao/v2/assets?Action=CreateAsset&Version=2024-01-01" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"GroupId":"<组 ID>","URL":"https://example.com/reference.jpg","AssetType":"Image"}'
+
+curl "$BASE_URL/doubao/v2/assets?Action=ListAssets&Version=2024-01-01" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"Filter":{"Statuses":["Active"],"AssetType":"Image"},"PageNumber":1,"PageSize":10}'
+```
+
 ## 归属、权限与计费
 
 - 素材组和素材归属于 `user_id`，不绑定创建它的 API Key。同用户所有有效 Key
@@ -197,7 +268,7 @@ curl "$BASE_URL/doubao/v2/assets?Action=GetVisualValidateResult&Version=2024-01-
 `Result` 外形；`BytedToken` 只会在官方创建接口响应中返回，查询时必须属于当前 API Key
 用户创建的会话，不能跨用户复用。
 
-插件 Action 兼容入口位于 `/doubao/v2/assets`，与 Doubao 插件路由保持同一命名空间。
+素材 Action 兼容入口位于 `/doubao/v2/assets`，由网关后端提供，与 Doubao 插件路由保持同一命名空间。
 若渠道 BaseURL 的路径以 `/seedance` 结尾，上游素材 Action 直接向 BaseURL 本身发送，Action 与
 Version 放在查询参数中；其他渠道 BaseURL 使用官方 `/v2/assets` 路径。网关不会自动添加
 `/seedance`，由管理员配置渠道 BaseURL 决定上游命名空间。

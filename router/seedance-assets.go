@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// setSeedanceAssetValidationActionRoute 将真人认证 Action 放入 Doubao 原生接口命名空间。
+// setSeedanceAssetValidationActionRoute 将素材管理和真人认证 Action 放入 Doubao 原生接口命名空间。
 func setSeedanceAssetValidationActionRoute(router *gin.Engine) {
 	router.POST("/doubao/v2/assets", middleware.RouteTag("relay"), middleware.TokenAuth(), middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.SeedanceAssetV2Action)
 }

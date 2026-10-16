@@ -248,7 +248,7 @@ func writeSeedanceAssetOfficialErrorWithCode(c *gin.Context, status int, action,
 	})
 }
 
-// SeedanceAssetV2Action exposes only the two official validation Actions that New API can bind safely.
+// SeedanceAssetV2Action 在同一入口分发素材管理和真人认证，资源归属由平台校验。
 func SeedanceAssetV2Action(c *gin.Context) {
 	action := strings.TrimSpace(c.Query("Action"))
 	version := strings.TrimSpace(c.Query("Version"))
@@ -296,6 +296,6 @@ func SeedanceAssetV2Action(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, seedanceAssetOfficialResponse("GetVisualValidateResult", gin.H{"GroupId": session.UpstreamGroupID}))
 	default:
-		writeSeedanceAssetOfficialError(c, http.StatusBadRequest, c.Query("Action"), "unsupported asset Action")
+		handleSeedanceAssetLibraryAction(c, action)
 	}
 }

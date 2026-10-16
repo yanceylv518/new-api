@@ -17,7 +17,8 @@ import (
 )
 
 type seedanceAssetGroupCreateRequest struct {
-	Name string `json:"name" binding:"required,max=64"`
+	Name        string  `json:"name" binding:"required,max=64"`
+	Description *string `json:"description" binding:"omitempty,max=1024"`
 	// 仅在建组时选择上游，已有素材的归属仍由认证用户和组绑定决定。
 	Model string `json:"model" binding:"max=191"`
 	// 兼容识别旧客户端的覆盖请求，普通建组固定为 AIGC。
@@ -35,40 +36,40 @@ type seedanceAssetGroupUpdateRequest struct {
 func UpdateSeedanceAssetGroup(c *gin.Context) {
 	var req seedanceAssetGroupUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	var group model.SeedanceAssetGroup
 	if err := model.DB.Where("user_id = ? AND id = ?", c.GetInt("id"), c.Param("id")).First(&group).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if group.Status == "Deleting" {
-		common.ApiErrorMsg(c, "asset group is being deleted")
+		seedanceAssetAPIErrorMsg(c, "asset group is being deleted")
 		return
 	}
 	duplicated, err := model.IsSeedanceAssetGroupNameDuplicated(group.ID, c.GetInt("id"), req.Name)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if duplicated {
-		common.ApiErrorI18n(c, i18n.MsgGroupNameExists)
+		seedanceAssetAPIErrorI18n(c, i18n.MsgGroupNameExists)
 		return
 	}
 	client, err := service.ResolveSeedanceAssetClient(c.Request.Context(), group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	var response struct{}
 	if err := client.UpdateSeedanceAssetGroup(c.Request.Context(), group.GroupID, strings.TrimSpace(req.Name), &response); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	previousName := group.Name
@@ -90,13 +91,13 @@ func UpdateSeedanceAssetGroup(c *gin.Context) {
 			common.SysError("failed to roll back Seedance asset group rename: " + rollbackErr.Error())
 		}
 		if duplicate, duplicateErr := model.IsSeedanceAssetGroupNameDuplicated(group.ID, c.GetInt("id"), group.Name); duplicateErr == nil && duplicate {
-			common.ApiErrorI18n(c, i18n.MsgGroupNameExists)
+			seedanceAssetAPIErrorI18n(c, i18n.MsgGroupNameExists)
 			return
 		}
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
-	common.ApiSuccess(c, group)
+	seedanceAssetAPISuccess(c, group)
 }
 
 // DeleteSeedanceAssetGroup 将当前用户的素材组删除请求持久化并交给后台清理。
@@ -104,16 +105,16 @@ func DeleteSeedanceAssetGroup(c *gin.Context) {
 	var group model.SeedanceAssetGroup
 	if err := model.DB.WithContext(c.Request.Context()).
 		Where("user_id = ? AND id = ?", c.GetInt("id"), c.Param("id")).First(&group).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	job := service.NewSeedanceAssetGroupDeleteCleanupJob(&group)
 	if err := model.QueueSeedanceAssetGroupDeletion(c.Request.Context(), job); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	service.EnqueueSeedanceAssetCleanup()
-	c.JSON(http.StatusAccepted, gin.H{
+	seedanceAssetAPIResponse(c, http.StatusAccepted, gin.H{
 		"success": true,
 		"message": "asset group deletion queued",
 		"data":    nil,
@@ -174,7 +175,7 @@ func seedanceAssetPreviewURLWithStorage(ctx context.Context, asset *model.Seedan
 func ListSeedanceAssetGroups(c *gin.Context) {
 	options, err := parseSeedanceLibraryQuery(c, true)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		seedanceAssetAPIResponse(c, http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAssetGroup{}).Where("user_id = ?", c.GetInt("id"))
@@ -183,57 +184,59 @@ func ListSeedanceAssetGroups(c *gin.Context) {
 	// 无分页参数时保留旧页面全量数组行为，显式分页才计算总数。
 	if options.paginated {
 		if err := query.Count(&total).Error; err != nil {
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 			return
 		}
-		options.page.Page = max(1, min(options.page.Page, int((total+int64(options.page.PageSize)-1)/int64(options.page.PageSize))))
+		if c.GetString(seedanceAssetActionContextKey) == "" {
+			options.page.Page = max(1, min(options.page.Page, int((total+int64(options.page.PageSize)-1)/int64(options.page.PageSize))))
+		}
 		query = query.Offset(options.page.GetStartIdx()).Limit(options.page.PageSize)
 	}
 	var groups []model.SeedanceAssetGroup
 	if err := query.Order(options.order).Find(&groups).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if options.paginated {
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": groups, "total": total, "page": options.page.Page, "page_size": options.page.PageSize})
+		seedanceAssetAPIResponse(c, http.StatusOK, gin.H{"success": true, "message": "", "data": groups, "total": total, "page": options.page.Page, "page_size": options.page.PageSize})
 		return
 	}
-	common.ApiSuccess(c, groups)
+	seedanceAssetAPISuccess(c, groups)
 }
 
 // CreateSeedanceAssetGroup 创建上游素材组并保存本地授权映射。
 func CreateSeedanceAssetGroup(c *gin.Context) {
 	var req seedanceAssetGroupCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	if req.GroupType != nil {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	duplicated, err := model.IsSeedanceAssetGroupNameDuplicated(0, c.GetInt("id"), req.Name)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if duplicated {
-		common.ApiErrorI18n(c, i18n.MsgGroupNameExists)
+		seedanceAssetAPIErrorI18n(c, i18n.MsgGroupNameExists)
 		return
 	}
 	channel, err := selectSeedanceAssetGroupChannel(c, strings.TrimSpace(req.Model))
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	client, err := service.NewSeedanceAssetClient(channel)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	var result struct {
@@ -242,7 +245,7 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		} `json:"Result"`
 	}
 	if err := client.CreateSeedanceAssetGroup(c.Request.Context(), req.Name, "AIGC", &result); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	group := &model.SeedanceAssetGroup{
@@ -251,27 +254,30 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint,
 		AssetCount: new(int64),
 	}
+	if req.Description != nil {
+		group.Description = strings.TrimSpace(*req.Description)
+	}
 	if group.GroupID == "" {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	if err := model.DB.Create(group).Error; err != nil {
 		cleanupSeedanceAssetGroupAfterFailure(c.Request.Context(), client, group.GroupID)
 		if duplicate, duplicateErr := model.IsSeedanceAssetGroupNameDuplicated(0, c.GetInt("id"), group.Name); duplicateErr == nil && duplicate {
-			common.ApiErrorI18n(c, i18n.MsgGroupNameExists)
+			seedanceAssetAPIErrorI18n(c, i18n.MsgGroupNameExists)
 			return
 		}
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
-	common.ApiSuccess(c, group)
+	seedanceAssetAPISuccess(c, group)
 }
 
 // ListSeedanceAssets 返回当前用户素材，GroupID 为空时返回全部素材。
 func ListSeedanceAssets(c *gin.Context) {
 	options, err := parseSeedanceLibraryQuery(c, false)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		seedanceAssetAPIResponse(c, http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAsset{}).Where("user_id = ?", c.GetInt("id"))
@@ -283,7 +289,7 @@ func ListSeedanceAssets(c *gin.Context) {
 	if err := query.Session(&gorm.Session{}).
 		Where("pending_status = ?", true).
 		Select("id").Limit(1).Find(&pendingMarker).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	// 全部筛选先于计数和分页，has_pending 保持组范围内的轮询语义。
@@ -297,25 +303,27 @@ func ListSeedanceAssets(c *gin.Context) {
 		groupLookup := model.DB.WithContext(c.Request.Context()).Select("asset_count").
 			Where("user_id = ? AND group_id = ?", c.GetInt("id"), options.groups[0]).Limit(1).Find(&group)
 		if groupLookup.Error != nil {
-			common.ApiError(c, groupLookup.Error)
+			seedanceAssetAPIError(c, groupLookup.Error)
 			return
 		}
 		if groupLookup.RowsAffected > 0 && group.AssetCount != nil {
 			total = *group.AssetCount
 		} else if err := query.Count(&total).Error; err != nil {
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 			return
 		}
 	} else if err := query.Count(&total).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	page := options.page
 	page.PageSize = max(1, min(100, page.PageSize))
-	page.Page = max(1, min(page.Page, int((total+int64(page.PageSize)-1)/int64(page.PageSize))))
+	if c.GetString(seedanceAssetActionContextKey) == "" {
+		page.Page = max(1, min(page.Page, int((total+int64(page.PageSize)-1)/int64(page.PageSize))))
+	}
 	var assets []model.SeedanceAsset
 	if err := query.Order(options.order).Offset(page.GetStartIdx()).Limit(page.PageSize).Find(&assets).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	// 同一页通常共用一个 OSS 位置，复用客户端避免每个素材重复加载和校验配置。
@@ -360,29 +368,29 @@ func ListSeedanceAssets(c *gin.Context) {
 	if firstPreviewSignFailure != nil {
 		common.SysError(fmt.Sprintf("failed to sign %d Seedance asset previews; first_asset_id=%d: %v", previewSignFailures, firstPreviewFailureAssetID, firstPreviewSignFailure))
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": assets, "total": total, "page": page.Page, "page_size": page.PageSize, "has_pending": pendingMarker.ID > 0})
+	seedanceAssetAPIResponse(c, http.StatusOK, gin.H{"success": true, "data": assets, "total": total, "page": page.Page, "page_size": page.PageSize, "has_pending": pendingMarker.ID > 0})
 }
 
 // RefreshSeedanceAsset 同步查询上游审核状态并更新本地记录。
 func RefreshSeedanceAsset(c *gin.Context) {
 	var asset model.SeedanceAsset
 	if err := model.DB.Where("user_id = ? AND id = ?", c.GetInt("id"), c.Param("id")).First(&asset).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if asset.Status == "Deleting" {
-		common.ApiErrorMsg(c, "asset is being deleted")
+		seedanceAssetAPIErrorMsg(c, "asset is being deleted")
 		return
 	}
 	loadedUpdatedAt := asset.UpdatedAt
 	client, err := service.ResolveSeedanceAssetClient(c.Request.Context(), asset.ChannelID, asset.KeyFingerprint, asset.AccountFingerprint)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	status, previewURL, err := client.GetSeedanceAsset(c.Request.Context(), asset.AssetID)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	attempts, nextPollAt := service.SeedanceAssetPollSchedule(status, asset.PollAttempts, common.GetTimestamp())
@@ -397,20 +405,20 @@ func RefreshSeedanceAsset(c *gin.Context) {
 	// 审核状态不会触发 OSS 回收，对象只在用户主动删除素材时移除。
 	_, err = model.UpdateSeedanceAssetIfUnchanged(asset.ID, loadedUpdatedAt, updates)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	// 成功更新和 CAS 冲突都返回数据库中的完整当前记录，禁止把旧状态重新写回前端缓存。
 	if err := model.DB.WithContext(c.Request.Context()).Where("user_id = ? AND id = ?", c.GetInt("id"), asset.ID).First(&asset).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	asset.PreviewURL, err = seedanceAssetPreviewURL(c.Request.Context(), &asset)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
-	common.ApiSuccess(c, asset)
+	seedanceAssetAPISuccess(c, asset)
 }
 
 const seedanceAssetBatchDeleteLimit = 100
@@ -429,21 +437,21 @@ type seedanceAssetBatchDeleteResult struct {
 func DeleteSeedanceAsset(c *gin.Context) {
 	var asset model.SeedanceAsset
 	if err := model.DB.Where("user_id = ? AND id = ?", c.GetInt("id"), c.Param("id")).First(&asset).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	replicas, err := model.FindSeedanceAssetReplicas(c.Request.Context(), asset.UserID, asset.ID)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	jobs := service.NewSeedanceAssetDeleteCleanupJobs(&asset, replicas)
 	if err := model.QueueSeedanceAssetDeletion(c.Request.Context(), jobs); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	service.EnqueueSeedanceAssetCleanup()
-	c.JSON(http.StatusAccepted, gin.H{"success": true, "data": nil})
+	seedanceAssetAPIResponse(c, http.StatusAccepted, gin.H{"success": true, "data": nil})
 }
 
 // DeleteSeedanceAssetBatch 按当前用户归属创建后台删除任务，避免批量上游请求阻塞单次 HTTP 请求。
@@ -641,31 +649,31 @@ func UploadSeedanceAsset(c *gin.Context) {
 func CreateSeedanceAsset(c *gin.Context) {
 	var req seedanceAssetRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	// 用户提供的地址交给上游抓取前必须执行现有 SSRF 策略，禁止任意协议和私网目标。
 	if err := service.ValidateSeedanceAssetSourceURL(strings.TrimSpace(req.SourceURL)); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid or disallowed asset source URL"})
+		seedanceAssetAPIResponse(c, http.StatusBadRequest, gin.H{"success": false, "message": "invalid or disallowed asset source URL"})
 		return
 	}
 	var group model.SeedanceAssetGroup
 	if err := model.DB.Where("user_id = ? AND group_id = ?", c.GetInt("id"), req.GroupID).First(&group).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if group.Status == "Deleting" {
-		common.ApiErrorMsg(c, "asset group is being deleted")
+		seedanceAssetAPIErrorMsg(c, "asset group is being deleted")
 		return
 	}
 	client, err := service.ResolveSeedanceAssetClient(c.Request.Context(), group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	assetID, err := client.CreateSeedanceAsset(c.Request.Context(), group.GroupID, strings.TrimSpace(req.SourceURL), req.AssetType, strings.TrimSpace(req.Name))
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	asset := &model.SeedanceAsset{
@@ -676,20 +684,20 @@ func CreateSeedanceAsset(c *gin.Context) {
 	asset.KeyFingerprint = group.KeyFingerprint
 	if err := model.CreateSeedanceAssetInGroup(c.Request.Context(), asset); err != nil {
 		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, "")
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	asset.PreviewURL, err = seedanceAssetPreviewURL(c.Request.Context(), asset)
 	if err != nil {
 		if deleteErr := model.DeleteSeedanceAssetWithCount(c.Request.Context(), asset.UserID, asset.ID, ""); deleteErr != nil {
 			common.SysError("failed to remove Seedance asset after preview signing failure: " + deleteErr.Error())
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 			return
 		}
 		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, "")
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	enqueueSeedanceAssetPolling()
-	c.JSON(http.StatusAccepted, gin.H{"success": true, "data": asset})
+	seedanceAssetAPIResponse(c, http.StatusAccepted, gin.H{"success": true, "data": asset})
 }

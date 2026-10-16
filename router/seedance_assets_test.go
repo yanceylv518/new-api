@@ -91,7 +91,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				common.IsMasterNode = previousMaster
 				assert.NoError(t, connection.Close())
 			})
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAsset{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
 			users := []model.User{{Id: 85001, Username: "assetsowner", AffCode: "assetsowner", Group: "default", Status: common.UserStatusEnabled}, {Id: 85002, Username: "assetsother", AffCode: "assetsother", Group: "default", Status: common.UserStatusEnabled}}
 			// 不同引擎使用不同用户，避免进程级限流跨测试累计。
 			for i := range users {
@@ -111,6 +111,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 			require.NoError(t, db.Delete(&tokens[6]).Error)
 			var calls atomic.Int32
 			var assetSequence atomic.Int32
+			var groupSequence atomic.Int32
 			var createdGroupType string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
@@ -122,6 +123,11 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 					}
 					assert.NoError(t, common.DecodeJson(r.Body, &body))
 					createdGroupType = body.GroupType
+					sequence := groupSequence.Add(1)
+					if sequence > 1 {
+						_, _ = fmt.Fprintf(w, `{"Result":{"Id":"group-api-%d"}}`, sequence)
+						return
+					}
 				}
 				if r.URL.Query().Get("Action") == "CreateAsset" {
 					_, _ = fmt.Fprintf(w, `{"Result":{"Id":"asset-api-%d"}}`, assetSequence.Add(1))
@@ -136,6 +142,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 			router := gin.New()
 			router.Use(middleware.BodyStorageCleanup())
 			setSeedanceAssetAPIRoutes(router)
+			setSeedanceAssetValidationActionRoute(router)
 			// 请求助手保留真实路由和鉴权，仅负责构造测试 HTTP 消息。
 			request := func(key, method, path, body string) *httptest.ResponseRecorder {
 				req := httptest.NewRequest(method, "/v1/seedance"+path, strings.NewReader(body))
@@ -243,8 +250,136 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 			beforeQueries := calls.Load()
 			verifySeedanceLibraryQueries(t, db, router, users[0].Id+10, users[1].Id)
 			assert.Equal(t, beforeQueries, calls.Load(), "local queries must not call upstream")
+			verifySeedanceAssetActions(t, db, router, users[0].Id+20, users[1].Id)
 		})
 	}
+}
+
+// verifySeedanceAssetActions 通过生产路由覆盖 Action 全链路，并与原 REST 接口交叉读取。
+func verifySeedanceAssetActions(t *testing.T, db *gorm.DB, router *gin.Engine, owner, outsider int) {
+	t.Helper()
+	require.NoError(t, db.Create(&model.User{Id: owner, Username: "actionowner", AffCode: "actionowner", Group: "default", Status: common.UserStatusEnabled}).Error)
+	tokens := []model.Token{
+		{UserId: owner, Key: "assetactionone", UnlimitedQuota: true, ExpiredTime: -1},
+		{UserId: owner, Key: "assetactiontwo", UnlimitedQuota: true, ExpiredTime: -1, ModelLimitsEnabled: true, ModelLimits: "doubao-seedance-2-0-fast-260128"},
+		{UserId: owner, Key: "assetactiondenied", UnlimitedQuota: true, ExpiredTime: -1, ModelLimitsEnabled: true, ModelLimits: "unavailable-model"},
+	}
+	require.NoError(t, db.Create(&tokens).Error)
+	request := func(key, action, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/doubao/v2/assets?Action="+action+"&Version=2024-01-01", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer sk-"+key)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	created := request("assetactiontwo", "CreateAssetGroup", `{"Name":"Action library","Description":"references","GroupType":"AIGC"}`)
+	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
+	var createdResponse struct {
+		Result struct {
+			ID string `json:"Id"`
+		}
+	}
+	require.NoError(t, common.Unmarshal(created.Body.Bytes(), &createdResponse))
+	groupID := createdResponse.Result.ID
+	require.NotEmpty(t, groupID)
+	assert.NotContains(t, created.Body.String(), "channel_id")
+	assert.NotContains(t, created.Body.String(), "user_id")
+	assert.NotContains(t, created.Body.String(), "fixtureupstream")
+	assert.Equal(t, http.StatusBadGateway, request("assetactiondenied", "CreateAssetGroup", `{"Name":"Denied"}`).Code)
+	assert.Equal(t, http.StatusBadRequest, request("assetactionone", "CreateAssetGroup", `{"Name":"Portrait","GroupType":"LivenessFace"}`).Code)
+	groupBody := fmt.Sprintf(`{"Id":%q}`, groupID)
+	assert.Contains(t, request("assetactionone", "GetAssetGroup", groupBody).Body.String(), `"Description":"references"`)
+	assert.Contains(t, request("assetactionone", "ListAssetGroups", `{}`).Body.String(), groupID)
+	updatedGroup := request("assetactiontwo", "UpdateAssetGroup", fmt.Sprintf(`{"Id":%q,"Description":"changed"}`, groupID))
+	require.Equal(t, http.StatusOK, updatedGroup.Code, updatedGroup.Body.String())
+	assert.Contains(t, request("assetactionone", "GetAssetGroup", groupBody).Body.String(), `"Description":"changed"`)
+	registered := request("assetactiontwo", "CreateAsset", fmt.Sprintf(`{"GroupId":%q,"URL":"https://8.8.8.8/reference.png","AssetType":"Image","Name":"reference"}`, groupID))
+	require.Equal(t, http.StatusOK, registered.Code, registered.Body.String())
+	require.NoError(t, common.Unmarshal(registered.Body.Bytes(), &createdResponse))
+	assetID := createdResponse.Result.ID
+	require.NotEmpty(t, assetID)
+	assetBody := fmt.Sprintf(`{"Id":%q}`, assetID)
+	pending := request("assetactionone", "GetAsset", assetBody)
+	require.Equal(t, http.StatusOK, pending.Code, pending.Body.String())
+	assert.Contains(t, pending.Body.String(), `"Status":"Processing"`)
+	assert.Contains(t, pending.Body.String(), `"URL":""`)
+	var asset model.SeedanceAsset
+	require.NoError(t, db.Where("user_id = ? AND asset_id = ?", owner, assetID).First(&asset).Error)
+	// 只模拟上游审核终态；读取仍经过平台真实查询、归属校验与响应转换。
+	require.NoError(t, db.Model(&asset).Update("status", "Active").Error)
+	active := request("assetactionone", "GetAsset", assetBody)
+	assert.Contains(t, active.Body.String(), `"URL":"https://8.8.8.8/reference.png"`)
+	updated := request("assetactiontwo", "UpdateAsset", fmt.Sprintf(`{"Id":%q,"Name":"reference renamed"}`, assetID))
+	require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+	assert.Contains(t, request("assetactionone", "GetAsset", assetBody).Body.String(), `"Name":"reference renamed"`)
+	for _, tc := range []struct {
+		action, body string
+		total, count int
+	}{
+		{"ListAssetGroups", `{"PageNumber":1,"PageSize":1}`, 1, 1},
+		{"ListAssetGroups", `{"PageNumber":99,"PageSize":1}`, 1, 0},
+		{"ListAssetGroups", `{"Filter":{"GroupType":"LivenessFace"}}`, 0, 0},
+		{"ListAssetGroups", `{"Filter":{"Name":"Action"}}`, 1, 1},
+		{"ListAssets", `{"Filter":{"Statuses":["Active"],"Name":"renamed","AssetType":"Image"}}`, 1, 1},
+		{"ListAssets", `{"Filter":{"Statuses":["Failed"]}}`, 0, 0},
+		{"ListAssets", `{"PageNumber":99,"PageSize":1}`, 1, 0},
+	} {
+		w := request("assetactiontwo", tc.action, tc.body)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var response struct {
+			ResponseMetadata struct{ Action string }
+			Result           struct {
+				TotalCount int
+				Items      []map[string]any
+			}
+		}
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &response))
+		assert.Equal(t, tc.action, response.ResponseMetadata.Action)
+		assert.Equal(t, tc.total, response.Result.TotalCount, tc.body)
+		assert.Len(t, response.Result.Items, tc.count, tc.body)
+	}
+	for _, tc := range []struct{ action, body string }{
+		{"GetAsset", assetBody}, {"UpdateAsset", fmt.Sprintf(`{"Id":%q,"Name":"stolen"}`, assetID)}, {"DeleteAsset", assetBody},
+		{"GetAssetGroup", groupBody}, {"UpdateAssetGroup", fmt.Sprintf(`{"Id":%q,"Name":"stolen"}`, groupID)}, {"DeleteAssetGroup", groupBody},
+		{"CreateAsset", fmt.Sprintf(`{"GroupId":%q,"URL":"https://8.8.8.8/reference.png","AssetType":"Image"}`, groupID)},
+	} {
+		w := request("assetkeyother", tc.action, tc.body)
+		assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), `"Code":"ResourceNotFound"`)
+	}
+	for _, tc := range []struct{ action, body string }{
+		{"ListAssets", `{"PageNumber":0}`}, {"ListAssets", `{"PageSize":101}`},
+		{"ListAssets", `{"PageNumber":null}`}, {"ListAssets", `{"Filter":[]}`},
+		{"ListAssets", `{"Filter":{"UserId":1}}`}, {"ListAssets", `{"Filter":{"Statuses":[null]}}`},
+		{"ListAssets", `{"Filter":{"AssetType":"PDF"}}`}, {"ListAssets", `{"SortBy":"name; DROP TABLE users"}`},
+		{"ListAssets", `{"user_id":1}`}, {"GetAsset", `{}`},
+		{"UpdateAsset", fmt.Sprintf(`{"Id":%q,"URL":"https://8.8.8.8/replaced.png"}`, assetID)},
+		{"CreateAsset", fmt.Sprintf(`{"GroupId":%q,"URL":"http://127.0.0.1/private","AssetType":"Image"}`, groupID)},
+	} {
+		w := request("assetactionone", tc.action, tc.body)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), `"ResponseMetadata"`)
+	}
+	// 新旧接口读取同一条记录，数字 ID 只用于 REST，Action 使用公开字符串 ID。
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/seedance/assets/%d", asset.ID), nil)
+	req.Header.Set("Authorization", "Bearer sk-assetactiontwo")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), `"name":"reference renamed"`)
+	deleted := request("assetactiontwo", "DeleteAsset", assetBody)
+	require.Equal(t, http.StatusAccepted, deleted.Code, deleted.Body.String())
+	assert.Contains(t, deleted.Body.String(), `"Status":"Deleting"`)
+	assert.Contains(t, request("assetactionone", "GetAsset", assetBody).Body.String(), `"Status":"Deleting"`)
+	deletedGroup := request("assetactiontwo", "DeleteAssetGroup", groupBody)
+	require.Equal(t, http.StatusAccepted, deletedGroup.Code, deletedGroup.Body.String())
+	assert.Contains(t, deletedGroup.Body.String(), `"Status":"Deleting"`)
+	var jobs int64
+	require.NoError(t, db.Model(&model.SeedanceAssetCleanupJob{}).Where("user_id = ?", owner).Count(&jobs).Error)
+	assert.EqualValues(t, 2, jobs)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, tokens[0].Id).Error)
+	assert.Zero(t, stored.UsedQuota)
 }
 
 // verifySeedanceLibraryQueries 在同一真实数据库矩阵内验证授权、组合筛选和稳定分页。

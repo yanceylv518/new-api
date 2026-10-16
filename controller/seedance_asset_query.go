@@ -19,6 +19,8 @@ import (
 type seedanceLibraryQuery struct {
 	groups, ids, assetIDs, statuses, assetTypes []string
 	search, order                               string
+	groupType                                   string
+	nameOnly                                    bool
 	after, before                               *time.Time
 	page                                        *common.PageInfo
 	paginated                                   bool
@@ -28,10 +30,23 @@ type seedanceLibraryQuery struct {
 // 单复数互斥，限制原始元素数以防去重前的无界输入；排序只能来自固定白名单。
 func parseSeedanceLibraryQuery(c *gin.Context, groups bool) (*seedanceLibraryQuery, error) {
 	q := &seedanceLibraryQuery{page: common.GetPageQuery(c)}
+	q.nameOnly = c.GetString(seedanceAssetActionContextKey) != ""
+	q.groupType = c.GetString("seedance_asset_action_group_type")
 	// URL.Query 会静默丢弃格式错误的参数，必须显式拒绝，避免意外退回全量查询。
 	values, err := url.ParseQuery(c.Request.URL.RawQuery)
 	if err != nil {
 		return nil, fmt.Errorf("invalid query string")
+	}
+	if q.nameOnly {
+		actionQuery, exists := c.Get("seedance_asset_action_query")
+		var valid bool
+		values, valid = actionQuery.(url.Values)
+		if !exists || !valid {
+			return nil, fmt.Errorf("asset Action query is unavailable")
+		}
+		// Action 已完成范围校验，不经过 Gin 的旧查询缓存或 REST 默认分页。
+		q.page.Page, _ = strconv.Atoi(values.Get("p"))
+		q.page.PageSize, _ = strconv.Atoi(values.Get("page_size"))
 	}
 	for _, key := range []string{"search", "sort_by", "sort_order", "created_after", "created_before", "p", "page_size", "ps", "size"} {
 		if len(values[key]) > 1 {
@@ -195,6 +210,9 @@ func (q *seedanceLibraryQuery) scope(db *gorm.DB) *gorm.DB {
 
 // filter 所有值均参数绑定，SQL 字段来自内部固定集合，同一字段多值为 OR、不同字段为 AND。
 func (q *seedanceLibraryQuery) filter(db *gorm.DB, groups bool) *gorm.DB {
+	if groups && q.groupType != "" {
+		db = db.Where("group_type = ?", q.groupType)
+	}
 	if len(q.ids) > 0 {
 		db = db.Where("id IN ?", q.ids)
 	}
@@ -215,7 +233,9 @@ func (q *seedanceLibraryQuery) filter(db *gorm.DB, groups bool) *gorm.DB {
 	}
 	if q.search != "" {
 		keyword := "%" + strings.NewReplacer("#", "##", "%", "#%", "_", "#_").Replace(strings.ToLower(q.search)) + "%"
-		if groups {
+		if q.nameOnly {
+			db = db.Where("LOWER(name) LIKE ? ESCAPE '#'", keyword)
+		} else if groups {
 			db = db.Where("(LOWER(name) LIKE ? ESCAPE '#' OR LOWER(group_id) LIKE ? ESCAPE '#')", keyword, keyword)
 		} else {
 			db = db.Where("(LOWER(name) LIKE ? ESCAPE '#' OR LOWER(asset_id) LIKE ? ESCAPE '#')", keyword, keyword)
@@ -228,37 +248,37 @@ func (q *seedanceLibraryQuery) filter(db *gorm.DB, groups bool) *gorm.DB {
 func GetSeedanceAssetGroup(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid id"})
+		seedanceAssetAPIResponse(c, http.StatusBadRequest, gin.H{"success": false, "message": "invalid id"})
 		return
 	}
 	var group model.SeedanceAssetGroup
 	err = model.DB.WithContext(c.Request.Context()).Where("user_id = ? AND id = ?", c.GetInt("id"), id).First(&group).Error
 	if err == gorm.ErrRecordNotFound {
-		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "resource not found"})
+		seedanceAssetAPIResponse(c, http.StatusNotFound, gin.H{"success": false, "message": "resource not found"})
 		return
 	}
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
-	common.ApiSuccess(c, group)
+	seedanceAssetAPISuccess(c, group)
 }
 
 // GetSeedanceAsset 返回同步到本地的状态及临时预览，不隐式刷新或调用上游。
 func GetSeedanceAsset(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid id"})
+		seedanceAssetAPIResponse(c, http.StatusBadRequest, gin.H{"success": false, "message": "invalid id"})
 		return
 	}
 	var asset model.SeedanceAsset
 	err = model.DB.WithContext(c.Request.Context()).Where("user_id = ? AND id = ?", c.GetInt("id"), id).First(&asset).Error
 	if err == gorm.ErrRecordNotFound {
-		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "resource not found"})
+		seedanceAssetAPIResponse(c, http.StatusNotFound, gin.H{"success": false, "message": "resource not found"})
 		return
 	}
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	asset.PreviewURL, err = seedanceAssetPreviewURL(c.Request.Context(), &asset)
@@ -266,5 +286,5 @@ func GetSeedanceAsset(c *gin.Context) {
 		asset.PreviewURL = ""
 		common.SysError(fmt.Sprintf("failed to sign Seedance asset preview; asset_id=%d: %v", asset.ID, err))
 	}
-	common.ApiSuccess(c, asset)
+	seedanceAssetAPISuccess(c, asset)
 }

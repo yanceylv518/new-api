@@ -85,6 +85,13 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 // 绑定。API Key 的资源读取按用户共享，但建组不能绕过模型或分组访问限制。
 func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.Channel, error) {
 	if modelName == "" {
+		if c.GetString(seedanceAssetActionContextKey) == "CreateAssetGroup" {
+			channels, err := selectSeedanceAssetValidationChannels(c, "")
+			if err != nil {
+				return nil, err
+			}
+			return channels[0], nil
+		}
 		if c.GetInt("token_id") > 0 {
 			return nil, errors.New("model is required when creating an asset group with an API key")
 		}
