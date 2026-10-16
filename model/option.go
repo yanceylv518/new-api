@@ -184,6 +184,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
+	common.OptionMap[system_setting.RequestTraceCompressionOptionKey] = system_setting.DefaultRequestTraceCompressionLevel
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
@@ -214,6 +215,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == system_setting.RequestTraceCompressionOptionKey {
+		return system_setting.ValidateRequestTraceCompressionLevel(value)
+	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
@@ -229,6 +233,9 @@ func validateOptionValue(key string, value string) error {
 func UpdateOption(key string, value string) error {
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
+	}
+	if key == system_setting.RequestTraceCompressionOptionKey {
+		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if err := validateOptionValue(key, value); err != nil {
 		return err
@@ -287,6 +294,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == system_setting.RequestTraceCompressionOptionKey {
+		if err := system_setting.ValidateRequestTraceCompressionLevel(value); err != nil {
+			return err
+		}
+	}
 	if key == retiredThemeOptionKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)

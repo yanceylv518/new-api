@@ -42,6 +42,7 @@ import {
   FormControl,
   FormDescription,
   FormField,
+  FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
@@ -76,16 +77,23 @@ import {
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
-import type { LogCleanupTask } from '../types'
+import type { LogCleanupTask, UpdateOptionRequest } from '../types'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTraceCompressionLevel: z.enum([
+    'fastest',
+    'default',
+    'better',
+    'best',
+  ]),
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultCompressionLevel: LogSettingsFormValues['RequestTraceCompressionLevel']
 }
 
 type ServerLogInfo = {
@@ -139,15 +147,14 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
   return task?.status === 'pending' || task?.status === 'running'
 }
 
-export function LogSettingsSection({
-  defaultEnabled,
-}: LogSettingsSectionProps) {
+export function LogSettingsSection(props: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
-      LogConsumeEnabled: defaultEnabled,
+      LogConsumeEnabled: props.defaultEnabled,
+      RequestTraceCompressionLevel: props.defaultCompressionLevel,
     },
   })
 
@@ -174,8 +181,14 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    form.reset(
+      {
+        LogConsumeEnabled: props.defaultEnabled,
+        RequestTraceCompressionLevel: props.defaultCompressionLevel,
+      },
+      { keepDirtyValues: true }
+    )
+  }, [props.defaultEnabled, props.defaultCompressionLevel, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -257,11 +270,28 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    const updates: UpdateOptionRequest[] = []
+    if (values.LogConsumeEnabled !== props.defaultEnabled) {
+      updates.push({
+        key: 'LogConsumeEnabled',
+        value: values.LogConsumeEnabled,
+      })
+    }
+    if (values.RequestTraceCompressionLevel !== props.defaultCompressionLevel) {
+      updates.push({
+        key: 'request_trace.compression_level',
+        value: values.RequestTraceCompressionLevel,
+      })
+    }
+    try {
+      for (const update of updates) {
+        const result = await updateOption.mutateAsync(update)
+        if (!result.success) return
+      }
+      form.reset(values)
+    } catch {
+      // 变更失败已由 useUpdateOption 显示错误，保留表单供用户重试。
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -340,7 +370,10 @@ export function LogSettingsSection({
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
           <SettingsPageFormActions
             onSave={form.handleSubmit(onSubmit)}
-            isSaving={updateOption.isPending}
+            isSaving={form.formState.isSubmitting}
+            isSaveDisabled={
+              Object.keys(form.formState.dirtyFields).length === 0
+            }
             saveLabel='Save log settings'
           />
           <FormField
@@ -360,10 +393,66 @@ export function LogSettingsSection({
                   <Switch
                     checked={field.value}
                     onCheckedChange={field.onChange}
+                    disabled={form.formState.isSubmitting}
                   />
                 </FormControl>
                 <FormMessage />
               </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='RequestTraceCompressionLevel'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Request timeline compression')}</FormLabel>
+                <Select
+                  items={[
+                    { value: 'fastest', label: t('Fastest (recommended)') },
+                    { value: 'default', label: t('Default compression') },
+                    { value: 'better', label: t('Higher compression') },
+                    { value: 'best', label: t('Maximum compression') },
+                  ]}
+                  value={field.value}
+                  onValueChange={field.onChange}
+                  disabled={form.formState.isSubmitting}
+                >
+                  <FormControl>
+                    <SelectTrigger className='w-full sm:w-64'>
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent alignItemWithTrigger={false}>
+                    <SelectGroup>
+                      <SelectItem value='fastest'>
+                        {t('Fastest (recommended)')}
+                      </SelectItem>
+                      <SelectItem value='default'>
+                        {t('Default compression')}
+                      </SelectItem>
+                      <SelectItem value='better'>
+                        {t('Higher compression')}
+                      </SelectItem>
+                      <SelectItem value='best'>
+                        {t('Maximum compression')}
+                      </SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <FormDescription>
+                  {t(
+                    'For relational log databases. ClickHouse stores JSON with native ZSTD(1) compression.'
+                  )}{' '}
+                  {t(
+                    'Compression is lossless. Short timelines stay uncompressed when that is smaller.'
+                  )}{' '}
+                  {t(
+                    'Changes apply to newly written timelines. Higher compression uses more CPU and memory.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
             )}
           />
 

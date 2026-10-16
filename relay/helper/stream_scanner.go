@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -82,6 +83,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
+	trace := requesttrace.FromContext(c.Request.Context())
+	streamTiming := requesttrace.Stream{}
+	var firstEventUS, lastEventUS int64
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -238,6 +242,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
+			observedAtUS := trace.OffsetUS()
 			// 检查是否需要停止
 			select {
 			case <-stopChan:
@@ -263,6 +268,19 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				continue
 			}
 			if !strings.HasPrefix(data, "[DONE]") {
+				if trace != nil {
+					now := observedAtUS
+					if streamTiming.FirstUS == nil {
+						firstEventUS = now
+						streamTiming.FirstUS = &firstEventUS
+					}
+					if streamTiming.LastUS != nil && now-*streamTiming.LastUS > streamTiming.MaxGapUS {
+						streamTiming.MaxGapUS = now - *streamTiming.LastUS
+					}
+					lastEventUS = now
+					streamTiming.LastUS = &lastEventUS
+					streamTiming.Count++
+				}
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
 
@@ -302,6 +320,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	streamTiming.End = string(info.StreamStatus.EndReason)
+	streamTiming.Failed = !info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors()
+	trace.SetStream(streamTiming)
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {

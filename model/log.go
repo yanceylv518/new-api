@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -286,6 +287,8 @@ func RecordTopupLog(userId int, content string, callerIp string, paymentMethod s
 
 func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string, tokenName string, content string, tokenId int, useTimeSeconds int,
 	isStream bool, group string, other *LogOther, knownKeys ...string) {
+	phase := requesttrace.FromRequest(c.Request).Begin("error_log")
+	defer phase.End()
 	// 写入前移除凭证与媒体编码，避免数据库及旧节点获得原始敏感内容。
 	content = common.SanitizeErrorLogContent(content, knownKeys...)
 	logger.LogInfo(c, fmt.Sprintf("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
@@ -326,7 +329,9 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
+	insertPhase := requesttrace.FromRequest(c.Request).Begin("log_insert")
 	err := createLog(log)
+	insertPhase.End()
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
 	}
@@ -351,6 +356,8 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	if !common.LogConsumeEnabled {
 		return
 	}
+	phase := requesttrace.FromRequest(c.Request).Begin("consume_log")
+	defer phase.End()
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
@@ -390,7 +397,9 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
+	insertPhase := requesttrace.FromRequest(c.Request).Begin("log_insert")
 	err := createLog(log)
+	insertPhase.End()
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
 	}

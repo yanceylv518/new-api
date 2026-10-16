@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -72,6 +74,7 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	trace := requesttrace.FromContext(c.Request.Context())
 
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -86,14 +89,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		var err error
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
+			trace.Fail("failed", "websocket_handshake", "upgrade_failed")
 			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
 			return
 		}
 		defer ws.Close()
+		trace.Status(http.StatusSwitchingProtocols)
 	}
 
 	defer func() {
 		if newAPIError != nil {
+			outcome := "failed"
+			var timeout interface{ Timeout() bool }
+			if errors.Is(newAPIError, context.Canceled) {
+				outcome = "canceled"
+			} else if errors.Is(newAPIError, context.DeadlineExceeded) || errors.As(newAPIError, &timeout) && timeout.Timeout() {
+				outcome = "timeout"
+			}
+			trace.Fail(outcome, "relay", "request_failed")
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(common.MaskCredentials(newAPIError.Error(), common.GetContextKeyString(c, constant.ContextKeyChannelKey)))))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
@@ -112,7 +125,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
+	validationPhase := trace.Begin("validate")
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
+	validationPhase.End()
 	if err != nil {
 		// Map "request body too large" to 413 so clients can handle it correctly
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
@@ -128,6 +143,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
+	trace.Describe(relayInfo.OriginModelName, relayInfo.UsingGroup, &relayInfo.IsStream)
+	preparePhase := trace.Begin("pricing_prepare")
+	defer preparePhase.End()
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
@@ -157,6 +175,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.SetEstimatePromptTokens(tokens)
 
 	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	preparePhase.End()
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
@@ -167,7 +186,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if priceData.FreeModel {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
 	} else {
+		prechargePhase := trace.Begin("precharge")
 		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
+		prechargePhase.End()
 		relayInfo.ReservedDiscountAmounts = priceData.DiscountAmounts
 		if newAPIError != nil {
 			return
@@ -197,7 +218,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
+		var selectionPhase *requesttrace.Span
+		if relayInfo.ChannelMeta != nil {
+			selectionPhase = trace.Begin("channel_select")
+		}
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
+		selectionPhase.End()
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
@@ -220,6 +246,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		trace.BeginAttempt(channel.Id)
+		attemptPhase := trace.Begin("channel_handler")
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -231,11 +259,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		default:
 			newAPIError = relayHandler(c, relayInfo)
 		}
+		attemptPhase.End()
+		trace.Describe(relayInfo.OriginModelName, relayInfo.UsingGroup, &relayInfo.IsStream)
 
 		if newAPIError == nil {
+			trace.EndAttempt("success")
 			relayInfo.LastError = nil
 			return
 		}
+		trace.EndAttempt("failed")
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
@@ -600,6 +632,7 @@ func executeTaskSubmissionWith(
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
 ) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
 	var result *relay.TaskSubmitResult
@@ -668,7 +701,16 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		trace.BeginAttempt(channel.Id)
+		attemptPhase := trace.Begin("channel_handler")
 		result, taskErr = submit(c, relayInfo)
+		attemptPhase.End()
+		if taskErr == nil {
+			trace.EndAttempt("success")
+		} else {
+			trace.EndAttempt("failed")
+		}
+		trace.Describe(relayInfo.OriginModelName, relayInfo.UsingGroup, nil)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
