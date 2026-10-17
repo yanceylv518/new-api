@@ -741,6 +741,14 @@ func executeTaskSubmissionWith(
 		task.PrivateData.InitialAccountingPending = true
 	}
 	if requestValue, exists := c.Get("task_request"); exists {
+		// 快照使用客户端 JSON 结构，避免重复保存插件派生的 prompt、metadata 等字段。
+		if requestContext, ok := common.GetContextKeyType[pluginruntime.RouteRequestContext](c, pluginruntime.ContextKeyRouteRequest); ok {
+			if body, ok := requestContext.Body.(map[string]any); ok && body["kind"] == string(pluginruntime.BodyJSON) {
+				if originalBody, present := body["value"]; present {
+					requestValue = originalBody
+				}
+			}
+		}
 		snapshot, snapshotErr := model.NewTaskRequestSnapshot(task, requestValue)
 		if snapshotErr != nil {
 			logger.LogWarn(c, fmt.Sprintf("task request snapshot build failed for %s: %v", task.TaskID, snapshotErr))
