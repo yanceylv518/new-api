@@ -368,3 +368,20 @@ func TestRunVideoPollingScopesSharedUpstreamIDs(t *testing.T) {
 		assert.Equal(t, 9500, getUserQuota(t, id))
 	}
 }
+				task.PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{"899", "900"}}
+				log := getLastLog(t)
+				require.NotNil(t, log)
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+				adminInfo, ok := other["admin_info"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, []any{"899", "900"}, adminInfo["use_channel"])
+		tasks[index].PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{strconv.Itoa(index + 1), "950"}}
+		var other map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+		var index int
+		_, err := fmt.Sscanf(other["task_id"].(string), "log-audit-%d", &index)
+		require.NoError(t, err)
+		adminInfo, ok := other["admin_info"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, []any{strconv.Itoa(index + 1), "950"}, adminInfo["use_channel"])

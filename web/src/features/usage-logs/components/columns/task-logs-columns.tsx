@@ -117,7 +117,10 @@ export function useTaskLogsColumns(
 
     if (isAdmin) {
       columns.push(
-        createChannelColumn<TaskLog>({ headerLabel: t('Channel') }),
+        createChannelColumn<TaskLog>({
+          headerLabel: t('Channel'),
+          getRetryChannels: (log) => log.admin_info?.use_channel,
+        }),
         {
           id: 'user',
           header: t('User'),

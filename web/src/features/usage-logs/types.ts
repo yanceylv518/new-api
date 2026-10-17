@@ -119,7 +119,7 @@ export interface LogOtherData {
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
     multi_key_index?: number
-    use_channel?: number[]
+    use_channel?: (string | number)[]
     local_count_tokens?: boolean
     usage_billing_path?: UsageBillingPath | string
     channel_affinity?: ChannelAffinityInfo
@@ -353,6 +353,7 @@ export interface TaskLog {
   admin_info?: {
     request_id?: string
     request_path?: string
+    use_channel?: string[]
     task_plugin?: TaskPluginInfo
   }
   root_info?: {

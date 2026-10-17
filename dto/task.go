@@ -84,6 +84,7 @@ type TaskPluginRuntimeInfo struct {
 type TaskAdminInfo struct {
 	RequestID   string          `json:"request_id,omitempty"`
 	RequestPath string          `json:"request_path,omitempty"`
+	UseChannel  []string        `json:"use_channel,omitempty"`
 	TaskPlugin  *TaskPluginInfo `json:"task_plugin,omitempty"`
 }
 

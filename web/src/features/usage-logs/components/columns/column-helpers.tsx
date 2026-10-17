@@ -17,12 +17,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { ColumnDef } from '@tanstack/react-table'
-import { Zap } from 'lucide-react'
+import { GitBranch, Zap } from 'lucide-react'
 /* eslint-disable react-refresh/only-export-components */
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 
 import { DataTableColumnHeader } from '@/components/data-table'
 import { StatusBadge } from '@/components/status-badge'
+import { Button } from '@/components/ui/button'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import {
   Tooltip,
   TooltipContent,
@@ -34,6 +41,42 @@ import { cn } from '@/lib/utils'
 
 import { formatDuration } from '../../lib/format'
 import { FailReasonDialog } from '../dialogs/fail-reason-dialog'
+
+export function RetryChainIndicator(props: {
+  channels?: readonly (string | number)[]
+}) {
+  const { t } = useTranslation()
+  const channels = Array.isArray(props.channels)
+    ? props.channels.map(String).filter(Boolean)
+    : []
+  if (channels.length <= 1) return null
+
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            variant='ghost'
+            size='icon-xs'
+            className='text-muted-foreground hover:text-foreground size-5 rounded-full'
+            aria-label={t('Retry Chain')}
+            onClick={(event) => event.stopPropagation()}
+          />
+        }
+      >
+        <GitBranch className='size-3.5 text-amber-500' aria-hidden='true' />
+      </PopoverTrigger>
+      <PopoverContent side='top' align='start' className='w-64 text-xs'>
+        <div className='flex flex-col gap-1'>
+          <p className='font-medium'>{t('Retry Chain')}</p>
+          <p className='text-muted-foreground font-mono break-all'>
+            {channels.join(' → ')}
+          </p>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
 
 /**
  * Cache tooltip component for token display
@@ -166,6 +209,7 @@ export function createDurationColumn<T>(config: {
 export function createChannelColumn<T>(config: {
   accessorKey?: string
   headerLabel: string
+  getRetryChannels?: (row: T) => readonly (string | number)[] | undefined
 }): ColumnDef<T> {
   const { accessorKey = 'channel_id', headerLabel } = config
 
@@ -179,7 +223,7 @@ export function createChannelColumn<T>(config: {
       if (!channelId) {
         return <span className='text-muted-foreground/60 text-xs'>-</span>
       }
-      return (
+      const badge = (
         <StatusBadge
           label={`#${channelId}`}
           autoColor={String(channelId)}
@@ -188,6 +232,16 @@ export function createChannelColumn<T>(config: {
           showDot={false}
           className='font-mono'
         />
+      )
+      if (!config.getRetryChannels) return badge
+
+      return (
+        <div className='inline-flex items-center gap-1'>
+          {badge}
+          <RetryChainIndicator
+            channels={config.getRetryChannels(row.original)}
+          />
+        </div>
       )
     },
     meta: { label: headerLabel },

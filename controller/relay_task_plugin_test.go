@@ -188,6 +188,7 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 
 	c := taskSubmissionTestContext()
 	c.Set(common.RequestIdKey, "request-public")
+	c.Set("use_channel", []string{"8"})
 	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
 		Generation: &pluginruntime.RoutingGeneration{Number: 42},
 		Plugin: &pluginruntime.LoadedPlugin{Meta: pluginruntime.Meta{
@@ -217,6 +218,7 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	require.NotNil(t, outcome.Task.PrivateData.Execution.TaskPlugin)
 	assert.Equal(t, "request-public", outcome.Task.PrivateData.Execution.RequestID)
 	assert.Equal(t, "/plugin/submit", outcome.Task.PrivateData.Execution.RequestPath)
+	assert.Equal(t, []string{"8", "1"}, outcome.Task.PrivateData.Execution.UseChannel)
 	assert.Equal(t, "1.2.3", outcome.Task.PrivateData.Execution.TaskPlugin.Version)
 	assert.Equal(t, uint64(42), outcome.Task.PrivateData.Execution.TaskPlugin.Generation)
 	require.NotNil(t, outcome.Task.PrivateData.Execution.TaskPlugin.Author)
@@ -226,11 +228,60 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	var stored model.Task
 	require.NoError(t, database.Where("task_id = ?", "task_public").First(&stored).Error)
 	require.NotNil(t, stored.PrivateData.Execution)
+	assert.Equal(t, []string{"8", "1"}, stored.PrivateData.Execution.UseChannel)
 	require.NotNil(t, stored.PrivateData.Execution.TaskPlugin)
 	assert.Equal(t, "document-parser", stored.PrivateData.Execution.TaskPlugin.Key)
 	require.NotNil(t, stored.PrivateData.Execution.TaskPlugin.Author)
 	assert.Equal(t, "Community Author", stored.PrivateData.Execution.TaskPlugin.Author.Name)
 	assert.Equal(t, "upstream-private", stored.PrivateData.UpstreamTaskID)
+}
+
+func TestTaskSubmissionRetryChainMatchesAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		attempts int
+	}{
+		{"retryable rejection", http.StatusServiceUnavailable, 2},
+		{"parameter rejection", http.StatusBadRequest, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			db := setupTaskSubmissionDatabase(t, true, &events)
+			previousRetries, previousErrorLog := common.RetryTimes, constant.ErrorLogEnabled
+			common.RetryTimes, constant.ErrorLogEnabled = 1, false
+			t.Cleanup(func() { common.RetryTimes, constant.ErrorLogEnabled = previousRetries, previousErrorLog })
+			billing := &taskSubmissionTestBilling{events: &events}
+			c := taskSubmissionTestContext()
+			attempts := 0
+			outcome, taskErr := executeTaskSubmissionWith(c, taskSubmissionRelayInfo(billing), func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				if attempts == 1 {
+					return nil, &dto.TaskError{Code: "upstream_rejected", Message: "rejected before acceptance", StatusCode: tc.status}
+				}
+				return &relay.TaskSubmitResult{UpstreamTaskID: "retry-upstream", Platform: "plugin"}, nil
+			})
+			assert.Equal(t, tc.attempts, attempts)
+			var count int64
+			require.NoError(t, db.Model(&model.Task{}).Count(&count).Error)
+			if tc.attempts == 1 {
+				require.NotNil(t, taskErr)
+				assert.Nil(t, outcome)
+				assert.Zero(t, count)
+				assert.Equal(t, 1, billing.refunds)
+				return
+			}
+			require.Nil(t, taskErr)
+			require.NotNil(t, outcome)
+			assert.EqualValues(t, 1, count)
+			assert.Zero(t, billing.refunds)
+			assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+			var stored model.Task
+			require.NoError(t, db.Where("task_id = ?", "task_public").First(&stored).Error)
+			require.NotNil(t, stored.PrivateData.Execution)
+			assert.Equal(t, []string{"1", "1"}, stored.PrivateData.Execution.UseChannel)
+		})
+	}
 }
 
 // A submit route declaring retainResult: false persists the task row for

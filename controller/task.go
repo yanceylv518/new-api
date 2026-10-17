@@ -601,6 +601,7 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			if execution := task.PrivateData.Execution; execution != nil {
 				adminInfo.RequestID = execution.RequestID
 				adminInfo.RequestPath = execution.RequestPath
+				adminInfo.UseChannel = execution.UseChannel
 				if snapshot := execution.TaskPlugin; snapshot != nil {
 					adminInfo.TaskPlugin = &dto.TaskPluginInfo{
 						Key:     snapshot.Key,
@@ -615,7 +616,7 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 					}
 				}
 			}
-			if adminInfo.RequestID != "" || adminInfo.RequestPath != "" || adminInfo.TaskPlugin != nil {
+			if adminInfo.RequestID != "" || adminInfo.RequestPath != "" || len(adminInfo.UseChannel) > 0 || adminInfo.TaskPlugin != nil {
 				item.AdminInfo = adminInfo
 			}
 		}

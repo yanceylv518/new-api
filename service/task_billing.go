@@ -94,6 +94,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		setTaskImageCount(other, info.PriceData.OtherRatios()["image_count"])
 	}
 	appendTaskLogInfo(task, other)
+	AppendRelayLogAdminInfo(c, info, other)
 	attachQuotaSaturation(c, info, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
@@ -222,6 +223,9 @@ func appendTaskLogInfo(task *model.Task, other *model.LogOther) {
 		AppendTaskPluginAuditInfo(other, task.PrivateData.Execution.TaskPlugin)
 	}
 	if task.PrivateData.UpstreamTaskID == "" && task.PrivateData.NodeName == "" {
+		if channels := task.PrivateData.Execution.UseChannel; len(channels) > 0 {
+			other.SetAdmin("use_channel", channels)
+		}
 		return
 	}
 	if task.PrivateData.UpstreamTaskID != "" {

@@ -17,18 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { ColumnDef } from '@tanstack/react-table'
-import { GitBranch, Sparkles, KeyRound } from 'lucide-react'
+import { Sparkles, KeyRound } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
 import {
   Tooltip,
   TooltipContent,
@@ -79,6 +74,7 @@ import { LogCostDisplay } from '../log-cost-display'
 import { ModelBadge } from '../model-badge'
 import { TimingMetricsCell, StreamTpsCell } from '../timing-metrics-cell'
 import { useUsageLogsContext } from '../usage-logs-provider'
+import { RetryChainIndicator } from './column-helpers'
 
 interface DetailSegment {
   text: string
@@ -481,37 +477,7 @@ export function useCommonLogsColumns(
                           aria-label={`${t('Key')} ${multiKeyIndex}`}
                         />
                       )}
-                      {hasRetryChain && (
-                        <Popover>
-                          <PopoverTrigger
-                            render={
-                              <button
-                                type='button'
-                                className='text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-5 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none'
-                                aria-label={t('Retry Chain')}
-                                onClick={(e) => e.stopPropagation()}
-                              />
-                            }
-                          >
-                            <GitBranch
-                              className='size-3.5 text-amber-500'
-                              aria-hidden='true'
-                            />
-                          </PopoverTrigger>
-                          <PopoverContent
-                            side='top'
-                            align='start'
-                            className='w-64 text-xs'
-                          >
-                            <div className='flex flex-col gap-1'>
-                              <p className='font-medium'>{t('Retry Chain')}</p>
-                              <p className='text-muted-foreground font-mono break-all'>
-                                {channelChain}
-                              </p>
-                            </div>
-                          </PopoverContent>
-                        </Popover>
-                      )}
+                      <RetryChainIndicator channels={useChannel} />
                       {affinity && (
                         <button
                           type='button'

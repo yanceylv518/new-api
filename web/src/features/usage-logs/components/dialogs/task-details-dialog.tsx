@@ -185,6 +185,13 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
               value={`#${props.log.channel_id}`}
               mono
             />
+            {(props.log.admin_info?.use_channel?.length ?? 0) > 1 ? (
+              <DetailRow
+                label={t('Retry Chain')}
+                value={props.log.admin_info?.use_channel?.join(' → ')}
+                mono
+              />
+            ) : null}
             <DetailRow label={t('Group')} value={props.log.group || '-'} />
             <DetailRow
               label={t('Quota')}

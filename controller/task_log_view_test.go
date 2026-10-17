@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -27,6 +28,7 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 			Execution: &model.TaskExecutionSnapshot{
 				RequestID:   "request-public",
 				RequestPath: "/v1/documents",
+				UseChannel:  []string{"8", "12"},
 				TaskPlugin: &model.TaskPluginSnapshot{
 					Key:     "document-parser",
 					Name:    "Document Parser",
@@ -57,6 +59,7 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	assert.Equal(t, "https://plugins.example/author", adminView.AdminInfo.TaskPlugin.Author.URL)
 	assert.Equal(t, "request-public", adminView.AdminInfo.RequestID)
 	assert.Equal(t, "/v1/documents", adminView.AdminInfo.RequestPath)
+	assert.Equal(t, []string{"8", "12"}, adminView.AdminInfo.UseChannel)
 	assert.Nil(t, adminView.RootInfo)
 
 	rootView := tasksToDto([]*model.Task{task}, false, common.RoleRootUser)[0]
@@ -77,6 +80,29 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(rootJSON), "channel-secret-canary")
 	assert.Contains(t, string(rootJSON), "upstream-private")
+	userJSON, err := common.Marshal(userView)
+	require.NoError(t, err)
+	assert.NotContains(t, string(userJSON), "use_channel")
+}
+
+func TestTaskLogRetryChainSnapshotRoundTrip(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	channels := []string{"8", "12"}
+	c.Set("use_channel", channels)
+	execution := service.TaskExecutionSnapshotFromContext(c)
+	require.NotNil(t, execution)
+	channels[0] = "99"
+	assert.Equal(t, []string{"8", "12"}, execution.UseChannel)
+
+	value, err := (model.TaskPrivateData{Execution: execution}).Value()
+	require.NoError(t, err)
+	var restored model.TaskPrivateData
+	require.NoError(t, restored.Scan(value))
+	require.NotNil(t, restored.Execution)
+	assert.Equal(t, []string{"8", "12"}, restored.Execution.UseChannel)
+	view := tasksToDto([]*model.Task{{TaskID: "task_retry", PrivateData: restored}}, false, common.RoleAdminUser)[0]
+	require.NotNil(t, view.AdminInfo)
+	assert.Equal(t, []string{"8", "12"}, view.AdminInfo.UseChannel)
 }
 
 func TestTaskLogDTODoesNotInventHistoricalPluginProvenance(t *testing.T) {

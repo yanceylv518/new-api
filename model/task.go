@@ -156,6 +156,7 @@ type TaskPrivateData struct {
 type TaskExecutionSnapshot struct {
 	RequestID   string              `json:"request_id,omitempty"`
 	RequestPath string              `json:"request_path,omitempty"`
+	UseChannel  []string            `json:"use_channel,omitempty"`
 	TaskPlugin  *TaskPluginSnapshot `json:"task_plugin,omitempty"`
 }
 
