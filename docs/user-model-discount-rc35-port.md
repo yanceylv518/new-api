@@ -456,3 +456,52 @@ rc35 本机 SQLite 10 万条规则基准（100 用户 × 1000 规则、20 用户
 - `go test -race ./service ./model ./common ./types -count=1 -timeout=3m`：model/common/types 全量通过（27.820s / 13.191s / 12.440s）；service 全量失败。更新“金额与元数据均无变化”的夹具后，`go test -json -race ./service -count=1 -timeout=2m` 仍在未改动的 `TestObserveChannelAffinityUsageCacheByRelayFormat_UnsupportedModeKeepsEmpty` 失败（计数期望 1、实际 3）。在保存的原提交 `d1e502277` 源码目录执行 `go test -race ./service -run '^TestObserveChannelAffinityUsageCacheByRelayFormat_' -count=3 -timeout=1m`，同类计数失败也复现。本轮不修改渠道亲和缓存；全量测试不计为通过。
 - `go build ./...`、`go vet ./model ./service`、`git diff --check`：通过。`git diff --exit-code HEAD -- model/quota_reserve.go model/user.go model/token.go model/user_cache.go` 通过，四个资金热路径文件未变化。
 - 本轮隔离 Compose 容器和网络已移除；本节记录提交前的验证结果，目标分支为 `custom/rc35-user-model-discount`，未部署。
+
+## 16. 视频分支排期与分层折扣适配（2026-10-16）
+
+本节针对 `custom/newapi-video`，来源为 `custom/rc35-user-model-discount@426f2e0da`。
+以视频分支现有固定折扣、缓存、金额快照和原子结算为基础增加以下能力：
+
+- 永久折扣和临时排期分层；临时有效期采用 `[start_time, end_time)`，未命中临时段时回退永久规则。
+- 多个不重叠的临时段、每周时段可视化编辑、条件表达式及版本冲突保护。
+- 折扣配置修改历史、分页用户选择器、规则状态筛选和有效期边界刷新。
+- 折扣日期按 `Asia/Shanghai` 编辑和显示；通用日期组件其他调用方保留原有浏览器时区。
+- 新增 `GET /api/user/model-pricing/history`；原有读取/替换规则接口扩展 `mode`、`permanent`、`periods`、`expression` 和时间字段，保留固定折扣请求的兼容入口。
+
+### 16.1 数据迁移
+
+只扩展独立表 `user_model_pricings`，增加 `slot`、`mode`、`start_time`、`end_time`、
+`expression`，并新增 `user_model_pricing_histories`。唯一索引从用户/模型调整为用户/模型/槽位；
+先创建新索引，再移除旧索引。历史固定折扣保留值和主键，不回填用户或任务大表。
+MySQL 历史 JSON 使用 MEDIUMTEXT，以容纳接近千段的完整规则快照。
+
+`tasks` 不增加 `billing_retry_at` 等列。所选折扣及折前小数基数保存到已有的
+`private_data.billing_context.user_discount` 和 `quota_before_discount`。
+
+### 16.2 计费契约
+
+请求开始时冻结规则、时间和条件需要的公开请求标量；重试不重新选规则。
+JSON 原始字段优先，multipart 和协议转换缺少原始 JSON 时从插件已解析的任务参数补齐；
+只保存表达式实际引用的白名单标量，不保存提示词、媒体、鉴权头或整个请求正文。
+最终结算仅更新依赖实际用量的条件，Token、秒数、数量和厂商单位使用最终有效事实。
+
+文本表达式求值失败时保留已冻结比例并记录错误。视频结算求值或资金事务失败时，
+保留非终态和预扣，沿用现有待核实/重试路径。确认失败的任务全额退还预扣，
+不能因折扣条件求值失败阻止退款。重复回调不重复记账。
+
+基础价格和请求倍率保持提交快照，只重新计算用户折扣。原价保留原有截断契约，
+有折扣时使用统一十进制取整。用户/令牌记录折后金额，渠道用量记录折前金额；
+日志继续保存折前、折后和优惠金额，并增加所选规则来源及表达式结果。
+
+视频仍由本分支的 `FinalizeVideoTask` 原子事务同时提交任务终态和账务。
+不移植旧分支的终态后补结算调度，不覆盖本分支的提交恢复、凭证加密、轮询退避和素材逻辑。
+Doubao、Hailuo 等插件共用宿主折扣链路，不要求逐个修改插件。
+
+### 16.3 本轮验证
+
+- MySQL 8.4.11 / PostgreSQL 15.19：新库、旧规则表升级、重复迁移、唯一性、历史容量及分层规则持久化通过。
+- 同两引擎的 mock 视频任务验证：Token/秒计价、固定任务价、冻结时刻、按实际用量改变比例、原价取整、退款、旧回调重放及资金写入故障后重试通过。
+- 即时完成的插件任务同样在提交响应中按实际用量重算折扣；固定折扣和条件折扣均写入实际金额及日志，不等待轮询修正。折扣求值失败时返回不可重试的本地错误，由现有提交意图保留已受理任务及预扣，不能把它当作上游未受理而重发或退款。
+- 文本折扣求值、异常回退、任务快照不可变及金额/渠道统计定向回归通过。
+- 前端类型检查和折扣编辑、排期、历史、用户选择、边界刷新等八个定向测试文件通过。
+- 未调用付费上游，未执行压测、完整测试套件或线上部署；本节不表示上述未执行项目已通过。

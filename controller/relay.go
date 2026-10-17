@@ -481,9 +481,11 @@ func newSubmittedTask(c *gin.Context, info *relaycommon.RelayInfo, result *relay
 	task.PrivateData.BillingContext = &model.TaskBillingContext{
 		ModelPrice: info.PriceData.ModelPrice, GroupRatio: info.PriceData.GroupRatioInfo.GroupRatio,
 		ModelRatio: info.PriceData.ModelRatio, OtherRatios: buildTaskBillingOtherRatios(&info.PriceData),
-		OriginModelName: info.OriginModelName,
-		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice,
-		TieredSnapshot:  info.TieredBillingSnapshot,
+		OriginModelName:     info.OriginModelName,
+		PerCallBilling:      common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice,
+		TieredSnapshot:      info.TieredBillingSnapshot,
+		UserDiscount:        info.UserModelDiscountEvaluation,
+		QuotaBeforeDiscount: info.PriceData.TaskQuotaBeforeDiscount,
 	}
 	task.Quota, task.Data, task.Action = result.Quota, result.TaskData, info.Action
 	task.PrivateData.PluginState = result.PluginState

@@ -24,7 +24,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -305,7 +304,13 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		priceData = types.PriceData{GroupRatioInfo: groupRatioInfo}
 		// 任务表达式已返回美元费用；不采用文本的每百万换算。
 		// 渠道映射仅选择上游计价配置；折扣始终匹配用户请求的公开计费身份。
-		discount := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(modelName)))
+		if err := helper.PrepareUserModelDiscount(c, info, 0, 0, facts); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "user_discount_invalid", http.StatusBadRequest)
+		}
+		discount := 10000
+		if info.UserModelDiscountEvaluation != nil {
+			discount = info.UserModelDiscountEvaluation.DiscountBPS
+		}
 		if discount >= 1 && discount < 10000 && !info.IsChannelTest {
 			priceData.AddOtherRatio(types.UserModelDiscountRatioKey, float64(discount)/10000)
 			beforeValue := decimal.NewFromFloat(cost).
@@ -318,6 +323,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			noteTaskQuotaClamp(info, clamp)
 		}
 		priceData.Quota, priceData.QuotaToPreConsume = quota, quota
+		priceData.TaskQuotaBeforeDiscount = decimal.NewFromFloat(cost).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).Mul(decimal.NewFromFloat(groupRatioInfo.GroupRatio)).String()
 		priceData.DiscountAmounts = types.NewDiscountAmounts(original, quota)
 		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
 	} else {
@@ -370,6 +376,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			}
 			original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
 			quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
+			info.PriceData.TaskQuotaBeforeDiscount = beforeValue.String()
 		} else {
 			before := base
 			if !common.StringsContains(constant.TaskPricePatches, modelName) {
@@ -377,6 +384,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			}
 			original, originalClamp = common.QuotaFromFloatChecked(before)
 			quota, clamp = common.QuotaFromFloatChecked(before)
+			basis := decimal.NewFromInt(int64(original))
+			if originalClamp == nil {
+				basis = decimal.NewFromFloat(before)
+			}
+			info.PriceData.TaskQuotaBeforeDiscount = basis.String()
 		}
 		if original > 0 && quota == 0 && info.PriceData.UserModelDiscountMultiplier() != 1 {
 			quota = 1
@@ -448,9 +460,18 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
+	submittedDiscount := info.PriceData.UserModelDiscountMultiplier()
+	if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusSuccess {
+		if err := service.ApplyImmediateTaskDiscount(info, parsed.Immediate); err != nil {
+			failure := service.TaskErrorWrapperLocal(err, "user_discount_settlement_failed", http.StatusBadGateway)
+			failure.NoRetry = true
+			return nil, failure
+		}
+	}
 	finalQuota := info.PriceData.Quota
 	if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusFailure {
 		finalQuota = 0
+		info.PriceData.DiscountAmounts = types.NewDiscountAmounts(0, 0)
 	} else if snap := info.TieredBillingSnapshot; snap != nil {
 		if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusSuccess && len(parsed.Immediate.UsageFacts) > 0 {
 			settlement, facts, err := service.EvaluateTaskCompletionUsage(snap, parsed.Immediate.UsageFacts)
@@ -458,6 +479,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				logger.LogWarn(c, fmt.Sprintf("task immediate usage settlement failed; retaining reserved quota: %v", err))
 			} else {
 				finalQuota = settlement.ActualQuotaAfterGroup
+				before := finalQuota
+				if ratio := info.PriceData.UserModelDiscountMultiplier(); ratio != 1 {
+					basis := decimal.NewFromFloat(settlement.ActualQuotaBeforeGroup).Mul(decimal.NewFromFloat(snap.GroupRatio))
+					var clamp *common.QuotaClamp
+					finalQuota, clamp = common.QuotaDiscountDecimalChecked(basis, ratio)
+					if before > 0 && finalQuota == 0 {
+						finalQuota = 1
+					}
+					noteTaskQuotaClamp(info, clamp)
+				}
+				info.PriceData.DiscountAmounts = types.NewDiscountAmounts(before, finalQuota)
 				snap.UsageFacts = facts
 				snap.EstimatedTier = settlement.MatchedTier
 				noteTaskQuotaClamp(info, settlement.Clamp)
@@ -470,6 +502,26 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				finalQuota = adjustedQuota
 				info.PriceData.Quota = finalQuota
 			}
+		}
+		if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusSuccess && submittedDiscount != info.PriceData.UserModelDiscountMultiplier() {
+			basis, err := decimal.NewFromString(info.PriceData.TaskQuotaBeforeDiscount)
+			if err != nil || basis.IsNegative() {
+				failure := service.TaskErrorWrapperLocal(errors.New("invalid submitted task pricing basis"), "user_discount_settlement_failed", http.StatusBadGateway)
+				failure.NoRetry = true
+				return nil, failure
+			}
+			before, clamp := common.QuotaFromDecimalChecked(basis)
+			if info.PriceData.UserModelDiscountMultiplier() == 1 {
+				before, clamp = common.QuotaFromDecimalChecked(basis.Truncate(0))
+				finalQuota = before
+			} else {
+				finalQuota, clamp = common.QuotaDiscountDecimalChecked(basis, info.PriceData.UserModelDiscountMultiplier())
+				if before > 0 && finalQuota == 0 {
+					finalQuota = 1
+				}
+			}
+			info.PriceData.DiscountAmounts = types.NewDiscountAmounts(before, finalQuota)
+			noteTaskQuotaClamp(info, clamp)
 		}
 	}
 
@@ -538,10 +590,17 @@ func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float6
 		beforeValue := adjustedPriceData.ApplyOtherRatiosBeforeDiscount(decimal.NewFromInt(int64(baseQuota)))
 		quota, clamp = common.QuotaDiscountDecimalChecked(beforeValue, discountRatio)
 		original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+		info.PriceData.TaskQuotaBeforeDiscount = beforeValue.String()
 	} else {
 		result := info.PriceData.ApplyOtherRatiosToFloat(baseQuota)
 		quota, clamp = common.QuotaFromFloatChecked(result)
-		original, originalClamp = common.QuotaFromFloatChecked(baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount())
+		before := baseQuota * info.PriceData.OtherRatioMultiplierBeforeDiscount()
+		original, originalClamp = common.QuotaFromFloatChecked(before)
+		basis := decimal.NewFromInt(int64(original))
+		if originalClamp == nil {
+			basis = decimal.NewFromFloat(before)
+		}
+		info.PriceData.TaskQuotaBeforeDiscount = basis.String()
 	}
 	noteTaskQuotaClamp(info, clamp)
 	noteTaskQuotaClamp(info, originalClamp)

@@ -21,17 +21,20 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   BadgePercent,
+  CalendarClock,
   ChevronLeft,
   ChevronRight,
   Loader2,
+  Plus,
   Search,
   X,
 } from 'lucide-react'
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -44,6 +47,14 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { handleServerError } from '@/lib/handle-server-error'
 import { cn } from '@/lib/utils'
 
@@ -52,11 +63,23 @@ import {
   buildUserModelPricingPayload,
   buildUserModelPricingRows,
   createUserModelPricingFormSchema,
+  countUserModelPricingPeriods,
+  getPricingPeriodStatus,
+  getUserModelPricingFormPeriods,
+  getUserModelPricingStatusOptions,
+  userModelPricingFormItem,
+  userModelPricingDiscountPercentSchema,
   FULL_PRICE_DISCOUNT_BPS,
   normalizeUserModelPricingModelName,
   type UserModelPricingFormValues,
 } from '../../lib/user-model-pricing-form'
 import type { User } from '../../types'
+import {
+  PricingPeriodStatusBadge,
+  TemporaryDiscountSummary,
+  UserModelPricingScheduleDialog,
+  UserModelPricingBatchTimeDialog,
+} from '../user-model-pricing-schedule'
 
 interface UserModelPricingDialogProps {
   open: boolean
@@ -64,6 +87,8 @@ interface UserModelPricingDialogProps {
   user: Pick<User, 'id' | 'username'>
   // 总览页编辑时只展示已经保存专属折扣的模型，用户管理页默认展示全部启用模型。
   configuredOnly?: boolean
+  // 只展示已配置模型时，提供切换到完整模型目录的入口，用于给该用户的其他模型添加折扣。
+  onShowAllModels?: () => void
   onSaved?: () => void | Promise<void>
 }
 
@@ -72,6 +97,9 @@ const MODEL_PAGE_SIZE = 25
 // 批量折扣输入的默认值；只有偏离该值时才要求显式应用后保存。
 const DEFAULT_BATCH_DISCOUNT_VALUE = FULL_PRICE_DISCOUNT_BPS / 100
 const DEFAULT_BATCH_DISCOUNT = String(DEFAULT_BATCH_DISCOUNT_VALUE)
+
+// 模型行内最多直接展示的临时折扣条数，其余折叠为数量提示。
+const ROW_TEMPORARY_DISCOUNT_PREVIEW = 2
 
 // 表头与数据行共用同一套列模板和水平内边距，确保复选框、模型名和折扣输入严格对齐。
 const MODEL_PRICING_GRID_CLASS =
@@ -85,6 +113,7 @@ type ModelPricingBatchActionsProps = {
   onValueChange: (value: string) => void
   onApply: () => void
   onClear: () => void
+  onValidity: () => void
 }
 
 /**
@@ -151,6 +180,15 @@ function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
         </Button>
         <Button
           type='button'
+          variant='outline'
+          disabled={props.disabled}
+          onClick={props.onValidity}
+        >
+          <CalendarClock aria-hidden='true' />
+          {t('Batch validity')}
+        </Button>
+        <Button
+          type='button'
           variant='ghost'
           size='icon-sm'
           aria-label={t('Clear selection')}
@@ -174,6 +212,42 @@ function ModelPricingBatchActions(props: ModelPricingBatchActionsProps) {
   )
 }
 
+type ModelTemporaryDiscountsProps = {
+  periods: NonNullable<UserModelPricingFormValues['items'][number]['periods']>
+  permanentPercent: number | null | undefined
+  now: number
+}
+
+function ModelTemporaryDiscounts(props: ModelTemporaryDiscountsProps) {
+  const { t } = useTranslation()
+  if (props.periods.length === 0) return null
+  const hidden = props.periods.length - ROW_TEMPORARY_DISCOUNT_PREVIEW
+
+  return (
+    <div className='mt-1 flex flex-col items-start gap-1'>
+      {props.periods.slice(0, ROW_TEMPORARY_DISCOUNT_PREVIEW).map((period) => (
+        <span
+          // 同一模型的临时折扣有效期互不重叠，起止时间足以区分各行。
+          key={`${period.start_time ?? ''}:${period.end_time ?? ''}`}
+          data-slot='model-temporary-discount'
+          className='text-muted-foreground flex max-w-full items-center gap-1.5 text-xs'
+        >
+          <PricingPeriodStatusBadge period={period} now={props.now} />
+          <TemporaryDiscountSummary
+            period={period}
+            permanentPercent={props.permanentPercent}
+          />
+        </span>
+      ))}
+      {hidden > 0 && (
+        <span className='text-muted-foreground text-xs'>
+          {t('{{n}} more temporary discount(s)', { n: hidden })}
+        </span>
+      )}
+    </div>
+  )
+}
+
 /** 管理员编辑单个用户的完整模型折扣比例规则。 */
 export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const { t } = useTranslation()
@@ -181,6 +255,11 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const configuredOnly = props.configuredOnly === true
   const [searchTerm, setSearchTerm] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [scheduleModel, setScheduleModel] = useState<string | null>(null)
+  const [batchTimeOpen, setBatchTimeOpen] = useState(false)
+  const [discardOpen, setDiscardOpen] = useState(false)
+  const [clockTick, setClockTick] = useState(0)
   // 以规范化模型名保存选择，翻页和搜索不改变批量操作的目标。
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set())
   const [batchDiscount, setBatchDiscount] = useState(DEFAULT_BATCH_DISCOUNT)
@@ -195,6 +274,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
   const form = useForm<UserModelPricingFormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: { items: [] },
+    mode: 'onChange',
     // 分页和筛选会卸载不可见行，但提交时必须保留这些行的值。
     shouldUnregister: false,
   })
@@ -215,6 +295,8 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     collection: NonNullable<typeof collection>
     rows: ReturnType<typeof buildUserModelPricingRows>
   } | null>(null)
+  const [initializedSnapshot, setInitializedSnapshot] =
+    useState<typeof editorSnapshot>(null)
   // 仅在打开且初次查询完成时建立会话，条件更新在渲染提交前完成，避免 effect 连锁重置。
   if (!props.open && editorSnapshot) {
     setEditorSnapshot(null)
@@ -243,8 +325,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     const configuredModels = collection.items
       .filter(
         (item) =>
-          item.discount_bps > 0 &&
-          item.discount_bps < FULL_PRICE_DISCOUNT_BPS &&
+          ((item.periods?.length ?? 0) > 0 ||
+            Boolean(item.permanent?.expression) ||
+            (item.permanent != null &&
+              item.permanent.discount_bps > 0 &&
+              item.permanent.discount_bps < FULL_PRICE_DISCOUNT_BPS) ||
+            Boolean(item.expression) ||
+            (item.discount_bps > 0 &&
+              item.discount_bps < FULL_PRICE_DISCOUNT_BPS)) &&
           normalizedEnabledNames.has(
             normalizeUserModelPricingModelName(item.model_name)
           )
@@ -267,6 +355,35 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     editorSnapshot.configuredOnly === configuredOnly
       ? editorSnapshot
       : null
+  const saveSessionRef = useRef(activeSnapshot)
+  useEffect(() => {
+    saveSessionRef.current = activeSnapshot
+    return () => {
+      saveSessionRef.current = null
+    }
+  }, [activeSnapshot])
+  // 模型目录先于 effect 回填表单，完成当前会话初始化前不得渲染或提交旧草稿。
+  const isDraftReady =
+    activeSnapshot !== null && initializedSnapshot === activeSnapshot
+
+  const draftValidation = useMemo(
+    () => formSchema.safeParse({ items: watchedItems ?? [] }),
+    [formSchema, watchedItems]
+  )
+  const draftCanSave =
+    isDraftReady &&
+    draftValidation.success &&
+    (watchedItems?.length ?? 0) === (activeSnapshot?.rows.length ?? 0) &&
+    buildUserModelPricingPayload(
+      draftValidation.data,
+      activeSnapshot?.collection.items
+    ).items.length <= 1000 &&
+    countUserModelPricingPeriods(
+      buildUserModelPricingPayload(
+        draftValidation.data,
+        activeSnapshot?.collection.items
+      ).items
+    ) <= 1000
 
   const pricingRows = useMemo(
     () => activeSnapshot?.rows ?? [],
@@ -278,30 +395,41 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     const discounts = new Map(
       activeSnapshot.collection.items.map((item) => [
         normalizeUserModelPricingModelName(item.model_name),
-        item.discount_bps / 100,
+        item,
       ])
     )
     form.reset({
       // 未配置模型在完整目录模式下按原价回填，已配置模式的行都有专属折扣值。
-      items: activeSnapshot.rows.map((model) => ({
-        model_name: model.model_name,
-        discount_percent:
-          discounts.get(normalizeUserModelPricingModelName(model.model_name)) ??
-          100,
-      })),
+      items: activeSnapshot.rows.map((model) =>
+        userModelPricingFormItem(
+          discounts.get(
+            normalizeUserModelPricingModelName(model.model_name)
+          ) ?? { model_name: model.model_name, discount_bps: 10000 }
+        )
+      ),
     })
+    setInitializedSnapshot(activeSnapshot)
   }, [activeSnapshot, form])
 
-  const handleOpenChange = (open: boolean) => {
+  const handleOpenChange = (open: boolean, discard = false) => {
+    if (!open && mutation.isPending && !discard) return
+    if (!open && !discard && form.formState.isDirty) {
+      setDiscardOpen(true)
+      return
+    }
     if (!open) {
       // 关闭时清空搜索状态，下一次打开从当前入口对应的模型集第一页开始。
       setSearchTerm('')
       setCurrentPage(1)
+      setStatusFilter('all')
+      setScheduleModel(null)
+      setBatchTimeOpen(false)
     }
     props.onOpenChange(open)
   }
 
   const mutation = useMutation({
+    onMutate: () => activeSnapshot,
     mutationFn: (values: UserModelPricingFormValues) =>
       replaceUserModelPricing(props.user.id, {
         ...buildUserModelPricingPayload(
@@ -310,24 +438,45 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
         ),
         revision: activeSnapshot?.collection.revision ?? 0,
       }),
-    onSuccess: async (response) => {
+    onSuccess: async (response, _values, submittedSnapshot) => {
       if (!response.success) {
         toast.error(response.message || t('Failed to save model pricing'))
         return
       }
       await queryClient.invalidateQueries({ queryKey: ['pricing'] })
       await queryClient.invalidateQueries({
-        queryKey: ['user-model-pricing', props.user.id],
+        queryKey: ['user-model-pricing-overview'],
+      })
+      await queryClient.invalidateQueries({
+        queryKey: ['user-model-pricing-rules'],
+      })
+      await queryClient.invalidateQueries({
+        queryKey: ['user-model-pricing-history'],
+      })
+      await queryClient.invalidateQueries({
+        queryKey: [
+          'user-model-pricing',
+          submittedSnapshot?.userId ?? props.user.id,
+        ],
       })
       toast.success(t('Model pricing saved'))
+      // 旧保存结果只刷新数据，不能关闭后来打开的编辑会话。
+      if (!submittedSnapshot || saveSessionRef.current !== submittedSnapshot) {
+        return
+      }
       // 保存后刷新总览摘要和展开明细，避免继续展示旧折扣。
       await props.onSaved?.()
-      handleOpenChange(false)
+      if (saveSessionRef.current === submittedSnapshot) {
+        handleOpenChange(false, true)
+      }
     },
-    onError: async (error) => {
+    onError: async (error, _values, submittedSnapshot) => {
       if (axios.isAxiosError(error) && error.response?.status === 409) {
         await queryClient.invalidateQueries({
-          queryKey: ['user-model-pricing', props.user.id],
+          queryKey: [
+            'user-model-pricing',
+            submittedSnapshot?.userId ?? props.user.id,
+          ],
         })
         toast.error(
           t(
@@ -340,7 +489,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     },
   })
 
-  const isLoading = !activeSnapshot && (query.isLoading || query.isFetching)
+  const isLoading =
+    (!activeSnapshot && (query.isLoading || query.isFetching)) ||
+    (activeSnapshot !== null && !isDraftReady)
   const hasLoadError =
     !activeSnapshot &&
     (query.isError ||
@@ -353,10 +504,32 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       pricingRows.map((model, index) => ({
         model,
         index,
-        searchName: model.model_name.toLowerCase(),
+        searchName: [model.model_name, ...model.aliases]
+          .join('\n')
+          .toLowerCase(),
       })),
     [pricingRows]
   )
+  const now = Math.floor(Date.now() / 1000)
+  useEffect(() => {
+    if (!props.open) return
+    const times = (watchedItems ?? [])
+      .flatMap((item) =>
+        getUserModelPricingFormPeriods(item).flatMap((period) => [
+          period.start_time,
+          period.end_time,
+        ])
+      )
+      .filter(
+        (value): value is number => typeof value === 'number' && value > now
+      )
+    if (times.length === 0) return
+    const timer = setTimeout(
+      () => setClockTick((tick) => tick + 1),
+      Math.min(2147483647, (Math.min(...times) - now) * 1000 + 100)
+    )
+    return () => clearTimeout(timer)
+  }, [props.open, watchedItems, now, clockTick])
   // 校验失败时按表单原始索引恢复搜索和分页，让被卸载的错误行重新挂载。
   const handleInvalid = (errors: FieldErrors<UserModelPricingFormValues>) => {
     const invalidItemKey = Object.keys(errors.items ?? {}).find((key) =>
@@ -371,14 +544,38 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     if (modelIndex < 0) return
 
     setSearchTerm('')
+    setStatusFilter('all')
+    setScheduleModel(modelRows[modelIndex].model.model_name)
     setCurrentPage(Math.floor(modelIndex / MODEL_PAGE_SIZE) + 1)
   }
   const filteredRows = useMemo(() => {
     const keyword = deferredSearchTerm.trim().toLowerCase()
-    return modelRows.filter(
-      ({ searchName }) => !keyword || searchName.includes(keyword)
-    )
-  }, [deferredSearchTerm, modelRows])
+    return modelRows.filter(({ searchName, index }) => {
+      if (keyword && !searchName.includes(keyword)) return false
+      if (statusFilter === 'all') return true
+      const item = watchedItems?.[index]
+      if (
+        !item ||
+        (item.mode !== 'layered' &&
+          item.mode !== 'scheduled' &&
+          !item.expression &&
+          item.discount_percent === 100)
+      ) {
+        return false
+      }
+      if (
+        item.mode === 'layered' &&
+        statusFilter === 'active' &&
+        (item.expression || (item.discount_percent ?? 100) < 100)
+      ) {
+        return true
+      }
+      const periods = getUserModelPricingFormPeriods(item)
+      return periods.some(
+        (period) => getPricingPeriodStatus(period, now) === statusFilter
+      )
+    })
+  }, [deferredSearchTerm, modelRows, watchedItems, statusFilter, now])
   const totalModels = pricingRows.length
   const totalFilteredModels = filteredRows.length
   const totalPages = Math.max(
@@ -406,10 +603,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
 
   const batchDiscountResult = useMemo(
     () =>
-      formSchema.shape.items.element.shape.discount_percent.safeParse(
+      userModelPricingDiscountPercentSchema(t).safeParse(
         batchDiscount.trim() === '' ? undefined : Number(batchDiscount)
       ),
-    [batchDiscount, formSchema]
+    [batchDiscount, t]
   )
   const selectedItems = useMemo(
     () =>
@@ -427,7 +624,9 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
     batchDiscountResult.success &&
     selectedItems.length === selectedModels.size &&
     selectedItems.every(
-      (item) => item.discount_percent === batchDiscountResult.data
+      (item) =>
+        !item.expression?.trim() &&
+        item.discount_percent === batchDiscountResult.data
     )
   const batchApplySatisfied =
     !requiresBatchApply ||
@@ -445,44 +644,89 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       setBatchError(result.error.issues[0].message)
       return
     }
-    const items = form
-      .getValues('items')
-      .map((item) =>
-        selectedModels.has(item.model_name)
-          ? { ...item, discount_percent: result.data }
-          : item
-      )
+    const items = form.getValues('items').map((item) =>
+      selectedModels.has(item.model_name)
+        ? {
+            ...item,
+            mode: 'layered' as const,
+            discount_percent: result.data,
+            expression: '',
+            calculation_type: 'fixed' as const,
+          }
+        : item
+    )
+    const payload = buildUserModelPricingPayload(
+      { items },
+      activeSnapshot.collection.items
+    )
     if (
-      buildUserModelPricingPayload({ items }, activeSnapshot.collection.items)
-        .items.length > 1000
+      payload.items.length > 1000 ||
+      countUserModelPricingPeriods(payload.items) > 1000
     ) {
       setBatchError(t('At most 1000 model pricing rules are allowed'))
       return
     }
-    const changedFields: `items.${number}.discount_percent`[] = []
-    items.forEach((item, index) => {
-      if (!selectedModels.has(item.model_name)) return
-      const name = `items.${index}.discount_percent` as const
-      form.setValue(name, item.discount_percent, {
-        shouldDirty: true,
-        shouldTouch: true,
-      })
-      changedFields.push(name)
-    })
+    // setValue 会递归通知数组子字段，整套回填才能避免千条规则被重复复制。
+    form.reset(
+      { items },
+      {
+        keepDefaultValues: true,
+        keepErrors: true,
+        keepTouched: true,
+        keepIsSubmitted: true,
+        keepSubmitCount: true,
+      }
+    )
     setBatchError(null)
     setAppliedBatchDiscount(result.data)
     // 批量写完再统一更新字段错误，避免每写一行就对完整表单重复校验。
-    void form.trigger(changedFields)
+    void form.trigger('items')
   }
+  const applyBatchTimes = (changes: {
+    start_time?: number
+    end_time?: number | null
+  }): string | null => {
+    const selected = form
+      .getValues('items')
+      .filter((item) => selectedModels.has(item.model_name))
+    if (selected.some((item) => !item.periods?.length)) {
+      return t('Every selected model must have a temporary discount')
+    }
+    const items = form.getValues('items').map((item) =>
+      selectedModels.has(item.model_name)
+        ? {
+            ...item,
+            periods: item.periods?.map((period) => ({
+              ...period,
+              ...changes,
+              legacy_unbounded:
+                changes.end_time !== undefined ||
+                (changes.start_time !== undefined &&
+                  changes.start_time !== period.start_time)
+                  ? false
+                  : period.legacy_unbounded,
+            })),
+          }
+        : item
+    )
+    const result = formSchema.safeParse({ items })
+    if (!result.success) return result.error.issues[0].message
+    form.setValue('items', items, { shouldDirty: true, shouldTouch: true })
+    form.clearErrors('items')
+    return null
+  }
+  const scheduleIndex = (watchedItems ?? []).findIndex(
+    (item) => item.model_name === scheduleModel
+  )
   // 连续的 flex 高度约束将可用空间传给模型滚动区，同时保留少量模型时的内容自适应高度。
   return (
     <Dialog
       open={props.open}
-      onOpenChange={handleOpenChange}
+      onOpenChange={(open) => handleOpenChange(open)}
       title={
         <span className='flex items-center gap-2'>
           <BadgePercent aria-hidden='true' />
-          {t('User model pricing')}
+          {t('Model discounts')}
         </span>
       }
       description={t(
@@ -502,6 +746,14 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
       footerClassName='flex-row justify-end [&>button]:flex-1 sm:[&>button]:flex-none'
       footer={
         <>
+          {form.formState.isDirty && (
+            <span
+              className='text-warning mr-auto self-center text-xs'
+              role='status'
+            >
+              {t('Unsaved changes')}
+            </span>
+          )}
           <Button
             type='button'
             variant='outline'
@@ -517,7 +769,10 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               !activeSnapshot ||
               isLoading ||
               hasLoadError ||
-              !batchApplySatisfied
+              !batchApplySatisfied ||
+              !draftCanSave ||
+              scheduleModel !== null ||
+              batchTimeOpen
             }
           >
             {mutation.isPending && <Loader2 className='animate-spin' />}
@@ -552,7 +807,25 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
             noValidate
             onSubmit={form.handleSubmit((values) => {
               // 除了禁用保存按钮，提交入口也要拦截回车等绕过点击的路径。
-              if (!batchApplySatisfied) return
+              if (
+                !batchApplySatisfied ||
+                !draftCanSave ||
+                scheduleModel !== null ||
+                batchTimeOpen
+              ) {
+                return
+              }
+              if (
+                countUserModelPricingPeriods(
+                  buildUserModelPricingPayload(
+                    values,
+                    activeSnapshot?.collection.items
+                  ).items
+                ) > 1000
+              ) {
+                toast.error(t('At most 1000 model pricing rules are allowed'))
+                return
+              }
               mutation.mutate(values)
             }, handleInvalid)}
             className='flex min-h-0 flex-1 flex-col gap-3 overflow-hidden'
@@ -575,13 +848,52 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     aria-label={t('Search models')}
                   />
                 </div>
+                <Select
+                  value={statusFilter}
+                  items={getUserModelPricingStatusOptions(t)}
+                  onValueChange={(value) => {
+                    if (value) {
+                      setStatusFilter(value)
+                      setCurrentPage(1)
+                    }
+                  }}
+                >
+                  <SelectTrigger aria-label={t('Discount status')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {getUserModelPricingStatusOptions(t).map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
               </div>
-              {totalModels > 0 && (
-                <span className='text-muted-foreground shrink-0 text-xs'>
-                  {t('Showing')} {displayStart}-{displayEnd} {t('of')}{' '}
-                  {totalFilteredModels} {t('models')}
-                </span>
-              )}
+              <div className='flex min-h-7 items-center justify-between gap-2'>
+                {totalModels > 0 && (
+                  <span className='text-muted-foreground shrink-0 text-xs'>
+                    {t('Showing')} {displayStart}-{displayEnd} {t('of')}{' '}
+                    {totalFilteredModels} {t('models')}
+                  </span>
+                )}
+                {configuredOnly && props.onShowAllModels && (
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='sm'
+                    className='ml-auto'
+                    // 切换模型目录会重建草稿，有未保存修改时先保存或放弃。
+                    disabled={form.formState.isDirty || mutation.isPending}
+                    onClick={props.onShowAllModels}
+                  >
+                    <Plus aria-hidden='true' />
+                    {t('Add other models')}
+                  </Button>
+                )}
+              </div>
             </div>
 
             <div
@@ -614,7 +926,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
               />
               <span>{t('Model')}</span>
               <span className='min-w-0 truncate'>
-                {t('Discount percentage')}
+                {t('Permanent discount')}
               </span>
             </div>
 
@@ -680,21 +992,55 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                             }}
                           />
                           <div className='min-w-0 py-2.5'>
-                            <span
-                              className='block truncate font-mono text-sm'
-                              title={
-                                model.aliases.length > 0
-                                  ? model.aliases.join(', ')
-                                  : model.model_name
-                              }
-                            >
-                              {model.model_name}
-                            </span>
+                            <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+                              <span
+                                className='max-w-full min-w-0 truncate font-mono text-sm'
+                                title={
+                                  model.aliases.length > 0
+                                    ? model.aliases.join(', ')
+                                    : model.model_name
+                                }
+                              >
+                                {model.model_name}
+                              </span>
+                              <Button
+                                type='button'
+                                variant='ghost'
+                                size='sm'
+                                className='shrink-0'
+                                disabled={mutation.isPending}
+                                onClick={() =>
+                                  setScheduleModel(model.model_name)
+                                }
+                                aria-label={t(
+                                  'Edit temporary discounts for {{model}}',
+                                  { model: model.model_name }
+                                )}
+                              >
+                                {(watchedItems?.[index]?.periods?.length ?? 0) >
+                                0 ? (
+                                  <CalendarClock aria-hidden='true' />
+                                ) : (
+                                  <Plus aria-hidden='true' />
+                                )}
+                                {(watchedItems?.[index]?.periods?.length ?? 0) >
+                                0
+                                  ? t('Edit temporary discounts')
+                                  : t('Add temporary discount')}
+                              </Button>
+                            </div>
                             {model.aliases.length > 0 && (
                               <span className='text-muted-foreground block truncate text-xs'>
                                 {model.aliases.join(', ')}
                               </span>
                             )}
+                            <ModelTemporaryDiscounts
+                              periods={watchedItems?.[index]?.periods ?? []}
+                              permanentPercent={
+                                watchedItems?.[index]?.discount_percent
+                              }
+                              now={now}
+                            />
                           </div>
 
                           <FormField
@@ -708,6 +1054,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                 <FormControl>
                                   <div className='relative'>
                                     <Input
+                                      disabled={mutation.isPending}
                                       type='number'
                                       min='0.01'
                                       max='100'
@@ -724,6 +1071,22 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                             ? nextValue
                                             : null
                                         )
+                                        form.setValue(
+                                          `items.${index}.expression`,
+                                          '',
+                                          {
+                                            shouldDirty: true,
+                                            shouldValidate: true,
+                                          }
+                                        )
+                                        form.setValue(
+                                          `items.${index}.calculation_type`,
+                                          'fixed',
+                                          {
+                                            shouldDirty: true,
+                                            shouldValidate: true,
+                                          }
+                                        )
                                       }}
                                     />
                                     <span className='text-muted-foreground pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-xs'>
@@ -731,6 +1094,13 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                                     </span>
                                   </div>
                                 </FormControl>
+                                {watchedItems?.[index]?.expression && (
+                                  <p className='text-muted-foreground text-xs'>
+                                    {t(
+                                      'Enter a fixed permanent percentage to replace the existing permanent conditions. Temporary rules are preserved.'
+                                    )}
+                                  </p>
+                                )}
                                 <FormMessage />
                               </FormItem>
                             )}
@@ -754,6 +1124,7 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
                     setBatchError(null)
                   }}
                   onApply={applyBatchDiscount}
+                  onValidity={() => setBatchTimeOpen(true)}
                   onClear={() => {
                     setSelectedModels(new Set())
                     setAppliedBatchDiscount(null)
@@ -807,6 +1178,52 @@ export function UserModelPricingDialog(props: UserModelPricingDialogProps) {
             )}
           </form>
         </Form>
+      )}
+      {props.open && scheduleIndex >= 0 && watchedItems?.[scheduleIndex] && (
+        <UserModelPricingScheduleDialog
+          key={scheduleModel}
+          value={watchedItems[scheduleIndex]}
+          onClose={() => setScheduleModel(null)}
+          onApply={(value) => {
+            const items = [...form.getValues('items')]
+            items[scheduleIndex] = value
+            if (
+              countUserModelPricingPeriods(
+                buildUserModelPricingPayload(
+                  { items },
+                  activeSnapshot?.collection.items
+                ).items
+              ) > 1000
+            ) {
+              return t('At most 1000 model pricing rules are allowed')
+            }
+            form.setValue(`items.${scheduleIndex}`, value, {
+              shouldDirty: true,
+              shouldTouch: true,
+              shouldValidate: true,
+            })
+            return null
+          }}
+        />
+      )}
+      <ConfirmDialog
+        open={discardOpen}
+        onOpenChange={setDiscardOpen}
+        title={t('Discard unsaved changes?')}
+        desc={t('Discount changes are saved only after you click Save.')}
+        confirmText={t('Discard changes')}
+        cancelBtnText={t('Keep editing')}
+        destructive
+        handleConfirm={() => {
+          setDiscardOpen(false)
+          handleOpenChange(false, true)
+        }}
+      />
+      {props.open && batchTimeOpen && (
+        <UserModelPricingBatchTimeDialog
+          onClose={() => setBatchTimeOpen(false)}
+          onApply={applyBatchTimes}
+        />
       )}
     </Dialog>
   )

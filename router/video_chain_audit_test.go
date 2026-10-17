@@ -46,7 +46,7 @@ func TestVideoHTTPBillingChainLoad(t *testing.T) {
 			connection, err := db.DB()
 			require.NoError(t, err)
 			connection.SetMaxOpenConns(1)
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Log{}, &model.Option{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}, &model.QuotaData{}, &model.Model{}, &model.Vendor{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.VideoTaskPendingLog{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Log{}, &model.Option{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}, &model.QuotaData{}, &model.Model{}, &model.Vendor{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.VideoTaskPendingLog{}))
 			oldDB, oldLog := model.DB, model.LOG_DB
 			oldOptions := common.OptionMap
 			common.OptionMap = make(map[string]string)

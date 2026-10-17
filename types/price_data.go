@@ -37,6 +37,8 @@ type PriceData struct {
 	DiscountAmounts   *DiscountAmounts
 	QuotaToPreConsume int // 按量计费的预消耗额度
 	GroupRatioInfo    GroupRatioInfo
+	// 冻结实际参与提交的折前小数，完成时不从取整后的金额反推。
+	TaskQuotaBeforeDiscount string
 }
 
 func (p *PriceData) AddOtherRatio(key string, ratio float64) {

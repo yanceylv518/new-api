@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { ChevronDownIcon } from 'lucide-react'
 import * as React from 'react'
+import { TZDate } from 'react-day-picker'
 import { enUS, fr, ja, ru, vi, zhCN } from 'react-day-picker/locale'
 import { useTranslation } from 'react-i18next'
 
@@ -46,6 +47,16 @@ interface DateTimePickerProps {
   onChange?: (date: Date | undefined) => void
   placeholder?: string
   className?: string
+  timeZone?: string
+  disabled?: boolean
+  clearable?: boolean
+  hideTimeWhenEmpty?: boolean
+  // 只按日期选择时隐藏时间输入，选中的日期沿用 value 中的时刻。
+  hideTime?: boolean
+  id?: string
+  'aria-label'?: string
+  'aria-invalid'?: boolean
+  'aria-describedby'?: string
 }
 
 export function DateTimePicker({
@@ -53,31 +64,44 @@ export function DateTimePicker({
   onChange,
   placeholder,
   className,
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+  disabled = false,
+  clearable = true,
+  hideTimeWhenEmpty = false,
+  hideTime = false,
+  id,
+  'aria-label': ariaLabel,
+  'aria-invalid': ariaInvalid,
+  'aria-describedby': ariaDescribedBy,
 }: DateTimePickerProps) {
   const { t, i18n } = useTranslation()
   const placeholderText = placeholder ?? t('Select date')
   const calendarLocale =
     calendarLocales[i18n.language as keyof typeof calendarLocales] ?? enUS
-  const currentYear = new Date().getFullYear()
+  const currentYear = dayjs().tz(timeZone).year()
   const [open, setOpen] = React.useState(false)
   const [date, setDate] = React.useState<Date | undefined>(value)
   const [month, setMonth] = React.useState<Date | undefined>(value)
   const [time, setTime] = React.useState<string>('00:00')
 
   React.useEffect(() => {
+    // 时间输入暂时为空时，保留已选日期，恢复时间后即可修正父表单中的无效值。
+    if (value && !Number.isFinite(value.getTime())) {
+      return
+    }
     setDate(value)
     setMonth(value)
     if (value) {
-      const hours = value.getHours().toString().padStart(2, '0')
-      const minutes = value.getMinutes().toString().padStart(2, '0')
-      setTime(`${hours}:${minutes}`)
+      setTime(dayjs(value).tz(timeZone).format('HH:mm'))
     }
-  }, [value])
+  }, [value, timeZone])
 
   const handleDateSelect = (selectedDate: Date | undefined) => {
     if (selectedDate) {
-      const [hours, minutes] = time.split(':').map(Number)
-      const newDate = new Date(selectedDate)
+      const selectedTime = time || '00:00'
+      const [hours, minutes] = selectedTime.split(':').map(Number)
+      setTime(selectedTime)
+      const newDate = new TZDate(selectedDate, timeZone)
       newDate.setHours(hours, minutes, 0, 0)
       setDate(newDate)
       setMonth(newDate)
@@ -95,8 +119,12 @@ export function DateTimePicker({
     setTime(newTime)
 
     if (date) {
+      if (!newTime) {
+        onChange?.(new Date(Number.NaN))
+        return
+      }
       const [hours, minutes] = newTime.split(':').map(Number)
-      const newDate = new Date(date)
+      const newDate = new TZDate(date, timeZone)
       newDate.setHours(hours, minutes, 0, 0)
       setDate(newDate)
       onChange?.(newDate)
@@ -116,46 +144,62 @@ export function DateTimePicker({
         <PopoverTrigger
           render={
             <Button
+              id={id}
+              type='button'
+              disabled={disabled}
+              aria-label={ariaLabel ?? placeholderText}
+              aria-invalid={ariaInvalid}
+              aria-describedby={ariaDescribedBy}
               variant='outline'
               className={cn(
-                'flex-1 justify-between font-normal',
+                'min-w-0 flex-1 justify-between font-normal aria-invalid:border-destructive',
                 !date && 'text-muted-foreground'
               )}
             />
           }
         >
-          {date ? dayjs(date).format('YYYY-MM-DD') : placeholderText}
+          {date
+            ? dayjs(date).tz(timeZone).format('YYYY-MM-DD')
+            : placeholderText}
           <ChevronDownIcon className='h-4 w-4 opacity-50' />
         </PopoverTrigger>
         <PopoverContent className='w-auto overflow-hidden p-0' align='start'>
           <Calendar
             mode='single'
+            timeZone={timeZone}
             selected={date}
             month={month}
             onMonthChange={setMonth}
             captionLayout='dropdown'
             onSelect={handleDateSelect}
             locale={calendarLocale}
-            startMonth={new Date(currentYear - 100, 0)}
-            endMonth={new Date(currentYear + 100, 11)}
+            startMonth={new TZDate(currentYear - 100, 0, timeZone)}
+            endMonth={new TZDate(currentYear + 100, 11, timeZone)}
           />
         </PopoverContent>
       </Popover>
-      <Input
-        type='time'
-        value={time}
-        onChange={handleTimeChange}
-        className='w-32 appearance-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
-        disabled={!date}
-      />
-      {date && (
+      {!hideTime && (!hideTimeWhenEmpty || date) && (
+        <Input
+          id={id ? `${id}-time` : undefined}
+          type='time'
+          value={time}
+          onChange={handleTimeChange}
+          className='w-32 appearance-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
+          disabled={disabled || !date}
+          aria-invalid={ariaInvalid}
+          aria-describedby={ariaDescribedBy}
+          aria-label={ariaLabel ? `${ariaLabel} (${t('Time')})` : t('Time')}
+        />
+      )}
+      {date && clearable && (
         <Button
+          disabled={disabled}
           type='button'
           variant='outline'
           size='icon'
           onClick={handleClear}
           className='shrink-0'
-          aria-label='Clear'
+          aria-label={t('Clear')}
         >
           <span aria-hidden='true'>✕</span>
         </Button>

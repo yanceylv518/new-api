@@ -561,12 +561,16 @@ func DeleteUserById(id int) (int64, error) {
 
 // HardDeleteUserById permanently deletes a user and returns how many scoped
 // access tokens were deleted with it.
-func HardDeleteUserById(id int) (int64, error) {
+func HardDeleteUserById(id int, actorIDs ...int) (int64, error) {
 	if id == 0 {
 		return 0, errors.New("id 为空！")
 	}
 	user := User{Id: id}
-	return user.HardDelete()
+	actorID := 0
+	if len(actorIDs) > 0 {
+		actorID = actorIDs[0]
+	}
+	return user.HardDeleteWithActor(actorID)
 }
 
 func inviteUser(inviterId int) error {
@@ -994,6 +998,11 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 }
 
 func (user *User) HardDelete() (int64, error) {
+	return user.HardDeleteWithActor(0)
+}
+
+// HardDeleteWithActor 在现有身份撤销事务中归档折扣，保留原有令牌和会话清理契约。
+func (user *User) HardDeleteWithActor(actorID int) (int64, error) {
 	if user.Id == 0 {
 		return 0, errors.New("id 为空！")
 	}
@@ -1014,6 +1023,9 @@ func (user *User) HardDelete() (int64, error) {
 			if err := tx.Unscoped().Select("id", commonKeyCol).Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
 				return err
 			}
+		}
+		if err := archiveDeletedUserModelPricing(tx, user.Id, actorID); err != nil {
+			return err
 		}
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err

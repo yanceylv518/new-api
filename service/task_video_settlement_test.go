@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strconv"
@@ -15,8 +16,10 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/discountexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -187,6 +190,229 @@ func TestVideoPollingMockLoadDatabaseMatrix(t *testing.T) {
 	}
 }
 
+func TestUserModelDiscountActualUsageKeepsFrozenTimeAndSource(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: "output_tokens >= 500 ? 0.29 : 0.8"}, Source: "temporary", Context: discountexpr.Context{At: 199, OutputTokens: 100}, DiscountBPS: 8000}
+	info := &relaycommon.RelayInfo{UserModelDiscountEvaluation: evaluation}
+	info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.8)
+	settleUserModelDiscount(ctx, info, 1000, 500, 20)
+	assert.Equal(t, 2900, evaluation.DiscountBPS)
+	assert.Equal(t, int64(199), evaluation.Context.At)
+	assert.Equal(t, "temporary", evaluation.Source)
+	assert.Equal(t, 0.29, info.PriceData.OtherRatios()[types.UserModelDiscountRatioKey])
+	settleUserModelDiscount(ctx, info, 2000, 1000, 40)
+	assert.Equal(t, 2900, evaluation.DiscountBPS)
+}
+
+func TestUserModelDiscountEvaluationFailureKeepsReservedRatio(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: "output_tokens > 0 ? 1.1 : 0.8"}, Context: discountexpr.Context{}, DiscountBPS: 8000}
+	info := &relaycommon.RelayInfo{UserModelDiscountEvaluation: evaluation}
+	info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.8)
+	settleUserModelDiscount(ctx, info, 10, 20, 0)
+	assert.NotEmpty(t, evaluation.Error)
+	assert.Equal(t, 8000, evaluation.DiscountBPS)
+	assert.Equal(t, 0.8, info.PriceData.OtherRatios()[types.UserModelDiscountRatioKey])
+}
+
+func TestUserModelDiscountTimeRuleIgnoresUsageChangesAtSettlement(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	source := `(hour("Asia/Shanghai") == 8 && minute("Asia/Shanghai") == 3) ? 0.29 : 0.8`
+	evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: source}, Source: "temporary", Context: discountexpr.Context{At: 199}, DiscountBPS: 2900}
+	info := &relaycommon.RelayInfo{UserModelDiscountEvaluation: evaluation}
+	info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.29)
+	for _, usage := range []int{0, 1, 10000, 1000000} {
+		settleUserModelDiscount(ctx, info, float64(usage), float64(usage), float64(usage))
+		assert.Equal(t, 2900, evaluation.DiscountBPS)
+		assert.Equal(t, int64(199), evaluation.Context.At)
+		assert.Equal(t, source, evaluation.Rule.Expression)
+		assert.Equal(t, 0.29, info.PriceData.OtherRatios()[types.UserModelDiscountRatioKey])
+	}
+}
+
+func TestUserModelDiscountTaskActualFactsDoNotMutateSubmittedSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		expression string
+		facts      map[string]any
+		want       int
+	}{
+		{"task_tokens >= 5000 ? 0.5 : 0.8", map[string]any{"task_tokens": 5000}, 5000},
+		{"seconds >= 10 ? 0.6 : 0.8", map[string]any{"seconds": float64(10)}, 6000},
+		{"count >= 2 && units >= 3 ? 0.7 : 0.8", map[string]any{"clips": 2, "units": int64(3)}, 7000},
+		{`(hour("Asia/Shanghai") == 8 && minute("Asia/Shanghai") == 3) ? 0.29 : 0.8`, map[string]any{"task_tokens": 1000000}, 2900},
+		{`(hour("Asia/Shanghai") == 8 && minute("Asia/Shanghai") == 3) ? 0.29 : 0.8`, map[string]any{"seconds": -1, "task_tokens": int64(2147483648)}, 2900},
+	} {
+		t.Run(tc.expression, func(t *testing.T) {
+			submitted := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: tc.expression}, Source: "temporary", Context: discountexpr.Context{At: 199}, DiscountBPS: 8000}
+			task := &model.Task{}
+			task.PrivateData.BillingContext = &model.TaskBillingContext{OtherRatios: map[string]float64{types.UserModelDiscountRatioKey: 0.8, "size": 2}, UserDiscount: submitted}
+			price, evaluation, err := taskUserModelDiscount(task, &relaycommon.TaskInfo{UsageFacts: tc.facts})
+			require.NoError(t, err)
+			require.NotNil(t, evaluation)
+			assert.Equal(t, tc.want, evaluation.DiscountBPS)
+			assert.Equal(t, "temporary", evaluation.Source)
+			assert.Equal(t, int64(199), evaluation.Context.At)
+			assert.Equal(t, 2.0, price.OtherRatios()["size"])
+			assert.Equal(t, float64(tc.want)/10000, price.OtherRatios()[types.UserModelDiscountRatioKey])
+			assert.Equal(t, 8000, submitted.DiscountBPS)
+			assert.Zero(t, submitted.Context.TaskTokens)
+			assert.Equal(t, 0.8, task.PrivateData.BillingContext.OtherRatios[types.UserModelDiscountRatioKey])
+		})
+	}
+}
+
+func TestUserModelDiscountTaskCompletionUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		result                relaycommon.TaskInfo
+		input, output, tokens float64
+		bps                   int
+		invalid               bool
+	}{
+		{name: "missing usage keeps estimates", input: 6000, output: 1000, tokens: 7000, bps: 5000},
+		{name: "H3 split aliases update independently", result: relaycommon.TaskInfo{UsageFacts: map[string]any{"prompt_tokens": 4000, "completion_tokens": 2000, "tokens": 6000}}, input: 4000, output: 2000, tokens: 6000, bps: 8000},
+		{name: "partial input keeps other estimates", result: relaycommon.TaskInfo{UsageFacts: map[string]any{"prompt_tokens": 4000}}, input: 4000, output: 1000, tokens: 7000, bps: 8000},
+		{name: "total does not overwrite output", result: relaycommon.TaskInfo{TotalTokens: 9000}, input: 6000, output: 1000, tokens: 9000, bps: 5000},
+		{name: "positive top-level token counts", result: relaycommon.TaskInfo{TotalTokens: 9000, CompletionTokens: 1500}, input: 6000, output: 1500, tokens: 9000, bps: 8000},
+		{name: "completion-only aggregate fallback", result: relaycommon.TaskInfo{CompletionTokens: 500}, input: 6000, output: 500, tokens: 500, bps: 8000},
+		{name: "explicit aggregate zero overrides positive total", result: relaycommon.TaskInfo{TotalTokens: 9000, UsageFacts: map[string]any{"tokens": 0}}, input: 6000, output: 1000, bps: 8000},
+		{name: "explicit split zeros", result: relaycommon.TaskInfo{TotalTokens: 9000, CompletionTokens: 1500, UsageFacts: map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}, bps: 8000},
+		{name: "canonical fields beat aliases and top-level counts", result: relaycommon.TaskInfo{TotalTokens: 9999, CompletionTokens: 9999, UsageFacts: map[string]any{"input_tokens": 6000, "prompt_tokens": 1, "output_tokens": 1000, "completion_tokens": 5000, "task_tokens": 7000, "tokens": 99, "total_tokens": 1}}, input: 6000, output: 1000, tokens: 7000, bps: 5000},
+		{name: "non-numeric usage retains estimates", result: relaycommon.TaskInfo{UsageFacts: map[string]any{"input_tokens": false, "output_tokens": "0", "tokens": nil}}, input: 6000, output: 1000, tokens: 7000, bps: 5000},
+		{name: "negative completion usage is rejected", result: relaycommon.TaskInfo{UsageFacts: map[string]any{"completion_tokens": -1}}, invalid: true},
+	} {
+		for _, immediate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/immediate=%t", tc.name, immediate), func(t *testing.T) {
+				submitted := &types.UserModelDiscountEvaluation{
+					Rule: types.UserModelDiscountWindow{Expression: `input_tokens >= 5000 && output_tokens <= 1000 && task_tokens >= 5000 ? 0.5 : 0.8`}, Source: "temporary", DiscountBPS: 5000,
+					Context: discountexpr.Context{At: 199, InputTokens: 6000, OutputTokens: 1000, TaskTokens: 7000, Seconds: 1, Count: 1, Units: 8, Params: map[string]any{"duration": float64(-1)}},
+				}
+				frozen := *submitted
+				var evaluation *types.UserModelDiscountEvaluation
+				var price *types.PriceData
+				var err error
+				if immediate {
+					info := &relaycommon.RelayInfo{UserModelDiscountEvaluation: submitted}
+					info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, 0.5)
+					info.PriceData.AddOtherRatio("size", 2)
+					err = ApplyImmediateTaskDiscount(info, &tc.result)
+					evaluation, price = info.UserModelDiscountEvaluation, &info.PriceData
+				} else {
+					task := &model.Task{PrivateData: model.TaskPrivateData{BillingContext: &model.TaskBillingContext{UserDiscount: submitted, OtherRatios: map[string]float64{types.UserModelDiscountRatioKey: 0.5, "size": 2}}}}
+					price, evaluation, err = taskUserModelDiscount(task, &tc.result)
+					assert.Same(t, submitted, task.PrivateData.BillingContext.UserDiscount)
+					assert.Equal(t, 0.5, task.PrivateData.BillingContext.OtherRatios[types.UserModelDiscountRatioKey])
+				}
+				assert.Equal(t, frozen, *submitted, "submitted discount snapshot must remain frozen")
+				if tc.invalid {
+					require.Error(t, err)
+					assert.Equal(t, 0.5, price.UserModelDiscountMultiplier())
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, evaluation)
+				want := frozen.Context
+				want.InputTokens, want.OutputTokens, want.TaskTokens = tc.input, tc.output, tc.tokens
+				assert.Equal(t, want, evaluation.Context)
+				assert.Equal(t, frozen.Rule, evaluation.Rule)
+				assert.Equal(t, frozen.Source, evaluation.Source)
+				assert.Equal(t, tc.bps, evaluation.DiscountBPS)
+				assert.Equal(t, float64(tc.bps)/10000, price.UserModelDiscountMultiplier())
+				assert.Equal(t, 2.0, price.OtherRatios()["size"])
+			})
+		}
+	}
+}
+
+func TestVideoLayeredDiscountAtomicSettlement(t *testing.T) {
+	truncate(t)
+	const initial = 100000
+	for index, tc := range []struct {
+		name, pricing, discount, basis             string
+		reserved, before, actual, finalBefore, bps int
+		facts                                      map[string]any
+		estimatedFacts                             map[string]any
+		frozenUsage                                *discountexpr.Context
+		failed, fundingFailure                     bool
+	}{
+		{name: "per-call frozen time", discount: `hour("Asia/Shanghai") == 10 ? 0.5 : 0.9`, basis: "100.9", reserved: 50, before: 101, actual: 50, finalBefore: 101, bps: 5000},
+		{name: "per-call actual seconds", discount: `seconds >= 3 ? 0.5 : 0.8`, basis: "100.9", reserved: 81, before: 101, actual: 50, finalBefore: 101, bps: 8000, facts: map[string]any{"seconds": float64(4)}},
+		{name: "per-call original rounding", discount: `seconds >= 3 ? 1.0 : 0.8`, basis: "100.9", reserved: 81, before: 101, actual: 100, finalBefore: 100, bps: 8000, facts: map[string]any{"seconds": float64(4)}},
+		{name: "token pricing", pricing: `tier("video", u("tokens") * 2 / 1000000)`, discount: `task_tokens >= 2000 ? 0.5 : 0.8`, reserved: 800, before: 1000, actual: 1000, finalBefore: 2000, bps: 8000, facts: map[string]any{"tokens": float64(2000)}},
+		{name: "missing tokens retain estimated charge and discount", pricing: `tier("video", u("tokens") * 2 / 1000000)`, discount: `task_tokens >= 2000 ? 0.5 : 0.8`, reserved: 2500, before: 5000, actual: 2500, finalBefore: 5000, bps: 5000, estimatedFacts: map[string]any{"tokens": 5000}, frozenUsage: &discountexpr.Context{TaskTokens: 5000}},
+		{name: "explicit zero tokens refund estimate", pricing: `tier("video", u("tokens") * 2 / 1000000)`, discount: `task_tokens >= 2000 ? 0.5 : 0.8`, reserved: 2500, before: 5000, actual: 0, finalBefore: 0, bps: 5000, facts: map[string]any{"tokens": 0}, estimatedFacts: map[string]any{"tokens": 5000}, frozenUsage: &discountexpr.Context{TaskTokens: 5000}},
+		{name: "H3 partial usage keeps frozen input discount", pricing: `tier("context", (u("prompt_tokens") + u("completion_tokens")) * 2 / 1000000)`, discount: `input_tokens >= 5000 ? 0.5 : 0.8`, reserved: 3500, before: 7000, actual: 4000, finalBefore: 8000, bps: 5000, facts: map[string]any{"completion_tokens": 2000}, estimatedFacts: map[string]any{"prompt_tokens": 6000, "completion_tokens": 1000}, frozenUsage: &discountexpr.Context{InputTokens: 6000, OutputTokens: 1000, TaskTokens: 7000}},
+		{name: "H3 actual input changes discount", pricing: `tier("context", (u("prompt_tokens") + u("completion_tokens")) * 2 / 1000000)`, discount: `input_tokens >= 5000 ? 0.5 : 0.8`, reserved: 3500, before: 7000, actual: 4800, finalBefore: 6000, bps: 5000, facts: map[string]any{"prompt_tokens": 4000, "completion_tokens": 2000, "tokens": 6000}, estimatedFacts: map[string]any{"prompt_tokens": 6000, "completion_tokens": 1000}, frozenUsage: &discountexpr.Context{InputTokens: 6000, OutputTokens: 1000, TaskTokens: 7000}},
+		{name: "second pricing and retry", pricing: `tier("video", u("seconds") * 0.001)`, discount: `seconds >= 3 ? 0.5 : 0.8`, reserved: 400, before: 500, actual: 1000, finalBefore: 2000, bps: 8000, facts: map[string]any{"seconds": float64(4)}, fundingFailure: true},
+		{name: "confirmed failure refunds reserve", discount: `seconds >= 3 ? 0.5 : 0.8`, basis: "100.9", reserved: 81, before: 101, actual: 0, finalBefore: 0, bps: 8000, failed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := 32000 + index
+			require.NoError(t, model.DB.Create(&model.User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: initial - tc.reserved, UsedQuota: tc.reserved}).Error)
+			require.NoError(t, model.DB.Create(&model.Token{Id: id, UserId: id, Key: fmt.Sprintf("discount-fixture-%d", id), RemainQuota: initial - tc.reserved, UsedQuota: tc.reserved}).Error)
+			require.NoError(t, model.DB.Create(&model.Channel{Id: id, UsedQuota: int64(tc.before)}).Error)
+			at := time.Date(2026, 10, 16, 2, 0, 0, 0, time.UTC).Unix()
+			evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: tc.discount, DiscountBPS: 10000}, Source: "temporary", DiscountBPS: tc.bps, Context: discountexpr.Context{At: at, Seconds: 1, TaskTokens: 1000}}
+			if tc.frozenUsage != nil {
+				evaluation.Context = *tc.frozenUsage
+				evaluation.Context.At = at
+			}
+			billing := &model.TaskBillingContext{ModelPrice: 99, GroupRatio: 7, OtherRatios: map[string]float64{types.UserModelDiscountRatioKey: float64(tc.bps) / 10000}, UserDiscount: evaluation, QuotaBeforeDiscount: tc.basis, PerCallBilling: tc.pricing == ""}
+			if tc.pricing != "" {
+				billing.TieredSnapshot = &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprVersion: 1, ExprString: tc.pricing, ExprHash: billingexpr.ExprHashString(tc.pricing), GroupRatio: 1, QuotaPerUnit: 500000, UsageFacts: tc.estimatedFacts}
+			}
+			task := &model.Task{TaskID: fmt.Sprintf("discount-task-%d", id), UserId: id, ChannelId: id, Quota: tc.reserved, Status: model.TaskStatusQueued, PrivateData: model.TaskPrivateData{TokenId: id, BillingContext: billing, DiscountAmounts: types.NewDiscountAmounts(tc.before, tc.reserved)}}
+			require.NoError(t, model.DB.Create(task).Error)
+			var submitted model.Task
+			require.NoError(t, model.DB.First(&submitted, task.ID).Error)
+			status := model.TaskStatus(model.TaskStatusSuccess)
+			if tc.failed {
+				status = model.TaskStatusFailure
+			}
+			result := &relaycommon.TaskInfo{Status: string(status), UsageFacts: tc.facts}
+			adaptor := &atomicVideoPollingFixture{key: "doubao"}
+			if tc.fundingFailure {
+				require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("discount-funding-error", func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" {
+						tx.AddError(errors.New("temporary token database failure"))
+					}
+				}))
+				task.Status = status
+				err := settleAtomicVideoTask(t.Context(), adaptor, task, model.TaskStatusQueued, result)
+				require.Error(t, err)
+				require.NoError(t, model.DB.Callback().Update().Remove("discount-funding-error"))
+				var pending model.Task
+				require.NoError(t, model.DB.First(&pending, task.ID).Error)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), pending.Status)
+				assert.Equal(t, tc.bps, pending.PrivateData.BillingContext.UserDiscount.DiscountBPS)
+				*task = pending
+			}
+			task.Status = status
+			require.NoError(t, settleAtomicVideoTask(t.Context(), adaptor, task, model.TaskStatusQueued, result))
+			// 旧请求重放不能产生第二笔资金变动。
+			submitted.Status = status
+			require.NoError(t, settleAtomicVideoTask(t.Context(), adaptor, &submitted, model.TaskStatusQueued, result))
+			var stored model.Task
+			var user model.User
+			var token model.Token
+			var channel model.Channel
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			require.NoError(t, model.DB.First(&user, id).Error)
+			require.NoError(t, model.DB.First(&token, id).Error)
+			require.NoError(t, model.DB.First(&channel, id).Error)
+			assert.Equal(t, tc.actual, stored.Quota)
+			assert.Equal(t, tc.finalBefore, stored.PrivateData.DiscountAmounts.Before)
+			assert.Equal(t, initial-tc.actual, user.Quota)
+			assert.Equal(t, tc.actual, user.UsedQuota)
+			assert.Equal(t, initial-tc.actual, token.RemainQuota)
+			assert.Equal(t, tc.actual, token.UsedQuota)
+			assert.EqualValues(t, tc.finalBefore, channel.UsedQuota)
+			assert.Equal(t, at, stored.PrivateData.BillingContext.UserDiscount.Context.At)
+			assert.Equal(t, tc.bps, evaluation.DiscountBPS, "submitted rule snapshot remains immutable")
+		})
+	}
+}
+
 func TestVideoPollingAtomicSettlementRetry(t *testing.T) {
 	for _, key := range []string{"hailuo", "doubao", "kling", "vidu", "alibaba", "jimeng", "sora"} {
 		for _, status := range []string{model.TaskStatusSuccess, model.TaskStatusFailure} {
@@ -203,6 +429,7 @@ func TestVideoPollingAtomicSettlementRetry(t *testing.T) {
 					usage = map[string]any{"tokens": float64(2000)}
 				}
 				task := &model.Task{TaskID: "atomic-poll", UserId: 900, ChannelId: 900, Quota: 1000, Status: model.TaskStatusQueued, Group: "default", PrivateData: model.TaskPrivateData{TokenId: 900, UpstreamTaskID: "upstream-audit", BillingContext: &model.TaskBillingContext{TieredSnapshot: &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprVersion: 1, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), QuotaPerUnit: 500000, GroupRatio: 1, UsageFacts: usage}}}}
+				task.PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{"899", "900"}}
 				require.NoError(t, model.DB.Create(task).Error)
 				channel := &model.Channel{Id: 900}
 				adaptor := &atomicVideoPollingFixture{key: key, scriptedPollingAdaptor: scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: status, UsageFacts: usage, Reason: "upstream failure"}}}
@@ -228,6 +455,13 @@ func TestVideoPollingAtomicSettlementRetry(t *testing.T) {
 				}
 				assert.Equal(t, 10000-actual, getUserQuota(t, 900))
 				assert.Equal(t, int64(1), countLogs(t))
+				log := getLastLog(t)
+				require.NotNil(t, log)
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+				adminInfo, ok := other["admin_info"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, []any{"899", "900"}, adminInfo["use_channel"])
 				var completed model.Task
 				require.NoError(t, model.DB.First(&completed, task.ID).Error)
 				assert.Equal(t, actual, completed.Quota)
@@ -247,6 +481,7 @@ func TestVideoSettlementConcurrentLogs(t *testing.T) {
 	tasks := make([]model.Task, tasksCount)
 	for index := range tasks {
 		tasks[index] = model.Task{TaskID: fmt.Sprintf("log-audit-%d", index), UserId: 950, ChannelId: 950, Quota: 100, Status: model.TaskStatusQueued, Group: "default"}
+		tasks[index].PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{strconv.Itoa(index + 1), "950"}}
 	}
 	require.NoError(t, model.DB.CreateInBatches(tasks, 32).Error)
 	var workers sync.WaitGroup
@@ -279,6 +514,14 @@ func TestVideoSettlementConcurrentLogs(t *testing.T) {
 	seen := make(map[string]bool, len(logs))
 	for _, entry := range logs {
 		assert.Equal(t, 100, entry.Quota)
+		var other map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+		var index int
+		_, err := fmt.Sscanf(other["task_id"].(string), "log-audit-%d", &index)
+		require.NoError(t, err)
+		adminInfo, ok := other["admin_info"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, []any{strconv.Itoa(index + 1), "950"}, adminInfo["use_channel"])
 		assert.False(t, seen[entry.Other])
 		seen[entry.Other] = true
 	}
@@ -368,20 +611,3 @@ func TestRunVideoPollingScopesSharedUpstreamIDs(t *testing.T) {
 		assert.Equal(t, 9500, getUserQuota(t, id))
 	}
 }
-				task.PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{"899", "900"}}
-				log := getLastLog(t)
-				require.NotNil(t, log)
-				var other map[string]any
-				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-				adminInfo, ok := other["admin_info"].(map[string]any)
-				require.True(t, ok)
-				assert.Equal(t, []any{"899", "900"}, adminInfo["use_channel"])
-		tasks[index].PrivateData.Execution = &model.TaskExecutionSnapshot{UseChannel: []string{strconv.Itoa(index + 1), "950"}}
-		var other map[string]any
-		require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
-		var index int
-		_, err := fmt.Sscanf(other["task_id"].(string), "log-audit-%d", &index)
-		require.NoError(t, err)
-		adminInfo, ok := other["admin_info"].(map[string]any)
-		require.True(t, ok)
-		assert.Equal(t, []any{strconv.Itoa(index + 1), "950"}, adminInfo["use_channel"])

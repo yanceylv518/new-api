@@ -125,6 +125,7 @@ func calculateAudioQuotaAmounts(info QuotaInfo) (int, int, *common.QuotaClamp) {
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.InputTokens), float64(usage.OutputTokens), float64(usage.InputTokenDetails.CachedTokens))
 	if relayInfo.UsePrice {
 		return nil
 	}
@@ -177,6 +178,18 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
 	noteQuotaClamp(relayInfo, clamp)
+	if evaluation := relayInfo.UserModelDiscountEvaluation; evaluation != nil && evaluation.Rule.Expression != "" {
+		if evaluation.Error != "" {
+			return fmt.Errorf("realtime discount expression: %s", evaluation.Error)
+		}
+		if relayInfo.Billing == nil {
+			if apiError := PreConsumeBilling(ctx, quota, relayInfo); apiError != nil {
+				return apiError
+			}
+			return nil
+		}
+		return relayInfo.Billing.Reserve(quota)
+	}
 
 	if userQuota < quota {
 		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))
@@ -196,6 +209,7 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.InputTokens), float64(usage.OutputTokens), float64(usage.InputTokenDetails.CachedTokens))
 
 	var tieredResult *billingexpr.TieredResult
 	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
@@ -336,6 +350,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	if usage == nil {
 		usage = &dto.Usage{PromptTokens: relayInfo.GetEstimatePromptTokens(), TotalTokens: relayInfo.GetEstimatePromptTokens()}
 	}
+	settleUserModelDiscount(ctx, relayInfo, float64(usage.PromptTokens), float64(usage.CompletionTokens), float64(usage.PromptTokensDetails.CachedTokens))
 
 	var tieredUsedVars map[string]bool
 	if snap := relayInfo.TieredBillingSnapshot; snap != nil {

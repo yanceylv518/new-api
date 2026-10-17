@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"maps"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -41,6 +42,8 @@ func GetPricing(c *gin.Context) {
 	// 定价响应可能包含用户专属折扣，统一禁止浏览器和中间代理复用响应。
 	c.Header("Cache-Control", "private, no-store")
 	pricing := model.GetPricing()
+	now := time.Now().Unix()
+	var nextChange int64
 	userId, exists := c.Get("id")
 	usableGroup := map[string]string{}
 	groupRatio := map[string]float64{}
@@ -78,7 +81,14 @@ func GetPricing(c *gin.Context) {
 	pricing = filterPricingByUsableGroups(pricing, usableGroup)
 	if exists {
 		for i := range pricing {
-			if discountBPS := modelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(pricing[i].ModelName))); discountBPS >= 1 && discountBPS < 10000 {
+			name := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(pricing[i].ModelName))
+			rule, source := modelDiscountBPS.RuleAt(name, now)
+			pricing[i].UserModelDiscountExpression = rule.Expression
+			pricing[i].UserModelDiscountSource = source
+			if boundary := modelDiscountBPS.NextChangeAt(name, now); boundary > 0 && (nextChange == 0 || boundary < nextChange) {
+				nextChange = boundary
+			}
+			if discountBPS := modelDiscountBPS.DiscountBPSAt(name, now); discountBPS >= 1 && discountBPS < 10000 {
 				pricing[i].UserModelDiscountBPS = discountBPS
 			}
 		}
@@ -91,14 +101,16 @@ func GetPricing(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"success":            true,
-		"data":               pricing,
-		"vendors":            model.GetVendors(),
-		"group_ratio":        groupRatio,
-		"usable_group":       usableGroup,
-		"supported_endpoint": model.GetSupportedEndpointMap(),
-		"auto_groups":        service.GetUserAutoGroup(group),
-		"pricing_version":    "a42d372ccf0b5dd13ecf71203521f9d2",
+		"success":              true,
+		"server_time":          time.Now().Unix(),
+		"next_discount_change": nextChange,
+		"data":                 pricing,
+		"vendors":              model.GetVendors(),
+		"group_ratio":          groupRatio,
+		"usable_group":         usableGroup,
+		"supported_endpoint":   model.GetSupportedEndpointMap(),
+		"auto_groups":          service.GetUserAutoGroup(group),
+		"pricing_version":      "a42d372ccf0b5dd13ecf71203521f9d2",
 	})
 }
 

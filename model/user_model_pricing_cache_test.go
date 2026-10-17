@@ -19,7 +19,7 @@ import (
 func setupUserModelPricingCacheTest(t *testing.T) User {
 	t.Helper()
 	setupUserUpdateTestState(t)
-	require.NoError(t, DB.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}))
+	require.NoError(t, DB.AutoMigrate(&UserModelPricing{}, &UserModelPricingRevision{}, &UserModelPricingHistory{}))
 	previousCache := userModelPricingCache
 	userModelPricingCache = &pricingSnapshotCache{}
 	t.Cleanup(func() { userModelPricingCache = previousCache })

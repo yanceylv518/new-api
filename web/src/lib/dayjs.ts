@@ -16,9 +16,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import dayjs from 'dayjs'
+import dayjs, { type ConfigType, type Dayjs } from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
+import timezone from 'dayjs/plugin/timezone'
+import utc from 'dayjs/plugin/utc'
 
 dayjs.extend(relativeTime)
+dayjs.extend(utc)
+dayjs.extend(timezone)
+
+export const SHANGHAI_TIME_ZONE = 'Asia/Shanghai'
+
+export function shanghaiTime(value?: ConfigType): Dayjs {
+  return dayjs(value).tz(SHANGHAI_TIME_ZONE)
+}
 
 export default dayjs

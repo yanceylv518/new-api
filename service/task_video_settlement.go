@@ -104,6 +104,19 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 	var clamp *common.QuotaClamp
 	var amounts *hosttypes.DiscountAmounts
 	bc := task.PrivateData.BillingContext
+	if task.Status != model.TaskStatusFailure {
+		price, evaluation, discountErr := taskUserModelDiscount(task, result)
+		if discountErr != nil {
+			return discountErr
+		}
+		if evaluation != nil {
+			billing := *bc
+			billing.UserDiscount = evaluation
+			billing.OtherRatios = price.OtherRatios()
+			bc = &billing
+			task.PrivateData.BillingContext = bc
+		}
+	}
 	switch {
 	case task.Status == model.TaskStatusFailure:
 		actual, reason = 0, task.FailReason
@@ -136,7 +149,39 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 			task.PrivateData.BillingContext = &billing
 		}
 	case bc != nil && bc.PerCallBilling:
-		// 按次价格在提交时已固定，终态只提交状态。
+		amounts = task.PrivateData.DiscountAmounts
+		// 基础价格及倍率保持提交快照，仅允许最终用量改变所冻结表达式的折扣。
+		if bc.UserDiscount != nil && original.PrivateData.BillingContext != nil && original.PrivateData.BillingContext.UserDiscount != nil &&
+			bc.UserDiscount.DiscountBPS != original.PrivateData.BillingContext.UserDiscount.DiscountBPS {
+			before := task.Quota
+			if amounts.ValidFor(task.Quota) {
+				before = amounts.Before
+			}
+			basis := decimal.NewFromInt(int64(before))
+			if bc.QuotaBeforeDiscount != "" {
+				var parseErr error
+				basis, parseErr = decimal.NewFromString(bc.QuotaBeforeDiscount)
+				if parseErr != nil || basis.IsNegative() {
+					return fmt.Errorf("task %s has an invalid pre-discount snapshot", task.TaskID)
+				}
+			}
+			price := taskBillingContextPriceData(bc)
+			if price.UserModelDiscountMultiplier() == 1 {
+				before, clamp = common.QuotaFromDecimalChecked(basis.Truncate(0))
+				actual = before
+			} else {
+				before, clamp = common.QuotaFromDecimalChecked(basis)
+				var discountClamp *common.QuotaClamp
+				actual, discountClamp = common.QuotaDiscountDecimalChecked(basis, price.UserModelDiscountMultiplier())
+				if before > 0 && actual == 0 {
+					actual = 1
+				}
+				if discountClamp != nil {
+					clamp = discountClamp
+				}
+			}
+			amounts = hosttypes.NewDiscountAmounts(before, actual)
+		}
 	default:
 		if adjusted := adaptor.AdjustBillingOnComplete(task, result); adjusted > 0 {
 			before := adjusted

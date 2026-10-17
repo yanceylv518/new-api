@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 
 import type { TFunction } from 'i18next'
-import { describe, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import {
   buildUserModelPricingPayload,
@@ -27,13 +27,198 @@ import {
   createUserModelPricingFormSchema,
   getAvailableUserModelPricingOptions,
   normalizeUserModelPricingModelName,
+  userModelPricingFormItem,
+  userModelPricingDiscountPercentSchema,
 } from '../user-model-pricing-form'
 
 // 测试只需要恒等翻译，类型断言用于满足 i18next 的运行时类型约束。
 const t = ((key: string) => key) as TFunction
 
+afterEach(() => vi.useRealTimers())
+
 describe('user model pricing form', () => {
+  test.each([80.001, 29.999, 0.011, 99.999])(
+    'rejects excess decimal precision in permanent, temporary and batch percentages: %s',
+    (percent) => {
+      expect(
+        userModelPricingDiscountPercentSchema(t).safeParse(percent).success
+      ).toBe(false)
+      const schema = createUserModelPricingFormSchema(t)
+      expect(
+        schema.safeParse({
+          items: [
+            { model_name: 'model', mode: 'layered', discount_percent: percent },
+          ],
+        }).success
+      ).toBe(false)
+      expect(
+        schema.safeParse({
+          items: [
+            {
+              model_name: 'model',
+              mode: 'layered',
+              discount_percent: 80,
+              periods: [
+                { discount_percent: percent, start_time: 100, end_time: 200 },
+              ],
+            },
+          ],
+        }).success
+      ).toBe(false)
+    }
+  )
+  test.each([0.01, 29, 29.99, 80.01, 100])(
+    'accepts exact basis-point percentages: %s',
+    (percent) => {
+      expect(
+        userModelPricingDiscountPercentSchema(t).safeParse(percent).success
+      ).toBe(true)
+    }
+  )
+  test('shows the saved permanent fallback and preserves temporary rules when replacing permanent conditions', () => {
+    const draft = userModelPricingFormItem({
+      model_name: 'model',
+      mode: 'layered',
+      discount_bps: 10000,
+      permanent: {
+        discount_bps: 10000,
+        expression: '(hour("Asia/Shanghai") >= 9) ? 0.6 : 0.8',
+      },
+      periods: [{ discount_bps: 5000, start_time: 100, end_time: 200 }],
+    })
+    expect(draft.discount_percent).toBe(80)
+    const payload = buildUserModelPricingPayload({
+      items: [
+        {
+          ...draft,
+          expression: '',
+          calculation_type: 'fixed',
+          discount_percent: 75,
+        },
+      ],
+    })
+    expect(payload.items[0].permanent).toEqual({
+      discount_bps: 7500,
+      expression: undefined,
+    })
+    expect(payload.items[0].periods).toEqual([
+      expect.objectContaining({
+        discount_bps: 5000,
+        start_time: 100,
+        end_time: 200,
+      }),
+    ])
+  })
+
+  test('updates editable time fallbacks to permanent references while preserving fixed overrides and legacy infinite rules', () => {
+    const conditional = '(hour("Asia/Shanghai") >= 9) ? 0.6 : 0.8'
+    const payload = buildUserModelPricingPayload({
+      items: [
+        {
+          model_name: 'model',
+          mode: 'layered',
+          discount_percent: 75,
+          periods: [
+            { expression: conditional, start_time: 100, end_time: 200 },
+            { expression: '0.5', start_time: 200, end_time: 300 },
+            {
+              expression: conditional,
+              start_time: 300,
+              end_time: null,
+              legacy_unbounded: true,
+            },
+          ],
+        },
+      ],
+    })
+    expect(
+      payload.items[0].periods?.map((period) => period.expression)
+    ).toEqual([
+      '(hour("Asia/Shanghai") >= 9) ? 0.6 : permanent_discount',
+      '(hour("Asia/Shanghai") >= 0) ? 0.5 : permanent_discount',
+      conditional,
+    ])
+  })
   const schema = createUserModelPricingFormSchema(t)
+
+  test.each([null, undefined, Number.NaN, 0, 101])(
+    'accepts valid scheduled periods when the unused single discount is %s',
+    (discount) => {
+      const result = schema.safeParse({
+        items: [
+          {
+            model_name: 'scheduled-model',
+            mode: 'scheduled',
+            discount_percent: discount,
+            periods: [{ discount_percent: 80, start_time: 100, end_time: 200 }],
+          },
+        ],
+      })
+      expect(result.success).toBe(true)
+    }
+  )
+
+  test('rejects an invalid scheduled period discount even when the single value is valid', () => {
+    expect(
+      schema.safeParse({
+        items: [
+          {
+            model_name: 'scheduled-model',
+            mode: 'scheduled',
+            discount_percent: 80,
+            periods: [
+              { discount_percent: 101, start_time: 100, end_time: 200 },
+            ],
+          },
+        ],
+      }).success
+    ).toBe(false)
+  })
+
+  test('keeps permanent rules timeless and fills temporary starts from browser time', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-08T02:00:00Z'))
+    const now = Math.floor(Date.now() / 1000)
+    const payload = buildUserModelPricingPayload(
+      {
+        items: [
+          { model_name: 'new-single', discount_percent: 80 },
+          {
+            model_name: 'new-scheduled',
+            mode: 'scheduled',
+            discount_percent: 100,
+            periods: [{ discount_percent: 70, end_time: now + 600 }],
+          },
+          {
+            model_name: 'existing',
+            mode: 'layered',
+            discount_percent: 100,
+            periods: [{ discount_percent: 60, start_time: 100, end_time: 200 }],
+          },
+        ],
+      },
+      [
+        {
+          model_name: 'existing',
+          mode: 'single',
+          discount_bps: 6000,
+          start_time: 100,
+          end_time: 200,
+        },
+      ]
+    )
+    expect(
+      payload.items.find((item) => item.model_name === 'new-single')?.permanent
+        ?.discount_bps
+    ).toBe(8000)
+    expect(
+      payload.items.find((item) => item.model_name === 'new-scheduled')
+        ?.periods?.[0].start_time
+    ).toBe(now)
+    expect(
+      payload.items.find((item) => item.model_name === 'existing')
+    ).toMatchObject({ periods: [{ start_time: 100, end_time: 200 }] })
+  })
 
   test('normalizes aliases with the same backend matching rules', () => {
     assert.equal(
@@ -109,7 +294,7 @@ describe('user model pricing form', () => {
     assert.equal(result.success, false)
   })
 
-  test('allows duplicate aliases when all rows use full price', () => {
+  test('rejects duplicate aliases even when all rows use full price', () => {
     const result = schema.safeParse({
       items: [
         { model_name: 'gemini-2.5-pro-thinking-1024', discount_percent: 100 },
@@ -117,7 +302,7 @@ describe('user model pricing form', () => {
       ],
     })
 
-    assert.equal(result.success, true)
+    assert.equal(result.success, false)
   })
 
   test('rejects discounts outside the supported range', () => {
@@ -136,6 +321,8 @@ describe('user model pricing form', () => {
   })
 
   test('builds a payload by filtering full-price rows and converting percentages', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-08T02:00:00Z'))
     const payload = buildUserModelPricingPayload({
       items: [
         { model_name: ' gpt-4o ', discount_percent: 80 },
@@ -150,10 +337,19 @@ describe('user model pricing form', () => {
 
     assert.deepEqual(payload, {
       items: [
-        { model_name: 'gpt-4o', discount_bps: 8000 },
+        {
+          model_name: 'gpt-4o',
+          discount_bps: 8000,
+          mode: 'layered',
+          permanent: { discount_bps: 8000, expression: undefined },
+          periods: [],
+        },
         {
           model_name: 'gemini-2.5-pro-thinking-*',
           discount_bps: 7550,
+          mode: 'layered',
+          permanent: { discount_bps: 7550, expression: undefined },
+          periods: [],
         },
       ],
     })

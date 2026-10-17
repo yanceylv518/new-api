@@ -45,7 +45,10 @@ func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.Pric
 		return
 	}
 	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
-	discountBPS := info.UserModelDiscountBPS.DiscountBPS(modelName)
+	discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(modelName, info.StartTime.Unix())
+	if info.UserModelDiscountEvaluation != nil {
+		discountBPS = info.UserModelDiscountEvaluation.DiscountBPS
+	}
 	if discountBPS < 1 || discountBPS >= 10000 {
 		return
 	}
@@ -88,6 +91,9 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 	}
 	billingModelName := info.GetBillingModelName()
+	if err := PrepareUserModelDiscount(c, info, float64(promptTokens), 0, nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	modelPrice, usePrice := ratio_setting.GetModelPrice(billingModelName, false)
 
 	groupRatioInfo := HandleGroupRatio(c, info)
@@ -136,8 +142,8 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
 		discountRatio := 1.0
-		if discountBPS := info.UserModelDiscountBPS.DiscountBPS(ratio_setting.FormatMatchingModelName(billingModelName)); discountBPS >= 1 && discountBPS < 10000 && !info.IsChannelTest {
-			discountRatio = float64(discountBPS) / 10000
+		if evaluation := info.UserModelDiscountEvaluation; evaluation != nil && !info.IsChannelTest {
+			discountRatio = float64(evaluation.DiscountBPS) / 10000
 		}
 		beforeValue := decimal.NewFromFloat(preConsumedTokens).
 			Mul(decimal.NewFromFloat(modelRatio)).
@@ -270,6 +276,9 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 // ModelPriceHelperPerCall 按次/按量计费的 PriceHelper (MJ、Task)
 func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hosttypes.PriceData, error) {
+	if err := PrepareUserModelDiscount(c, info, 0, 0, nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	groupRatioInfo := HandleGroupRatio(c, info)
 
 	modelPrice, success := ratio_setting.GetModelPrice(info.OriginModelName, true)
@@ -360,6 +369,9 @@ func HasPriceOrRatioEntry(name string) bool {
 }
 
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
+	if err := PrepareUserModelDiscount(c, info, float64(promptTokens), 0, nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
 	if !ok {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)

@@ -111,7 +111,7 @@ func performVerifiedManageUserRequest(t *testing.T, body string, identity servic
 // 管理接口必须跨组列出启用模型，拒绝非法草稿和旧版本覆盖，并沿用目标用户权限边界。
 func TestUserModelPricingManagementContract(t *testing.T) {
 	db := setupManageUserTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.Ability{}))
+	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.Ability{}))
 	user := model.User{Username: "pricing-contract", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
 	require.NoError(t, db.Create(&user).Error)
 	require.NoError(t, db.Create(&[]model.Ability{

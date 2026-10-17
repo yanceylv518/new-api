@@ -420,6 +420,13 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)
+	if billingUsage != nil {
+		input := billingUsage.PromptTokens
+		if billingUsage.UsageSemantic == "anthropic" {
+			input += billingUsage.PromptTokensDetails.CachedTokens + billingUsage.PromptTokensDetails.CacheCreationTokensTotal()
+		}
+		settleUserModelDiscount(ctx, relayInfo, float64(input), float64(billingUsage.CompletionTokens), float64(billingUsage.PromptTokensDetails.CachedTokens))
+	}
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")
 	}

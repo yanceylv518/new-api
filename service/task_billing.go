@@ -71,6 +71,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	}
 	other.SetPublic("group_ratio", info.PriceData.GroupRatioInfo.GroupRatio)
 	other.SetPublic(types.UserModelDiscountRatioKey, info.PriceData.UserModelDiscountMultiplier())
+	info.UserModelDiscountEvaluation.AddToLog(other)
 	info.PriceData.DiscountAmounts.AddToLog(other)
 	if info.PriceData.DiscountAmounts != nil {
 		other.SetPublic("discount_cost_scope", "task_total")
@@ -93,8 +94,8 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	} else {
 		setTaskImageCount(other, info.PriceData.OtherRatios()["image_count"])
 	}
-	appendTaskLogInfo(task, other)
 	AppendRelayLogAdminInfo(c, info, other)
+	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
@@ -145,6 +146,7 @@ func resolveTokenKey(ctx context.Context, tokenId int, taskID string) string {
 func taskBillingOther(task *model.Task) *model.LogOther {
 	other := model.NewLogOther()
 	if bc := task.PrivateData.BillingContext; bc != nil {
+		bc.UserDiscount.AddToLog(other)
 		other.SetPublic("model_price", bc.ModelPrice)
 		if bc.ModelRatio > 0 {
 			other.SetPublic("model_ratio", bc.ModelRatio)
@@ -221,11 +223,11 @@ func appendTaskLogInfo(task *model.Task, other *model.LogOther) {
 	}
 	if task.PrivateData.Execution != nil {
 		AppendTaskPluginAuditInfo(other, task.PrivateData.Execution.TaskPlugin)
-	}
-	if task.PrivateData.UpstreamTaskID == "" && task.PrivateData.NodeName == "" {
 		if channels := task.PrivateData.Execution.UseChannel; len(channels) > 0 {
 			other.SetAdmin("use_channel", channels)
 		}
+	}
+	if task.PrivateData.UpstreamTaskID == "" && task.PrivateData.NodeName == "" {
 		return
 	}
 	if task.PrivateData.UpstreamTaskID != "" {

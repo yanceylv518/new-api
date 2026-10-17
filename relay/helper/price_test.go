@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/discountexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -24,6 +26,70 @@ import (
 )
 
 // 修饰符和基础名共享计费身份，渠道测试必须保持原价，不允许伪造请求倍率覆盖用户折扣。
+func TestPrepareUserDiscountFreezesNormalizedTaskParameters(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	ctx.Request.Header.Set("Content-Type", "multipart/form-data; boundary=fixture")
+	ctx.Set("task_request", map[string]any{"resolution": "720p", "duration": float64(4), "prompt": "not persisted"})
+	end := int64(200)
+	info := &relaycommon.RelayInfo{OriginModelName: "discount-video", StartTime: time.Unix(100, 0),
+		UserModelDiscountBPS: hosttypes.NewUserModelDiscountScheduleSnapshot(map[string]hosttypes.UserModelDiscountConfig{
+			"discount-video": {Mode: hosttypes.UserModelPricingLayered, Permanent: &hosttypes.UserModelDiscountWindow{DiscountBPS: 7500}, Periods: []hosttypes.UserModelDiscountWindow{{StartTime: 0, EndTime: &end, Expression: `param("resolution") == "720p" && seconds >= 4 ? 0.5 : permanent_discount`}}},
+		})}
+	require.NoError(t, PrepareUserModelDiscount(ctx, info, 0, 0, nil))
+	require.NotNil(t, info.UserModelDiscountEvaluation)
+	assert.Equal(t, 5000, info.UserModelDiscountEvaluation.DiscountBPS)
+	assert.Equal(t, map[string]any{"resolution": "720p"}, info.UserModelDiscountEvaluation.Context.Params)
+	encoded, err := common.Marshal(info.UserModelDiscountEvaluation)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "not persisted")
+	ctx.Set("task_request", map[string]any{"resolution": "480p", "duration": float64(1)})
+	info.StartTime = time.Unix(500, 0)
+	require.NoError(t, PrepareUserModelDiscount(ctx, info, 0, 0, nil))
+	assert.Equal(t, int64(100), info.UserModelDiscountEvaluation.Context.At)
+	assert.Equal(t, 5000, info.UserModelDiscountEvaluation.DiscountBPS)
+}
+
+func TestPrepareUserDiscountTaskUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, expression string
+		normalized, facts      map[string]any
+		want                   discountexpr.Context
+		invalid                bool
+	}{
+		{name: "H3 split token aliases", expression: `input_tokens == 6000 && output_tokens == 1000 && task_tokens == 7000 ? 0.5 : 1`, facts: map[string]any{"prompt_tokens": 6000, "completion_tokens": int64(1000), "tokens": float64(7000)}, want: discountexpr.Context{InputTokens: 6000, OutputTokens: 1000, TaskTokens: 7000}},
+		{name: "canonical fields take precedence", expression: `input_tokens == 6000 && output_tokens == 1000 && task_tokens == 7000 ? 0.5 : 1`, facts: map[string]any{"input_tokens": 6000, "prompt_tokens": 1, "output_tokens": 1000, "completion_tokens": 2, "task_tokens": 7000, "tokens": 9999, "total_tokens": 8888}, want: discountexpr.Context{InputTokens: 6000, OutputTokens: 1000, TaskTokens: 7000}},
+		{name: "canonical zero beats aliases", expression: `input_tokens == 0 && output_tokens == 0 && task_tokens == 0 ? 0.5 : 1`, facts: map[string]any{"input_tokens": 0, "prompt_tokens": 6000, "output_tokens": 0, "completion_tokens": 1000, "task_tokens": 0, "tokens": 7000}, want: discountexpr.Context{}},
+		{name: "aggregate does not become output", expression: `task_tokens >= 2000 && output_tokens == 0 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000}, want: discountexpr.Context{TaskTokens: 5000}},
+		{name: "smart duration", body: `{"duration":-1}`, expression: `task_tokens >= 2000 && param("duration") == -1 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000}, want: discountexpr.Context{TaskTokens: 5000, Params: map[string]any{"duration": float64(-1)}}},
+		{name: "normalized smart duration", normalized: map[string]any{"duration": -1}, expression: `task_tokens >= 2000 && param("duration") == -1 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000}, want: discountexpr.Context{TaskTokens: 5000, Params: map[string]any{"duration": float64(-1)}}},
+		{name: "smart seconds alias", body: `{"seconds":-1}`, expression: `task_tokens >= 2000 && param("seconds") == -1 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000}, want: discountexpr.Context{TaskTokens: 5000, Params: map[string]any{"seconds": float64(-1)}}},
+		{name: "smart duration uses estimated seconds", body: `{"duration":-1}`, expression: `seconds >= 4 ? 0.5 : 1`, facts: map[string]any{"seconds": 4}, want: discountexpr.Context{Seconds: 4}},
+		{name: "other negative durations stay invalid", body: `{"duration":-2}`, expression: `task_tokens >= 2000 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000}, invalid: true},
+		{name: "negative actual seconds stay invalid", body: `{"duration":-1}`, expression: `task_tokens >= 2000 ? 0.5 : 1`, facts: map[string]any{"tokens": 5000, "seconds": -1}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Set("task_request", tc.normalized)
+			info := &relaycommon.RelayInfo{OriginModelName: "discount-video", StartTime: time.Unix(100, 0), BillingRequestInput: &billingexpr.RequestInput{Body: []byte(tc.body)},
+				UserModelDiscountBPS: hosttypes.NewUserModelDiscountScheduleSnapshot(map[string]hosttypes.UserModelDiscountConfig{
+					"discount-video": {Mode: hosttypes.UserModelPricingLayered, Permanent: &hosttypes.UserModelDiscountWindow{DiscountBPS: 10000, Expression: tc.expression}},
+				})}
+			err := PrepareUserModelDiscount(ctx, info, 0, 0, tc.facts)
+			if tc.invalid {
+				require.Error(t, err)
+				assert.Nil(t, info.UserModelDiscountEvaluation)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, info.UserModelDiscountEvaluation)
+			tc.want.At, tc.want.Count = 100, 1
+			assert.Equal(t, tc.want, info.UserModelDiscountEvaluation.Context)
+			assert.Equal(t, 5000, info.UserModelDiscountEvaluation.DiscountBPS)
+		})
+	}
+}
+
 func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {
 	saved := ratio_setting.ModelRatio2JSONString()
 	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(saved)) })
@@ -31,7 +97,7 @@ func TestModelDiscountMatchesCanonicalBillingIdentity(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Set("group", "default")
 	for _, channelTest := range []bool{false, true} {
-		info := &relaycommon.RelayInfo{OriginModelName: "discount-model@temperature:0.2", UserGroup: "default", UsingGroup: "default", IsChannelTest: channelTest,
+		info := &relaycommon.RelayInfo{OriginModelName: "discount-model@temperature:0.2", UserGroup: "default", UsingGroup: "default", IsChannelTest: channelTest, StartTime: time.Unix(0, 0),
 			UserModelDiscountBPS: hosttypes.NewUserModelDiscountSnapshot(map[string]int{"discount-model": 8000})}
 		price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
 		require.NoError(t, err)

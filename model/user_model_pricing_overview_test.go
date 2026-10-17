@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
@@ -10,6 +11,58 @@ import (
 )
 
 // 为总览测试建立与编辑目录一致的启用模型集合，避免把规则表中的历史模型误当成当前模型。
+func assertUserModelPricingScheduledOverview(t *testing.T) {
+	t.Helper()
+	user := User{Username: "scheduled-overview-user", AffCode: "scheduled-overview-user", Role: common.RoleCommonUser}
+	require.NoError(t, DB.Create(&user).Error)
+	createEnabledPricingAbilities(t, "schedule-alpha", "schedule-beta", "schedule-gamma", "schedule-delta")
+	now := time.Now().Unix()
+	end := func(value int64) *int64 { return &value }
+	rules := []UserModelPricing{
+		{ModelName: "schedule-alpha", Slot: 0, DiscountBPS: 5000, StartTime: now - 900, EndTime: end(now - 600)},
+		{ModelName: "schedule-alpha", Slot: 1, DiscountBPS: 6000, StartTime: now - 600, EndTime: end(now + 600)},
+		{ModelName: "schedule-alpha", Slot: 2, DiscountBPS: 7000, StartTime: now + 600},
+		{ModelName: "schedule-beta", Slot: 0, DiscountBPS: 8000, StartTime: now + 900, EndTime: end(now + 1800)},
+		{ModelName: "schedule-beta", Slot: 1, DiscountBPS: 7500, StartTime: now + 600, EndTime: end(now + 900)},
+		{ModelName: "schedule-delta", Slot: 0, DiscountBPS: 4000, StartTime: now - 900, EndTime: end(now - 600)},
+		{ModelName: "schedule-delta", Slot: 1, DiscountBPS: 4500, StartTime: now - 600, EndTime: end(now - 300)},
+		{ModelName: "schedule-gamma", Slot: 0, DiscountBPS: 9000, StartTime: now - 300},
+	}
+	for index := range rules {
+		rules[index].UserId = user.Id
+		rules[index].Mode = "scheduled"
+	}
+	require.NoError(t, DB.Create(&rules).Error)
+	for _, summary := range []bool{false, true} {
+		result, err := GetUserModelPricingOverview(t.Context(), user.Username, common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{}, summary)
+		require.NoError(t, err)
+		require.Len(t, result.Items, 1)
+		assert.EqualValues(t, 4, result.TotalRules)
+		assert.EqualValues(t, 8, result.TotalPeriods)
+		assert.EqualValues(t, 4, result.TotalModels)
+		assert.EqualValues(t, 2, result.ActiveRules)
+		assert.Equal(t, 4, result.Items[0].RuleCount)
+		assert.Equal(t, 8, result.Items[0].PeriodCount)
+		if summary {
+			preview := result.Items[0].PreviewRules
+			require.Len(t, preview, 3)
+			assert.Equal(t, []string{"schedule-alpha", "schedule-beta", "schedule-delta"}, []string{preview[0].ModelName, preview[1].ModelName, preview[2].ModelName})
+			assert.Equal(t, 6000, preview[0].DiscountBPS)
+			assert.Equal(t, 7500, preview[1].DiscountBPS)
+			assert.Equal(t, 4500, preview[2].DiscountBPS)
+		} else {
+			assert.Len(t, result.Items[0].Rules, 8)
+		}
+	}
+	result, err := GetUserModelPricingOverview(t.Context(), "schedule-alpha", common.RoleRootUser, 0, 20, UserModelPricingOverviewFilters{Status: "pending"}, true)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.TotalRules)
+	assert.EqualValues(t, 1, result.TotalPeriods)
+	require.Len(t, result.Items, 1)
+	require.Len(t, result.Items[0].PreviewRules, 1)
+	assert.Equal(t, 7000, result.Items[0].PreviewRules[0].DiscountBPS)
+}
+
 func createEnabledPricingAbilities(t testing.TB, names ...string) {
 	t.Helper()
 	abilities := make([]Ability, len(names))

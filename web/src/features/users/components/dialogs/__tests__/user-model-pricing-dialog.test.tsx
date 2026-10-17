@@ -18,7 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
 
-import { afterEach, describe, test } from 'vitest'
+import { waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+
+import type { UserModelPricingItem } from '../../../types'
 
 // 使用 Vitest 的 jsdom，避免混用 DOM 实现导致节点归属判断失真。
 const domWindow = window
@@ -80,7 +83,10 @@ let renderedDialog: RenderedDialog | null = null
 // 为组件测试提供稳定的定价、状态和已有折扣数据，避免依赖真实后端。
 function installApiFixtures(
   pricingModels = models,
-  pricingItems = [{ model_name: 'model-03', discount_bps: 8000 }]
+  pricingItems: UserModelPricingItem[] = [
+    { model_name: 'model-03', discount_bps: 8000 },
+  ],
+  serverTime?: number
 ) {
   apiClient.get = async (url) => {
     switch (url) {
@@ -94,6 +100,7 @@ function installApiFixtures(
               user_id: 42,
               items: pricingItems,
               revision: 1,
+              server_time: serverTime,
               model_names: pricingModels.map((model) => model.model_name),
             },
           },
@@ -108,30 +115,15 @@ async function waitForCondition(
   condition: () => boolean,
   failureMessage: string
 ): Promise<void> {
-  if (condition()) return
-
-  await new Promise<void>((resolve, reject) => {
-    const observer = new MutationObserver(() => {
-      if (!condition()) return
-      clearTimeout(timeoutId)
-      observer.disconnect()
-      resolve()
-    })
-    const timeoutId = setTimeout(() => {
-      observer.disconnect()
-      reject(new Error(`${failureMessage}: ${document.body.textContent}`))
-    }, 1500)
-
-    observer.observe(document, {
-      attributes: true,
-      childList: true,
-      characterData: true,
-      subtree: true,
-    })
-  })
+  await waitFor(() => assert.equal(condition(), true, failureMessage))
 }
 
-async function renderDialog(expectedInputCount = 25, configuredOnly = false) {
+async function renderDialog(
+  expectedInputCount = 25,
+  configuredOnly = false,
+  onOpenChange: (open: boolean) => void = () => undefined,
+  onShowAllModels?: () => void
+) {
   const host = document.createElement('div')
   document.body.append(host)
   const root = createRoot(host)
@@ -151,9 +143,10 @@ async function renderDialog(expectedInputCount = 25, configuredOnly = false) {
           <I18nextProvider i18n={i18n}>
             <UserModelPricingDialog
               open={open}
-              onOpenChange={() => undefined}
+              onOpenChange={onOpenChange}
               user={{ id: 42, username: 'pricing-user' }}
               configuredOnly={configuredOnly}
+              onShowAllModels={onShowAllModels}
             />
           </I18nextProvider>
         </QueryClientProvider>
@@ -162,14 +155,11 @@ async function renderDialog(expectedInputCount = 25, configuredOnly = false) {
   }
   renderedDialog = { host, queryClient, root, renderOpen }
   await renderOpen(true)
-  await act(
-    async () =>
-      await waitForCondition(
-        () =>
-          document.querySelectorAll('input[type="number"]').length ===
-          expectedInputCount,
-        'model pricing dialog did not render the first page'
-      )
+  await waitForCondition(
+    () =>
+      document.querySelectorAll('input[type="number"]').length ===
+      expectedInputCount,
+    'model pricing dialog did not render the first page'
   )
 }
 
@@ -220,6 +210,160 @@ afterEach(async () => {
 })
 
 describe('user model pricing dialog', () => {
+  test('an old pending save does not close a later editing session', async () => {
+    installApiFixtures(models.slice(0, 2))
+    const onOpenChange = vi.fn()
+    await renderDialog(2, false, onOpenChange)
+    let finishSave: ((value: { data: unknown }) => void) | undefined
+    apiClient.put = async () =>
+      new Promise((resolve) => {
+        finishSave = resolve
+      })
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () => {
+      form.dispatchEvent(
+        new domWindow.Event('submit', {
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event
+      )
+    })
+    await waitFor(() => assert.ok(finishSave))
+    assert.ok(renderedDialog)
+    await renderedDialog.renderOpen(false)
+    await renderedDialog.renderOpen(true)
+    await waitFor(() =>
+      assert.ok(document.querySelector('[data-slot="model-pricing-row"]'))
+    )
+    assert.ok(finishSave)
+    await act(async () => {
+      finishSave?.({ data: { success: true } })
+    })
+    await waitFor(() =>
+      expect(renderedDialog?.queryClient.isMutating()).toBe(0)
+    )
+    expect(onOpenChange).not.toHaveBeenCalled()
+    expect(
+      document.querySelector('[data-slot="model-pricing-row"]')
+    ).not.toBeNull()
+    finishSave = undefined
+    const currentForm = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(currentForm)
+    await act(async () => {
+      currentForm.dispatchEvent(
+        new domWindow.Event('submit', {
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event
+      )
+    })
+    await waitFor(() => assert.ok(finishSave))
+    await act(async () => {
+      finishSave?.({ data: { success: true } })
+    })
+    await waitFor(() =>
+      expect(onOpenChange).toHaveBeenCalledExactlyOnceWith(false)
+    )
+  })
+  test('rejects a batch start change for legacy unbounded temporary periods before changing drafts', async () => {
+    const start = new Date('2030-10-08T10:00:00+08:00').getTime() / 1000
+    const selected = models.slice(0, 2)
+    installApiFixtures(
+      selected,
+      selected.map(({ model_name }) => ({
+        model_name,
+        mode: 'layered',
+        discount_bps: 8000,
+        permanent: { discount_bps: 8000 },
+        periods: [
+          {
+            discount_bps: 6000,
+            start_time: start,
+            end_time: null,
+            legacy_unbounded: true,
+          },
+        ],
+      }))
+    )
+    await renderDialog(2)
+    const selectAll = document.querySelector<HTMLElement>(
+      '[aria-label="Select all (filtered)"]'
+    )
+    assert.ok(selectAll)
+    await act(async () => selectAll.click())
+    const configure = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        '[data-slot="model-pricing-batch"] button'
+      ),
+    ].find((button) => button.textContent === 'Batch validity')
+    assert.ok(configure)
+    await act(async () => configure.click())
+    const changeStart = document.querySelector<HTMLElement>('#batch-start')
+    assert.ok(changeStart)
+    await act(async () => changeStart.click())
+    const apply = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Apply')
+    assert.ok(apply)
+    await act(async () => apply.click())
+    expect(document.body.textContent).toContain(
+      'Temporary discounts require an end time'
+    )
+    expect(getModelInput('model-01').value).toBe('80')
+    expect(getModelInput('model-02').value).toBe('80')
+  })
+  test('searches concrete aliases while editing one canonical rule', async () => {
+    const aliases = [
+      'gemini-2.5-pro-thinking-1024',
+      'gemini-2.5-pro-thinking-2048',
+    ].map((model_name, index) => ({ ...models[0], id: index + 1, model_name }))
+    installApiFixtures(aliases, [
+      { model_name: 'gemini-2.5-pro-thinking-*', discount_bps: 8000 },
+    ])
+    await renderDialog(1)
+    const search = document.querySelector<HTMLInputElement>(
+      '[aria-label="Search models"]'
+    )
+    assert.ok(search)
+    await changeInput(search, 'thinking-2048')
+    await waitForCondition(
+      () =>
+        document.querySelectorAll('[data-slot="model-pricing-row"]').length ===
+        1,
+      'alias search must retain its canonical rule'
+    )
+    expect(document.body.textContent).not.toContain(
+      'No models matched your search.'
+    )
+  })
+  test('keeps model values unchanged when a batch percentage has excess precision', async () => {
+    installApiFixtures(models, configuredItemsFor(models))
+    await renderDialog()
+    const selectAll = document.querySelector<HTMLElement>(
+      '[aria-label="Select all (filtered)"]'
+    )
+    assert.ok(selectAll)
+    await act(async () => selectAll.click())
+    const batch = document.querySelector<HTMLInputElement>(
+      '[aria-label="Batch discount percentage"]'
+    )
+    assert.ok(batch)
+    await changeInput(batch, '80.001')
+    const apply = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Apply discount')
+    assert.ok(apply)
+    await act(async () => apply.click())
+    expect(document.body.textContent).toContain(
+      'Enter a percentage from 0.01 to 100, with up to two decimal places.'
+    )
+    expect(getModelInput('model-01').value).toBe('80')
+  })
   // 全选覆盖分页外的模型，超出规则上限时整批拒绝，原价重置仍然可用。
   test('selects across all pages and rejects batches exceeding the rule limit', async () => {
     const bulkModels = Array.from({ length: 1001 }, (_, index) => ({
@@ -341,18 +485,15 @@ describe('user model pricing dialog', () => {
     }
     assert.equal(submittedPayload.revision, 1)
     assert.equal(submittedPayload.items.length, models.length)
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-01'),
-      { model_name: 'model-01', discount_bps: 6525 }
-    )
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-30'),
-      { model_name: 'model-30', discount_bps: 6525 }
-    )
-    assert.deepEqual(
-      submittedPayload.items.find((item) => item.model_name === 'model-29'),
-      { model_name: 'model-29', discount_bps: 8000 }
-    )
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-01')
+    ).toMatchObject({ model_name: 'model-01', discount_bps: 6525 })
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-30')
+    ).toMatchObject({ model_name: 'model-30', discount_bps: 6525 })
+    expect(
+      submittedPayload.items.find((item) => item.model_name === 'model-29')
+    ).toMatchObject({ model_name: 'model-29', discount_bps: 8000 })
   })
 
   // 多选修改批量折扣后，必须显式应用且所有选中模型已同步才能保存。
@@ -460,16 +601,30 @@ describe('user model pricing dialog', () => {
       ...document.querySelectorAll<HTMLButtonElement>('button'),
     ].find((button) => button.textContent === 'Apply discount')
     assert.ok(apply)
+    const clear = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Clear selection"]'
+    )
+    assert.ok(clear)
+    const toolbar = clear.parentElement
+    assert.ok(toolbar)
+    const validity = [...toolbar.querySelectorAll('button')].find(
+      (button) => button.textContent === 'Batch validity'
+    )
+    assert.ok(validity)
+    expect(
+      Boolean(
+        validity.compareDocumentPosition(clear) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+      )
+    ).toBe(true)
     await act(async () => apply.click())
     assert.equal(getModelInput('model-03').value, '100')
     assert.ok(renderedDialog)
     await renderedDialog.renderOpen(false)
     await renderedDialog.renderOpen(true)
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().length === 1,
-        'reopened models missing'
-      )
+    await waitForCondition(
+      () => visibleModelNames().length === 1,
+      'reopened models missing'
     )
     assert.equal(
       document.querySelector('[aria-label="Batch discount percentage"]'),
@@ -562,7 +717,7 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     })
-    assert.deepEqual(submitted, {
+    expect(submitted).toMatchObject({
       revision: 1,
       items: [{ model_name: 'disabled-model', discount_bps: 6000 }],
     })
@@ -580,13 +735,11 @@ describe('user model pricing dialog', () => {
       return fixtureGet(url)
     }
     await renderedDialog.renderOpen(true)
-    await act(async () =>
-      waitForCondition(
-        () =>
-          document.body.textContent?.includes('Failed to load model pricing') ??
-          false,
-        'load failure was not shown'
-      )
+    await waitForCondition(
+      () =>
+        document.body.textContent?.includes('Failed to load model pricing') ??
+        false,
+      'load failure was not shown'
     )
     const save = document.querySelector<HTMLButtonElement>(
       'button[type="submit"][form="user-model-pricing-form"]'
@@ -600,11 +753,9 @@ describe('user model pricing dialog', () => {
     ].find((button) => button.textContent === 'Retry')
     assert.ok(retry)
     await act(async () => retry.click())
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().length === 1,
-        'retry did not restore editing'
-      )
+    await waitForCondition(
+      () => visibleModelNames().length === 1,
+      'retry did not restore editing'
     )
     assert.equal(getModelInput('model-03').value, '80')
     assert.equal(save.disabled, false)
@@ -663,7 +814,7 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     })
-    assert.deepEqual(submitted, {
+    expect(submitted).toMatchObject({
       revision: 1,
       items: [{ model_name: 'model-03', discount_bps: 5500 }],
     })
@@ -671,11 +822,9 @@ describe('user model pricing dialog', () => {
     // 重新打开才加载最新完整快照，避免后台自动合并造成其他管理员的规则被覆盖。
     await renderedDialog.renderOpen(false)
     await renderedDialog.renderOpen(true)
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames()[0] === 'model-01',
-        'latest rules were not loaded'
-      )
+    await waitForCondition(
+      () => visibleModelNames()[0] === 'model-01',
+      'latest rules were not loaded'
     )
     assert.equal(getModelInput('model-01').value, '70')
     assert.deepEqual(visibleModelNames(), ['model-01'])
@@ -760,11 +909,9 @@ describe('user model pricing dialog', () => {
     assert.equal(modelPricingPagination.classList.contains('shrink-0'), true)
 
     await act(async () => nextPageButton.click())
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().includes('model-26'),
-        'next page was not rendered'
-      )
+    await waitForCondition(
+      () => visibleModelNames().includes('model-26'),
+      'next page was not rendered'
     )
     assert.equal(visibleModelNames().length, 5)
 
@@ -773,11 +920,9 @@ describe('user model pricing dialog', () => {
     )
     assert.ok(searchInput)
     await changeInput(searchInput, 'model-30')
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().length === 1,
-        'model search did not filter the list'
-      )
+    await waitForCondition(
+      () => visibleModelNames().length === 1,
+      'model search did not filter the list'
     )
     assert.deepEqual(visibleModelNames(), ['model-30'])
   })
@@ -819,15 +964,135 @@ describe('user model pricing dialog', () => {
   })
 
   // 编辑入口只展示当前用户已配置且仍启用的模型，不再把未改模型混入列表。
+  test('offers the full model catalog from the configured view until edits are pending', async () => {
+    installApiFixtures(models.slice(0, 2), [
+      { model_name: 'model-01', discount_bps: 8000 },
+    ])
+    let requested = 0
+    await renderDialog(1, true, undefined, () => requested++)
+    const showAll = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Add other models')
+    assert.ok(showAll)
+    expect(showAll.disabled).toBe(false)
+    await act(async () => showAll.click())
+    expect(requested).toBe(1)
+    // 切换目录会重建草稿，存在未保存修改时不允许切换。
+    await changeInput(getModelInput('model-01'), '70')
+    expect(showAll.disabled).toBe(true)
+  })
+
   test('shows only configured enabled models in the edit dialog', async () => {
     installApiFixtures()
     await renderDialog(1, true)
 
     assert.deepEqual(visibleModelNames(), ['model-03'])
-    assert.equal(
-      document.querySelector<HTMLElement>('[data-slot="select-trigger"]'),
-      null
+    const filters = [
+      ...document.querySelectorAll<HTMLElement>('[data-slot="select-trigger"]'),
+    ]
+    expect(filters).toHaveLength(1)
+    expect(filters[0].getAttribute('aria-label')).toBe('Discount status')
+  })
+
+  test('uses browser time for scheduled status even when server time differs', async () => {
+    const browserNow = Math.floor(Date.now() / 1000)
+    const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(browserNow * 1000)
+    try {
+      installApiFixtures(
+        models.slice(0, 1),
+        [
+          {
+            model_name: 'model-01',
+            discount_bps: 8000,
+            mode: 'single',
+            start_time: browserNow + 3600,
+            end_time: null,
+          },
+        ],
+        browserNow + 7200
+      )
+      await renderDialog(1, true)
+      expect(document.body.textContent).toContain('Edit temporary discounts')
+      const filter = document.querySelector<HTMLElement>(
+        '[aria-label="Discount status"]'
+      )
+      assert.ok(filter)
+      await act(async () => filter.click())
+      const pending = [
+        ...document.querySelectorAll<HTMLElement>('[role="option"]'),
+      ].find((option) => option.textContent === 'Not started')
+      assert.ok(pending)
+      await act(async () => pending.click())
+      expect(visibleModelNames()).toEqual(['model-01'])
+    } finally {
+      dateSpy.mockRestore()
+    }
+  })
+
+  test('saves a temporary override alongside a full-price permanent discount', async () => {
+    installApiFixtures(models.slice(0, 1), [
+      { model_name: 'model-01', discount_bps: 8000 },
+    ])
+    await renderDialog(1, true)
+    await changeInput(getModelInput('model-01'), '100')
+    const edit = document.querySelector<HTMLElement>(
+      '[aria-label="Edit temporary discounts for model-01"]'
     )
+    assert.ok(edit)
+    expect(edit.textContent).toBe('Add temporary discount')
+    await act(async () => edit.click())
+    expect(document.querySelector('[role="tab"]')).toBeNull()
+    // 首次配置直接给出一条待填写的全天临时折扣，不需要再点一次添加。
+    const periodInput = document.querySelector<HTMLInputElement>(
+      '#temporary-discount-0-percent'
+    )
+    assert.ok(periodInput)
+    await changeInput(periodInput, '75')
+    const apply = [
+      ...document.querySelectorAll<HTMLButtonElement>('button'),
+    ].find((button) => button.textContent === 'Apply to draft')
+    assert.ok(apply)
+    await act(async () => apply.click())
+    expect(document.querySelector('#temporary-discount-0-percent')).toBeNull()
+    expect(
+      document.querySelector('[data-slot="model-temporary-discount"]')
+        ?.textContent
+    ).toContain('Every day · All day · 75%')
+    expect(
+      document.querySelector(
+        '[aria-label="Edit temporary discounts for model-01"]'
+      )?.textContent
+    ).toBe('Edit temporary discounts')
+    let submitted: unknown
+    apiClient.put = async (_url, payload) => {
+      submitted = payload
+      return { data: { success: true } }
+    }
+    const form = document.querySelector<HTMLFormElement>(
+      '#user-model-pricing-form'
+    )
+    assert.ok(form)
+    await act(async () =>
+      form.dispatchEvent(
+        new domWindow.Event('submit', { bubbles: true, cancelable: true })
+      )
+    )
+    expect(submitted).toMatchObject({
+      revision: 1,
+      items: [
+        {
+          model_name: 'model-01',
+          mode: 'layered',
+          periods: [
+            {
+              discount_bps: 10000,
+              expression:
+                '((weekday("Asia/Shanghai") >= 0 && (hour("Asia/Shanghai") * 60 + minute("Asia/Shanghai")) >= 0)) ? 0.75 : permanent_discount',
+            },
+          ],
+        },
+      ],
+    })
   })
 
   // 用户管理入口展示接口返回的全部启用模型，未配置项按原价回填。
@@ -853,11 +1118,9 @@ describe('user model pricing dialog', () => {
     )
     assert.ok(nextPageButton)
     await act(async () => nextPageButton.click())
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().includes('model-30'),
-        'second page was not rendered'
-      )
+    await waitForCondition(
+      () => visibleModelNames().includes('model-30'),
+      'second page was not rendered'
     )
 
     await changeInput(getModelInput('model-30'), '')
@@ -866,13 +1129,11 @@ describe('user model pricing dialog', () => {
     )
     assert.ok(previousPageButton)
     await act(async () => previousPageButton.click())
-    await act(async () =>
-      waitForCondition(
-        () =>
-          visibleModelNames().includes('model-01') &&
-          !visibleModelNames().includes('model-30'),
-        'first page was not rendered'
-      )
+    await waitForCondition(
+      () =>
+        visibleModelNames().includes('model-01') &&
+        !visibleModelNames().includes('model-30'),
+      'first page was not rendered'
     )
 
     const saveButton = document.querySelector<HTMLButtonElement>(
@@ -892,23 +1153,19 @@ describe('user model pricing dialog', () => {
         }) as unknown as Event
       )
     )
-    await act(async () =>
-      waitForCondition(
-        () => visibleModelNames().includes('model-30'),
-        'invalid model was not revealed'
-      )
+    await waitForCondition(
+      () => visibleModelNames().includes('model-30'),
+      'invalid model was not revealed'
     )
 
-    await act(async () =>
-      waitForCondition(
-        () =>
-          Boolean(
-            getModelInput('model-30')
-              .closest('[data-slot="form-item"]')
-              ?.querySelector('[aria-invalid="true"]')
-          ),
-        'invalid model did not receive an error state'
-      )
+    await waitForCondition(
+      () =>
+        Boolean(
+          getModelInput('model-30')
+            .closest('[data-slot="form-item"]')
+            ?.querySelector('[aria-invalid="true"]')
+        ),
+      'invalid model did not receive an error state'
     )
     const invalidInput = getModelInput('model-30')
     assert.equal(invalidInput.value, '')

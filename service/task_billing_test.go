@@ -23,11 +23,20 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 func TestMain(m *testing.M) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	var dialect gorm.Dialector = sqlite.Open(":memory:")
+	databaseType := common.DatabaseTypeSQLite
+	if dsn := os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN"); dsn != "" {
+		dialect, databaseType = mysql.Open(dsn), common.DatabaseTypeMySQL
+	} else if dsn := os.Getenv("TASK_PLUGIN_TEST_POSTGRES_DSN"); dsn != "" {
+		dialect, databaseType = postgres.Open(dsn), common.DatabaseTypePostgreSQL
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{})
 	if err != nil {
 		panic("failed to open test db: " + err.Error())
 	}
@@ -40,7 +49,7 @@ func TestMain(m *testing.M) {
 	model.DB = db
 	model.LOG_DB = db
 
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.SetDatabaseTypes(databaseType, databaseType)
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
@@ -49,6 +58,9 @@ func TestMain(m *testing.M) {
 		&model.Task{},
 		&model.VideoTaskPendingLog{},
 		&model.User{},
+		&model.UserModelPricing{},
+		&model.UserModelPricingRevision{},
+		&model.UserModelPricingHistory{},
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
@@ -296,12 +308,13 @@ func TestTaskBillingOtherOmitsEmptyUsageFacts(t *testing.T) {
 	assert.NotContains(t, other, "usage_facts")
 }
 
-func callLogTaskConsumption(t *testing.T, info *relaycommon.RelayInfo, task *model.Task) *model.Log {
+func callLogTaskConsumption(t *testing.T, info *relaycommon.RelayInfo, task *model.Task, channels ...string) *model.Log {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
 	ctx.Set("token_name", "test_token")
+	ctx.Set("use_channel", channels)
 	LogTaskConsumption(ctx, info, task)
 	log := getLastLog(t)
 	require.NotNil(t, log)
@@ -338,10 +351,13 @@ func TestLogTaskConsumptionIncludesTieredSnapshotUsageFacts(t *testing.T) {
 		},
 	}
 
-	log := callLogTaskConsumption(t, info, task)
+	log := callLogTaskConsumption(t, info, task, "39", "40")
 
 	var other map[string]any
 	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	adminInfo, ok := other["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, []any{"39", "40"}, adminInfo["use_channel"])
 	assert.Equal(t, "tiered_expr", other["billing_mode"])
 	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(expression)), other["expr_b64"])
 	assert.Equal(t, "720P", other["matched_tier"])
@@ -455,6 +471,7 @@ func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {
 	task.PrivateData.UpstreamTaskID = "upstream-private"
 	task.PrivateData.NodeName = "node-a"
 	task.PrivateData.Execution = &model.TaskExecutionSnapshot{
+		UseChannel: []string{"8", "12"},
 		TaskPlugin: &model.TaskPluginSnapshot{
 			Key:     "document-parser",
 			Name:    "Document Parser",
@@ -473,6 +490,7 @@ func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {
 	assert.Equal(t, "task_public", other["task_id"])
 	adminInfo, ok := other["admin_info"].(map[string]any)
 	require.True(t, ok)
+	assert.Equal(t, []string{"8", "12"}, adminInfo["use_channel"])
 	pluginInfo, ok := adminInfo["task_plugin"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "document-parser", pluginInfo["key"])

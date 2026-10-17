@@ -345,6 +345,7 @@ func migrateDB() error {
 		&User{},
 		&UserModelPricing{},
 		&UserModelPricingRevision{},
+		&UserModelPricingHistory{},
 		&AccountingBatchReceipt{},
 		&UserSession{},
 		&AuthFlow{},
@@ -395,6 +396,9 @@ func migrateDB() error {
 		return err
 	}
 	if err := migrateSeedanceAssetListPerformance(DB); err != nil {
+		return err
+	}
+	if err := migrateUserModelPricingScheduleIndex(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

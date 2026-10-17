@@ -596,9 +596,12 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 		name, status string
 		actual       any
 		count        float64
+		discount     float64
 	}{
-		{"partial", "SUCCESS", 2, 2}, {"zero", "SUCCESS", 0, 0}, {"larger", "SUCCESS", 6, 6},
-		{"invalid usage", "SUCCESS", -1, 4}, {"expression failure", "SUCCESS", 7, 4}, {"negative result", "SUCCESS", 8, 4}, {"missing usage", "SUCCESS", nil, 4}, {"failed", "FAILURE", 9, 0},
+		{"partial", "SUCCESS", 2, 2, 0}, {"zero", "SUCCESS", 0, 0, 0}, {"larger", "SUCCESS", 6, 6, 0},
+		{"invalid usage", "SUCCESS", -1, 4, 0}, {"expression failure", "SUCCESS", 7, 4, 0}, {"negative result", "SUCCESS", 8, 4, 0}, {"missing usage", "SUCCESS", nil, 4, 0}, {"failed", "FAILURE", 9, 0, 0},
+		{"discounted partial", "SUCCESS", 2, 2, 0.8}, {"discounted larger", "SUCCESS", 6, 6, 0.5}, {"discounted failure", "FAILURE", 9, 0, 0.8},
+		{"fixed discounted immediate", "SUCCESS", 2, 2, 0.5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -637,10 +640,20 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			info.UserSetting.BillingPreference = "wallet_only"
 			info.PublicTaskID = model.GenerateTaskID()
 			info.LockedChannel = &ch
+			if tc.discount > 0 {
+				info.StartTime = time.Now()
+				info.UserModelDiscountBPS = types.NewUserModelDiscountScheduleSnapshot(map[string]types.UserModelDiscountConfig{"document-model": {Mode: types.UserModelPricingLayered, Permanent: &types.UserModelDiscountWindow{DiscountBPS: 10000, Expression: `units >= 5 ? 0.5 : 0.8`}}})
+				if tc.name == "fixed discounted immediate" {
+					info.UserModelDiscountBPS = types.NewUserModelDiscountSnapshot(map[string]int{"document-model": 5000})
+				}
+			}
 			outcome, taskErr := executeTaskSubmission(c, info)
 			require.Nil(t, taskErr)
 			require.NotNil(t, outcome)
 			want := common.QuotaRound(tc.count * 0.01 * common.QuotaPerUnit)
+			if tc.discount > 0 {
+				want = common.QuotaRound(float64(want) * tc.discount)
+			}
 			assert.Equal(t, want, outcome.Result.Quota)
 			assert.Equal(t, want, info.PriceData.Quota)
 			var stored model.Task
