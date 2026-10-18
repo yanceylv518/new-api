@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "新しく書き込まれたタイムラインを短時間再確認しています…",
+    "Automatic rechecks finished. You can refresh manually.": "自動再確認が終了しました。手動で更新できます。",
     "Timeline view": "タイムライン表示",
     "Waterfall": "ウォーターフォール",
     "Stage details": "ステージ詳細",

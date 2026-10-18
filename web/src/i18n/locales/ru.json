@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "Краткая повторная проверка новой записи хронологии…",
+    "Automatic rechecks finished. You can refresh manually.": "Автоматические проверки завершены. Можно обновить вручную.",
     "Timeline view": "Вид хронологии",
     "Waterfall": "Водопад",
     "Stage details": "Этапы",

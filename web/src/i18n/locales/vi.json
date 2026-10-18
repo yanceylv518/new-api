@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "Đang kiểm tra lại trong thời gian ngắn để tìm dòng thời gian mới ghi…",
+    "Automatic rechecks finished. You can refresh manually.": "Đã kết thúc kiểm tra tự động. Bạn có thể làm mới thủ công.",
     "Timeline view": "Chế độ dòng thời gian",
     "Waterfall": "Biểu đồ thác nước",
     "Stage details": "Chi tiết giai đoạn",

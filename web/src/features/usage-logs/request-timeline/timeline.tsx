@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { EmptyState } from '@/components/empty-state'
@@ -51,6 +51,8 @@ import {
   getChannelStart,
 } from './lib/timeline-model'
 import { buildTimelineSegments } from './lib/timeline-scale'
+
+const EMPTY_TIMELINE_RECHECK_DELAYS = [500, 1000, 2000] as const
 
 function TimelineEvents(props: {
   result: RequestTimelineResult
@@ -208,6 +210,13 @@ export function RequestTimeline(props: {
 }) {
   const { t } = useTranslation()
   const viewerId = useAuthStore((state) => state.auth.user?.id)
+  const recheckScope = `${props.requestId}:${props.admin}:${viewerId ?? ''}`
+  const [automaticRecheck, setAutomaticRecheck] = useState(() => ({
+    scope: recheckScope,
+    count: 0,
+  }))
+  const recheckCount =
+    automaticRecheck.scope === recheckScope ? automaticRecheck.count : 0
   const query = useQuery({
     queryKey: [
       'request-timeline',
@@ -219,9 +228,31 @@ export function RequestTimeline(props: {
       getRequestTimeline(props.requestId, props.admin, signal),
     enabled: props.enabled && isRequestId(props.requestId),
     retry: false,
-    staleTime: 30_000,
+    staleTime: (current) => (current.state.data?.found ? 30_000 : 0),
     refetchOnWindowFocus: false,
   })
+  const refetch = query.refetch
+  const canAutoRecheck =
+    props.enabled &&
+    !query.isFetching &&
+    !query.isError &&
+    query.data?.found === false &&
+    query.data.enabled &&
+    recheckCount < EMPTY_TIMELINE_RECHECK_DELAYS.length
+  useEffect(() => {
+    if (!canAutoRecheck) return
+    const delay = EMPTY_TIMELINE_RECHECK_DELAYS[recheckCount]
+    if (delay === undefined) return
+    const timer = window.setTimeout(() => {
+      setAutomaticRecheck({ scope: recheckScope, count: recheckCount + 1 })
+      void refetch()
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [canAutoRecheck, recheckCount, recheckScope, refetch])
+  const refresh = useCallback(() => {
+    setAutomaticRecheck({ scope: recheckScope, count: 0 })
+    void refetch()
+  }, [recheckScope, refetch])
   if (!isRequestId(props.requestId)) {
     return <EmptyState title={t('No request ID available')} />
   }
@@ -232,7 +263,11 @@ export function RequestTimeline(props: {
     return (
       <ErrorState
         title={t('Unable to load request timeline')}
-        onRetry={() => void query.refetch()}
+        action={
+          <Button type='button' disabled={query.isFetching} onClick={refresh}>
+            {t('Retry')}
+          </Button>
+        }
       />
     )
   }
@@ -248,12 +283,28 @@ export function RequestTimeline(props: {
         )}
         action={
           <div className='space-y-3 text-center'>
+            {(canAutoRecheck || query.isFetching) && (
+              <p className='text-muted-foreground text-sm' role='status'>
+                {t('Checking briefly for a newly written timeline...')}
+              </p>
+            )}
+            {!query.isFetching &&
+              recheckCount >= EMPTY_TIMELINE_RECHECK_DELAYS.length && (
+                <p className='text-muted-foreground text-sm' role='status'>
+                  {t('Automatic rechecks finished. You can refresh manually.')}
+                </p>
+              )}
             {!result.enabled && (
               <p className='text-muted-foreground text-sm'>
                 {t('Request trace collection is currently disabled')}
               </p>
             )}
-            <Button variant='outline' onClick={() => void query.refetch()}>
+            <Button
+              type='button'
+              variant='outline'
+              disabled={query.isFetching}
+              onClick={refresh}
+            >
               {t('Refresh')}
             </Button>
           </div>
@@ -271,7 +322,7 @@ export function RequestTimeline(props: {
         summary={summary}
         admin={props.admin}
         refreshing={query.isFetching}
-        onRefresh={() => void query.refetch()}
+        onRefresh={refresh}
       />
       <TimelineMetrics
         result={result}

@@ -131,6 +131,7 @@ export async function getRequestTimeline(
 ): Promise<RequestTimelineResult> {
   const config = {
     signal,
+    disableDuplicate: true,
     skipBusinessError: true,
     skipErrorHandler: true,
   } satisfies ApiRequestConfig

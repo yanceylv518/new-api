@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "Checking briefly for a newly written timeline...",
+    "Automatic rechecks finished. You can refresh manually.": "Automatic rechecks finished. You can refresh manually.",
     "Timeline view": "Timeline view",
     "Waterfall": "Waterfall",
     "Stage details": "Stage details",

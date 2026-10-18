@@ -103,7 +103,7 @@ export function RequestTimelineDialog(props: {
       bodyClassName='pr-2 sm:pr-4'
     >
       {searchable && <RequestIdSearch onSearch={setSearchedId} />}
-      {requestId && (
+      {props.open && requestId && (
         <RequestTimeline
           key={requestId}
           requestId={requestId}

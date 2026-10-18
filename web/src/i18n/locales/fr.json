@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "Recherche temporaire d’une chronologie nouvellement écrite…",
+    "Automatic rechecks finished. You can refresh manually.": "Les nouvelles recherches automatiques sont terminées. Vous pouvez actualiser manuellement.",
     "Timeline view": "Vue de la chronologie",
     "Waterfall": "Cascade",
     "Stage details": "Étapes",

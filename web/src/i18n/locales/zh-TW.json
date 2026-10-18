@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Checking briefly for a newly written timeline...": "暫時重新查詢新寫入的時間線…",
+    "Automatic rechecks finished. You can refresh manually.": "自動重新查詢已結束，可手動重新整理。",
     "Timeline view": "時間線檢視",
     "Waterfall": "瀑布圖",
     "Stage details": "階段明細",
