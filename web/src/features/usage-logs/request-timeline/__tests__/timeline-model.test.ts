@@ -22,6 +22,7 @@ import { describe, expect, test } from 'vitest'
 import type { RequestTimelineData } from '../api'
 import {
   buildTimelineGroups,
+  buildTimelineObservations,
   findTimelineNode,
   flattenTimeline,
   getChannelStart,
@@ -144,4 +145,175 @@ describe('request timeline rows', () => {
   test('the first attempt starts at its observed boundary after gateway preparation', () => {
     expect(getChannelStart(retriedData())).toBe(16_950)
   })
+})
+
+function observedData(): RequestTimelineData {
+  const exchange = (
+    index: number,
+    wrote: number,
+    first: number,
+    status: number
+  ) => ({
+    index: 1,
+    kind: 'http',
+    start_us: wrote - 1,
+    headers_us: first + 1,
+    first_byte_us: first,
+    end_us: first + 10,
+    status,
+    protocol: 'HTTP/1.1',
+    proxy: false,
+    reused: true,
+    bytes_read: 10,
+    end_reason: 'eof',
+    events: [
+      { sequence: index, name: 'wrote_request', offset_us: wrote },
+      { sequence: index + 1, name: 'first_byte', offset_us: first },
+    ],
+  })
+  return {
+    measurement_version: 2,
+    method: 'POST',
+    route: '/v1/chat/completions',
+    phases: [{ name: 'log_insert', start_us: 180, end_us: 190 }],
+    attempts: [
+      {
+        index: 1,
+        channel_id: 12,
+        start_us: 10,
+        end_us: 80,
+        outcome: 'failed',
+        exchanges: [exchange(1, 20, 40, 503)],
+      },
+      {
+        index: 2,
+        channel_id: 27,
+        start_us: 100,
+        end_us: 190,
+        outcome: 'success',
+        exchanges: [exchange(3, 110, 150, 200)],
+        stream: {
+          first_us: 160,
+          last_us: 180,
+          count: 3,
+          max_gap_us: 15,
+          end: 'done',
+          failed: false,
+        },
+      },
+    ],
+    response: {
+      bytes_written: 10,
+      write_failed: false,
+      last_write_us: 185,
+      cancel_observed_us: null,
+      hijacked: false,
+    },
+    capture: { truncated: false, missing: [] },
+    errors: [],
+  }
+}
+
+describe('request timeline observations', () => {
+  test('complete boundaries produce separate intervals without adding overlapping work', () => {
+    const observations = buildTimelineObservations(observedData(), 200, 2)
+    expect(
+      Object.fromEntries(observations.map((item) => [item.kind, item.duration]))
+    ).toEqual({
+      retry_window: 90,
+      response_wait: 40,
+      read_gap: 15,
+      log_insert: 10,
+      write_tail: 15,
+    })
+    expect(observations.map((item) => item.duration)).toEqual([
+      90, 40, 15, 15, 10,
+    ])
+    expect(
+      observations.find((item) => item.kind === 'read_gap')
+    ).not.toHaveProperty('start')
+  })
+
+  test('missing boundaries and an unrecorded final attempt do not borrow request completion', () => {
+    const data = observedData()
+    data.phases[0].end_us = null
+    data.response.last_write_us = null
+    for (const attempt of data.attempts) {
+      for (const exchange of attempt.exchanges ?? []) {
+        exchange.first_byte_us = null
+      }
+      if (attempt.stream) attempt.stream.first_us = null
+    }
+    expect(buildTimelineObservations(data, 200, 3)).toEqual([])
+  })
+
+  test('reversed or out-of-request boundaries are omitted while valid retries remain', () => {
+    const data = observedData()
+    data.phases[0].end_us = 201
+    data.response.last_write_us = 201
+    for (const attempt of data.attempts) {
+      for (const exchange of attempt.exchanges ?? []) {
+        exchange.first_byte_us = exchange.start_us
+      }
+      if (attempt.stream) attempt.stream.max_gap_us = 21
+    }
+    expect(buildTimelineObservations(data, 200, 2)).toEqual([
+      {
+        kind: 'retry_window',
+        duration: 90,
+        start: 10,
+        end: 100,
+        nodeId: 'attempt-2',
+      },
+    ])
+  })
+
+  test('duplicate request-write events exclude that exchange from response wait comparison', () => {
+    const data = observedData()
+    const events = data.attempts[1].exchanges?.[0].events
+    if (!events) throw new Error('event fixture missing')
+    events.push({ sequence: 5, name: 'wrote_request', offset_us: 120 })
+    expect(
+      buildTimelineObservations(data, 200, 2).find(
+        (item) => item.kind === 'response_wait'
+      )
+    ).toMatchObject({
+      duration: 20,
+      nodeId: 'exchange-1-1',
+    })
+  })
+
+  test('truncated events omit ambiguous response waits while preserving recorded stream gaps', () => {
+    const data = observedData()
+    data.capture.truncated = true
+    const observations = buildTimelineObservations(data, 200, 2)
+    expect(observations.some((item) => item.kind === 'response_wait')).toBe(
+      false
+    )
+    expect(
+      observations.find((item) => item.kind === 'read_gap')?.duration
+    ).toBe(15)
+  })
+
+  test('observed zero-length intervals remain zero instead of becoming missing', () => {
+    const data = observedData()
+    data.phases[0].end_us = 180
+    data.response.last_write_us = 200
+    const observations = buildTimelineObservations(data, 200, 2)
+    expect(
+      observations.find((item) => item.kind === 'log_insert')?.duration
+    ).toBe(0)
+    expect(
+      observations.find((item) => item.kind === 'write_tail')?.duration
+    ).toBe(0)
+  })
+
+  test.each([undefined, 1, 3])(
+    'measurement version %s retains its original view without new derived observations',
+    (version) => {
+      const data = observedData()
+      data.measurement_version = version
+      expect(buildTimelineObservations(data, 200, 2)).toEqual([])
+    }
+  )
 })
