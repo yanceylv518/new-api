@@ -163,7 +163,6 @@ describe('request timeline dialog', () => {
       screen.queryByRole('list', { name: 'Request stages' })
     ).not.toBeInTheDocument()
     expect(requestedUrls).toEqual(['/api/request-traces/self/req_retry_1'])
-    expect(screen.queryByText('Timing observations')).not.toBeInTheDocument()
   })
 
   test('a missing timeline is rechecked three times and then waits for manual refresh', async () => {
@@ -281,41 +280,5 @@ describe('request timeline dialog', () => {
     view.setOpen(true)
     await advance(0)
     expect(requestedUrls).toHaveLength(2)
-  })
-
-  test('selecting an observation expands its collapsed attempt and selects its upstream exchange', async () => {
-    const timeline = response.detail?.timeline
-    if (!timeline || !response.detail) {
-      throw new Error('timeline fixture missing')
-    }
-    timeline.measurement_version = 2
-    const finalExchange = timeline.attempts[1].exchanges?.[0]
-    if (!finalExchange) throw new Error('exchange fixture missing')
-    finalExchange.first_byte_us = 350_100
-    for (const event of finalExchange.events ?? []) {
-      if (event.name === 'first_byte') event.offset_us = 350_100
-    }
-    response.detail.final_attempt_first_byte_offset_us = 350_100
-    renderDialog({ requestId: 'req_retry_1', admin: true })
-    const stages = await screen.findByRole('list', { name: 'Request stages' })
-    expect(
-      within(stages).getByRole('button', {
-        name: 'Expand Attempt 1 · Channel #12',
-      })
-    ).toHaveAttribute('aria-expanded', 'false')
-    await userEvent.click(
-      screen.getByRole('button', {
-        name: 'Longest observed response-byte wait',
-      })
-    )
-    expect(
-      within(stages).getByRole('button', {
-        name: 'Collapse Attempt 1 · Channel #12',
-      })
-    ).toHaveAttribute('aria-expanded', 'true')
-    const inspector = screen.getByRole('region', { name: 'Selected stage' })
-    expect(
-      within(inspector).getByRole('heading', { name: /503/ })
-    ).toBeInTheDocument()
   })
 })

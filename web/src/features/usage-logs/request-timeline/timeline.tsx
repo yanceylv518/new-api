@@ -36,7 +36,6 @@ import {
 } from './api'
 import { TimelineAttempts } from './components/timeline-attempts'
 import { TimelineChart } from './components/timeline-chart'
-import { TimelineDiagnostics } from './components/timeline-diagnostics'
 import { TimelineInspector } from './components/timeline-inspector'
 import { TimelineIssues } from './components/timeline-issues'
 import { TimelineRecords } from './components/timeline-records'
@@ -48,7 +47,6 @@ import {
 import { buildTraceEvents, type TraceEventRow } from './lib/timeline-events'
 import {
   buildTimelineGroups,
-  buildTimelineObservations,
   flattenTimeline,
   getChannelStart,
 } from './lib/timeline-model'
@@ -79,7 +77,6 @@ function TimelineStages(props: {
   total: number
 }) {
   const { t } = useTranslation()
-  const attemptCount = props.result.detail?.attempt_count ?? 0
   const model = useMemo(() => {
     const groups = buildTimelineGroups(t, props.data, props.total)
     const rows = flattenTimeline(groups, new Set())
@@ -94,13 +91,8 @@ function TimelineStages(props: {
         end: node.end,
         nodeId: node.id,
       }))
-    const observations = buildTimelineObservations(
-      props.data,
-      props.total,
-      attemptCount
-    )
-    return { groups, index, rows, stages, observations }
-  }, [t, props.data, props.total, attemptCount])
+    return { groups, index, stages }
+  }, [t, props.data, props.total])
   const finalAttempt = props.data.attempts.at(-1)
   const finalExchange = finalAttempt?.exchanges?.at(-1)
   const waitId = [
@@ -152,27 +144,6 @@ function TimelineStages(props: {
   }, [])
   return (
     <>
-      <TimelineDiagnostics
-        observations={model.observations}
-        onSelect={(id) => {
-          if (model.index.has(id)) {
-            const ancestors: string[] = []
-            for (const row of model.rows) {
-              ancestors.length = row.depth
-              if (row.node.id === id) break
-              ancestors[row.depth] = row.node.id
-            }
-            setCollapsed((previous) => {
-              const next = new Set(previous)
-              for (const ancestor of ancestors) next.delete(ancestor)
-              return next
-            })
-            setSelectedId(id)
-            setView('waterfall')
-            setWindow(null)
-          }
-        }}
-      />
       <Tabs
         value={view}
         onValueChange={(value) => {
