@@ -16,17 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import {
-  getCoreRowModel,
-  getPaginationRowModel,
-  useReactTable,
-  type ColumnDef,
-} from '@tanstack/react-table'
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import {
-  DataTablePagination,
   StaticDataTable,
   type StaticDataTableColumn,
 } from '@/components/data-table'
@@ -35,12 +28,8 @@ import { Button } from '@/components/ui/button'
 import type { TraceEventRow } from '../lib/timeline-events'
 import { formatTraceDuration } from '../lib/timeline-scale'
 
-const ROW_COLUMNS: ColumnDef<TraceEventRow>[] = [
-  { id: 'entry', accessorKey: 'label' },
-]
-
-/** 阶段和事件共用精确数值表，仅渲染当前页。 */
-export function TimelineRecords(props: {
+/** 长列表在表格内滚动，避免把弹窗正文持续撑高。 */
+export const TimelineRecords = memo(function TimelineRecords(props: {
   rows: TraceEventRow[]
   events?: boolean
   onSelect: (id: string) => void
@@ -48,14 +37,6 @@ export function TimelineRecords(props: {
   const { t } = useTranslation()
   const onSelect = props.onSelect
   const events = props.events
-  const table = useReactTable({
-    data: props.rows,
-    columns: ROW_COLUMNS,
-    getRowId: (row) => row.id,
-    getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize: 50 } },
-  })
   const columns = useMemo<StaticDataTableColumn<TraceEventRow>[]>(() => {
     const result: StaticDataTableColumn<TraceEventRow>[] = [
       {
@@ -138,14 +119,19 @@ export function TimelineRecords(props: {
             )}
       </p>
       <StaticDataTable
+        className='focus-visible:ring-ring/50 max-h-[min(50dvh,28rem)] overflow-auto overscroll-contain outline-none focus-visible:ring-[3px] [&>[data-slot=table-container]]:overflow-visible'
+        containerProps={{
+          role: 'region',
+          'aria-label': events ? t('Event list') : t('Stage details'),
+          tabIndex: 0,
+        }}
         columns={columns}
-        data={table.getRowModel().rows.map((row) => row.original)}
+        data={props.rows}
         getRowKey={(row) => row.id}
         getRowClassName={(row) => (row.failed ? 'bg-destructive/5' : undefined)}
         emptyContent={t('No data available')}
-        tableClassName='min-w-[42rem]'
+        tableClassName='min-w-[42rem] [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10 [&_thead]:bg-background'
       />
-      <DataTablePagination table={table} compact />
     </div>
   )
-}
+})
