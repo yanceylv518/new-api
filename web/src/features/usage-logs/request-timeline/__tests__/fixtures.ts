@@ -16,7 +16,41 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { RequestTimelineResult } from '../api'
+import type { RequestTimelineResult, RequestTimelineWriterStatus } from '../api'
+
+export function writerStatusResult(): RequestTimelineWriterStatus {
+  return {
+    initialized: true,
+    enabled: true,
+    accepting: true,
+    node_id: 'fixture-node',
+    started_at_us: 1_760_509_900_000_000,
+    queue_capacity: 512,
+    accepted: 10,
+    pending: 1,
+    processing: 0,
+    buffered: 0,
+    writing: 1,
+    outstanding: 2,
+    oldest_outstanding_age_us: 250_000,
+    written: 7,
+    failed: 1,
+    dropped: 3,
+    retries: 2,
+    dropped_encoding: 1,
+    dropped_queue_full: 1,
+    dropped_stopped: 1,
+    dropped_shutdown: 0,
+    last_written_at_us: 1_760_509_910_000_000,
+    last_failed_at_us: 1_760_509_908_000_000,
+    last_batch_size: 2,
+    last_batch_duration_us: 200_123,
+    retention_days: 7,
+    cleanup_deleted: 3000,
+    cleanup_failed: 0,
+    cleanup_pending: false,
+  }
+}
 
 // 一次重试后成功的流式请求：第 1 次复用连接返回 503，第 2 次新建连接成功。
 // 偏移单位与接口一致，均为微秒。

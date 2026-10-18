@@ -120,6 +120,40 @@ export type RequestTimelineData = z.infer<typeof timeline>
 export type RequestTimelineResult = z.infer<typeof queryResult>
 export type TracePhase = z.infer<typeof phase>
 
+const writerStatus = z.object({
+  initialized: z.boolean(),
+  enabled: z.boolean(),
+  accepting: z.boolean(),
+  node_id: z.string(),
+  started_at_us: timestamp,
+  queue_capacity: timestamp,
+  accepted: timestamp,
+  pending: timestamp,
+  processing: timestamp,
+  buffered: timestamp,
+  writing: timestamp,
+  outstanding: timestamp,
+  oldest_outstanding_age_us: offset,
+  written: timestamp,
+  failed: timestamp,
+  dropped: timestamp,
+  retries: timestamp,
+  dropped_encoding: timestamp,
+  dropped_queue_full: timestamp,
+  dropped_stopped: timestamp,
+  dropped_shutdown: timestamp,
+  last_written_at_us: offset,
+  last_failed_at_us: offset,
+  last_batch_size: timestamp,
+  last_batch_duration_us: offset,
+  retention_days: timestamp,
+  cleanup_deleted: timestamp,
+  cleanup_failed: timestamp,
+  cleanup_pending: z.boolean(),
+})
+
+export type RequestTimelineWriterStatus = z.infer<typeof writerStatus>
+
 export function isRequestId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,64}$/.test(value)
 }
@@ -144,4 +178,19 @@ export async function getRequestTimeline(
     .object({ success: z.literal(true), data: queryResult })
     .parse(response.data)
   return envelope.data
+}
+
+export async function getRequestTimelineWriterStatus(
+  signal: AbortSignal
+): Promise<RequestTimelineWriterStatus> {
+  const config = {
+    signal,
+    disableDuplicate: true,
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  } satisfies ApiRequestConfig
+  const response = await api.get<unknown>('/api/request-traces/status', config)
+  return z
+    .object({ success: z.literal(true), data: writerStatus })
+    .parse(response.data).data
 }

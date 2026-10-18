@@ -59,6 +59,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { RequestTimelineWriterStatusPanel } from '@/features/usage-logs/request-timeline/components/writer-status'
 import { api } from '@/lib/api'
 import dayjs from '@/lib/dayjs'
 import { formatTimestampToDate } from '@/lib/format'
@@ -455,6 +456,8 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
               </FormItem>
             )}
           />
+
+          <RequestTimelineWriterStatusPanel />
 
           <SettingsControlGroup className='space-y-3'>
             <div>
