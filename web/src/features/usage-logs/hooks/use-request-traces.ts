@@ -24,6 +24,7 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 export type RequestTrace = {
+  version?: number
   request_id: string
   attempt: number
   created_at: number
@@ -35,10 +36,12 @@ export type RequestTrace = {
     finish_reason?: string
     stage?: string
     client_error_type?: string
+    outcome?: 'success' | 'failed' | 'cancelled' | 'unknown'
   }
   admin_info?: {
     channel_id?: number
     shape_incomplete?: boolean
+    shape_incomplete_reason?: string
     client: {
       ua?: string
       content_type?: string
@@ -65,6 +68,7 @@ export type RequestTrace = {
       proto?: string
       req_bytes?: number
       header_ms: number
+      ms?: number
       request_id?: string
       resp_id?: string
       resp_model?: string
@@ -89,14 +93,20 @@ export type RequestTrace = {
       last_chunk_ms?: number
       done: boolean
       end_marker?: string
+      end_marker_policy?: 'required' | 'not_applicable'
       usage_chunk: boolean
       metadata_incomplete?: boolean
+      incomplete_reasons?: string[]
       keys?: Record<string, string[]>
     }
   }
 }
 
-export function useRequestTraces(requestId: string, enabled: boolean) {
+export function useRequestTraces(
+  requestId: string,
+  enabled: boolean,
+  createdAt?: number
+) {
   const { t } = useTranslation()
   const user = useAuthStore((state) => state.auth.user)
   const queryClient = useQueryClient()
@@ -104,20 +114,30 @@ export function useRequestTraces(requestId: string, enabled: boolean) {
     () => ['request-traces', user?.id, user?.role, requestId],
     [user?.id, user?.role, requestId]
   )
+  const recentPollUntil = useMemo(
+    () =>
+      enabled && requestId && createdAt && Date.now() / 1000 - createdAt < 60
+        ? Date.now() + 5000
+        : 0,
+    [requestId, enabled, createdAt]
+  )
   useEffect(() => {
     if (!enabled) return
     return () => {
       void queryClient.cancelQueries({ queryKey, exact: true })
     }
   }, [enabled, queryClient, queryKey])
-  return useQuery({
+  const query = useQuery({
     queryKey,
     enabled: enabled && !!user && !!requestId,
-    queryFn: async ({ signal }): Promise<RequestTrace[]> => {
+    queryFn: async ({
+      signal,
+    }): Promise<{ records: RequestTrace[]; pending: boolean }> => {
       const response = await api.get<{
         success: boolean
         message?: string
         data?: RequestTrace[]
+        pending?: boolean
       }>(`/api/log/trace?request_id=${encodeURIComponent(requestId)}`, {
         signal,
       })
@@ -126,11 +146,29 @@ export function useRequestTraces(requestId: string, enabled: boolean) {
           response.data.message || t('Failed to load request trace')
         )
       }
-      return response.data.data
+      return {
+        records: response.data.data,
+        pending: response.data.pending === true,
+      }
+    },
+    refetchInterval: (state) => {
+      const result = state.state.data
+      if (
+        result?.pending ||
+        (result?.records.length === 0 && Date.now() < recentPollUntil)
+      ) {
+        return 1000
+      }
+      return false
     },
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   })
+  return {
+    ...query,
+    data: query.data?.records,
+    isTracePending: query.data?.pending === true,
+  }
 }
 
 export function formatTraceTime(ms: number) {

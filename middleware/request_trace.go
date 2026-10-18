@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -63,11 +62,30 @@ func RequestTrace() gin.HandlerFunc {
 		observer.Finish()
 		response, clientMetadata, clientReason := observer.Snapshot()
 		failed := trace.Failed || response.Error || c.Writer.Status() >= 400 || clientMetadata.ErrorType != ""
+		completed := response.Done || (response.EndMarkerPolicy == "not_applicable" && clientReason != nil && *clientReason != "")
+		cancelled := c.Request.Context().Err() != nil && !completed
+		failed = failed || cancelled
 		userId := c.GetInt("id")
 		if userId == 0 && (!failed || !config.AnonymousErrors) {
 			return
 		}
 		if !failed && !common.LogConsumeEnabled {
+			return
+		}
+		keep := failed || config.SampleSuccess(c.GetString(common.RequestIdKey))
+		partial := response.MetadataIncomplete || trace.ShapeIncomplete
+		for _, attempt := range trace.Attempts {
+			if attempt.Diagnostic || attempt.Failed || attempt.Upstream.Status >= 400 || attempt.Upstream.ErrorType != "" {
+				keep = true
+			}
+			if attempt.Observer != nil {
+				attempt.Observer.Finish()
+				keep = keep || attempt.Observer.HasError()
+				partial = partial || attempt.Observer.HasIncompleteMetadata()
+			}
+		}
+		model.RecordRequestTraceCollection(!keep, partial)
+		if !keep {
 			return
 		}
 		trace.Lock()
@@ -89,6 +107,8 @@ func RequestTrace() gin.HandlerFunc {
 			attempts = []*common.RequestTraceAttempt{{Attempt: -1, Started: trace.Started}}
 		}
 		rows := make([]model.RequestTrace, 0, len(attempts))
+		finished := time.Now()
+		milliseconds := finished.Sub(trace.Started).Milliseconds()
 		for index, attempt := range attempts {
 			upstream := attempt.Upstream
 			attemptResponse := common.RequestTraceResponse{}
@@ -102,6 +122,19 @@ func RequestTrace() gin.HandlerFunc {
 			}
 			last := index == len(attempts)-1
 			attemptFailed := attempt.Failed || attemptResponse.Error || upstream.Status >= 400 || upstream.ErrorType != "" || (last && failed)
+			attemptFinished := attempt.Finished
+			if attempt.Observer != nil {
+				if observed := attempt.Observer.FinishedAt(); !observed.IsZero() && (attemptFinished.IsZero() || observed.Before(attemptFinished)) {
+					attemptFinished = observed
+				}
+			}
+			if attemptFinished.IsZero() {
+				attemptFinished = finished
+			}
+			if attempt.Attempt >= 0 {
+				duration := max(int64(0), attemptFinished.Sub(attempt.Started).Milliseconds())
+				upstream.Milliseconds = &duration
+			}
 			status, responseBytes := upstream.Status, int64(0)
 			if attempt.Observer != nil {
 				responseBytes = attempt.Observer.Size()
@@ -128,12 +161,21 @@ func RequestTrace() gin.HandlerFunc {
 					}
 				}
 			}
-			data := common.RequestTraceData{Trace: common.RequestTraceSummary{Milliseconds: time.Since(trace.Started).Milliseconds(), RequestBytes: trace.RequestBytes, ResponseBytes: responseBytes, Status: status, FinishReason: reason, Stage: stage}}
+			outcome := "success"
+			if attemptFailed {
+				outcome = "failed"
+			}
+			if last && cancelled {
+				outcome, stage = "cancelled", "client_disconnect"
+			} else if last && !attemptFailed && reason != nil && *reason == "" {
+				outcome = "unknown"
+			}
+			data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Milliseconds: milliseconds, RequestBytes: trace.RequestBytes, ResponseBytes: responseBytes, Status: status, FinishReason: reason, Stage: stage, Outcome: outcome}}
 			if last {
 				data.Trace.ClientErrorType = clientMetadata.ErrorType
 			}
-			if config.Level == "all" || attemptFailed {
-				data.AdminInfo = &common.RequestTraceAdmin{ChannelID: attempt.ChannelID, Client: trace.Client, Shape: trace.Shape, Upstream: upstream, Response: attemptResponse, ShapeIncomplete: trace.ShapeIncomplete}
+			if config.Level == "all" || attempt.Diagnostic || attemptFailed {
+				data.AdminInfo = &common.RequestTraceAdmin{ChannelID: attempt.ChannelID, Client: trace.Client, Shape: trace.Shape, Upstream: upstream, Response: attemptResponse, ShapeIncomplete: trace.ShapeIncomplete, ShapeIncompleteReason: trace.ShapeIncompleteReason}
 			}
 			encoded, err := common.Marshal(data)
 			if err != nil {
@@ -142,10 +184,7 @@ func RequestTrace() gin.HandlerFunc {
 			}
 			rows = append(rows, model.RequestTrace{RequestId: c.GetString(common.RequestIdKey), Attempt: attempt.Attempt, UserId: userId, CreatedAt: common.GetTimestamp(), Data: string(encoded)})
 		}
-		// 客户端断开后仍保存已采集的摘要，但数据库写入受独立超时约束。
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 3*time.Second)
-		defer cancel()
-		if err := model.RecordRequestTraces(ctx, rows); err != nil {
+		if err := model.SubmitRequestTraces(rows); err != nil {
 			logger.LogError(c, "failed to record request trace: "+err.Error())
 		}
 	}

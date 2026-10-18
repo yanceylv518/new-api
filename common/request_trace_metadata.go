@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"math"
 	"slices"
@@ -21,6 +22,9 @@ const traceMaxToolCalls = 256
 const traceMaxToolNameBytes = 128
 const traceMaxCachedPayloads = 64
 const traceMaxCachedStrings = 256
+
+var errTraceRequestTooLarge = errors.New("request trace shape exceeds capture limit")
+var errTraceRequestInvalidJSON = errors.New("request trace shape is not valid JSON")
 
 type traceKeyLayer uint8
 
@@ -72,6 +76,8 @@ type tracePayloadResponse struct {
 	Done                  bool
 	UsageChunk            bool
 	MetadataIncomplete    bool
+	IncompleteReasons     []string
+	EndMarkerPolicy       string
 }
 
 type tracePayloadUpstream struct {
@@ -188,8 +194,11 @@ func readRequestTraceShape(reader io.Reader) (*RequestTraceShape, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > TraceMetadataMaxBytes || !gjson.ValidBytes(data) {
-		return nil, io.ErrUnexpectedEOF
+	if len(data) > TraceMetadataMaxBytes {
+		return nil, errTraceRequestTooLarge
+	}
+	if !gjson.ValidBytes(data) {
+		return nil, errTraceRequestInvalidJSON
 	}
 	r := gjson.ParseBytes(data)
 	shape := &RequestTraceShape{Keys: traceFieldNames(r)}
@@ -317,6 +326,7 @@ type TraceBodyObserver struct {
 	event        []byte
 	stream       bool
 	finished     bool
+	finishedAt   time.Time
 	skippingLine bool
 	bytes        int64
 	response     RequestTraceResponse
@@ -356,7 +366,7 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 		}
 		if len(o.buffer)+len(data) > TraceMetadataMaxBytes {
 			o.buffer = nil
-			o.response.MetadataIncomplete = true
+			o.markIncomplete("size_limit")
 			return
 		}
 		o.buffer = append(o.buffer, data...)
@@ -373,7 +383,7 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 				o.buffer = nil
 				o.event = nil
 				o.skippingLine = true
-				o.response.MetadataIncomplete = true
+				o.markIncomplete("size_limit")
 			} else if newline >= 0 && len(o.buffer) == 0 {
 				remaining := data[newline+1:]
 				separator := 0
@@ -423,7 +433,7 @@ func (o *TraceBodyObserver) consumeLine(line []byte) {
 	value := bytes.TrimSpace(line[5:])
 	if len(o.event)+len(value)+1 > TraceMetadataMaxBytes {
 		o.event = nil
-		o.response.MetadataIncomplete = true
+		o.markIncomplete("size_limit")
 		return
 	}
 	if len(o.event) > 0 {
@@ -451,6 +461,30 @@ func (o *TraceBodyObserver) Finish() {
 	o.buffer = nil
 	o.event = nil
 	o.finished = true
+	o.finishedAt = time.Now()
+}
+
+func (o *TraceBodyObserver) FinishedAt() time.Time {
+	o.Lock()
+	defer o.Unlock()
+	return o.finishedAt
+}
+
+func traceIncompleteReason(reasons []string, reason string) []string {
+	if len(reasons) < 8 && !slices.Contains(reasons, reason) {
+		return append(reasons, reason)
+	}
+	return reasons
+}
+
+func (o *TraceBodyObserver) markIncomplete(reason string) {
+	o.response.MetadataIncomplete = true
+	o.response.IncompleteReasons = traceIncompleteReason(o.response.IncompleteReasons, reason)
+}
+
+func (o *tracePayloadParser) markIncomplete(reason string) {
+	o.response.MetadataIncomplete = true
+	o.response.IncompleteReasons = traceIncompleteReason(o.response.IncompleteReasons, reason)
 }
 
 func (o *TraceBodyObserver) Snapshot() (RequestTraceResponse, RequestTraceUpstream, *string) {
@@ -484,6 +518,12 @@ func (o *TraceBodyObserver) HasError() bool {
 	o.Lock()
 	defer o.Unlock()
 	return o.response.Error
+}
+
+func (o *TraceBodyObserver) HasIncompleteMetadata() bool {
+	o.Lock()
+	defer o.Unlock()
+	return o.response.MetadataIncomplete
 }
 
 func (o *tracePayloadParser) fieldNames(layer traceKeyLayer, value gjson.Result) {
@@ -532,12 +572,15 @@ func (o *tracePayloadParser) fieldNames(layer traceKeyLayer, value gjson.Result)
 
 func (o *tracePayloadParser) captureTool(key string, name gjson.Result, nameDelta bool) {
 	if len(o.tools) >= traceMaxToolCalls {
-		o.response.MetadataIncomplete = true
+		o.markIncomplete("tool_limit")
 		return
 	}
 	tool := traceToolCall{key: key, nameDelta: nameDelta}
 	if name.Exists() {
 		tool.invalidName = name.Type != gjson.String || len(name.Str) > traceMaxToolNameBytes
+		if tool.invalidName {
+			o.markIncomplete("invalid_tool_name")
+		}
 		if !tool.invalidName {
 			tool.name = strings.Clone(name.Str)
 		}
@@ -550,7 +593,7 @@ func (o *tracePayloadParser) toolIndex(value gjson.Result) string {
 		return value.String()
 	}
 	if value.Exists() {
-		o.response.MetadataIncomplete = true
+		o.markIncomplete("invalid_tool_index")
 	}
 	return ""
 }
@@ -580,6 +623,12 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 	}
 	o.response.UsageChunk = o.response.UsageChunk || response.UsageChunk
 	o.response.MetadataIncomplete = o.response.MetadataIncomplete || response.MetadataIncomplete
+	for _, reason := range response.IncompleteReasons {
+		o.response.IncompleteReasons = traceIncompleteReason(o.response.IncompleteReasons, reason)
+	}
+	if response.EndMarkerPolicy != "" {
+		o.response.EndMarkerPolicy = response.EndMarkerPolicy
+	}
 	if response.Chunks > 0 {
 		o.response.Chunks++
 		o.response.LastChunkMilliseconds = time.Since(o.started).Milliseconds()
@@ -621,7 +670,7 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 		current, exists := o.toolCalls[tool.key]
 		if !exists {
 			if len(o.toolCalls) >= traceMaxToolCalls {
-				o.response.MetadataIncomplete = true
+				o.markIncomplete("tool_limit")
 				continue
 			}
 			if o.toolCalls == nil {
@@ -635,6 +684,7 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 			// OpenAI 的函数名可能跨多个 delta；完整名称合并后再脱敏，避免跨片绕过。
 			if current.invalidName || tool.invalidName || len(current.name)+len(tool.name) > traceMaxToolNameBytes {
 				current.name, current.invalidName = "", true
+				o.markIncomplete("invalid_tool_name")
 			} else {
 				current.name += tool.name
 			}
@@ -681,10 +731,11 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	if bytes.Equal(data, []byte("[DONE]")) {
 		o.response.Done = true
 		o.response.EndMarker = "[DONE]"
+		o.response.EndMarkerPolicy = "required"
 		return
 	}
 	if !gjson.ValidBytes(data) {
-		o.response.MetadataIncomplete = true
+		o.markIncomplete("invalid_json")
 		return
 	}
 	r := gjson.ParseBytes(data)
@@ -695,8 +746,16 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	}
 	o.fieldNames(traceKeysRoot, r)
 	kind := r.Get("type").String()
+	if o.stream {
+		switch {
+		case candidates.IsArray():
+			o.response.EndMarkerPolicy = "not_applicable"
+		case choices.IsArray(), strings.HasPrefix(kind, "response."), strings.HasPrefix(kind, "message_"), strings.HasPrefix(kind, "content_block_"):
+			o.response.EndMarkerPolicy = "required"
+		}
+	}
 	if kind == "" && !choices.IsArray() && !candidates.IsArray() && !r.Get("output").IsArray() && !r.Get("error").IsObject() {
-		o.response.MetadataIncomplete = true
+		o.markIncomplete("unsupported_format")
 	}
 	root := r
 	nestedRoot := false
@@ -837,7 +896,7 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 					if n := tool.Get("index"); n.Type == gjson.Number {
 						position = n.String()
 					} else if n.Exists() {
-						o.response.MetadataIncomplete = true
+						o.markIncomplete("invalid_tool_index")
 					}
 					o.captureTool("openai:"+choicePosition+":"+position, tool.Get("function.name"), o.stream && delta.IsObject())
 					return true

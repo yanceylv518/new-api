@@ -79,31 +79,14 @@ import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
 import type { LogCleanupTask } from '../types'
-
-const requestTraceCompressionLevelSchema = z.enum([
-  'fast',
-  'standard',
-  'high',
-  'best',
-])
-
-const requestTraceConfigSchema = z.object({
-  level: z.enum(['off', 'errors', 'all']),
-  pre_channel_errors_enabled: z.boolean(),
-  anonymous_errors_enabled: z.boolean(),
-  upstream_request_id_headers: z.array(z.string()).optional().default([]),
-  compression_level: requestTraceCompressionLevelSchema
-    .optional()
-    .default('fast'),
-})
-
-const defaultRequestTraceConfig: z.infer<typeof requestTraceConfigSchema> = {
-  level: 'errors',
-  pre_channel_errors_enabled: true,
-  anonymous_errors_enabled: false,
-  upstream_request_id_headers: [],
-  compression_level: 'fast',
-}
+import { RequestTracePolicyControls } from './request-trace-policy'
+import {
+  defaultRequestTraceConfig,
+  logSettingsSchema,
+  requestTraceConfigSchema,
+  type LogSettingsFormValues,
+} from './request-trace-policy-schema'
+import { RequestTraceStatus } from './request-trace-status'
 
 const MAX_REQUEST_ID_HEADERS = 16
 const MAX_REQUEST_ID_HEADER_LENGTH = 128
@@ -116,17 +99,6 @@ const upstreamRequestIDHeadersSchema = z
       .regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/)
   )
   .max(MAX_REQUEST_ID_HEADERS)
-
-const logSettingsSchema = z.object({
-  LogConsumeEnabled: z.boolean(),
-  RequestTraceLevel: z.enum(['off', 'errors', 'all']),
-  RequestTracePreChannelErrorsEnabled: z.boolean(),
-  RequestTraceAnonymousErrorsEnabled: z.boolean(),
-  RequestTraceUpstreamRequestIdHeaders: z.string(),
-  RequestTraceCompressionLevel: requestTraceCompressionLevelSchema,
-})
-
-type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
@@ -212,6 +184,11 @@ export function LogSettingsSection({
       RequestTraceUpstreamRequestIdHeaders:
         defaultTraceConfig.upstream_request_id_headers.join('\n'),
       RequestTraceCompressionLevel: defaultTraceConfig.compression_level,
+      RequestTraceSuccessSampleRate: defaultTraceConfig.success_sample_rate,
+      RequestTraceRetentionDays: defaultTraceConfig.retention_days,
+      RequestTraceDiagnosticChannels:
+        defaultTraceConfig.diagnostic_channel_ids.join(', '),
+      RequestTraceDiagnosticExpiresAt: defaultTraceConfig.diagnostic_expires_at,
     },
   })
 
@@ -248,6 +225,11 @@ export function LogSettingsSection({
       RequestTraceUpstreamRequestIdHeaders:
         defaultTraceConfig.upstream_request_id_headers.join('\n'),
       RequestTraceCompressionLevel: defaultTraceConfig.compression_level,
+      RequestTraceSuccessSampleRate: defaultTraceConfig.success_sample_rate,
+      RequestTraceRetentionDays: defaultTraceConfig.retention_days,
+      RequestTraceDiagnosticChannels:
+        defaultTraceConfig.diagnostic_channel_ids.join(', '),
+      RequestTraceDiagnosticExpiresAt: defaultTraceConfig.diagnostic_expires_at,
     })
   }, [defaultEnabled, defaultTraceConfig, form])
 
@@ -350,6 +332,49 @@ export function LogSettingsSection({
       )
       return
     }
+    const channelIDs = [
+      ...new Set(
+        values.RequestTraceDiagnosticChannels.split(/[,，\s]+/)
+          .filter(Boolean)
+          .map(Number)
+      ),
+    ]
+    if (
+      !z.array(z.number().int().positive()).max(16).safeParse(channelIDs)
+        .success
+    ) {
+      form.setError(
+        'RequestTraceDiagnosticChannels',
+        {
+          type: 'validate',
+          message: t('Enter up to 16 positive integer channel IDs.'),
+        },
+        { shouldFocus: true }
+      )
+      return
+    }
+    const diagnosticChanged =
+      values.RequestTraceDiagnosticExpiresAt !==
+        defaultTraceConfig.diagnostic_expires_at ||
+      JSON.stringify(channelIDs) !==
+        JSON.stringify(defaultTraceConfig.diagnostic_channel_ids)
+    const now = Math.floor(Date.now() / 1000)
+    if (
+      channelIDs.length > 0 &&
+      (!values.RequestTraceDiagnosticExpiresAt ||
+        values.RequestTraceDiagnosticExpiresAt > now + 86400 ||
+        (diagnosticChanged && values.RequestTraceDiagnosticExpiresAt <= now))
+    ) {
+      form.setError(
+        'RequestTraceDiagnosticExpiresAt',
+        {
+          type: 'validate',
+          message: t('Choose a future diagnostic expiry within 24 hours.'),
+        },
+        { shouldFocus: true }
+      )
+      return
+    }
     try {
       if (values.LogConsumeEnabled !== defaultEnabled) {
         const response = await updateOption.mutateAsync({
@@ -368,9 +393,21 @@ export function LogSettingsSection({
           ).values(),
         ],
         compression_level: values.RequestTraceCompressionLevel,
+        success_sample_rate: values.RequestTraceSuccessSampleRate,
+        retention_days: values.RequestTraceRetentionDays,
+        diagnostic_channel_ids: channelIDs,
+        diagnostic_expires_at: channelIDs.length
+          ? values.RequestTraceDiagnosticExpiresAt
+          : 0,
       }
       if (
         config.level !== (defaultTraceConfig?.level ?? 'errors') ||
+        config.success_sample_rate !== defaultTraceConfig.success_sample_rate ||
+        config.retention_days !== defaultTraceConfig.retention_days ||
+        config.diagnostic_expires_at !==
+          defaultTraceConfig.diagnostic_expires_at ||
+        JSON.stringify(config.diagnostic_channel_ids) !==
+          JSON.stringify(defaultTraceConfig.diagnostic_channel_ids) ||
         config.compression_level !== defaultTraceConfig.compression_level ||
         config.pre_channel_errors_enabled !==
           (defaultTraceConfig?.pre_channel_errors_enabled ?? true) ||
@@ -640,6 +677,10 @@ export function LogSettingsSection({
               )}
             />
           </SettingsControlGroup>
+          <RequestTracePolicyControls
+            form={form}
+            disabled={updateOption.isPending}
+          />
           <SettingsControlGroup>
             <FormField
               control={form.control}
@@ -722,11 +763,27 @@ export function LogSettingsSection({
                 </div>
                 <Progress value={logCleanupProgress} />
                 <div className='text-muted-foreground mt-2 text-xs'>
-                  {t('{{processed}} of {{total}} log entries processed.', {
-                    processed: logCleanupProcessed,
-                    total: logCleanupTotal,
-                  })}
+                  {logCleanupState?.phase === 'traces'
+                    ? t(
+                        'Trace cleanup: {{processed}} of {{total}} records processed.',
+                        {
+                          processed: logCleanupState.trace_processed ?? 0,
+                          total: logCleanupState.trace_total ?? 0,
+                        }
+                      )
+                    : t('{{processed}} of {{total}} log entries processed.', {
+                        processed: logCleanupProcessed,
+                        total: logCleanupTotal,
+                      })}
                 </div>
+                {!!logCleanupState?.trace_processed &&
+                  logCleanupState.phase !== 'traces' && (
+                    <p className='text-muted-foreground mt-1 text-xs'>
+                      {t('{{count}} trace records removed.', {
+                        count: logCleanupState.trace_processed,
+                      })}
+                    </p>
+                  )}
                 {logCleanupTask.status === 'failed' && logCleanupTask.error && (
                   <div className='text-destructive mt-2 text-xs'>
                     {logCleanupTask.error}
@@ -737,6 +794,8 @@ export function LogSettingsSection({
           </SettingsControlGroup>
         </SettingsForm>
       </Form>
+
+      <RequestTraceStatus />
 
       <Separator />
 

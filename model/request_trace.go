@@ -104,7 +104,7 @@ func DeleteOldRequestTraces(ctx context.Context, timestamp int64, limit int) (in
 		return count, LOG_DB.WithContext(ctx).Exec("ALTER TABLE request_trace_metadata DELETE WHERE created_at < ? SETTINGS mutations_sync = 1", timestamp).Error
 	}
 	var ids []int64
-	if err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("created_at < ?", timestamp).Order("id").Limit(limit).Pluck("id", &ids).Error; err != nil {
+	if err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("created_at < ?", timestamp).Order("created_at").Order("id").Limit(limit).Pluck("id", &ids).Error; err != nil {
 		return 0, err
 	}
 	if len(ids) == 0 {
@@ -112,6 +112,24 @@ func DeleteOldRequestTraces(ctx context.Context, timestamp int64, limit int) (in
 	}
 	result := LOG_DB.WithContext(ctx).Where("id IN ?", ids).Delete(&RequestTrace{})
 	return result.RowsAffected, result.Error
+}
+
+func CountOldRequestTraces(ctx context.Context, timestamp int64) (int64, error) {
+	var count int64
+	err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("created_at < ?", timestamp).Count(&count).Error
+	return count, err
+}
+
+func GetLatestRequestTraceCleanup(ctx context.Context) (*SystemTask, error) {
+	var task SystemTask
+	result := DB.WithContext(ctx).Where("type = ?", SystemTaskTypeRequestTraceCleanup).Order("id desc").Limit(1).Find(&task)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+	return &task, nil
 }
 
 func migrateRequestTraceTableName(db *gorm.DB) error {

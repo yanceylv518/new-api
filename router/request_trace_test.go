@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/internal/requesttracetest"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -42,16 +44,24 @@ func setupRequestTraceDatabase(t testing.TB) *gorm.DB {
 	previousConfig := common.GetRequestTraceConfig()
 	common.SQLitePath = filepath.Join(t.TempDir(), "trace.sqlite")
 	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.LogConsumeEnabled = false, false, false, true
-	t.Setenv("SQL_DSN", "local")
+	dsn := "local"
+	if os.Getenv("REQUEST_TRACE_TEST_DSN") != "" {
+		dsn = requesttracetest.MySQLDSN(t)
+	}
+	t.Setenv("SQL_DSN", dsn)
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitDB())
 	model.LOG_DB = model.DB
-	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	common.SetLogDatabaseType(common.MainDatabaseType())
 	db := model.DB
 	db.Logger = logger.Default.LogMode(logger.Silent)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		sqlDB.SetMaxOpenConns(16)
+	} else {
+		sqlDB.SetMaxOpenConns(1)
+	}
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.RequestTrace{}, &model.Option{}, &model.AuditLog{}, &model.UserSession{}))
 	require.NoError(t, db.Create(&model.User{Id: 11, Username: "trace-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "trace-owner"}).Error)
 	t.Cleanup(func() {
@@ -417,7 +427,7 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			db := setupRequestTraceDatabase(t)
 			common.LogConsumeEnabled = tc.consume
-			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: tc.level, PreChannelErrors: tc.preChannel, AnonymousErrors: tc.anonymous})))
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: tc.level, PreChannelErrors: tc.preChannel, AnonymousErrors: tc.anonymous, SuccessSampleRate: 100})))
 			engine := gin.New()
 			engine.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
 			engine.POST("/v1/chat/completions", func(c *gin.Context) {
@@ -457,11 +467,13 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 			}
 			assert.Equal(t, recorder.Header().Get(common.RequestIdKey), rows[0].RequestId)
 			assert.Equal(t, tc.userID, rows[0].UserId)
+			decoded, err := common.DecodeRequestTraceStorage(rows[0].Data)
+			require.NoError(t, err)
 			for _, secret := range []string{"private-response-body", "private-message-body", "private-error-original"} {
-				assert.NotContains(t, rows[0].Data, secret)
+				assert.NotContains(t, decoded, secret)
 			}
 			var data common.RequestTraceData
-			require.NoError(t, common.UnmarshalJsonStr(rows[0].Data, &data))
+			require.NoError(t, common.UnmarshalJsonStr(decoded, &data))
 			assert.Equal(t, tc.status, data.Trace.Status)
 			assert.EqualValues(t, recorder.Body.Len(), data.Trace.ResponseBytes)
 			assert.Equal(t, tc.detailed, data.AdminInfo != nil)
@@ -778,7 +790,7 @@ func TestRequestTraceUpstreamRequestIDHTTPPropagation(t *testing.T) {
 				{"retry-clears-id", []string{"X-Provider-Id"}, nil, "", true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: mode, UpstreamRequestIDHeaders: tc.configured})))
+					require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: mode, UpstreamRequestIDHeaders: tc.configured, SuccessSampleRate: 100})))
 					var calls atomic.Int32
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 						w.Header().Set("Content-Type", "application/json")
@@ -929,6 +941,12 @@ func TestRequestTraceConfigValidationAndCancelledStorage(t *testing.T) {
 	invalidConfigs := []string{`{broken`, `{"level":"unknown"}`, `{"level":"all","anonymous_errors_enabled":"yes"}`,
 		`{"level":"all","upstream_request_id_headers":"X-Id"}`,
 		`{"level":"all","upstream_request_id_headers":[123]}`,
+		`{"level":"all","success_sample_rate":-1}`, `{"level":"all","success_sample_rate":101}`,
+		`{"level":"all","success_sample_rate":1.5}`, `{"level":"all","retention_days":-1}`,
+		`{"level":"all","retention_days":3651}`, `{"level":"all","diagnostic_channel_ids":[0]}`,
+		`{"level":"all","diagnostic_channel_ids":[7]}`,
+		`{"level":"all","success_sample_rate":null}`, `{"level":"all","retention_days":null}`,
+		`{"level":"all","diagnostic_expires_at":null}`,
 	}
 	for _, name := range []string{"", " ", "X Id", "X:Id", "X\r\nInjected", "请求ID", strings.Repeat("a", 129)} {
 		invalidConfigs = append(invalidConfigs, common.GetJsonString(common.RequestTraceConfig{Level: "all", UpstreamRequestIDHeaders: []string{name}}))
@@ -936,9 +954,9 @@ func TestRequestTraceConfigValidationAndCancelledStorage(t *testing.T) {
 	invalidConfigs = append(invalidConfigs, common.GetJsonString(common.RequestTraceConfig{Level: "all", UpstreamRequestIDHeaders: make([]string, 17)}))
 	for _, invalid := range invalidConfigs {
 		require.Error(t, model.UpdateOption("RequestTraceConfig", invalid))
-		assert.Equal(t, common.RequestTraceConfig{Level: "all", PreChannelErrors: true, UpstreamRequestIDHeaders: []string{"X-Provider-Id", "Nvcf-Reqid"}}, common.GetRequestTraceConfig())
+		assert.Equal(t, common.RequestTraceConfig{Level: "all", PreChannelErrors: true, UpstreamRequestIDHeaders: []string{"X-Provider-Id", "Nvcf-Reqid"}, CompressionLevel: "fast", SuccessSampleRate: 100}, common.GetRequestTraceConfig())
 		var option model.Option
-		require.NoError(t, db.Where("key = ?", "RequestTraceConfig").First(&option).Error)
+		require.NoError(t, db.Where(map[string]any{"key": "RequestTraceConfig"}).First(&option).Error)
 		assert.Equal(t, valid, option.Value)
 	}
 	copied := common.GetRequestTraceConfig()
@@ -960,4 +978,149 @@ func TestRequestTraceConfigValidationAndCancelledStorage(t *testing.T) {
 	collector := &common.RequestTraceCollector{}
 	collector.CaptureRequest(storage, true)
 	assert.True(t, collector.ShapeIncomplete)
+}
+
+func TestRequestTraceSamplingAndDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, level  string
+		rate         int
+		diagnostic   bool
+		expired      bool
+		otherChannel bool
+		retry        bool
+		status       int
+		details      []bool
+	}{
+		{name: "zero success sample", level: "all", rate: 0, status: 200},
+		{name: "all success detailed", level: "all", rate: 100, status: 200, details: []bool{true}},
+		{name: "all success summary", level: "errors", rate: 100, status: 200, details: []bool{false}},
+		{name: "diagnostic overrides sample", level: "errors", rate: 0, diagnostic: true, status: 200, details: []bool{true}},
+		{name: "expired diagnostic", level: "errors", rate: 0, diagnostic: true, expired: true, status: 200},
+		{name: "unmatched diagnostic", level: "errors", rate: 0, diagnostic: true, otherChannel: true, status: 200},
+		{name: "off overrides diagnostic", level: "off", rate: 100, diagnostic: true, status: 200},
+		{name: "failed request overrides sample", level: "errors", rate: 0, status: 502, details: []bool{true}},
+		{name: "failed retry preserves request chain", level: "errors", rate: 0, retry: true, status: 200, details: []bool{true, false}},
+		{name: "each retry has its own duration", level: "all", rate: 0, retry: true, status: 200, details: []bool{true, true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = setupRequestTraceDatabase(t)
+			config := common.RequestTraceConfig{Level: tc.level, PreChannelErrors: true, SuccessSampleRate: tc.rate}
+			if tc.diagnostic {
+				config.DiagnosticChannelIDs = []int{7}
+				config.DiagnosticExpiresAt = time.Now().Add(time.Hour).Unix()
+				if tc.expired {
+					config.DiagnosticExpiresAt = time.Now().Add(-time.Hour).Unix()
+				}
+			}
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+			engine := gin.New()
+			engine.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+			engine.POST("/v1/chat/completions", func(c *gin.Context) {
+				c.Set("id", 11)
+				_, err := common.GetBodyStorage(c)
+				require.NoError(t, err)
+				if trace := common.GetRequestTrace(c); trace != nil {
+					base := time.Now().Add(-5 * time.Second)
+					trace.Started = base
+					channelID := 7
+					if tc.otherChannel {
+						channelID = 8
+					}
+					if tc.retry {
+						first := trace.StartAttempt(0, channelID, c.Request)
+						first.Started, first.Finished = base.Add(time.Second), base.Add(2*time.Second)
+						first.Failed, first.Upstream.Status = true, 502
+					}
+					index := 0
+					if tc.retry {
+						index = 1
+					}
+					last := trace.StartAttempt(index, channelID, c.Request)
+					last.Started, last.Finished = base.Add(3*time.Second), base.Add(4*time.Second)
+					last.Upstream.Status = tc.status
+				}
+				if tc.status >= 400 {
+					c.Data(tc.status, "application/json", []byte(`{"error":{"type":"test_error","message":"private-sampling-error"}}`))
+				} else {
+					c.Data(200, "application/json", []byte(`{"choices":[{"message":{"content":"private-sampling-body"},"finish_reason":"stop"}]}`))
+				}
+			})
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"private-sampling-input"}]}`)))
+			rows, err := model.GetRequestTraces(t.Context(), recorder.Header().Get(common.RequestIdKey), 0, true)
+			require.NoError(t, err)
+			require.Len(t, rows, len(tc.details))
+			for index, row := range rows {
+				assert.Equal(t, tc.details[index], row.AdminInfo != nil)
+				assert.GreaterOrEqual(t, row.Trace.Milliseconds, int64(5000))
+				if row.AdminInfo != nil {
+					require.NotNil(t, row.AdminInfo.Upstream.Milliseconds)
+					assert.EqualValues(t, 1000, *row.AdminInfo.Upstream.Milliseconds)
+					assert.NotEqual(t, row.Trace.Milliseconds, *row.AdminInfo.Upstream.Milliseconds)
+				}
+				encoded := common.GetJsonString(row)
+				assert.NotContains(t, encoded, "private-sampling-")
+			}
+			if tc.retry && len(rows) == 2 {
+				assert.Equal(t, "failed", rows[0].Trace.Outcome)
+				assert.Equal(t, "success", rows[1].Trace.Outcome)
+				assert.Equal(t, rows[0].Trace.Milliseconds, rows[1].Trace.Milliseconds)
+			}
+		})
+	}
+	parsed, err := common.ParseRequestTraceConfig(`{"level":"errors"}`)
+	require.NoError(t, err)
+	assert.Equal(t, 100, parsed.SuccessSampleRate)
+	parsed.SuccessSampleRate = 35
+	selected := 0
+	for index := range 100 {
+		id := fmt.Sprintf("stable-sample-%d", index)
+		keep := parsed.SampleSuccess(id)
+		assert.Equal(t, keep, parsed.SampleSuccess(id))
+		if keep {
+			selected++
+		}
+	}
+	assert.Greater(t, selected, 0)
+	assert.Less(t, selected, 100)
+}
+
+func TestRequestTraceRootStatusAuthorization(t *testing.T) {
+	db := setupRequestTraceDatabase(t)
+	require.NoError(t, db.AutoMigrate(&model.SystemTask{}))
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("trace-status-history-failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "system_tasks" {
+			tx.AddError(errors.New("test cleanup history unavailable"))
+		}
+	}))
+	engine := gin.New()
+	engine.GET("/api/log/trace/status", middleware.RootAuth(), controller.GetRequestTraceStatus)
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		pat := rand.Text()
+		user := model.User{Username: fmt.Sprintf("trace-status-%d", role), Role: role, Status: common.UserStatusEnabled, Group: "default", AffCode: fmt.Sprintf("trace-status-aff-%d", role), AccessToken: &pat, AuthVersion: 1}
+		require.NoError(t, db.Create(&user).Error)
+		request := httptest.NewRequest(http.MethodGet, "/api/log/trace/status", nil)
+		request.Header.Set("Authorization", "Bearer "+pat)
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		if role != common.RoleRootUser {
+			assert.Equal(t, http.StatusForbidden, recorder.Code)
+			continue
+		}
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var result struct {
+			Success bool `json:"success"`
+			Data    struct {
+				FailedRows   int64  `json:"failed_rows"`
+				CleanupError string `json:"cleanup_error"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
+		assert.True(t, result.Success)
+		assert.Contains(t, result.Data.CleanupError, "test cleanup history unavailable")
+		assert.GreaterOrEqual(t, result.Data.FailedRows, int64(0))
+	}
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/log/trace/status", nil))
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 }

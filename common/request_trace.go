@@ -1,8 +1,11 @@
 package common
 
 import (
+	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,18 +28,23 @@ type RequestTraceConfig struct {
 	AnonymousErrors          bool     `json:"anonymous_errors_enabled"`
 	UpstreamRequestIDHeaders []string `json:"upstream_request_id_headers,omitempty"`
 	CompressionLevel         string   `json:"compression_level,omitempty"`
+	SuccessSampleRate        int      `json:"success_sample_rate"`
+	RetentionDays            int      `json:"retention_days"`
+	DiagnosticChannelIDs     []int    `json:"diagnostic_channel_ids,omitempty"`
+	DiagnosticExpiresAt      int64    `json:"diagnostic_expires_at,omitempty"`
 }
 
 var requestTraceConfig = struct {
 	sync.RWMutex
 	value RequestTraceConfig
-}{value: RequestTraceConfig{Level: "errors", PreChannelErrors: true, CompressionLevel: "fast"}}
+}{value: RequestTraceConfig{Level: "errors", PreChannelErrors: true, CompressionLevel: "fast", SuccessSampleRate: 100}}
 
 func GetRequestTraceConfig() RequestTraceConfig {
 	requestTraceConfig.RLock()
 	defer requestTraceConfig.RUnlock()
 	config := requestTraceConfig.value
 	config.UpstreamRequestIDHeaders = append([]string(nil), config.UpstreamRequestIDHeaders...)
+	config.DiagnosticChannelIDs = append([]int(nil), config.DiagnosticChannelIDs...)
 	return config
 }
 
@@ -52,7 +60,16 @@ func SetRequestTraceOption(key, value string) error {
 }
 
 func ParseRequestTraceConfig(value string) (RequestTraceConfig, error) {
-	config := RequestTraceConfig{CompressionLevel: "fast"}
+	config := RequestTraceConfig{CompressionLevel: "fast", SuccessSampleRate: 100}
+	var fields map[string]json.RawMessage
+	if err := UnmarshalJsonStr(value, &fields); err != nil {
+		return config, err
+	}
+	for _, name := range []string{"success_sample_rate", "retention_days", "diagnostic_expires_at"} {
+		if strings.TrimSpace(string(fields[name])) == "null" {
+			return config, errors.New("request trace " + name + " must be an integer")
+		}
+	}
 	if err := UnmarshalJsonStr(value, &config); err != nil {
 		return config, err
 	}
@@ -61,6 +78,28 @@ func ParseRequestTraceConfig(value string) (RequestTraceConfig, error) {
 	}
 	if _, ok := requestTraceStorageEncoders[config.CompressionLevel]; !ok {
 		return config, errors.New("invalid request trace compression level")
+	}
+	if config.SuccessSampleRate < 0 || config.SuccessSampleRate > 100 {
+		return config, errors.New("request trace success sample rate must be between 0 and 100")
+	}
+	if config.RetentionDays < 0 || config.RetentionDays > 3650 {
+		return config, errors.New("request trace retention must be between 0 and 3650 days")
+	}
+	if len(config.DiagnosticChannelIDs) > 16 {
+		return config, errors.New("at most 16 diagnostic channels are allowed")
+	}
+	var channels []int
+	for _, channelID := range config.DiagnosticChannelIDs {
+		if channelID <= 0 {
+			return config, errors.New("diagnostic channel IDs must be positive integers")
+		}
+		if !slices.Contains(channels, channelID) {
+			channels = append(channels, channelID)
+		}
+	}
+	config.DiagnosticChannelIDs = channels
+	if config.DiagnosticExpiresAt < 0 || config.DiagnosticExpiresAt > time.Now().Add(24*time.Hour).Unix() || (len(channels) > 0 && config.DiagnosticExpiresAt == 0) {
+		return config, errors.New("diagnostic expiry is required and must be within 24 hours")
 	}
 	if len(config.UpstreamRequestIDHeaders) > maxUpstreamRequestIDHeaders {
 		return config, errors.New("at most 16 upstream request ID response headers are allowed")
@@ -87,6 +126,22 @@ func ParseRequestTraceConfig(value string) (RequestTraceConfig, error) {
 	return config, nil
 }
 
+func (config RequestTraceConfig) SampleSuccess(requestID string) bool {
+	if config.SuccessSampleRate >= 100 {
+		return true
+	}
+	if config.SuccessSampleRate <= 0 {
+		return false
+	}
+	digest := fnv.New64a()
+	_, _ = digest.Write([]byte(requestID))
+	return digest.Sum64()%100 < uint64(config.SuccessSampleRate)
+}
+
+func (config RequestTraceConfig) DiagnoseChannel(channelID int) bool {
+	return config.Level != "off" && len(config.DiagnosticChannelIDs) > 0 && config.DiagnosticExpiresAt > time.Now().Unix() && slices.Contains(config.DiagnosticChannelIDs, channelID)
+}
+
 func GetUpstreamRequestID(headers http.Header) string {
 	requestTraceConfig.RLock()
 	defer requestTraceConfig.RUnlock()
@@ -111,6 +166,7 @@ type RequestTraceSummary struct {
 	FinishReason    *string `json:"finish_reason,omitempty"`
 	Stage           string  `json:"stage,omitempty"`
 	ClientErrorType string  `json:"client_error_type,omitempty"`
+	Outcome         string  `json:"outcome,omitempty"`
 }
 
 type RequestTraceShape struct {
@@ -146,6 +202,8 @@ type RequestTraceResponse struct {
 	UsageChunk            bool                `json:"usage_chunk"`
 	Keys                  map[string][]string `json:"keys,omitempty"`
 	MetadataIncomplete    bool                `json:"metadata_incomplete,omitempty"`
+	IncompleteReasons     []string            `json:"incomplete_reasons,omitempty"`
+	EndMarkerPolicy       string              `json:"end_marker_policy,omitempty"`
 }
 
 type RequestTraceUpstream struct {
@@ -153,6 +211,7 @@ type RequestTraceUpstream struct {
 	Protocol           string `json:"proto,omitempty"`
 	RequestBytes       *int64 `json:"req_bytes,omitempty"`
 	HeaderMilliseconds int64  `json:"header_ms"`
+	Milliseconds       *int64 `json:"ms,omitempty"`
 	RequestID          string `json:"request_id,omitempty"`
 	ResponseID         string `json:"resp_id,omitempty"`
 	Model              string `json:"resp_model,omitempty"`
@@ -172,41 +231,46 @@ type RequestTraceClient struct {
 }
 
 type RequestTraceAdmin struct {
-	ShapeIncomplete bool                 `json:"shape_incomplete,omitempty"`
-	ChannelID       int                  `json:"channel_id,omitempty"`
-	Client          RequestTraceClient   `json:"client"`
-	Shape           *RequestTraceShape   `json:"shape,omitempty"`
-	Upstream        RequestTraceUpstream `json:"upstream"`
-	Response        RequestTraceResponse `json:"resp"`
+	ShapeIncomplete       bool                 `json:"shape_incomplete,omitempty"`
+	ShapeIncompleteReason string               `json:"shape_incomplete_reason,omitempty"`
+	ChannelID             int                  `json:"channel_id,omitempty"`
+	Client                RequestTraceClient   `json:"client"`
+	Shape                 *RequestTraceShape   `json:"shape,omitempty"`
+	Upstream              RequestTraceUpstream `json:"upstream"`
+	Response              RequestTraceResponse `json:"resp"`
 }
 
 type RequestTraceData struct {
+	Version   int                 `json:"version,omitempty"`
 	Trace     RequestTraceSummary `json:"trace"`
 	AdminInfo *RequestTraceAdmin  `json:"admin_info,omitempty"`
 }
 
 type RequestTraceAttempt struct {
-	Attempt   int
-	Started   time.Time
-	ChannelID int
-	Failed    bool
-	Upstream  RequestTraceUpstream
-	Observer  *TraceBodyObserver
+	Attempt    int
+	Started    time.Time
+	Finished   time.Time
+	ChannelID  int
+	Failed     bool
+	Diagnostic bool
+	Upstream   RequestTraceUpstream
+	Observer   *TraceBodyObserver
 }
 
 type RequestTraceCollector struct {
 	sync.Mutex
-	Config          RequestTraceConfig
-	Started         time.Time
-	Client          RequestTraceClient
-	RequestBytes    *int64
-	Shape           *RequestTraceShape
-	ShapeIncomplete bool
-	Stage           string
-	ErrorLogged     bool
-	Failed          bool
-	Attempts        []*RequestTraceAttempt
-	ClientObserver  *TraceBodyObserver
+	Config                RequestTraceConfig
+	Started               time.Time
+	Client                RequestTraceClient
+	RequestBytes          *int64
+	Shape                 *RequestTraceShape
+	ShapeIncomplete       bool
+	ShapeIncompleteReason string
+	Stage                 string
+	ErrorLogged           bool
+	Failed                bool
+	Attempts              []*RequestTraceAttempt
+	ClientObserver        *TraceBodyObserver
 }
 
 func GetRequestTrace(c *gin.Context) *RequestTraceCollector {
@@ -227,6 +291,10 @@ func (t *RequestTraceCollector) StartAttempt(attempt, channelID int, req *http.R
 	t.Lock()
 	defer t.Unlock()
 	a := &RequestTraceAttempt{Attempt: attempt, ChannelID: channelID, Started: time.Now()}
+	if count := len(t.Attempts); count > 0 && t.Attempts[count-1].Finished.IsZero() {
+		t.Attempts[count-1].Finished = a.Started
+	}
+	a.Diagnostic = t.Config.DiagnoseChannel(channelID)
 	if req.ContentLength >= 0 {
 		size := req.ContentLength
 		a.Upstream.RequestBytes = &size
@@ -234,6 +302,14 @@ func (t *RequestTraceCollector) StartAttempt(attempt, channelID int, req *http.R
 	t.Attempts = append(t.Attempts, a)
 	t.Stage = "upstream"
 	return a
+}
+
+func (t *RequestTraceCollector) FinishAttempt(attempt int) {
+	t.Lock()
+	defer t.Unlock()
+	if count := len(t.Attempts); count > 0 && t.Attempts[count-1].Attempt == attempt && t.Attempts[count-1].Finished.IsZero() {
+		t.Attempts[count-1].Finished = time.Now()
+	}
 }
 
 func (t *RequestTraceCollector) CaptureRequest(storage BodyStorage, detailed bool) {
@@ -244,17 +320,27 @@ func (t *RequestTraceCollector) CaptureRequest(storage BodyStorage, detailed boo
 	}
 	if size > TraceMetadataMaxBytes {
 		t.ShapeIncomplete = true
+		t.ShapeIncompleteReason = "size_limit"
 		return
 	}
 	reader, err := storage.NewReader()
 	if err != nil {
 		t.ShapeIncomplete = true
+		t.ShapeIncompleteReason = "body_unavailable"
 		return
 	}
 	defer reader.Close()
 	shape, err := readRequestTraceShape(reader)
 	if err != nil {
 		t.ShapeIncomplete = true
+		switch {
+		case errors.Is(err, errTraceRequestTooLarge):
+			t.ShapeIncompleteReason = "size_limit"
+		case errors.Is(err, errTraceRequestInvalidJSON):
+			t.ShapeIncompleteReason = "invalid_json"
+		default:
+			t.ShapeIncompleteReason = "body_unavailable"
+		}
 		return
 	}
 	t.Shape = shape

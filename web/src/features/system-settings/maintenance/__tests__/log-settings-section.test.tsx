@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosHeaders } from 'axios'
 import i18n from 'i18next'
@@ -25,6 +25,7 @@ import { useState } from 'react'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { SettingsPageProvider } from '../../components/settings-page-context'
 import { LogSettingsSection } from '../log-settings-section'
@@ -44,6 +45,11 @@ const config = {
   pre_channel_errors_enabled: true,
   anonymous_errors_enabled: false,
   upstream_request_id_headers: ['X-Existing-Id'],
+  compression_level: 'fast',
+  success_sample_rate: 100,
+  retention_days: 0,
+  diagnostic_channel_ids: [],
+  diagnostic_expires_at: 0,
 }
 
 function SettingsFixture(props: { config?: string }) {
@@ -78,6 +84,30 @@ beforeEach(async () => {
     }
     if (url === '/api/system-task/current') {
       return response({ success: true, data: null })
+    }
+    if (url === '/api/log/trace/status') {
+      return response({
+        success: true,
+        data: {
+          node: 'trace-test-instance',
+          running: true,
+          queued_rows: 3,
+          queued_bytes: 1024,
+          queue_row_limit: 8192,
+          queue_byte_limit: 16777216,
+          in_flight_rows: 1,
+          persisted_rows: 57,
+          failed_rows: 2,
+          fallback_rows: 4,
+          retries: 1,
+          collected_requests: 80,
+          sampled_out_requests: 20,
+          partial_requests: 2,
+          average_write_ms: 1.5,
+          last_write_ms: 2.3,
+          cleanup_error: 'synthetic cleanup read error',
+        },
+      })
     }
     throw new Error(`Unexpected GET: ${url}`)
   })
@@ -278,5 +308,154 @@ describe('request trace log settings', () => {
         screen.getByRole('button', { name: 'Save log settings' })
       ).toBeEnabled()
     )
+  })
+
+  test.each([0, 35, 100])(
+    'saves the successful request sample rate %s',
+    async (rate) => {
+      render(
+        <SettingsFixture
+          config={JSON.stringify({
+            ...config,
+            success_sample_rate: rate === 100 ? 35 : 100,
+          })}
+        />
+      )
+      const input = screen.getByRole('spinbutton', {
+        name: 'Successful request sample rate (%)',
+      })
+      await userEvent.clear(input)
+      await userEvent.type(input, String(rate))
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Save log settings' })
+      )
+      await waitFor(() =>
+        expect(api.put).toHaveBeenCalledWith('/api/option/', {
+          key: 'RequestTraceConfig',
+          value: JSON.stringify({ ...config, success_sample_rate: rate }),
+        })
+      )
+    }
+  )
+
+  test('saves independent retention and leaves consumption logging enabled', async () => {
+    render(<SettingsFixture config={JSON.stringify(config)} />)
+    const input = screen.getByRole('spinbutton', {
+      name: 'Request trace retention (days)',
+    })
+    await userEvent.clear(input)
+    await userEvent.type(input, '7')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    await waitFor(() =>
+      expect(api.put).toHaveBeenCalledWith('/api/option/', {
+        key: 'RequestTraceConfig',
+        value: JSON.stringify({ ...config, retention_days: 7 }),
+      })
+    )
+    expect(
+      screen.getByRole('switch', { name: 'Record quota usage' })
+    ).toHaveAttribute('aria-checked', 'true')
+  })
+
+  test.each([
+    ['Successful request sample rate (%)', '101'],
+    ['Request trace retention (days)', '3651'],
+  ])(
+    'rejects out-of-range %s before issuing a mutation',
+    async (name, value) => {
+      render(<SettingsFixture config={JSON.stringify(config)} />)
+      const input = screen.getByRole('spinbutton', { name })
+      await userEvent.clear(input)
+      await userEvent.type(input, value)
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Save log settings' })
+      )
+      expect(api.put).not.toHaveBeenCalled()
+    }
+  )
+
+  test('deduplicates diagnostic channel IDs and preserves a valid expiry', async () => {
+    const expires = Math.floor(Date.now() / 1000) + 3600
+    render(
+      <SettingsFixture
+        config={JSON.stringify({ ...config, diagnostic_expires_at: expires })}
+      />
+    )
+    await userEvent.type(
+      screen.getByRole('textbox', { name: 'Temporary diagnostic channel IDs' }),
+      '7, 8, 7'
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    await waitFor(() =>
+      expect(api.put).toHaveBeenCalledWith('/api/option/', {
+        key: 'RequestTraceConfig',
+        value: JSON.stringify({
+          ...config,
+          diagnostic_channel_ids: [7, 8],
+          diagnostic_expires_at: expires,
+        }),
+      })
+    )
+  })
+
+  test('rejects a newly configured channel without a future expiry', async () => {
+    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await userEvent.type(
+      screen.getByRole('textbox', { name: 'Temporary diagnostic channel IDs' }),
+      '7'
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    expect(
+      await screen.findByText(
+        'Choose a future diagnostic expiry within 24 hours.'
+      )
+    ).toBeInTheDocument()
+    expect(api.put).not.toHaveBeenCalled()
+  })
+
+  test('rejects malformed diagnostic channels before issuing a mutation', async () => {
+    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await userEvent.type(
+      screen.getByRole('textbox', { name: 'Temporary diagnostic channel IDs' }),
+      '7, invalid'
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    expect(
+      await screen.findByText('Enter up to 16 positive integer channel IDs.')
+    ).toBeInTheDocument()
+    expect(api.put).not.toHaveBeenCalled()
+  })
+
+  test('shows instance writer counters even when cleanup history is unavailable', async () => {
+    const previous = useAuthStore.getState().auth.user
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 11, username: 'trace-root', role: 100 })
+    try {
+      render(<SettingsFixture config={JSON.stringify(config)} />)
+      const region = await screen.findByRole('region', {
+        name: 'Asynchronous trace writer',
+      })
+      await within(region).findByText(
+        'Responding instance: trace-test-instance'
+      )
+      expect(within(region).getByText('57')).toBeInTheDocument()
+      expect(within(region).getByText('3 / 8,192')).toBeInTheDocument()
+      expect(
+        within(region).getByText(
+          'Request trace cleanup: synthetic cleanup read error'
+        )
+      ).toBeInTheDocument()
+    } finally {
+      useAuthStore.getState().auth.setUser(previous)
+    }
   })
 })

@@ -78,6 +78,10 @@ export type LogCleanupTaskPayload = {
 }
 
 export type LogCleanupTaskState = {
+  phase?: 'traces' | 'logs' | 'done'
+  trace_total?: number
+  trace_processed?: number
+  trace_remaining?: number
   total: number
   processed: number
   progress: number
@@ -86,6 +90,7 @@ export type LogCleanupTaskState = {
 
 export type LogCleanupTaskResult = {
   deleted_count: number
+  trace_deleted_count?: number
 }
 
 export type LogCleanupTask = SystemTask<

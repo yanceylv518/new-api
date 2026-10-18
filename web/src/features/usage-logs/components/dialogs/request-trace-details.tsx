@@ -25,6 +25,7 @@ import { LoadingState } from '@/components/loading-state'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import {
   Collapsible,
   CollapsibleContent,
@@ -68,8 +69,12 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
   let endMarkerLabel = t('End marker missing')
   if (response?.end_marker) {
     endMarkerLabel = response.end_marker
+  } else if (response?.end_marker_policy === 'not_applicable') {
+    endMarkerLabel = t('This protocol has no separate end marker')
   } else if (response?.done) {
     endMarkerLabel = t('End marker received (type not recorded)')
+  } else if (response?.end_marker_policy !== 'required') {
+    endMarkerLabel = t('End marker not reported')
   }
   const toolCallsByName = useMemo(
     () =>
@@ -88,9 +93,14 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     () => (props.previous ? null : parseLogOther(props.log.other)),
     [props.previous, props.log.other]
   )
-  const failed = props.previous
-    ? (summary?.status ?? 0) >= 400 || !!response?.error
-    : props.log.type === 5 || (summary?.status ?? 0) >= 400 || !!response?.error
+  const failed =
+    (!props.previous && props.log.type === 5) ||
+    summary?.outcome === 'failed' ||
+    summary?.outcome === 'cancelled' ||
+    (summary?.status ?? 0) >= 400 ||
+    !!response?.error ||
+    !!upstream?.error_type ||
+    ['failed', 'error', 'ERROR'].includes(summary?.finish_reason ?? '')
   const truncated =
     summary?.finish_reason !== undefined &&
     (['length', 'max_tokens', 'MAX_TOKENS'].includes(summary.finish_reason) ||
@@ -98,9 +108,28 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
   const toolFinish = ['tool_calls', 'tool_use'].includes(
     summary?.finish_reason ?? ''
   )
-  let finishLabel = t('Normal completion')
+  let finishLabel = t('Unknown')
   let finishVariant: StatusBadgeProps['variant'] = 'neutral'
-  if (summary?.finish_reason === '') {
+  if (summary?.outcome === 'cancelled') {
+    finishLabel = t('Client disconnected')
+    finishVariant = 'orange'
+  } else if (failed) {
+    finishLabel = t('Failed')
+    finishVariant = 'red'
+  } else if (
+    response?.refused ||
+    [
+      'content_filter',
+      'SAFETY',
+      'BLOCKLIST',
+      'PROHIBITED_CONTENT',
+      'SPII',
+      'RECITATION',
+    ].includes(summary?.finish_reason ?? '')
+  ) {
+    finishLabel = t('Refused')
+    finishVariant = 'orange'
+  } else if (summary?.finish_reason === '') {
     finishLabel = t('Missing')
     finishVariant = 'red'
   } else if (truncated) {
@@ -109,6 +138,21 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
   } else if (toolFinish) {
     finishLabel = t('Tool call')
     finishVariant = 'blue'
+  } else if (
+    ['stop', 'end_turn', 'stop_sequence', 'STOP', 'completed'].includes(
+      summary?.finish_reason ?? ''
+    )
+  ) {
+    finishLabel = t('Normal completion')
+  }
+  const incompleteReasonLabels: Record<string, string> = {
+    size_limit: t('Capture size limit reached'),
+    body_unavailable: t('Request body unavailable for metadata'),
+    invalid_json: t('Metadata payload is not valid JSON'),
+    unsupported_format: t('Response format is not recognized'),
+    tool_limit: t('Tool-call capture limit reached'),
+    invalid_tool_name: t('Tool name is invalid or too long'),
+    invalid_tool_index: t('Tool-call index is invalid'),
   }
   const parameters = [
     shape?.max_tokens !== undefined ? `max_tokens=${shape.max_tokens}` : '',
@@ -142,13 +186,16 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           other?.error_code ||
           other?.error_type) && (
           <DetailSection label={t('Error Information')} variant='danger'>
+            {summary?.outcome && (
+              <DetailRow label={t('Completion status')} value={finishLabel} />
+            )}
             {summary?.stage && (
               <DetailRow
                 label={t('Failure stage')}
                 value={t(`Request trace stage: ${summary.stage}`)}
               />
             )}
-            {(summary?.status ?? other?.status_code) != null && (
+            {(summary?.status ?? other?.status_code ?? 0) > 0 && (
               <DetailRow
                 label={t('Status Code')}
                 value={summary?.status ?? other?.status_code}
@@ -297,9 +344,12 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           )}
           {admin?.shape_incomplete && (
             <p className='text-muted-foreground text-xs'>
-              {t(
-                'Request metadata was unavailable or exceeded the capture limit.'
-              )}
+              {admin.shape_incomplete_reason
+                ? (incompleteReasonLabels[admin.shape_incomplete_reason] ??
+                  admin.shape_incomplete_reason)
+                : t(
+                    'Request metadata was unavailable or exceeded the capture limit.'
+                  )}
             </p>
           )}
         </DetailSection>
@@ -348,8 +398,18 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
             />
             {props.previous && summary && (
               <DetailRow
-                label={t('Response Time')}
-                value={formatTraceTime(summary.ms)}
+                label={
+                  upstream.ms !== undefined
+                    ? t('Attempt duration')
+                    : t('Request elapsed time')
+                }
+                value={formatTraceTime(upstream.ms ?? summary.ms)}
+              />
+            )}
+            {!props.previous && upstream.ms !== undefined && (
+              <DetailRow
+                label={t('Attempt duration')}
+                value={formatTraceTime(upstream.ms)}
               />
             )}
             {upstream.req_bytes !== undefined && (
@@ -614,7 +674,9 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
                 <span
                   className={cn(
                     response.end_marker && 'font-mono',
-                    !response.done && 'text-destructive'
+                    !response.done &&
+                      response.end_marker_policy === 'required' &&
+                      'text-destructive'
                   )}
                 >
                   {endMarkerLabel}
@@ -624,9 +686,13 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           )}
           {response?.metadata_incomplete && (
             <p className='text-muted-foreground text-xs'>
-              {t(
-                'Response metadata is partial because an event was unavailable or exceeded the capture limit.'
-              )}
+              {response.incomplete_reasons?.length
+                ? response.incomplete_reasons
+                    .map((reason) => incompleteReasonLabels[reason] ?? reason)
+                    .join(' · ')
+                : t(
+                    'Response metadata is partial because an event was unavailable or exceeded the capture limit.'
+                  )}
             </p>
           )}
           {truncated && (
@@ -716,9 +782,19 @@ export function RequestTraceDetails(props: {
         log={props.log}
         isAdmin={props.isAdmin}
       />
-      {props.query.isPending && props.log.request_id && (
-        <LoadingState className='min-h-0 py-4' />
-      )}
+      {(props.query.isPending || props.query.isTracePending) &&
+        props.log.request_id && (
+          <div role='status' aria-live='polite'>
+            <LoadingState
+              className='min-h-0 py-4'
+              message={
+                props.query.isTracePending
+                  ? t('Trace metadata is waiting to be written')
+                  : undefined
+              }
+            />
+          </div>
+        )}
       {props.query.isError && (
         <ErrorState
           title={t('Failed to load request trace')}
@@ -726,6 +802,24 @@ export function RequestTraceDetails(props: {
           className='min-h-0 py-4'
         />
       )}
+      {!props.query.isPending &&
+        !props.query.isTracePending &&
+        !props.query.isError &&
+        records.length === 0 &&
+        props.log.request_id && (
+          <div className='text-muted-foreground flex flex-wrap items-center gap-2 text-xs'>
+            <span>{t('No trace metadata is available for this request.')}</span>
+            <Button
+              type='button'
+              size='sm'
+              variant='ghost'
+              disabled={props.query.isFetching}
+              onClick={() => void props.query.refetch()}
+            >
+              {t('Refresh trace')}
+            </Button>
+          </div>
+        )}
       {previous.length > 0 && (
         <Collapsible className='min-w-0 space-y-2'>
           <CollapsibleTrigger className='group inline-flex cursor-pointer items-center gap-1 text-xs font-semibold'>

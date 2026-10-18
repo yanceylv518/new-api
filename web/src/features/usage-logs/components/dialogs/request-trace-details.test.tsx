@@ -265,6 +265,7 @@ describe('request trace log details', () => {
               content_chars: 0,
               reasoning_chars: 0,
               done: false,
+              end_marker_policy: 'required',
               usage_chunk: false,
               metadata_incomplete: true,
             },
@@ -398,6 +399,7 @@ describe('request trace log details', () => {
               chunks: 93,
               last_chunk_ms: 15120,
               done: false,
+              end_marker_policy: 'required',
               usage_chunk: false,
             },
           },
@@ -420,7 +422,9 @@ describe('request trace log details', () => {
     ).toBeInTheDocument()
     expect(screen.getByText(/First: 2.81 s/)).toBeInTheDocument()
     expect(screen.getByText(/Last: 15.12 s/)).toBeInTheDocument()
-    expect(screen.getByText('No')).toHaveClass('text-destructive')
+    expect(screen.getByText('End marker missing')).toHaveClass(
+      'text-destructive'
+    )
     expect(screen.getByText(/Usage event missing/)).toHaveClass(
       'text-destructive'
     )
@@ -516,5 +520,173 @@ describe('request trace log details', () => {
     await userEvent.click(trigger)
     expect(screen.getByText('first-attempt-id')).toBeVisible()
     expect(screen.getByText('overloaded')).toBeVisible()
+  })
+
+  test.each([
+    ['failed', 'failed', true, 'required', false, 'Failed'],
+    ['PROVIDER_UNKNOWN', 'unknown', false, 'required', false, 'Unknown'],
+    ['SAFETY', 'success', false, 'not_applicable', false, 'Refused'],
+    ['STOP', 'success', false, 'not_applicable', false, 'Normal completion'],
+  ] as const)(
+    'classifies %s without inventing successful completion',
+    async (reason, outcome, error, policy, done, label) => {
+      vi.spyOn(api, 'get').mockResolvedValue(
+        response([
+          {
+            ...detailed,
+            trace: { ...summary.trace, finish_reason: reason, outcome },
+            admin_info: {
+              ...detailed.admin_info,
+              resp: {
+                ...detailed.admin_info.resp,
+                chunks: 2,
+                error,
+                done,
+                end_marker_policy: policy,
+              },
+            },
+          },
+        ])
+      )
+      renderDetails({ isAdmin: true, log: { ...log, is_stream: true } })
+      await screen.findByText(reason)
+      expect(screen.getAllByText(label).length).toBeGreaterThan(0)
+      if (label !== 'Normal completion') {
+        expect(screen.queryByText('Normal completion')).not.toBeInTheDocument()
+      }
+      if (policy === 'not_applicable') {
+        expect(
+          screen.getByText('This protocol has no separate end marker')
+        ).not.toHaveClass('text-destructive')
+        expect(screen.queryByText('[DONE]')).not.toBeInTheDocument()
+      }
+    }
+  )
+
+  test('shows an actual end marker and keeps legacy received markers distinct', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...detailed,
+          admin_info: {
+            ...detailed.admin_info,
+            resp: {
+              ...detailed.admin_info.resp,
+              chunks: 3,
+              done: true,
+              end_marker: '[DONE]',
+              end_marker_policy: 'required',
+            },
+          },
+        },
+      ])
+    )
+    renderDetails({ isAdmin: true, log: { ...log, is_stream: true } })
+    expect(await screen.findByText('[DONE]')).toBeInTheDocument()
+    expect(
+      screen.queryByText('End marker received (type not recorded)')
+    ).not.toBeInTheDocument()
+  })
+
+  test('uses per-attempt durations instead of duplicating request elapsed time', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...detailed,
+          trace: { ...summary.trace, ms: 5000, status: 502 },
+          admin_info: {
+            ...detailed.admin_info,
+            upstream: { ...detailed.admin_info.upstream, ms: 11 },
+          },
+        },
+        {
+          ...detailed,
+          attempt: 1,
+          trace: { ...summary.trace, ms: 5000 },
+          admin_info: {
+            ...detailed.admin_info,
+            upstream: { ...detailed.admin_info.upstream, ms: 22 },
+          },
+        },
+      ])
+    )
+    renderDetails({ isAdmin: true })
+    expect(await screen.findByText('22 ms')).toBeVisible()
+    expect(screen.getByText('5.00 s')).toBeVisible()
+    expect(screen.queryByText('11 ms')).not.toBeInTheDocument()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Previous upstream attempts (1)' })
+    )
+    expect(screen.getByText('11 ms')).toBeVisible()
+    expect(screen.getAllByText('Attempt duration')).toHaveLength(2)
+  })
+
+  test('explains partial capture using the recorded reason codes', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...detailed,
+          admin_info: {
+            ...detailed.admin_info,
+            shape: undefined,
+            shape_incomplete: true,
+            shape_incomplete_reason: 'body_unavailable',
+            resp: {
+              ...detailed.admin_info.resp,
+              metadata_incomplete: true,
+              incomplete_reasons: ['invalid_json', 'tool_limit'],
+            },
+          },
+        },
+      ])
+    )
+    renderDetails({ isAdmin: true })
+    expect(
+      await screen.findByText('Request body unavailable for metadata')
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(/Metadata payload is not valid JSON/)
+    ).toHaveTextContent('Tool-call capture limit reached')
+  })
+
+  test('polls pending asynchronous metadata until the committed row is available', async () => {
+    vi.spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        ...response([]),
+        data: { success: true, data: [], pending: true },
+      })
+      .mockResolvedValueOnce(response([detailed]))
+    renderDetails({ isAdmin: true })
+    expect(
+      await screen.findByText('Trace metadata is waiting to be written')
+    ).toBeInTheDocument()
+    await waitFor(
+      () =>
+        expect(
+          screen.queryByText('Trace metadata is waiting to be written')
+        ).not.toBeInTheDocument(),
+      { timeout: 3000 }
+    )
+    expect(screen.getByText('15 ms')).toBeInTheDocument()
+    expect(api.get).toHaveBeenCalledTimes(2)
+  })
+
+  test('stops asynchronous metadata polling when the detail unmounts', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      ...response([]),
+      data: { success: true, data: [], pending: true },
+    })
+    const view = renderDetails({ isAdmin: true })
+    await screen.findByText('Trace metadata is waiting to be written')
+    vi.useFakeTimers()
+    try {
+      view.unmount()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(api.get).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

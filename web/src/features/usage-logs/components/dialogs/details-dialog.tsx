@@ -513,7 +513,8 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
   const showTiming = isTimingLogType(props.log.type)
   const traceQuery = useRequestTraces(
     props.log.request_id,
-    props.open && (props.log.type === 2 || props.log.type === 5)
+    props.open && (props.log.type === 2 || props.log.type === 5),
+    props.log.created_at
   )
   const finalTrace = traceQuery.data?.at(-1)
   const responseMilliseconds = finalTrace?.trace.ms

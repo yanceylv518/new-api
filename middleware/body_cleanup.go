@@ -18,7 +18,7 @@ func BodyStorageCleanup() gin.HandlerFunc {
 				}
 				detailed := trace.Config.Level == "all" || trace.Failed || c.Writer.Status() >= 400
 				for _, attempt := range trace.Attempts {
-					if attempt.Failed || attempt.Upstream.Status >= 400 || attempt.Upstream.ErrorType != "" {
+					if attempt.Diagnostic || attempt.Failed || attempt.Upstream.Status >= 400 || attempt.Upstream.ErrorType != "" {
 						detailed = true
 					}
 					if attempt.Observer != nil {

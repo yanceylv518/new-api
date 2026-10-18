@@ -238,6 +238,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		default:
 			newAPIError = relayHandler(c, relayInfo)
 		}
+		if trace := common.GetRequestTrace(c); trace != nil {
+			trace.FinishAttempt(relayInfo.RetryIndex)
+		}
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
