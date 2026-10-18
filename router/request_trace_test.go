@@ -528,7 +528,7 @@ func TestRequestTraceDetailAuthorizationAndLegacyLogs(t *testing.T) {
 	require.NoError(t, db.Create(&model.Log{UserId: 11, Type: model.LogTypeConsume, RequestId: "legacy-id", CreatedAt: 4, Other: legacyOther}).Error)
 	var traceQueries int
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("trace-list-query-count", func(tx *gorm.DB) {
-		if tx.Statement.Table == "request_traces" {
+		if tx.Statement.Table == "request_trace_metadata" {
 			traceQueries++
 		}
 	}))
@@ -624,7 +624,7 @@ func TestRequestTraceWriteFailurePreservesForwardedResponse(t *testing.T) {
 	db := setupRequestTraceDatabase(t)
 	require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all"}`))
 	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("trace-persistence-failure", func(tx *gorm.DB) {
-		if tx.Statement.Table == "request_traces" {
+		if tx.Statement.Table == "request_trace_metadata" {
 			tx.AddError(errors.New("mock persistence failure"))
 		}
 	}))

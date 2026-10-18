@@ -19,6 +19,10 @@ type RequestTrace struct {
 	Data      string `gorm:"type:text"`
 }
 
+func (RequestTrace) TableName() string {
+	return "request_trace_metadata"
+}
+
 type RequestTraceView struct {
 	RequestId string `json:"request_id"`
 	Attempt   int    `json:"attempt"`
@@ -56,7 +60,7 @@ func RecordRequestTraces(ctx context.Context, rows []RequestTrace) error {
 func GetRequestTraces(ctx context.Context, requestId string, userId int, admin bool) ([]RequestTraceView, error) {
 	tx := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("request_id = ?", requestId)
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		tx = LOG_DB.WithContext(ctx).Table("request_traces FINAL").Where("request_id = ?", requestId)
+		tx = LOG_DB.WithContext(ctx).Table("request_trace_metadata FINAL").Where("request_id = ?", requestId)
 	}
 	if !admin {
 		tx = tx.Where("user_id = ?", userId)
@@ -97,7 +101,7 @@ func DeleteOldRequestTraces(ctx context.Context, timestamp int64, limit int) (in
 		if count == 0 {
 			return 0, nil
 		}
-		return count, LOG_DB.WithContext(ctx).Exec("ALTER TABLE request_traces DELETE WHERE created_at < ? SETTINGS mutations_sync = 1", timestamp).Error
+		return count, LOG_DB.WithContext(ctx).Exec("ALTER TABLE request_trace_metadata DELETE WHERE created_at < ? SETTINGS mutations_sync = 1", timestamp).Error
 	}
 	var ids []int64
 	if err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("created_at < ?", timestamp).Order("id").Limit(limit).Pluck("id", &ids).Error; err != nil {
@@ -110,12 +114,35 @@ func DeleteOldRequestTraces(ctx context.Context, timestamp int64, limit int) (in
 	return result.RowsAffected, result.Error
 }
 
+func migrateRequestTraceTableName(db *gorm.DB) error {
+	migrator := db.Migrator()
+	if !migrator.HasTable("request_traces") {
+		return nil
+	}
+	if migrator.HasTable(&RequestTrace{}) {
+		return fmt.Errorf("both request_traces and request_trace_metadata exist; resolve the table conflict before migration")
+	}
+	var err error
+	if db.Dialector.Name() == "clickhouse" {
+		err = db.Exec("RENAME TABLE request_traces TO request_trace_metadata").Error
+	} else {
+		err = migrator.RenameTable("request_traces", &RequestTrace{})
+	}
+	if err != nil {
+		return fmt.Errorf("rename request_traces to request_trace_metadata: %w", err)
+	}
+	return nil
+}
+
 func migrateRequestTraces() error {
+	if err := migrateRequestTraceTableName(LOG_DB); err != nil {
+		return err
+	}
 	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return LOG_DB.AutoMigrate(&RequestTrace{})
 	}
 	ttlDays := clickHouseLogTTLDays()
-	statement := `CREATE TABLE IF NOT EXISTS request_traces (
+	statement := `CREATE TABLE IF NOT EXISTS request_trace_metadata (
 		id Int64 DEFAULT 0, request_id String, attempt Int32, user_id Int32,
 		created_at UInt64, data String
 	) ENGINE = ReplacingMergeTree(created_at) ORDER BY (request_id, attempt)` + clickHouseLogTTLClause(ttlDays)
@@ -123,14 +150,14 @@ func migrateRequestTraces() error {
 		return err
 	}
 	if ttlDays > 0 {
-		return LOG_DB.Exec("ALTER TABLE request_traces MODIFY TTL " + clickHouseLogTTLExpression(ttlDays)).Error
+		return LOG_DB.Exec("ALTER TABLE request_trace_metadata MODIFY TTL " + clickHouseLogTTLExpression(ttlDays)).Error
 	}
 	var definition string
-	if err := LOG_DB.Raw("SHOW CREATE TABLE request_traces").Scan(&definition).Error; err != nil {
+	if err := LOG_DB.Raw("SHOW CREATE TABLE request_trace_metadata").Scan(&definition).Error; err != nil {
 		return err
 	}
 	if strings.Contains(definition, "TTL ") {
-		return LOG_DB.Exec("ALTER TABLE request_traces REMOVE TTL").Error
+		return LOG_DB.Exec("ALTER TABLE request_trace_metadata REMOVE TTL").Error
 	}
 	return nil
 }

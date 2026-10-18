@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/internal/requesttracetest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,7 +17,9 @@ import (
 
 func TestRequestTraceDatabaseMatrix(t *testing.T) {
 	cases := []struct{ name, dsn string }{{"sqlite", "local"}}
-	if os.Getenv("REQUEST_TRACE_EXTERNAL_TESTS") == "1" {
+	if os.Getenv("REQUEST_TRACE_TEST_DSN") != "" {
+		cases = []struct{ name, dsn string }{{"mysql", requesttracetest.MySQLDSN(t)}}
+	} else if os.Getenv("REQUEST_TRACE_EXTERNAL_TESTS") == "1" {
 		cases = append(cases, struct{ name, dsn string }{"mysql", "root@tcp(127.0.0.1:13327)/request_trace_review?charset=utf8mb4&parseTime=true&timeout=5s"}, struct{ name, dsn string }{"postgres", "postgres://postgres@127.0.0.1:15428/request_trace_review?sslmode=disable&connect_timeout=5"}, struct{ name, dsn string }{"clickhouse", "clickhouse://default@127.0.0.1:19000/request_trace_review?dial_timeout=5s"})
 	}
 	for _, tc := range cases {
@@ -39,7 +43,7 @@ func TestRequestTraceDatabaseMatrix(t *testing.T) {
 				if dbType != common.DatabaseTypeClickHouse {
 					assert.NoError(t, db.Migrator().DropTable(&RequestTrace{}, &Log{}, &AuditLog{}))
 				} else {
-					for _, table := range []string{"request_traces", "logs", "audit_logs"} {
+					for _, table := range []string{"request_trace_metadata", "logs", "audit_logs"} {
 						assert.NoError(t, db.Exec("DROP TABLE IF EXISTS "+table).Error)
 					}
 				}
@@ -60,13 +64,32 @@ func TestRequestTraceDatabaseMatrix(t *testing.T) {
 			for range 2 {
 				require.NoError(t, migrateRequestTraces())
 			}
+			if dbType == common.DatabaseTypeMySQL {
+				metadata := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 201}, AdminInfo: &common.RequestTraceAdmin{Client: common.RequestTraceClient{UserAgent: strings.Repeat("migration-metadata", 64)}}})
+				require.NoError(t, RecordRequestTraces(t.Context(), []RequestTrace{{RequestId: "rename-preserved", UserId: 11, CreatedAt: 100, Data: metadata}}))
+				var before RequestTrace
+				require.NoError(t, db.Where("request_id = ?", "rename-preserved").First(&before).Error)
+				require.NoError(t, db.Migrator().RenameTable(&RequestTrace{}, "request_traces"))
+				for range 2 {
+					require.NoError(t, migrateRequestTraces())
+				}
+				var after RequestTrace
+				require.NoError(t, db.Where("request_id = ?", "rename-preserved").First(&after).Error)
+				assert.Equal(t, before, after)
+				assert.False(t, db.Migrator().HasTable("request_traces"))
+				require.NoError(t, db.Exec("CREATE TABLE request_traces LIKE request_trace_metadata").Error)
+				assert.Error(t, migrateRequestTraces())
+				require.NoError(t, db.Where("request_id = ?", "rename-preserved").First(&after).Error)
+				assert.Equal(t, before, after)
+				require.NoError(t, db.Migrator().DropTable("request_traces"))
+			}
 			if dbType != common.DatabaseTypeClickHouse {
 				require.True(t, db.Migrator().HasIndex(&RequestTrace{}, "idx_request_trace_attempt"))
 				require.True(t, db.Migrator().HasIndex(&RequestTrace{}, "idx_request_traces_created_at"))
 				require.NoError(t, db.Migrator().DropTable(&RequestTrace{}))
 				require.NoError(t, db.AutoMigrate(&Log{}))
 			} else {
-				require.NoError(t, db.Exec("DROP TABLE request_traces").Error)
+				require.NoError(t, db.Exec("DROP TABLE request_trace_metadata").Error)
 				require.NoError(t, migrateClickHouseLogDB())
 			}
 			legacyOther := `{"model_price":0.01,"admin_info":{"use_channel":["7"]}}`
@@ -124,11 +147,11 @@ func TestRequestTraceDatabaseMatrix(t *testing.T) {
 				t.Setenv("LOG_SQL_CLICKHOUSE_TTL_DAYS", "7")
 				require.NoError(t, migrateRequestTraces())
 				var definition string
-				require.NoError(t, db.Raw("SHOW CREATE TABLE request_traces").Scan(&definition).Error)
+				require.NoError(t, db.Raw("SHOW CREATE TABLE request_trace_metadata").Scan(&definition).Error)
 				assert.Contains(t, definition, "TTL")
 				t.Setenv("LOG_SQL_CLICKHOUSE_TTL_DAYS", "0")
 				require.NoError(t, migrateRequestTraces())
-				require.NoError(t, db.Raw("SHOW CREATE TABLE request_traces").Scan(&definition).Error)
+				require.NoError(t, db.Raw("SHOW CREATE TABLE request_trace_metadata").Scan(&definition).Error)
 				assert.NotContains(t, definition, "TTL ")
 			}
 		})
