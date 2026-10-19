@@ -430,6 +430,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		responseBody = claudeRespStr
 	case types.RelayFormatGemini:
+		common.ReuseUpstreamRequestTrace(c, resp)
 		break
 	}
 

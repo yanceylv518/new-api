@@ -17,11 +17,19 @@ import (
 )
 
 const TraceMetadataMaxBytes = 1 << 20
+const traceSummaryMaxBytes = 64 << 10
 const traceMaxKeys = 32
 const traceMaxToolCalls = 256
 const traceMaxToolNameBytes = 128
 const traceMaxCachedPayloads = 64
 const traceMaxCachedStrings = 256
+
+type TraceMetadataLevel string
+
+const (
+	TraceMetadataSummary TraceMetadataLevel = "summary"
+	TraceMetadataFull    TraceMetadataLevel = "full"
+)
 
 var errTraceRequestTooLarge = errors.New("request trace shape exceeds capture limit")
 var errTraceRequestInvalidJSON = errors.New("request trace shape is not valid JSON")
@@ -51,11 +59,6 @@ const (
 	traceFieldErrorType
 	traceFieldErrorCode
 )
-
-type tracePayloadKey struct {
-	digest [sha256.Size]byte
-	stream bool
-}
 
 type traceToolCall struct {
 	key         string
@@ -105,13 +108,36 @@ type tracePayloadMetadata struct {
 	errorEvent    bool
 	messageObject bool
 	tools         []traceToolCall
-	bytes         int
 }
 
 type tracePayloadParser struct {
 	tracePayloadMetadata
 	stream  bool
-	parsing *tracePayloadCache
+	summary bool
+	parsing *traceParseWorkspace
+}
+
+type traceParseWorkspace struct {
+	sync.Mutex
+	shared   bool
+	payloads map[tracePayloadKey]*traceCachedPayload
+	order    []tracePayloadKey
+	head     int
+	count    int
+	bytes    int
+	strings  map[traceStringKey]string
+	lastKeys [traceKeyLayerCount]*tracePayloadKeys
+	parser   tracePayloadParser
+}
+
+type tracePayloadKey struct {
+	digest [sha256.Size]byte
+	stream bool
+}
+
+type traceCachedPayload struct {
+	metadata tracePayloadMetadata
+	bytes    int
 }
 
 type traceStringKey struct {
@@ -119,63 +145,56 @@ type traceStringKey struct {
 	limit int
 }
 
-type tracePayloadCache struct {
-	sync.Mutex
-	payloads map[tracePayloadKey]*tracePayloadMetadata
-	order    []tracePayloadKey
-	bytes    int
-	strings  map[traceStringKey]string
-	lastKeys [traceKeyLayerCount]*tracePayloadKeys
-	parser   tracePayloadParser
-}
-
-func (cache *tracePayloadCache) metadataString(value string, limit int) string {
+func (workspace *traceParseWorkspace) metadataString(value string, limit int) string {
 	if value == "" {
 		return ""
 	}
 	key := traceStringKey{value: value, limit: limit}
-	if cached, exists := cache.strings[key]; exists {
-		return cached
+	if cleaned, found := workspace.strings[key]; found {
+		return cleaned
 	}
 	cleaned := strings.Clone(TraceMetadataString(value, limit))
-	if len(value) <= 256 && len(cache.strings) < traceMaxCachedStrings {
-		if cache.strings == nil {
-			cache.strings = make(map[traceStringKey]string)
+	if len(value) <= 256 && len(workspace.strings) < traceMaxCachedStrings {
+		if workspace.strings == nil {
+			workspace.strings = make(map[traceStringKey]string)
 		}
 		key.value = strings.Clone(value)
-		cache.strings[key] = cleaned
+		workspace.strings[key] = cleaned
 	}
 	return cleaned
 }
 
-func (cache *tracePayloadCache) parse(data []byte, stream, reuseOnly bool) tracePayloadMetadata {
-	key := tracePayloadKey{digest: sha256.Sum256(data), stream: stream}
-	cache.Lock()
-	defer cache.Unlock()
-	if metadata, exists := cache.payloads[key]; exists {
-		return *metadata
+func (workspace *traceParseWorkspace) parse(data []byte, stream, summary, store bool) tracePayloadMetadata {
+	workspace.Lock()
+	defer workspace.Unlock()
+	var key tracePayloadKey
+	if workspace.shared && !summary {
+		key = tracePayloadKey{digest: sha256.Sum256(data), stream: stream}
+		if cached, found := workspace.payloads[key]; found {
+			return cached.metadata
+		}
 	}
-	// 工作区由请求内缓存锁串行使用；事件结果不引用下一次解析会改写的状态。
-	parser := &cache.parser
-	*parser = tracePayloadParser{stream: stream, parsing: cache}
+	// 请求内只复用解析元数据；摘要事件不计算哈希，不保留事件正文。
+	parser := &workspace.parser
+	*parser = tracePayloadParser{stream: stream, summary: summary, parsing: workspace}
 	parser.parsePayload(data)
 	metadata := parser.tracePayloadMetadata
-	metadata.bytes = len(data)
-	if !reuseOnly && len(data) <= TraceMetadataMaxBytes {
-		if cache.payloads == nil {
-			cache.payloads = make(map[tracePayloadKey]*tracePayloadMetadata)
+	if workspace.shared && !summary && store && len(data) <= TraceMetadataMaxBytes {
+		if workspace.payloads == nil {
+			workspace.payloads = make(map[tracePayloadKey]*traceCachedPayload)
+			workspace.order = make([]tracePayloadKey, traceMaxCachedPayloads)
 		}
-		for len(cache.order) > 0 && (len(cache.order) >= traceMaxCachedPayloads || cache.bytes+len(data) > TraceMetadataMaxBytes) {
-			oldest := cache.order[0]
-			cache.bytes -= cache.payloads[oldest].bytes
-			delete(cache.payloads, oldest)
-			cache.order = cache.order[1:]
+		for workspace.count > 0 && (workspace.count == traceMaxCachedPayloads || workspace.bytes+len(data) > TraceMetadataMaxBytes) {
+			oldest := workspace.order[workspace.head]
+			workspace.bytes -= workspace.payloads[oldest].bytes
+			delete(workspace.payloads, oldest)
+			workspace.head = (workspace.head + 1) % traceMaxCachedPayloads
+			workspace.count--
 		}
-		stored := new(tracePayloadMetadata)
-		*stored = metadata
-		cache.payloads[key] = stored
-		cache.order = append(cache.order, key)
-		cache.bytes += len(data)
+		workspace.payloads[key] = &traceCachedPayload{metadata: metadata, bytes: len(data)}
+		workspace.order[(workspace.head+workspace.count)%traceMaxCachedPayloads] = key
+		workspace.count++
+		workspace.bytes += len(data)
 	}
 	return metadata
 }
@@ -321,32 +340,165 @@ func traceCountRequestContent(value gjson.Result, shape *RequestTraceShape, dept
 // 解析缓冲只在请求处理中存在；超限时丢弃缓冲并标记统计不完整，落库结构没有正文字段。
 type TraceBodyObserver struct {
 	sync.Mutex
-	started      time.Time
-	buffer       []byte
-	event        []byte
-	stream       bool
-	finished     bool
-	finishedAt   time.Time
-	skippingLine bool
-	bytes        int64
-	response     RequestTraceResponse
-	upstream     RequestTraceUpstream
-	finishReason *string
-	toolCalls    map[string]traceToolCall
-	cache        *tracePayloadCache
-	reuseOnly    bool
+	started       time.Time
+	buffer        []byte
+	event         []byte
+	stream        bool
+	finished      bool
+	finishedAt    time.Time
+	skippingLine  bool
+	bytes         int64
+	response      RequestTraceResponse
+	upstream      RequestTraceUpstream
+	finishReason  *string
+	toolCalls     map[string]traceToolCall
+	workspace     *traceParseWorkspace
+	cachePayloads bool
+	level         TraceMetadataLevel
+	summaryEvents int64
+	source        *TraceBodyObserver
 }
 
 func NewTraceBodyObserver(started time.Time) *TraceBodyObserver {
-	return &TraceBodyObserver{started: started, cache: &tracePayloadCache{}}
+	return NewTraceBodyObserverWithMode(started, TraceMetadataFull)
 }
 
-// 同一请求的采集器共享有界事件摘要，分别累计转换前后及重试统计；缓存不保留正文。
+func NewTraceBodyObserverWithMode(started time.Time, level TraceMetadataLevel) *TraceBodyObserver {
+	return &TraceBodyObserver{started: started, level: level}
+}
+
 func (o *TraceBodyObserver) NewRelatedObserver() *TraceBodyObserver {
 	o.Lock()
 	defer o.Unlock()
-	o.reuseOnly = true
-	return &TraceBodyObserver{started: o.started, cache: o.cache}
+	return o.relatedObserver(o.level)
+}
+
+func (o *TraceBodyObserver) NewRelatedObserverWithMode(level TraceMetadataLevel) *TraceBodyObserver {
+	o.Lock()
+	defer o.Unlock()
+	return o.relatedObserver(level)
+}
+
+func (o *TraceBodyObserver) relatedObserver(level TraceMetadataLevel) *TraceBodyObserver {
+	if o.workspace == nil {
+		o.workspace = &traceParseWorkspace{}
+	}
+	o.workspace.Lock()
+	o.workspace.shared = true
+	o.workspace.Unlock()
+	observer := NewTraceBodyObserverWithMode(o.started, level)
+	observer.workspace, observer.cachePayloads = o.workspace, true
+	return observer
+}
+
+func (o *TraceBodyObserver) Prepare(contentType string, contentLength int64) {
+	o.Lock()
+	defer o.Unlock()
+	if contentType != "" {
+		o.response.ContentType = TraceMetadataString(contentType, 128)
+		o.stream = strings.Contains(contentType, "text/event-stream")
+	}
+	if !o.stream && contentLength > 0 && o.source == nil {
+		limit := o.bufferLimit()
+		if contentLength > int64(limit) {
+			o.markIncomplete("size_limit")
+			return
+		}
+		o.buffer = make([]byte, 0, int(contentLength))
+	}
+}
+
+func (o *TraceBodyObserver) MetadataLevel() TraceMetadataLevel {
+	o.Lock()
+	source, level := o.source, o.level
+	o.Unlock()
+	if source != nil {
+		return source.MetadataLevel()
+	}
+	return level
+}
+
+func (o *TraceBodyObserver) PromoteToFull() {
+	o.Lock()
+	defer o.Unlock()
+	o.promoteToFull()
+}
+
+func (o *TraceBodyObserver) promoteToFull() {
+	if o.level == TraceMetadataFull {
+		return
+	}
+	if o.summaryEvents > 0 {
+		// 升级前没有保存正文，不能补算已略过事件的字符和工具数量。
+		o.markIncomplete("capture_upgraded")
+	}
+	o.level = TraceMetadataFull
+}
+
+func (o *TraceBodyObserver) ReuseUpstream(source *TraceBodyObserver) {
+	if source == nil || source == o {
+		return
+	}
+	source.Lock()
+	workspace := source.workspace
+	source.Unlock()
+	o.Lock()
+	defer o.Unlock()
+	if !o.finished && o.response.Chunks == 0 && len(o.buffer) == 0 && len(o.event) == 0 {
+		o.source = source
+		if workspace != nil && workspace == o.workspace {
+			workspace.Lock()
+			workspace.shared = false
+			workspace.payloads, workspace.order = nil, nil
+			workspace.head, workspace.count, workspace.bytes = 0, 0, 0
+			workspace.Unlock()
+		}
+	}
+}
+
+func (o *TraceBodyObserver) DeliveryFailed() {
+	o.Lock()
+	defer o.Unlock()
+	o.response.Error = true
+	o.markIncomplete("client_delivery_incomplete")
+}
+
+func (o *TraceBodyObserver) ObserveClientError() {
+	o.Lock()
+	defer o.Unlock()
+	if o.source != nil {
+		o.source = nil
+		if o.bytes > 0 {
+			o.markIncomplete("capture_upgraded")
+		}
+	}
+	o.promoteToFull()
+	o.response.Error = true
+}
+
+func (o *TraceBodyObserver) readFailed() {
+	o.Lock()
+	defer o.Unlock()
+	o.promoteToFull()
+	o.response.Error = true
+	o.markIncomplete("upstream_read_error")
+}
+
+func (o *TraceBodyObserver) bufferLimit() int {
+	if !o.stream && o.level == TraceMetadataSummary {
+		return traceSummaryMaxBytes
+	}
+	return TraceMetadataMaxBytes
+}
+
+func (o *TraceBodyObserver) appendBuffer(data []byte) {
+	if capacity := len(o.buffer) + len(data); capacity > cap(o.buffer) {
+		capacity = min(o.bufferLimit(), max(capacity, max(4096, cap(o.buffer)*2)))
+		grown := make([]byte, len(o.buffer), capacity)
+		copy(grown, o.buffer)
+		o.buffer = grown
+	}
+	o.buffer = append(o.buffer, data...)
 }
 
 func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
@@ -356,7 +508,28 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 		return
 	}
 	o.bytes += int64(len(data))
-	if o.response.ContentType != contentType {
+	o.observe(data, contentType)
+}
+
+func (o *TraceBodyObserver) ObserveString(data string, contentType string) {
+	o.Lock()
+	defer o.Unlock()
+	if o.finished {
+		return
+	}
+	o.bytes += int64(len(data))
+	if o.source != nil {
+		return
+	}
+	// 仅在本次调用内读取；缓冲区与保留的元数据均取得自己的拷贝。
+	o.observe(StringToByteSlice(data), contentType)
+}
+
+func (o *TraceBodyObserver) observe(data []byte, contentType string) {
+	if o.source != nil {
+		return
+	}
+	if o.response.ContentType == "" && contentType != "" {
 		o.response.ContentType = TraceMetadataString(contentType, 128)
 		o.stream = strings.Contains(contentType, "text/event-stream")
 	}
@@ -364,12 +537,12 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 		if o.response.MetadataIncomplete {
 			return
 		}
-		if len(o.buffer)+len(data) > TraceMetadataMaxBytes {
+		if len(o.buffer)+len(data) > o.bufferLimit() {
 			o.buffer = nil
 			o.markIncomplete("size_limit")
 			return
 		}
-		o.buffer = append(o.buffer, data...)
+		o.appendBuffer(data)
 		return
 	}
 	for len(data) > 0 {
@@ -403,7 +576,7 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 				}
 				o.consumeLine(part)
 			} else {
-				o.buffer = append(o.buffer, part...)
+				o.appendBuffer(part)
 				if newline >= 0 {
 					o.consumeLine(o.buffer)
 				}
@@ -489,6 +662,25 @@ func (o *tracePayloadParser) markIncomplete(reason string) {
 
 func (o *TraceBodyObserver) Snapshot() (RequestTraceResponse, RequestTraceUpstream, *string) {
 	o.Lock()
+	if o.source != nil {
+		source, local := o.source, o.response
+		o.Unlock()
+		response, upstream, reason := source.Snapshot()
+		if local.ContentType != "" {
+			response.ContentType = local.ContentType
+		}
+		if local.Error {
+			response.Error, response.Done, response.EndMarker = true, false, ""
+		}
+		response.MetadataIncomplete = response.MetadataIncomplete || local.MetadataIncomplete
+		if len(local.IncompleteReasons) > 0 {
+			response.IncompleteReasons = append([]string(nil), response.IncompleteReasons...)
+		}
+		for _, item := range local.IncompleteReasons {
+			response.IncompleteReasons = traceIncompleteReason(response.IncompleteReasons, item)
+		}
+		return response, upstream, reason
+	}
 	defer o.Unlock()
 	response := o.response
 	for _, tool := range o.toolCalls {
@@ -516,18 +708,20 @@ func (o *TraceBodyObserver) Size() int64 {
 // HasError 读取已解析的错误状态；收尾时先 Finish，避免遗漏最后一个事件。
 func (o *TraceBodyObserver) HasError() bool {
 	o.Lock()
-	defer o.Unlock()
-	return o.response.Error
+	source, failed := o.source, o.response.Error
+	o.Unlock()
+	return failed || (source != nil && source.HasError())
 }
 
 func (o *TraceBodyObserver) HasIncompleteMetadata() bool {
 	o.Lock()
-	defer o.Unlock()
-	return o.response.MetadataIncomplete
+	source, incomplete := o.source, o.response.MetadataIncomplete
+	o.Unlock()
+	return incomplete || (source != nil && source.HasIncompleteMetadata())
 }
 
 func (o *tracePayloadParser) fieldNames(layer traceKeyLayer, value gjson.Result) {
-	if !value.IsObject() {
+	if o.summary || !value.IsObject() {
 		return
 	}
 	var keys []string
@@ -559,7 +753,7 @@ func (o *tracePayloadParser) fieldNames(layer traceKeyLayer, value gjson.Result)
 	if o.keys[layer] != nil && slices.Equal(keys, names[:count]) {
 		return
 	}
-	// 复用同层最近一次的相同字段列表，缓存事件与工作区都不修改该列表。
+	// 同层字段列表只读复用，不保留事件内容。
 	if last := o.parsing.lastKeys[layer]; last != nil && slices.Equal(last.names, names[:count]) {
 		o.keys[layer] = last
 		return
@@ -598,8 +792,78 @@ func (o *tracePayloadParser) toolIndex(value gjson.Result) string {
 	return ""
 }
 
+func traceSummaryNeedsParsing(data []byte) bool {
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return true
+	}
+	for index, value := range data {
+		if value != '"' {
+			continue
+		}
+		rest := data[index:]
+		var keyLength int
+		errorWord := false
+		switch {
+		case bytes.HasPrefix(rest, []byte(`"error"`)):
+			keyLength = len(`"error"`)
+			errorWord = true
+		case bytes.HasPrefix(rest, []byte(`"finish_reason"`)):
+			keyLength = len(`"finish_reason"`)
+		case bytes.HasPrefix(rest, []byte(`"finishReason"`)):
+			keyLength = len(`"finishReason"`)
+		case bytes.HasPrefix(rest, []byte(`"stop_reason"`)):
+			keyLength = len(`"stop_reason"`)
+		case bytes.HasPrefix(rest, []byte(`"usage"`)):
+			keyLength = len(`"usage"`)
+		case bytes.HasPrefix(rest, []byte(`"usageMetadata"`)):
+			keyLength = len(`"usageMetadata"`)
+		case bytes.HasPrefix(rest, []byte(`"message_stop"`)),
+			bytes.HasPrefix(rest, []byte(`"response.completed"`)),
+			bytes.HasPrefix(rest, []byte(`"response.done"`)),
+			bytes.HasPrefix(rest, []byte(`"response.failed"`)),
+			bytes.HasPrefix(rest, []byte(`"response.incomplete"`)):
+			return true
+		}
+		if keyLength == 0 {
+			continue
+		}
+		rest = bytes.TrimSpace(rest[keyLength:])
+		if len(rest) == 0 || rest[0] != ':' {
+			if errorWord {
+				return true
+			}
+			continue
+		}
+		rest = bytes.TrimSpace(rest[1:])
+		// 常见 Chat 流事件总带 finish_reason:null，不能因此逐事件解析。
+		if len(rest) > 0 && !bytes.HasPrefix(rest, []byte("null")) {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *TraceBodyObserver) consumePayload(data []byte) {
-	metadata := o.cache.parse(data, o.stream, o.reuseOnly)
+	summary := o.level == TraceMetadataSummary
+	if summary && o.stream && !traceSummaryNeedsParsing(data) {
+		o.summaryEvents++
+		o.response.Chunks++
+		o.response.LastChunkMilliseconds = time.Since(o.started).Milliseconds()
+		return
+	}
+	if o.workspace == nil {
+		o.workspace = &traceParseWorkspace{}
+	}
+	metadata := o.workspace.parse(data, o.stream, summary, o.cachePayloads)
+	if summary && (metadata.response.Error || metadata.response.EndMarker == "response.incomplete") {
+		o.promoteToFull()
+		metadata = o.workspace.parse(data, o.stream, false, o.cachePayloads)
+	} else if summary {
+		o.summaryEvents++
+	}
+	if summary && o.stream && metadata.response.Chunks == 0 && !bytes.Equal(data, []byte("[DONE]")) {
+		metadata.response.Chunks = 1
+	}
 	response := metadata.response
 	o.response.Error = o.response.Error || response.Error
 	o.response.ContentCharacters += response.ContentCharacters
@@ -739,6 +1003,10 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 		return
 	}
 	r := gjson.ParseBytes(data)
+	if o.summary {
+		o.parseSummary(r)
+		return
+	}
 	choices := r.Get("choices")
 	candidates := r.Get("candidates")
 	if o.stream {
@@ -1032,6 +1300,76 @@ func (o *tracePayloadParser) countContentBlock(block gjson.Result, key string) {
 	}
 }
 
+func (o *tracePayloadParser) parseSummary(value gjson.Result) {
+	root := value
+	if response := value.Get("response"); response.IsObject() {
+		root = response
+	} else if message := value.Get("message"); message.IsObject() {
+		root = message
+	}
+	kind := value.Get("type").String()
+	if o.stream {
+		o.response.Chunks = 1
+		if strings.HasPrefix(kind, "response.") || strings.HasPrefix(kind, "message_") || value.Get("choices").IsArray() {
+			o.response.EndMarkerPolicy = "required"
+		}
+	}
+	if problem := root.Get("error"); problem.IsObject() {
+		o.response.Error = true
+		o.upstream.ErrorType = o.parsing.metadataString(problem.Get("type").String(), 128)
+		if o.upstream.ErrorType == "" {
+			o.upstream.ErrorType = o.parsing.metadataString(problem.Get("status").String(), 128)
+		}
+		o.upstream.ErrorCode = o.parsing.metadataString(problem.Get("code").String(), 128)
+		o.fields |= traceFieldErrorType | traceFieldErrorCode
+	}
+	if kind == "error" || kind == "response.failed" || root.Get("status").String() == "failed" {
+		o.response.Error = true
+	}
+	setReason := func(reason gjson.Result) {
+		if reason.Type == gjson.String {
+			text := o.parsing.metadataString(reason.String(), 128)
+			o.finishReason = &text
+		}
+	}
+	value.Get("choices").ForEach(func(_, choice gjson.Result) bool {
+		setReason(choice.Get("finish_reason"))
+		return true
+	})
+	setReason(root.Get("stop_reason"))
+	setReason(value.Get("delta.stop_reason"))
+	if candidates := value.Get("candidates"); candidates.IsArray() {
+		o.response.EndMarkerPolicy = "not_applicable"
+		candidates.ForEach(func(_, candidate gjson.Result) bool {
+			setReason(candidate.Get("finishReason"))
+			return true
+		})
+	}
+	switch kind {
+	case "message_stop", "response.completed", "response.done", "response.failed", "response.incomplete":
+		o.response.Done = true
+		o.response.EndMarker = strings.Clone(kind)
+	}
+	if status := root.Get("status"); status.Type == gjson.String {
+		switch status.Str {
+		case "completed", "failed", "incomplete":
+			setReason(status)
+			if detail := root.Get("incomplete_details.reason"); detail.Type == gjson.String && detail.Str != "" {
+				reason := status.Str + ":" + o.parsing.metadataString(detail.Str, 128)
+				o.finishReason = &reason
+			}
+		}
+	}
+	if o.finishReason == nil && (kind == "response.failed" || kind == "response.incomplete") {
+		reason := strings.Clone(strings.TrimPrefix(kind, "response."))
+		o.finishReason = &reason
+	}
+	o.response.UsageChunk = root.Get("usage").IsObject() || value.Get("usageMetadata").IsObject()
+	if !o.stream {
+		o.response.Done = true
+	}
+}
+
 type TraceResponseBody struct {
 	io.ReadCloser
 	Observer    *TraceBodyObserver
@@ -1044,6 +1382,9 @@ func (body *TraceResponseBody) Read(data []byte) (int, error) {
 		body.Observer.Observe(data[:n], body.ContentType)
 	}
 	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			body.Observer.readFailed()
+		}
 		body.Observer.Finish()
 	}
 	return n, err

@@ -156,6 +156,65 @@ const detailed = {
 }
 
 describe('request trace log details', () => {
+  test('hides uncollected counts for summary metadata while preserving billing tokens', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...detailed,
+          admin_info: {
+            ...detailed.admin_info,
+            metadata_level: 'summary',
+            resp: {
+              ...detailed.admin_info.resp,
+              tool_calls: 2,
+              tool_calls_by_name: { search: 2 },
+              metadata_incomplete: true,
+            },
+          },
+        },
+      ])
+    )
+    renderDetails({ isAdmin: true, isRoot: true })
+    await screen.findByText('Finish reason')
+    expect(screen.queryByText('Body: 61 characters')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('Reasoning: 318 characters')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('region', { name: 'Tool calls' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('33 characters')).not.toBeInTheDocument()
+    expect(screen.getByText('Input Tokens')).toBeInTheDocument()
+    expect(screen.getByText('Output Tokens')).toBeInTheDocument()
+  })
+
+  test('hides partial tool counts after a late capture upgrade', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...detailed,
+          admin_info: {
+            ...detailed.admin_info,
+            metadata_level: 'full',
+            resp: {
+              ...detailed.admin_info.resp,
+              tool_calls: 2,
+              tool_calls_by_name: { search: 2 },
+              metadata_incomplete: true,
+              incomplete_reasons: ['capture_upgraded'],
+            },
+          },
+        },
+      ])
+    )
+    renderDetails({ isAdmin: true, isRoot: true })
+    await screen.findByText('Finish reason')
+    expect(
+      screen.queryByRole('region', { name: 'Tool calls' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('Body: 61 characters')).not.toBeInTheDocument()
+  })
+
   test('fetches only when a consume or error detail is open', async () => {
     const get = vi.spyOn(api, 'get').mockResolvedValue(response([summary]))
     const client = queryClient()

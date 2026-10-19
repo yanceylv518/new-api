@@ -2,8 +2,8 @@ package common
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -13,21 +13,19 @@ import (
 const requestTraceStoragePrefix = "zstd-base64-v1:"
 const requestTraceCompressionMinBytes = 256
 
-var requestTraceStorageEncoders = map[string]func() (*zstd.Encoder, error){
-	"fast":     requestTraceStorageEncoder(zstd.SpeedFastest),
-	"standard": requestTraceStorageEncoder(zstd.SpeedDefault),
-	"high":     requestTraceStorageEncoder(zstd.SpeedBetterCompression),
-	"best":     requestTraceStorageEncoder(zstd.SpeedBestCompression),
+type RequestTraceCompressor struct {
+	encoder *zstd.Encoder
+	level   string
+	buffer  []byte
 }
 
-func requestTraceStorageEncoder(level zstd.EncoderLevel) func() (*zstd.Encoder, error) {
-	return sync.OnceValues(func() (*zstd.Encoder, error) {
-		return zstd.NewWriter(nil,
-			zstd.WithEncoderLevel(level),
-			zstd.WithEncoderConcurrency(min(runtime.GOMAXPROCS(0), 4)),
-			zstd.WithWindowSize(TraceMetadataMaxBytes),
-		)
-	})
+func (c *RequestTraceCompressor) Close() error {
+	var err error
+	if c.encoder != nil {
+		err = c.encoder.Close()
+	}
+	c.encoder, c.buffer, c.level = nil, nil, ""
+	return err
 }
 
 var requestTraceStorageDecoder = sync.OnceValues(func() (*zstd.Decoder, error) {
@@ -37,30 +35,49 @@ var requestTraceStorageDecoder = sync.OnceValues(func() (*zstd.Decoder, error) {
 	)
 })
 
-func EncodeRequestTraceStorage(value string) (string, error) {
+func EncodeRequestTraceStorage(value string) (encoded string, err error) {
+	var compressor RequestTraceCompressor
+	defer func() { err = errors.Join(err, compressor.Close()) }()
+	return compressor.Encode(value)
+}
+
+// 压缩器只由一个写入 worker 使用，切换档位时释放旧编码器和缓冲。
+func (c *RequestTraceCompressor) Encode(value string) (string, error) {
 	if len(value) > TraceMetadataMaxBytes {
 		return "", fmt.Errorf("request trace metadata exceeds %d bytes", TraceMetadataMaxBytes)
 	}
 	requestTraceConfig.RLock()
 	level := requestTraceConfig.value.CompressionLevel
 	requestTraceConfig.RUnlock()
-	createEncoder, ok := requestTraceStorageEncoders[level]
-	if !ok {
+	if level != "fast" && level != "standard" {
 		return "", fmt.Errorf("invalid request trace compression level")
 	}
-	// 小摘要省去压缩；读取端兼容无前缀 JSON，四档设置仍用于较大的记录。
+	if c.level != level {
+		if err := c.Close(); err != nil {
+			return "", err
+		}
+		c.level = level
+	}
+	// 小摘要保留原 JSON，避免初始化压缩器。
 	if len(value) < requestTraceCompressionMinBytes {
 		return value, nil
 	}
-	encoder, err := createEncoder()
-	if err != nil {
-		return "", fmt.Errorf("initialize request trace compressor: %w", err)
+	if c.encoder == nil {
+		encoderLevel := zstd.SpeedFastest
+		if level == "standard" {
+			encoderLevel = zstd.SpeedDefault
+		}
+		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(encoderLevel), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(TraceMetadataMaxBytes))
+		if err != nil {
+			return "", fmt.Errorf("initialize request trace compressor: %w", err)
+		}
+		c.encoder = encoder
 	}
-	compressed := encoder.EncodeAll([]byte(value), nil)
-	if len(requestTraceStoragePrefix)+base64.StdEncoding.EncodedLen(len(compressed)) >= len(value) {
+	c.buffer = c.encoder.EncodeAll([]byte(value), c.buffer[:0])
+	if len(requestTraceStoragePrefix)+base64.StdEncoding.EncodedLen(len(c.buffer)) >= len(value) {
 		return value, nil
 	}
-	return requestTraceStoragePrefix + base64.StdEncoding.EncodeToString(compressed), nil
+	return requestTraceStoragePrefix + base64.StdEncoding.EncodeToString(c.buffer), nil
 }
 
 func DecodeRequestTraceStorage(value string) (string, error) {

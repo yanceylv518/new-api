@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -13,13 +14,29 @@ import (
 
 type traceResponseWriter struct {
 	gin.ResponseWriter
-	observer *common.TraceBodyObserver
+	observer       *common.TraceBodyObserver
+	contentType    string
+	contentTypeSet bool
+}
+
+func (w *traceResponseWriter) prepare() {
+	if !w.contentTypeSet {
+		w.contentType = w.Header().Get("Content-Type")
+		w.contentTypeSet = true
+	}
+	if w.Status() >= 400 {
+		w.observer.PromoteToFull()
+	}
 }
 
 func (w *traceResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	if n > 0 {
-		w.observer.Observe(data[:n], w.Header().Get("Content-Type"))
+		w.prepare()
+		w.observer.Observe(data[:n], w.contentType)
+	}
+	if err != nil {
+		w.observer.DeliveryFailed()
 	}
 	return n, err
 }
@@ -27,7 +44,11 @@ func (w *traceResponseWriter) Write(data []byte) (int, error) {
 func (w *traceResponseWriter) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
 	if n > 0 {
-		w.observer.Observe([]byte(data[:n]), w.Header().Get("Content-Type"))
+		w.prepare()
+		w.observer.ObserveString(data[:n], w.contentType)
+	}
+	if err != nil {
+		w.observer.DeliveryFailed()
 	}
 	return n, err
 }
@@ -41,7 +62,7 @@ func RequestTrace() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		trace := &common.RequestTraceCollector{Config: config, Started: time.Now(), Stage: "auth", Client: common.RequestTraceClient{
+		trace := &common.RequestTraceCollector{Config: config, SampledSuccess: config.SampleSuccess(c.GetString(common.RequestIdKey)), Started: time.Now(), Stage: "auth", Client: common.RequestTraceClient{
 			UserAgent: common.TraceMetadataString(c.Request.UserAgent(), 256), ContentType: common.TraceMetadataString(c.GetHeader("Content-Type"), 128), AnthropicVersion: common.TraceMetadataString(c.GetHeader("anthropic-version"), 64),
 		}}
 		if c.Request.ContentLength >= 0 {
@@ -49,7 +70,7 @@ func RequestTrace() gin.HandlerFunc {
 			trace.Client.WireBytes = &size
 		}
 		c.Set(common.RequestTraceContextKey, trace)
-		observer := common.NewTraceBodyObserver(trace.Started)
+		observer := common.NewTraceBodyObserverWithMode(trace.Started, trace.ResponseMetadataLevel(0, 0))
 		trace.ClientObserver = observer
 		original := c.Writer
 		c.Writer = &traceResponseWriter{ResponseWriter: original, observer: observer}
@@ -72,15 +93,19 @@ func RequestTrace() gin.HandlerFunc {
 		if !failed && !common.LogConsumeEnabled {
 			return
 		}
-		keep := failed || config.SampleSuccess(c.GetString(common.RequestIdKey))
+		keep := failed || trace.SampledSuccess
+		priority := failed
 		partial := response.MetadataIncomplete || trace.ShapeIncomplete
 		for _, attempt := range trace.Attempts {
 			if attempt.Diagnostic || attempt.Failed || attempt.Upstream.Status >= 400 || attempt.Upstream.ErrorType != "" {
 				keep = true
+				priority = true
 			}
 			if attempt.Observer != nil {
 				attempt.Observer.Finish()
-				keep = keep || attempt.Observer.HasError()
+				attemptFailed := attempt.Observer.HasError()
+				keep = keep || attemptFailed
+				priority = priority || attemptFailed
 				partial = partial || attempt.Observer.HasIncompleteMetadata()
 			}
 		}
@@ -175,16 +200,26 @@ func RequestTrace() gin.HandlerFunc {
 				data.Trace.ClientErrorType = clientMetadata.ErrorType
 			}
 			if config.Level == "all" || attempt.Diagnostic || attemptFailed {
-				data.AdminInfo = &common.RequestTraceAdmin{ChannelID: attempt.ChannelID, Client: trace.Client, Shape: trace.Shape, Upstream: upstream, Response: attemptResponse, ShapeIncomplete: trace.ShapeIncomplete, ShapeIncompleteReason: trace.ShapeIncompleteReason}
+				level := observer.MetadataLevel()
+				if !last && attempt.Observer != nil {
+					level = attempt.Observer.MetadataLevel()
+				}
+				data.AdminInfo = &common.RequestTraceAdmin{MetadataLevel: level, ChannelID: attempt.ChannelID, Client: trace.Client, Shape: trace.Shape, Upstream: upstream, Response: attemptResponse, ShapeIncomplete: trace.ShapeIncomplete, ShapeIncompleteReason: trace.ShapeIncompleteReason}
+			} else {
+				data.AdminInfo = &common.RequestTraceAdmin{MetadataLevel: common.TraceMetadataSummary, ChannelID: attempt.ChannelID, Client: trace.Client, Upstream: upstream, Response: attemptResponse}
 			}
-			encoded, err := common.Marshal(data)
+			if data.AdminInfo.MetadataLevel == common.TraceMetadataSummary {
+				// 旧界面据此隐藏未采集的计数；实例不完整计数仍读取观察器的实际缺失状态。
+				data.AdminInfo.Response.MetadataIncomplete = true
+			}
+			encoded, err := common.MarshalRequestTraceStorageData(data)
 			if err != nil {
 				logger.LogError(c, "failed to encode request trace: "+err.Error())
 				continue
 			}
 			rows = append(rows, model.RequestTrace{RequestId: c.GetString(common.RequestIdKey), Attempt: attempt.Attempt, UserId: userId, CreatedAt: common.GetTimestamp(), Data: string(encoded)})
 		}
-		if err := model.SubmitRequestTraces(rows); err != nil {
+		if err := model.SubmitRequestTracesWithPriority(rows, priority); err != nil && !errors.Is(err, model.ErrRequestTraceDropped) {
 			logger.LogError(c, "failed to record request trace: "+err.Error())
 		}
 	}

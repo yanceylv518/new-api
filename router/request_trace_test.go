@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -23,9 +24,12 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -66,6 +70,9 @@ func setupRequestTraceDatabase(t testing.TB) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.RequestTrace{}, &model.Option{}, &model.AuditLog{}, &model.UserSession{}))
 	require.NoError(t, db.Create(&model.User{Id: 11, Username: "trace-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "trace-owner"}).Error)
 	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, model.StopRequestTraceWriter(ctx))
 		require.NoError(t, sqlDB.Close())
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.SetDatabaseTypes(previousMain, previousLog)
@@ -73,7 +80,13 @@ func setupRequestTraceDatabase(t testing.TB) *gorm.DB {
 		common.RedisEnabled, common.MemoryCacheEnabled, common.LogConsumeEnabled = previousRedis, previousMemory, previousConsume
 		require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(previousConfig)))
 	})
+	model.StartRequestTraceWriter()
 	return db
+}
+
+func awaitRequestTraceWrites(t *testing.T) {
+	t.Helper()
+	require.Eventually(t, func() bool { return model.GetRequestTraceWriterStats().QueuedRows == 0 }, 5*time.Second, 5*time.Millisecond)
 }
 
 func TestRequestTraceProtocolMetadata(t *testing.T) {
@@ -461,6 +474,7 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 			engine.ServeHTTP(recorder, request)
 			assert.Equal(t, tc.status, recorder.Code)
 			var rows []model.RequestTrace
+			awaitRequestTraceWrites(t)
 			require.NoError(t, db.Find(&rows).Error)
 			require.Len(t, rows, tc.rows)
 			if len(rows) == 0 {
@@ -477,7 +491,8 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 			require.NoError(t, common.UnmarshalJsonStr(decoded, &data))
 			assert.Equal(t, tc.status, data.Trace.Status)
 			assert.EqualValues(t, recorder.Body.Len(), data.Trace.ResponseBytes)
-			assert.Equal(t, tc.detailed, data.AdminInfo != nil)
+			require.NotNil(t, data.AdminInfo)
+			assert.Equal(t, tc.detailed, data.AdminInfo.Shape != nil)
 			if tc.detailed {
 				require.NotNil(t, data.AdminInfo.Shape)
 			}
@@ -623,6 +638,7 @@ func TestRequestTraceConcurrentHTTPPersistence(t *testing.T) {
 	}
 	wg.Wait()
 	var rows []model.RequestTrace
+	awaitRequestTraceWrites(t)
 	require.NoError(t, db.Find(&rows).Error)
 	require.Len(t, rows, 32)
 	ids := make(map[string]bool)
@@ -650,6 +666,7 @@ func TestRequestTraceWriteFailurePreservesForwardedResponse(t *testing.T) {
 	assert.Equal(t, 200, recorder.Code)
 	assert.Equal(t, payload, recorder.Body.String())
 	var count int64
+	awaitRequestTraceWrites(t)
 	require.NoError(t, db.Model(&model.RequestTrace{}).Count(&count).Error)
 	assert.Zero(t, count)
 }
@@ -704,6 +721,7 @@ func TestRequestTraceHTTPAttemptsAndStreamingErrors(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"private-input"}]}`)))
 			require.Equal(t, 200, recorder.Code)
+			awaitRequestTraceWrites(t)
 			rows, err := model.GetRequestTraces(t.Context(), recorder.Header().Get(common.RequestIdKey), 0, true)
 			require.NoError(t, err)
 			if streamedError {
@@ -718,7 +736,8 @@ func TestRequestTraceHTTPAttemptsAndStreamingErrors(t *testing.T) {
 				assert.Equal(t, "provider-first", rows[0].AdminInfo.Upstream.RequestID)
 				assert.Greater(t, rows[0].Trace.ResponseBytes, int64(0))
 				assert.Equal(t, 502, rows[0].Trace.Status)
-				assert.Nil(t, rows[1].AdminInfo)
+				require.NotNil(t, rows[1].AdminInfo)
+				assert.Equal(t, common.TraceMetadataSummary, rows[1].AdminInfo.MetadataLevel)
 			}
 			var stored []model.RequestTrace
 			require.NoError(t, db.Find(&stored).Error)
@@ -844,6 +863,7 @@ func TestRequestTraceUpstreamRequestIDHTTPPropagation(t *testing.T) {
 					require.NoError(t, db.Where("request_id = ?", requestID).First(&original).Error)
 					assert.Equal(t, tc.expected, original.UpstreamRequestId)
 					assert.Equal(t, `{"original":true}`, original.Other)
+					awaitRequestTraceWrites(t)
 					rows, err := model.GetRequestTraces(t.Context(), requestID, 0, true)
 					require.NoError(t, err)
 					if mode == "off" {
@@ -863,7 +883,9 @@ func TestRequestTraceUpstreamRequestIDHTTPPropagation(t *testing.T) {
 						require.NotNil(t, rows[len(rows)-1].AdminInfo)
 						assert.Equal(t, tc.expected, rows[len(rows)-1].AdminInfo.Upstream.RequestID)
 					} else {
-						assert.Nil(t, rows[len(rows)-1].AdminInfo)
+						require.NotNil(t, rows[len(rows)-1].AdminInfo)
+						assert.Equal(t, common.TraceMetadataSummary, rows[len(rows)-1].AdminInfo.MetadataLevel)
+						assert.Equal(t, tc.expected, rows[len(rows)-1].AdminInfo.Upstream.RequestID)
 					}
 				})
 			}
@@ -1048,11 +1070,13 @@ func TestRequestTraceSamplingAndDiagnostics(t *testing.T) {
 			})
 			recorder := httptest.NewRecorder()
 			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"private-sampling-input"}]}`)))
+			awaitRequestTraceWrites(t)
 			rows, err := model.GetRequestTraces(t.Context(), recorder.Header().Get(common.RequestIdKey), 0, true)
 			require.NoError(t, err)
 			require.Len(t, rows, len(tc.details))
 			for index, row := range rows {
-				assert.Equal(t, tc.details[index], row.AdminInfo != nil)
+				require.NotNil(t, row.AdminInfo)
+				assert.Equal(t, tc.details[index], row.AdminInfo.Shape != nil)
 				assert.GreaterOrEqual(t, row.Trace.Milliseconds, int64(5000))
 				if row.AdminInfo != nil {
 					require.NotNil(t, row.AdminInfo.Upstream.Milliseconds)
@@ -1084,6 +1108,93 @@ func TestRequestTraceSamplingAndDiagnostics(t *testing.T) {
 	}
 	assert.Greater(t, selected, 0)
 	assert.Less(t, selected, 100)
+}
+
+func TestRequestTracePriorityHTTPAdmission(t *testing.T) {
+	for _, kind := range []string{"failed", "diagnostic", "retry"} {
+		t.Run(kind, func(t *testing.T) {
+			db := setupRequestTraceDatabase(t)
+			config := common.RequestTraceConfig{Level: "errors", PreChannelErrors: true, SuccessSampleRate: 100}
+			if kind == "diagnostic" {
+				config.DiagnosticChannelIDs = []int{7}
+				config.DiagnosticExpiresAt = time.Now().Add(time.Hour).Unix()
+			}
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+			entered, released := make(chan struct{}, 1), make(chan struct{})
+			var once sync.Once
+			release := func() { once.Do(func() { close(released) }) }
+			t.Cleanup(release)
+			require.NoError(t, db.Callback().Create().Before("gorm:create").Register("trace-priority-gate", func(tx *gorm.DB) {
+				if tx.Statement.Table != (model.RequestTrace{}).TableName() {
+					return
+				}
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-released:
+				case <-tx.Statement.Context.Done():
+					tx.AddError(tx.Statement.Context.Err())
+				}
+			}))
+			filled := false
+			for start := 0; start < model.GetRequestTraceWriterStats().QueueRowLimit; start += 128 {
+				rows := make([]model.RequestTrace, 128)
+				for index := range rows {
+					rows[index] = model.RequestTrace{RequestId: fmt.Sprintf("regular-%d", start+index), UserId: 11, Data: `{"trace":{"status":200}}`}
+				}
+				err := model.SubmitRequestTraces(rows)
+				if errors.Is(err, model.ErrRequestTraceDropped) {
+					filled = true
+					break
+				}
+				require.NoError(t, err)
+			}
+			require.True(t, filled)
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("trace writer did not reach database boundary")
+			}
+			before := model.GetRequestTraceWriterStats()
+			app := gin.New()
+			app.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+			app.POST("/v1/chat/completions", func(c *gin.Context) {
+				c.Set("id", 11)
+				_, err := common.GetBodyStorage(c)
+				require.NoError(t, err)
+				trace := common.GetRequestTrace(c)
+				if kind == "diagnostic" {
+					trace.StartAttempt(0, 7, c.Request)
+				}
+				if kind == "retry" {
+					attempt := trace.StartAttempt(0, 7, c.Request)
+					attempt.Failed, attempt.Upstream.Status = true, 502
+					trace.StartAttempt(1, 7, c.Request).Upstream.Status = 200
+				}
+				if kind == "failed" {
+					c.Data(502, "application/json", []byte(`{"error":{"type":"upstream_error"}}`))
+				} else {
+					c.Data(200, "application/json", []byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+				}
+			})
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[]}`)))
+			requestID := recorder.Header().Get(common.RequestIdKey)
+			assert.True(t, model.HasPendingRequestTrace(requestID, 11, false))
+			assert.Equal(t, before.DroppedPriorityRows, model.GetRequestTraceWriterStats().DroppedPriorityRows)
+			release()
+			awaitRequestTraceWrites(t)
+			traces, err := model.GetRequestTraces(t.Context(), requestID, 0, true)
+			require.NoError(t, err)
+			expected := 1
+			if kind == "retry" {
+				expected = 2
+			}
+			assert.Len(t, traces, expected)
+		})
+	}
 }
 
 func TestRequestTraceChatTerminalUsage(t *testing.T) {
@@ -1152,6 +1263,206 @@ func TestRequestTraceChatTerminalUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRequestTraceCompactSummaryStorage(t *testing.T) {
+	level := common.TraceMetadataSummary
+	data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Status: 200, Milliseconds: 20, ResponseBytes: 50}, AdminInfo: &common.RequestTraceAdmin{MetadataLevel: level, ChannelID: 7, Client: common.RequestTraceClient{UserAgent: "client-agent", ContentType: "application/json"}, Upstream: common.RequestTraceUpstream{Status: 200, RequestID: "provider-id", HeaderMilliseconds: 4}, Response: common.RequestTraceResponse{Done: true, EndMarker: "[DONE]", UsageChunk: true, MetadataIncomplete: true}}}
+	encoded, err := common.MarshalRequestTraceStorageData(data)
+	require.NoError(t, err)
+	for _, field := range []string{`"content_chars"`, `"reasoning_chars"`, `"client"`, `"tool_calls"`} {
+		assert.NotContains(t, string(encoded), field)
+	}
+	var restored common.RequestTraceData
+	require.NoError(t, common.Unmarshal(encoded, &restored))
+	assert.Equal(t, data.Trace, restored.Trace)
+	require.NotNil(t, restored.AdminInfo)
+	assert.Equal(t, "provider-id", restored.AdminInfo.Upstream.RequestID)
+	assert.EqualValues(t, 4, restored.AdminInfo.Upstream.HeaderMilliseconds)
+	assert.Equal(t, data.AdminInfo.Response, restored.AdminInfo.Response)
+	assert.Contains(t, common.GetJsonString(restored), `"client":{}`)
+	data.AdminInfo.MetadataLevel = common.TraceMetadataFull
+	full, err := common.MarshalRequestTraceStorageData(data)
+	require.NoError(t, err)
+	assert.JSONEq(t, common.GetJsonString(data), string(full))
+}
+
+func TestRequestTraceNativeRelayMetadata(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	chat := `{"id":"chat-id","object":"chat.completion","model":"mock-model","choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	claudeJSON := `{"id":"claude-id","type":"message","model":"mock-model","role":"assistant","content":[{"type":"text","text":"你好"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	geminiJSON := `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"你好"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+	for _, tc := range []struct {
+		name, payload, reason string
+		format                types.RelayFormat
+		stream                bool
+		handler               func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+	}{
+		{name: "OpenAI native", payload: chat, reason: "stop", format: types.RelayFormatOpenAI, handler: openai.OpenaiHandler},
+		{name: "OpenAI converted to Claude", payload: chat, reason: "end_turn", format: types.RelayFormatClaude, handler: openai.OpenaiHandler},
+		{name: "Responses native", payload: `{"id":"resp-id","object":"response","status":"completed","model":"mock-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, reason: "completed", format: types.RelayFormatOpenAIResponses, handler: openai.OaiResponsesHandler},
+		{name: "Claude native", payload: claudeJSON, reason: "end_turn", format: types.RelayFormatClaude, handler: func(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response) (*dto.Usage, *types.NewAPIError) {
+			return claude.ClaudeHandler(c, response, info)
+		}},
+		{name: "Gemini native", payload: geminiJSON, reason: "STOP", format: types.RelayFormatGemini, handler: gemini.GeminiTextGenerationHandler},
+		{name: "Gemini native stream", payload: "data: " + geminiJSON + "\n\n", reason: "STOP", format: types.RelayFormatGemini, stream: true, handler: gemini.GeminiTextGenerationStreamHandler},
+		{name: "Claude native stream", payload: "data: {\"type\":\"message_start\",\"message\":{\"id\":\"claude-id\",\"type\":\"message\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n", reason: "end_turn", format: types.RelayFormatClaude, stream: true, handler: func(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response) (*dto.Usage, *types.NewAPIError) {
+			return claude.ClaudeStreamHandler(c, response, info)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRequestTraceDatabase(t)
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all"}`))
+			app := gin.New()
+			app.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+			app.POST("/v1/chat/completions", func(c *gin.Context) {
+				c.Set("id", 11)
+				_, err := common.GetBodyStorage(c)
+				require.NoError(t, err)
+				trace := common.GetRequestTrace(c)
+				attempt := trace.StartAttempt(0, 7, c.Request)
+				attempt.Upstream.Status = 200
+				attempt.Observer = common.NewTraceBodyObserver(time.Now())
+				contentType := "application/json"
+				if tc.stream {
+					contentType = "text/event-stream"
+				}
+				response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{contentType}}, Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(tc.payload)), ContentType: contentType, Observer: attempt.Observer}}
+				info := &relaycommon.RelayInfo{RelayFormat: tc.format, IsStream: tc.stream, RequestURLPath: c.Request.URL.Path, ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelId: 7, UpstreamModelName: "mock-model"}}
+				info.ChannelSetting.PassThroughBodyEnabled = true
+				usage, relayError := tc.handler(c, info, response)
+				require.Nil(t, relayError)
+				require.NotNil(t, usage)
+			})
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"测试"}]}`)))
+			require.Equal(t, 200, recorder.Code)
+			awaitRequestTraceWrites(t)
+			rows, err := model.GetRequestTraces(t.Context(), recorder.Header().Get(common.RequestIdKey), 0, true)
+			require.NoError(t, err)
+			require.Len(t, rows, 1)
+			require.NotNil(t, rows[0].AdminInfo)
+			require.NotNil(t, rows[0].Trace.FinishReason)
+			assert.Equal(t, tc.reason, *rows[0].Trace.FinishReason)
+			assert.EqualValues(t, 2, rows[0].AdminInfo.Response.ContentCharacters)
+			assert.EqualValues(t, recorder.Body.Len(), rows[0].Trace.ResponseBytes)
+			assert.Equal(t, common.TraceMetadataFull, rows[0].AdminInfo.MetadataLevel)
+			assert.False(t, rows[0].AdminInfo.Response.MetadataIncomplete)
+		})
+	}
+}
+
+func TestRequestTraceSummaryAndPromotion(t *testing.T) {
+	t.Run("related full observer does not leak detailed counts into summary", func(t *testing.T) {
+		client := common.NewTraceBodyObserverWithMode(time.Now(), common.TraceMetadataSummary)
+		upstream := client.NewRelatedObserverWithMode(common.TraceMetadataFull)
+		body := `{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}`
+		upstream.ObserveString(body, "application/json")
+		upstream.Finish()
+		client.ObserveString(body, "application/json")
+		client.Finish()
+		full, _, _ := upstream.Snapshot()
+		summary, _, reason := client.Snapshot()
+		assert.EqualValues(t, 2, full.ContentCharacters)
+		assert.Zero(t, summary.ContentCharacters)
+		assert.Nil(t, summary.Keys)
+		require.NotNil(t, reason)
+		assert.Equal(t, "stop", *reason)
+	})
+	for _, tc := range []struct {
+		name, payload, reason, marker string
+		error, full, partial          bool
+	}{
+		{name: "chat null finish reasons", payload: "data: {\"choices\":[{\"delta\":{\"content\":\"私密\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", reason: "stop", marker: "[DONE]"},
+		{name: "tool deltas stay summary", payload: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"search\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n", marker: "[DONE]"},
+		{name: "error words in text do not fail", payload: "data: {\"choices\":[{\"delta\":{\"content\":\"error response.failed\"}}]}\n\ndata: [DONE]\n\n", marker: "[DONE]"},
+		{name: "null error stays summary", payload: "data: {\"error\":null}\n\ndata: [DONE]\n\n", marker: "[DONE]"},
+		{name: "claude stop", payload: "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n", reason: "end_turn", marker: "message_stop"},
+		{name: "gemini stop", payload: "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n", reason: "STOP"},
+		{name: "responses complete", payload: "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n", reason: "completed", marker: "response.completed"},
+		{name: "first event error", payload: "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded\",\"code\":\"busy\"}}\n\n", error: true, full: true},
+		{name: "late error", payload: "data: {\"choices\":[{\"delta\":{\"content\":\"私密\"}}]}\n\ndata: {\"error\":{\"type\":\"overloaded\"}}\n\n", error: true, full: true, partial: true},
+		{name: "responses failed", payload: "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n", reason: "failed", marker: "response.failed", error: true, full: true},
+		{name: "responses incomplete", payload: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"私密\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", reason: "incomplete:max_output_tokens", marker: "response.incomplete", full: true, partial: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observer := common.NewTraceBodyObserverWithMode(time.Now(), common.TraceMetadataSummary)
+			// 网络分片可切在字段名、UTF-8 字符或事件分隔符内部。
+			for offset := 0; offset < len(tc.payload); offset += 7 {
+				observer.ObserveString(tc.payload[offset:min(offset+7, len(tc.payload))], "text/event-stream")
+			}
+			observer.Finish()
+			response, _, reason := observer.Snapshot()
+			assert.Equal(t, tc.error, response.Error)
+			assert.Equal(t, tc.full, observer.MetadataLevel() == common.TraceMetadataFull)
+			assert.Equal(t, tc.partial, response.MetadataIncomplete)
+			assert.Equal(t, tc.marker, response.EndMarker)
+			assert.EqualValues(t, len(tc.payload), observer.Size())
+			if tc.reason != "" {
+				require.NotNil(t, reason)
+				assert.Equal(t, tc.reason, *reason)
+			}
+			assert.Zero(t, response.ContentCharacters)
+			assert.Zero(t, response.ToolCalls)
+			if tc.partial {
+				assert.Contains(t, response.IncompleteReasons, "capture_upgraded")
+			}
+		})
+	}
+	t.Run("summary JSON size limit preserves byte count", func(t *testing.T) {
+		payload := `{"choices":[{"message":{"content":"` + strings.Repeat("x", 64<<10) + `"},"finish_reason":"stop"}]}`
+		for _, level := range []common.TraceMetadataLevel{common.TraceMetadataSummary, common.TraceMetadataFull} {
+			observer := common.NewTraceBodyObserverWithMode(time.Now(), level)
+			observer.Prepare("application/json", int64(len(payload)))
+			observer.ObserveString(payload, "application/json")
+			observer.Finish()
+			response, _, _ := observer.Snapshot()
+			assert.EqualValues(t, len(payload), observer.Size())
+			assert.Equal(t, level == common.TraceMetadataSummary, response.MetadataIncomplete)
+			if level == common.TraceMetadataFull {
+				assert.EqualValues(t, 64<<10, response.ContentCharacters)
+			} else {
+				assert.Contains(t, response.IncompleteReasons, "size_limit")
+			}
+		}
+	})
+	t.Run("upstream read failure upgrades and preserves the failed request", func(t *testing.T) {
+		observer := common.NewTraceBodyObserverWithMode(time.Now(), common.TraceMetadataSummary)
+		body := &common.TraceResponseBody{
+			ReadCloser: io.NopCloser(io.MultiReader(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"私密\"}}]}\n\n"), iotest.ErrReader(io.ErrUnexpectedEOF))),
+			Observer:   observer, ContentType: "text/event-stream",
+		}
+		_, err := io.ReadAll(body)
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		require.NoError(t, body.Close())
+		response, _, _ := observer.Snapshot()
+		assert.True(t, response.Error)
+		assert.Equal(t, common.TraceMetadataFull, observer.MetadataLevel())
+		assert.Contains(t, response.IncompleteReasons, "upstream_read_error")
+		assert.Contains(t, response.IncompleteReasons, "capture_upgraded")
+		assert.Zero(t, response.ContentCharacters)
+	})
+	t.Run("reuse preserves source and delivery failure stays local", func(t *testing.T) {
+		source := common.NewTraceBodyObserver(time.Now())
+		source.ObserveString(`{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}`, "application/json")
+		source.Finish()
+		client := common.NewTraceBodyObserver(time.Now())
+		client.ReuseUpstream(source)
+		client.ObserveString("forwarded", "application/json")
+		client.DeliveryFailed()
+		client.Finish()
+		response, _, _ := client.Snapshot()
+		assert.EqualValues(t, 2, response.ContentCharacters)
+		assert.True(t, response.Error)
+		assert.False(t, response.Done)
+		assert.Contains(t, response.IncompleteReasons, "client_delivery_incomplete")
+		upstream, _, _ := source.Snapshot()
+		assert.False(t, upstream.Error)
+		assert.True(t, upstream.Done)
+		assert.EqualValues(t, 9, client.Size())
+	})
 }
 
 func TestRequestTraceRootStatusAuthorization(t *testing.T) {

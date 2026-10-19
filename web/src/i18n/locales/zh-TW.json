@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "未能完整讀取上游回應。",
+    "Trace rows dropped for failed or diagnostic requests": "失敗或診斷請求丟棄的追蹤筆數",
+    "Trace rows dropped for regular requests": "一般請求丟棄的追蹤筆數",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "佇列為失敗或診斷請求保留部分容量。可用容量耗盡時，優先追蹤仍可能被丟棄。",
+    "Dropped trace rows": "已捨棄追蹤列數",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "計數僅屬於目前執行個體，重新啟動後重設。待寫入列數包含正在寫入的記錄；佇列滿時直接捨棄新追蹤中繼資料，不阻塞請求。程序崩潰可能遺失記憶體中尚未寫入的追蹤。",
+    "Summary mode does not collect character counts or tool-call statistics.": "摘要模式不蒐集字元數與工具呼叫統計。",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "詳細蒐集在部分事件之後才開始，無法補齊先前的文字與工具統計。",
+    "The client did not receive the complete response.": "用戶端未完整接收回應。",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 僅儲存失敗請求，100 儲存全部成功請求。失敗重試與臨時診斷一律保留；未命中取樣的請求使用輕量錯誤偵測。",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "快速檔優先降低 CPU 與記憶體用量，標準檔優先壓縮率。舊的較高與最高檔設定按標準檔處理，僅影響關聯式資料庫的新記錄。",
     "Enable request tracing": "啟用請求追蹤",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "關閉並儲存後停止新增追蹤中繼資料，歷史追蹤檢視、用量日誌與計費不受影響。",
     "Request trace settings": "請求追蹤設定",

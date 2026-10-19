@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "Ответ вышестоящего сервера не удалось прочитать полностью.",
+    "Trace rows dropped for failed or diagnostic requests": "Отброшенные строки трассировки ошибочных и диагностических запросов",
+    "Trace rows dropped for regular requests": "Отброшенные строки трассировки обычных запросов",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "Часть очереди зарезервирована для ошибочных и диагностических запросов. При исчерпании доступной ёмкости приоритетные трассировки также могут отбрасываться.",
+    "Dropped trace rows": "Отброшенные строки трассировки",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "Счётчики локальны для этого экземпляра и сбрасываются при перезапуске. Ожидающие строки включают текущие записи. При заполнении очереди новые метаданные отбрасываются без блокировки запросов. При аварии трассировки в памяти могут быть потеряны.",
+    "Summary mode does not collect character counts or tool-call statistics.": "В режиме сводки количество символов и статистика вызовов инструментов не собираются.",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "Подробный сбор начался после части событий; их статистику текста и инструментов восстановить нельзя.",
+    "The client did not receive the complete response.": "Клиент получил ответ не полностью.",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 сохраняет только ошибки, 100 — все успешные запросы. Неудачные повторы и временная диагностика сохраняются всегда. Запросы вне выборки используют облегчённое обнаружение ошибок.",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "Быстрый режим снижает затраты CPU и памяти, стандартный отдаёт приоритет сжатию. Старые настройки high и best используют стандартный режим. Применяется к новым записям в реляционной базе.",
     "Enable request tracing": "Включить трассировку запросов",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "После отключения и сохранения новые метаданные трассировки не записываются. Просмотр существующих трассировок, журналы использования и тарификация не меняются.",
     "Request trace settings": "Настройки трассировки запросов",

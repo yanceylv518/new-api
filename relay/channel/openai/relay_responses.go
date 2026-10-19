@@ -36,6 +36,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 
 	// 写入新的 response body
+	common.ReuseUpstreamRequestTrace(c, resp)
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	// compute usage
@@ -77,6 +78,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 
+	common.ReuseUpstreamRequestTrace(c, resp)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息

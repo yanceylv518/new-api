@@ -39,7 +39,9 @@ type TraceStatus = {
   in_flight_rows: number
   persisted_rows: number
   failed_rows: number
-  fallback_rows: number
+  dropped_rows?: number
+  dropped_priority_rows?: number
+  dropped_regular_rows?: number
   retries: number
   collected_requests: number
   sampled_out_requests: number
@@ -99,7 +101,15 @@ export function RequestTraceStatus() {
         [t('Trace rows being written'), status.in_flight_rows.toLocaleString()],
         [t('Persisted trace rows'), status.persisted_rows.toLocaleString()],
         [t('Failed trace rows'), status.failed_rows.toLocaleString()],
-        [t('Synchronous fallback rows'), status.fallback_rows.toLocaleString()],
+        [t('Dropped trace rows'), status.dropped_rows?.toLocaleString() ?? '—'],
+        [
+          t('Trace rows dropped for failed or diagnostic requests'),
+          status.dropped_priority_rows?.toLocaleString() ?? '—',
+        ],
+        [
+          t('Trace rows dropped for regular requests'),
+          status.dropped_regular_rows?.toLocaleString() ?? '—',
+        ],
         [t('Trace write retries'), status.retries.toLocaleString()],
         [
           t('Sampled-out successful requests'),
@@ -140,10 +150,15 @@ export function RequestTraceStatus() {
       </div>
       <p className='text-muted-foreground text-xs'>
         {t(
-          'Counters are local to the responding instance and reset on restart. Pending rows include writes in flight. A full queue falls back to a bounded synchronous write. Pending in-memory traces may be lost if the process crashes.'
+          'Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.'
         )}
       </p>
       {query.isPending && <LoadingState className='min-h-0 py-3' />}
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.'
+        )}
+      </p>
       {query.isError && (
         <ErrorState
           title={t('Failed to load trace writer status')}

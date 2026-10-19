@@ -73,6 +73,14 @@ function SettingsFixture(props: { config?: string }) {
   )
 }
 
+async function renderTraceSettings(element: Parameters<typeof render>[0]) {
+  const view = render(element)
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Request trace settings' })
+  )
+  return view
+}
+
 beforeEach(async () => {
   await i18n.changeLanguage('en')
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
@@ -98,7 +106,10 @@ beforeEach(async () => {
           in_flight_rows: 1,
           persisted_rows: 57,
           failed_rows: 2,
-          fallback_rows: 4,
+          fallback_rows: 0,
+          dropped_rows: 40,
+          dropped_priority_rows: 17,
+          dropped_regular_rows: 23,
           retries: 1,
           collected_requests: 80,
           sampled_out_requests: 20,
@@ -115,14 +126,91 @@ beforeEach(async () => {
 })
 
 describe('request trace log settings', () => {
+  test('keeps settings collapsed and writer polling unmounted until opened', async () => {
+    const previous = useAuthStore.getState().auth.user
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 11, username: 'trace-root', role: 100 })
+    try {
+      render(<SettingsFixture config={JSON.stringify(config)} />)
+      const accordion = screen.getByRole('button', {
+        name: 'Request trace settings',
+      })
+      expect(accordion).toHaveAttribute('aria-expanded', 'false')
+      expect(
+        screen.queryByRole('textbox', {
+          name: 'Upstream request ID response headers',
+        })
+      ).not.toBeInTheDocument()
+      expect(
+        vi
+          .mocked(api.get)
+          .mock.calls.some(([url]) => url === '/api/log/trace/status')
+      ).toBe(false)
+      await userEvent.click(accordion)
+      await screen.findByRole('region', { name: 'Asynchronous trace writer' })
+      expect(accordion).toHaveAttribute('aria-expanded', 'true')
+      await userEvent.click(accordion)
+      expect(accordion).toHaveAttribute('aria-expanded', 'false')
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('region', { name: 'Asynchronous trace writer' })
+        ).not.toBeInTheDocument()
+      )
+    } finally {
+      useAuthStore.getState().auth.setUser(previous)
+    }
+  })
+
+  test('retains the selected detail level when toggled and saves off', async () => {
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify({ ...config, level: 'all' })} />
+    )
+    const toggle = screen.getByRole('switch', {
+      name: 'Enable request tracing',
+    })
+    await userEvent.click(toggle)
+    await userEvent.click(toggle)
+    expect(
+      screen.getByRole('combobox', { name: 'Request trace level' })
+    ).toHaveTextContent('All requests in detail')
+    await userEvent.click(toggle)
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    await waitFor(() =>
+      expect(api.put).toHaveBeenLastCalledWith('/api/option/', {
+        key: 'RequestTraceConfig',
+        value: JSON.stringify({ ...config, level: 'off' }),
+      })
+    )
+  })
+
+  test.each(['high', 'best'])(
+    'maps legacy %s compression to standard',
+    async (compression) => {
+      await renderTraceSettings(
+        <SettingsFixture
+          config={JSON.stringify({ ...config, compression_level: compression })}
+        />
+      )
+      const select = screen.getByRole('combobox', { name: 'Compression level' })
+      expect(select).toHaveTextContent('Standard compression')
+      await userEvent.click(select)
+      expect(screen.getAllByRole('option')).toHaveLength(2)
+    }
+  )
+
   test.each([
-    ['off', 'Off'],
+    ['off', 'Detailed failures only'],
     ['errors', 'Detailed failures only'],
     ['all', 'All requests in detail'],
   ])(
     'shows the label for saved level %s before opening the dropdown',
     async (level, label) => {
-      render(<SettingsFixture config={JSON.stringify({ ...config, level })} />)
+      await renderTraceSettings(
+        <SettingsFixture config={JSON.stringify({ ...config, level })} />
+      )
       expect(
         screen.getByRole('combobox', { name: 'Request trace level' })
       ).toHaveTextContent(label)
@@ -133,7 +221,7 @@ describe('request trace log settings', () => {
   )
 
   test('supports old configs and updates inputs when settings are reloaded', async () => {
-    const view = render(
+    const view = await renderTraceSettings(
       <SettingsFixture config='{"level":"errors","pre_channel_errors_enabled":true,"anonymous_errors_enabled":false}' />
     )
     expect(
@@ -156,7 +244,9 @@ describe('request trace log settings', () => {
   })
 
   test('saves custom priority and preserves unrelated trace options', async () => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     const input = screen.getByRole('textbox', {
       name: 'Upstream request ID response headers',
     })
@@ -177,7 +267,7 @@ describe('request trace log settings', () => {
   })
 
   test('keeps header configuration editable when request tracing is off', async () => {
-    render(
+    await renderTraceSettings(
       <SettingsFixture config={JSON.stringify({ ...config, level: 'off' })} />
     )
     const input = screen.getByRole('textbox', {
@@ -213,7 +303,9 @@ describe('request trace log settings', () => {
       Array.from({ length: 17 }, (_, index) => `X-Id-${index}`).join('\n'),
     ],
   ])('blocks saving %s before any setting mutation', async (_name, value) => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     const input = screen.getByRole('textbox', {
       name: 'Upstream request ID response headers',
     })
@@ -234,7 +326,9 @@ describe('request trace log settings', () => {
   })
 
   test('uses translated dropdown options after changing the level', async () => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     await userEvent.click(
       screen.getByRole('combobox', { name: 'Request trace level' })
     )
@@ -257,7 +351,9 @@ describe('request trace log settings', () => {
 
   test('keeps user input after a failed save and allows a retry', async () => {
     vi.mocked(api.put).mockRejectedValueOnce(new Error('Save unavailable'))
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     const input = screen.getByRole('textbox', {
       name: 'Upstream request ID response headers',
     })
@@ -287,7 +383,9 @@ describe('request trace log settings', () => {
           complete = resolve
         })
     )
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     const input = screen.getByRole('textbox', {
       name: 'Upstream request ID response headers',
     })
@@ -313,7 +411,7 @@ describe('request trace log settings', () => {
   test.each([0, 35, 100])(
     'saves the successful request sample rate %s',
     async (rate) => {
-      render(
+      await renderTraceSettings(
         <SettingsFixture
           config={JSON.stringify({
             ...config,
@@ -339,7 +437,9 @@ describe('request trace log settings', () => {
   )
 
   test('saves independent retention and leaves consumption logging enabled', async () => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     const input = screen.getByRole('spinbutton', {
       name: 'Request trace retention (days)',
     })
@@ -365,7 +465,9 @@ describe('request trace log settings', () => {
   ])(
     'rejects out-of-range %s before issuing a mutation',
     async (name, value) => {
-      render(<SettingsFixture config={JSON.stringify(config)} />)
+      await renderTraceSettings(
+        <SettingsFixture config={JSON.stringify(config)} />
+      )
       const input = screen.getByRole('spinbutton', { name })
       await userEvent.clear(input)
       await userEvent.type(input, value)
@@ -378,7 +480,7 @@ describe('request trace log settings', () => {
 
   test('deduplicates diagnostic channel IDs and preserves a valid expiry', async () => {
     const expires = Math.floor(Date.now() / 1000) + 3600
-    render(
+    await renderTraceSettings(
       <SettingsFixture
         config={JSON.stringify({ ...config, diagnostic_expires_at: expires })}
       />
@@ -403,7 +505,9 @@ describe('request trace log settings', () => {
   })
 
   test('rejects a newly configured channel without a future expiry', async () => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     await userEvent.type(
       screen.getByRole('textbox', { name: 'Temporary diagnostic channel IDs' }),
       '7'
@@ -420,7 +524,9 @@ describe('request trace log settings', () => {
   })
 
   test('rejects malformed diagnostic channels before issuing a mutation', async () => {
-    render(<SettingsFixture config={JSON.stringify(config)} />)
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify(config)} />
+    )
     await userEvent.type(
       screen.getByRole('textbox', { name: 'Temporary diagnostic channel IDs' }),
       '7, invalid'
@@ -440,7 +546,9 @@ describe('request trace log settings', () => {
       .getState()
       .auth.setUser({ id: 11, username: 'trace-root', role: 100 })
     try {
-      render(<SettingsFixture config={JSON.stringify(config)} />)
+      await renderTraceSettings(
+        <SettingsFixture config={JSON.stringify(config)} />
+      )
       const region = await screen.findByRole('region', {
         name: 'Asynchronous trace writer',
       })
@@ -448,6 +556,16 @@ describe('request trace log settings', () => {
         'Responding instance: trace-test-instance'
       )
       expect(within(region).getByText('57')).toBeInTheDocument()
+      expect(
+        within(region).getByText(
+          'Trace rows dropped for failed or diagnostic requests'
+        )
+      ).toBeInTheDocument()
+      expect(
+        within(region).getByText('Trace rows dropped for regular requests')
+      ).toBeInTheDocument()
+      expect(within(region).getByText('17')).toBeInTheDocument()
+      expect(within(region).getByText('23')).toBeInTheDocument()
       expect(within(region).getByText('3 / 8,192')).toBeInTheDocument()
       expect(
         within(region).getByText(

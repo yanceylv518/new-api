@@ -557,7 +557,18 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		attempt.Upstream.Status = resp.StatusCode
 		attempt.Upstream.Protocol = resp.Proto
 		attempt.Upstream.HeaderMilliseconds = time.Since(attempt.Started).Milliseconds()
-		attempt.Observer = trace.ClientObserver.NewRelatedObserver()
+		level := trace.ResponseMetadataLevel(attempt.ChannelID, resp.StatusCode)
+		if attempt.Diagnostic {
+			level = common2.TraceMetadataFull
+		}
+		attempt.Observer = common2.NewTraceBodyObserverWithMode(trace.Started, level)
+		if trace.ClientObserver != nil {
+			attempt.Observer = trace.ClientObserver.NewRelatedObserverWithMode(level)
+		}
+		attempt.Observer.Prepare(resp.Header.Get("Content-Type"), resp.ContentLength)
+		if attempt.Diagnostic {
+			trace.ClientObserver.PromoteToFull()
+		}
 		if resp.Body != nil {
 			resp.Body = &common2.TraceResponseBody{ReadCloser: resp.Body, Observer: attempt.Observer, ContentType: resp.Header.Get("Content-Type")}
 		}

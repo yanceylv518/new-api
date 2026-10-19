@@ -48,7 +48,7 @@ export function RequestTracePolicyControls(props: {
             <FormLabel>{t('Successful request sample rate (%)')}</FormLabel>
             <FormDescription>
               {t(
-                '0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.'
+                '0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.'
               )}
             </FormDescription>
             <FormControl>

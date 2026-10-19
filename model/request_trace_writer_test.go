@@ -3,7 +3,6 @@ package model
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -142,65 +141,62 @@ func TestRequestTraceWriterMySQL(t *testing.T) {
 		assert.Zero(t, GetRequestTraceWriterStats().InFlightRows)
 		assert.Error(t, SubmitRequestTraces(traceWriterRows("closed", 0, 1, data)))
 	})
-	t.Run("row budget uses synchronous fallback without dropping data", func(t *testing.T) {
+	t.Run("row budget drops immediately while database is blocked", func(t *testing.T) {
 		db, _ := requestTraceWriterMySQL(t)
 		before := GetRequestTraceWriterStats()
 		entered, release := blockTraceWriterCreates(t, db)
 		for start := 0; start < requestTraceQueueRows; start += requestTraceBatchRows {
-			require.NoError(t, SubmitRequestTraces(traceWriterRows("row-budget", start, requestTraceBatchRows, data)))
+			require.NoError(t, SubmitRequestTracesWithPriority(traceWriterRows("row-budget", start, requestTraceBatchRows, data), true))
 		}
 		awaitTraceWriterCreate(t, entered)
 		awaitTraceWriterCreate(t, entered)
 		assert.Equal(t, requestTraceQueueRows, GetRequestTraceWriterStats().QueuedRows)
-		fallback := make(chan error, 1)
-		go func() { fallback <- SubmitRequestTraces(traceWriterRows("row-overflow", 0, 1, data)) }()
-		awaitTraceWriterCreate(t, entered)
-		assert.EqualValues(t, 1, GetRequestTraceWriterStats().FallbackRows-before.FallbackRows)
+		require.ErrorIs(t, SubmitRequestTraces(traceWriterRows("row-overflow", 0, 1, data)), ErrRequestTraceDropped)
+		assert.EqualValues(t, 1, GetRequestTraceWriterStats().DroppedRows-before.DroppedRows)
+		assert.Zero(t, GetRequestTraceWriterStats().FallbackRows)
+		assert.False(t, HasPendingRequestTrace("row-overflow-0", 11, false))
 		release()
-		require.NoError(t, <-fallback)
 		stopTraceWriter(t)
 		var count int64
 		require.NoError(t, db.Model(&RequestTrace{}).Count(&count).Error)
-		assert.EqualValues(t, requestTraceQueueRows+1, count)
+		assert.EqualValues(t, requestTraceQueueRows, count)
 		after := GetRequestTraceWriterStats()
-		assert.EqualValues(t, requestTraceQueueRows+1, after.PersistedRows-before.PersistedRows)
+		assert.EqualValues(t, requestTraceQueueRows, after.PersistedRows-before.PersistedRows)
 		assert.Equal(t, before.FailedRows, after.FailedRows)
 		assert.Zero(t, after.QueuedRows)
 		assert.Zero(t, after.QueuedBytes)
 	})
-	t.Run("byte budget uses synchronous fallback and releases accounting", func(t *testing.T) {
+	t.Run("byte budget drops without waiting and releases accounting", func(t *testing.T) {
 		db, _ := requestTraceWriterMySQL(t)
 		before := GetRequestTraceWriterStats()
 		entered, release := blockTraceWriterCreates(t, db)
 		large := `{"padding":"` + strings.Repeat("x", 512<<10) + `"}`
 		accepted := requestTraceQueueBytes / len(large)
 		for index := range accepted {
-			require.NoError(t, SubmitRequestTraces(traceWriterRows("byte-budget", index, 1, large)))
+			require.NoError(t, SubmitRequestTracesWithPriority(traceWriterRows("byte-budget", index, 1, large), true))
 		}
 		awaitTraceWriterCreate(t, entered)
 		awaitTraceWriterCreate(t, entered)
 		assert.Equal(t, accepted*len(large), GetRequestTraceWriterStats().QueuedBytes)
-		fallback := make(chan error, 1)
-		go func() { fallback <- SubmitRequestTraces(traceWriterRows("byte-overflow", 0, 1, large)) }()
-		awaitTraceWriterCreate(t, entered)
-		assert.EqualValues(t, 1, GetRequestTraceWriterStats().FallbackRows-before.FallbackRows)
+		require.ErrorIs(t, SubmitRequestTraces(traceWriterRows("byte-overflow", 0, 1, large)), ErrRequestTraceDropped)
+		assert.EqualValues(t, 1, GetRequestTraceWriterStats().DroppedRows-before.DroppedRows)
+		assert.Zero(t, GetRequestTraceWriterStats().FallbackRows)
 		release()
-		require.NoError(t, <-fallback)
 		stopTraceWriter(t)
 		var count int64
 		require.NoError(t, db.Model(&RequestTrace{}).Count(&count).Error)
-		assert.EqualValues(t, accepted+1, count)
+		assert.EqualValues(t, accepted, count)
 		assert.Zero(t, GetRequestTraceWriterStats().QueuedBytes)
 	})
-	t.Run("oversized request group stays atomic in synchronous fallback", func(t *testing.T) {
+	t.Run("oversized request group is dropped atomically", func(t *testing.T) {
 		db, _ := requestTraceWriterMySQL(t)
 		before := GetRequestTraceWriterStats()
 		rows := traceWriterRows("large-group", 0, requestTraceBatchRows+1, data)
-		require.NoError(t, SubmitRequestTraces(rows))
+		require.ErrorIs(t, SubmitRequestTraces(rows), ErrRequestTraceDropped)
 		var count int64
 		require.NoError(t, db.Model(&RequestTrace{}).Count(&count).Error)
-		assert.EqualValues(t, len(rows), count)
-		assert.EqualValues(t, len(rows), GetRequestTraceWriterStats().FallbackRows-before.FallbackRows)
+		assert.Zero(t, count)
+		assert.EqualValues(t, len(rows), GetRequestTraceWriterStats().DroppedRows-before.DroppedRows)
 	})
 	t.Run("injected MySQL deadlock retries once without duplicate rows", func(t *testing.T) {
 		db, _ := requestTraceWriterMySQL(t)
@@ -277,15 +273,72 @@ func TestRequestTraceWriterMySQL(t *testing.T) {
 		assert.Zero(t, after.InFlightRows)
 		assert.False(t, HasPendingRequestTrace("cancel-0", 11, false))
 	})
-	t.Run("unencodable metadata fails visibly and releases pending index", func(t *testing.T) {
+	t.Run("oversized metadata is dropped before enqueue", func(t *testing.T) {
 		_, _ = requestTraceWriterMySQL(t)
 		before := GetRequestTraceWriterStats()
 		err := SubmitRequestTraces(traceWriterRows("invalid-size", 0, 1, strings.Repeat("x", common.TraceMetadataMaxBytes+1)))
-		require.Error(t, err)
-		assert.False(t, errors.Is(err, context.Canceled))
-		assert.EqualValues(t, 1, GetRequestTraceWriterStats().FailedRows-before.FailedRows)
+		require.ErrorIs(t, err, ErrRequestTraceDropped)
+		assert.EqualValues(t, 1, GetRequestTraceWriterStats().DroppedRows-before.DroppedRows)
+		assert.Equal(t, before.FailedRows, GetRequestTraceWriterStats().FailedRows)
 		assert.False(t, HasPendingRequestTrace("invalid-size-0", 11, false))
 	})
+	t.Run("writer can restart after a completed drain", func(t *testing.T) {
+		db, _ := requestTraceWriterMySQL(t)
+		stopTraceWriter(t)
+		before := GetRequestTraceWriterStats()
+		require.ErrorIs(t, SubmitRequestTraces(traceWriterRows("stopped", 0, 1, data)), ErrRequestTraceDropped)
+		StartRequestTraceWriter()
+		require.NoError(t, SubmitRequestTraces(traceWriterRows("restarted", 0, 1, data)))
+		stopTraceWriter(t)
+		var count int64
+		require.NoError(t, db.Model(&RequestTrace{}).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+		assert.EqualValues(t, 1, GetRequestTraceWriterStats().DroppedRows-before.DroppedRows)
+	})
+}
+
+func TestRequestTracePriorityReserveMySQL(t *testing.T) {
+	for _, tc := range []struct {
+		name, data     string
+		regular, total int
+	}{
+		{name: "row reserve", data: `{"trace":{"status":200}}`, regular: requestTraceQueueRows - requestTraceReservedRows, total: requestTraceQueueRows},
+		{name: "byte reserve", data: `{"padding":"` + strings.Repeat("x", 512<<10) + `"}`, regular: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, _ := requestTraceWriterMySQL(t)
+			entered, release := blockTraceWriterCreates(t, db)
+			before := GetRequestTraceWriterStats()
+			regular, total := tc.regular, tc.total
+			if regular < 0 {
+				regular = (requestTraceQueueBytes - requestTraceReservedBytes) / len(tc.data)
+				total = requestTraceQueueBytes / len(tc.data)
+			}
+			for index := range regular {
+				require.NoError(t, SubmitRequestTraces(traceWriterRows("regular", index, 1, tc.data)))
+			}
+			awaitTraceWriterCreate(t, entered)
+			require.ErrorIs(t, SubmitRequestTraces(traceWriterRows("regular-overflow", 0, 1, tc.data)), ErrRequestTraceDropped)
+			for index := range total - regular {
+				require.NoError(t, SubmitRequestTracesWithPriority(traceWriterRows("priority", index, 1, tc.data), true))
+			}
+			require.ErrorIs(t, SubmitRequestTracesWithPriority(traceWriterRows("priority-overflow", 0, 1, tc.data), true), ErrRequestTraceDropped)
+			assert.False(t, HasPendingRequestTrace("regular-overflow-0", 11, false))
+			assert.False(t, HasPendingRequestTrace("priority-overflow-0", 11, false))
+			release()
+			stopTraceWriter(t)
+			after := GetRequestTraceWriterStats()
+			assert.EqualValues(t, 1, after.DroppedRegularRows-before.DroppedRegularRows)
+			assert.EqualValues(t, 1, after.DroppedPriorityRows-before.DroppedPriorityRows)
+			assert.EqualValues(t, 2, after.DroppedRows-before.DroppedRows)
+			assert.EqualValues(t, total, after.PersistedRows-before.PersistedRows)
+			assert.Zero(t, after.QueuedRows)
+			assert.Zero(t, after.QueuedBytes)
+			var count int64
+			require.NoError(t, db.Model(&RequestTrace{}).Count(&count).Error)
+			assert.EqualValues(t, total, count)
+		})
+	}
 }
 
 func TestRequestTraceMainAndSeparateLogMigration(t *testing.T) {
@@ -328,6 +381,33 @@ func TestRequestTraceMainAndSeparateLogMigration(t *testing.T) {
 }
 
 func TestRequestTraceStorageContractMySQL(t *testing.T) {
+	t.Run("live compression changes and legacy frames remain readable", func(t *testing.T) {
+		_, _ = requestTraceWriterMySQL(t)
+		value := `{"trace":{"status":200},"padding":"` + strings.Repeat("metadata-", 200) + `"}`
+		var compressor common.RequestTraceCompressor
+		t.Cleanup(func() { assert.NoError(t, compressor.Close()) })
+		for _, level := range []string{"fast", "standard", "fast"} {
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", fmt.Sprintf(`{"level":"all","compression_level":%q}`, level)))
+			encoded, err := compressor.Encode(value)
+			require.NoError(t, err)
+			decoded, err := common.DecodeRequestTraceStorage(encoded)
+			require.NoError(t, err)
+			assert.Equal(t, value, decoded)
+		}
+		require.NoError(t, compressor.Close())
+		encoded, err := compressor.Encode(`{"trace":{"status":201}}`)
+		require.NoError(t, err)
+		assert.Equal(t, `{"trace":{"status":201}}`, encoded)
+		for _, level := range []zstd.EncoderLevel{zstd.SpeedBetterCompression, zstd.SpeedBestCompression} {
+			encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level), zstd.WithEncoderConcurrency(1))
+			require.NoError(t, err)
+			frame := encoder.EncodeAll([]byte(value), nil)
+			require.NoError(t, encoder.Close())
+			decoded, err := common.DecodeRequestTraceStorage("zstd-base64-v1:" + base64.StdEncoding.EncodeToString(frame))
+			require.NoError(t, err)
+			assert.Equal(t, value, decoded)
+		}
+	})
 	for _, level := range []string{"fast", "standard", "high", "best"} {
 		t.Run(level, func(t *testing.T) {
 			_, _ = requestTraceWriterMySQL(t)

@@ -285,6 +285,9 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 }
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	if info.RelayFormat == types.RelayFormatClaude && shouldSkipClaudeMessageDeltaUsagePatch(info) {
+		common.ReuseUpstreamRequestTrace(c, resp)
+	}
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
 		Created:      common.GetTimestamp(),
@@ -361,6 +364,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		}
 	case types.RelayFormatClaude:
 		responseData = data
+		common.ReuseUpstreamRequestTrace(c, httpResp)
 	case types.RelayFormatGemini:
 		{
 			convertResult, convertErr := service.ConvertResponse(c, info, types.RelayFormatGemini, &claudeResponse)

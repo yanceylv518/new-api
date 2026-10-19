@@ -39,6 +39,7 @@ export type RequestTrace = {
     outcome?: 'success' | 'failed' | 'cancelled' | 'unknown'
   }
   admin_info?: {
+    metadata_level?: 'summary' | 'full'
     channel_id?: number
     shape_incomplete?: boolean
     shape_incomplete_reason?: string

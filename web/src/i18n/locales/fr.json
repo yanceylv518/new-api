@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "La réponse du serveur en amont n’a pas pu être lue entièrement.",
+    "Trace rows dropped for failed or diagnostic requests": "Lignes de trace abandonnées pour les requêtes en échec ou de diagnostic",
+    "Trace rows dropped for regular requests": "Lignes de trace abandonnées pour les requêtes ordinaires",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "Une partie de la capacité de la file est réservée aux requêtes en échec ou de diagnostic. Les traces prioritaires peuvent aussi être abandonnées lorsque la capacité disponible est épuisée.",
+    "Dropped trace rows": "Lignes de trace abandonnées",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "Les compteurs sont locaux à cette instance et réinitialisés au redémarrage. Les lignes en attente incluent les écritures en cours. Une file pleine abandonne les nouvelles métadonnées sans bloquer les requêtes. Un arrêt brutal peut perdre les traces en mémoire.",
+    "Summary mode does not collect character counts or tool-call statistics.": "Le mode résumé ne collecte ni le nombre de caractères ni les statistiques d’appels d’outils.",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "La capture détaillée a commencé après certains événements ; leurs statistiques de texte et d’outils ne peuvent pas être récupérées.",
+    "The client did not receive the complete response.": "Le client n’a pas reçu la réponse complète.",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 conserve uniquement les échecs ; 100 conserve toutes les réussites. Les tentatives échouées et les diagnostics temporaires sont toujours conservés. Les requêtes non échantillonnées utilisent une détection légère des erreurs.",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "Rapide réduit le coût CPU et mémoire ; standard privilégie la compression. Les anciens niveaux high et best utilisent standard. Cela concerne les nouveaux enregistrements en base relationnelle.",
     "Enable request tracing": "Activer le traçage des requêtes",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "Désactiver puis enregistrer arrête les nouvelles métadonnées de trace. La consultation des traces existantes, les journaux d’utilisation et la facturation restent inchangés.",
     "Request trace settings": "Paramètres de traçage des requêtes",

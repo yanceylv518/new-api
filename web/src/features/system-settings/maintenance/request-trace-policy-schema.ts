@@ -18,14 +18,17 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import * as z from 'zod'
 
-const compressionLevelSchema = z.enum(['fast', 'standard', 'high', 'best'])
+const compressionLevelSchema = z.enum(['fast', 'standard'])
 
 export const requestTraceConfigSchema = z.object({
   level: z.enum(['off', 'errors', 'all']),
   pre_channel_errors_enabled: z.boolean(),
   anonymous_errors_enabled: z.boolean(),
   upstream_request_id_headers: z.array(z.string()).optional().default([]),
-  compression_level: compressionLevelSchema.optional().default('fast'),
+  compression_level: z.preprocess(
+    (level) => (level === 'high' || level === 'best' ? 'standard' : level),
+    compressionLevelSchema.optional().default('fast')
+  ),
   success_sample_rate: z.number().int().min(0).max(100).optional().default(100),
   retention_days: z.number().int().min(0).max(3650).optional().default(0),
   diagnostic_channel_ids: z

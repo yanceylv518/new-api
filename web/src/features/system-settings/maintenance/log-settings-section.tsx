@@ -640,7 +640,7 @@ export function LogSettingsSection({
                           <FormLabel>{t('Compression level')}</FormLabel>
                           <FormDescription>
                             {t(
-                              'Applies to new request trace metadata in relational databases. Higher compression uses more CPU.'
+                              'Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.'
                             )}
                           </FormDescription>
                           <Select
@@ -649,11 +649,6 @@ export function LogSettingsSection({
                               {
                                 value: 'standard',
                                 label: t('Standard compression'),
-                              },
-                              { value: 'high', label: t('Higher compression') },
-                              {
-                                value: 'best',
-                                label: t('Maximum compression'),
                               },
                             ]}
                             value={field.value}
@@ -672,12 +667,6 @@ export function LogSettingsSection({
                                 </SelectItem>
                                 <SelectItem value='standard'>
                                   {t('Standard compression')}
-                                </SelectItem>
-                                <SelectItem value='high'>
-                                  {t('Higher compression')}
-                                </SelectItem>
-                                <SelectItem value='best'>
-                                  {t('Maximum compression')}
                                 </SelectItem>
                               </SelectGroup>
                             </SelectContent>

@@ -361,6 +361,10 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		responseBody = geminiRespStr
 	}
 
+	if info.RelayFormat == types.RelayFormatOpenAI && !forceFormat && !usageModified &&
+		!(info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise()) {
+		common.ReuseUpstreamRequestTrace(c, resp)
+	}
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	return &simpleResponse.Usage, nil

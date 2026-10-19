@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "未能完整读取上游响应。",
+    "Trace rows dropped for failed or diagnostic requests": "失败或诊断请求丢弃的追踪条数",
+    "Trace rows dropped for regular requests": "普通请求丢弃的追踪条数",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "队列为失败或诊断请求预留部分容量。可用容量耗尽时，优先追踪仍可能被丢弃。",
+    "Dropped trace rows": "已丢弃追踪行数",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "计数仅属于当前实例，重启后重置。待落库行数包含正在写入的记录；队列满时直接丢弃新追踪元数据，不阻塞请求。进程崩溃可能丢失内存中尚未落库的追踪。",
+    "Summary mode does not collect character counts or tool-call statistics.": "摘要模式不采集字符数和工具调用统计。",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "详细采集在部分事件之后才开始，无法补齐此前的文本和工具统计。",
+    "The client did not receive the complete response.": "客户端未完整接收响应。",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 仅保存失败请求，100 保存全部成功请求。失败重试和临时诊断始终保留；未命中采样的请求使用轻量错误探测。",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "快速档优先降低 CPU 和内存开销，标准档优先压缩率。旧的较高和最高档配置按标准档处理，仅影响关系数据库新记录。",
     "Enable request tracing": "启用请求追踪",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "关闭并保存后停止新增追踪元数据，历史追踪查看、用量日志和计费不受影响。",
     "Request trace settings": "请求追踪设置",

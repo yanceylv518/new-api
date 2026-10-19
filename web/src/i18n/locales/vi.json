@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "Không thể đọc đầy đủ phản hồi từ máy chủ thượng nguồn.",
+    "Trace rows dropped for failed or diagnostic requests": "Số dòng truy vết bị bỏ của yêu cầu lỗi hoặc chẩn đoán",
+    "Trace rows dropped for regular requests": "Số dòng truy vết bị bỏ của yêu cầu thông thường",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "Một phần dung lượng hàng đợi được dành cho yêu cầu lỗi hoặc chẩn đoán. Truy vết ưu tiên vẫn có thể bị bỏ khi hết dung lượng khả dụng.",
+    "Dropped trace rows": "Số dòng dấu vết bị loại bỏ",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "Bộ đếm chỉ thuộc máy chủ này và đặt lại khi khởi động lại. Số dòng đang chờ gồm cả dòng đang ghi. Khi hàng đợi đầy, siêu dữ liệu mới bị loại bỏ để không chặn yêu cầu. Tiến trình bị lỗi có thể làm mất dấu vết chưa lưu trong bộ nhớ.",
+    "Summary mode does not collect character counts or tool-call statistics.": "Chế độ tóm tắt không thu thập số ký tự và thống kê gọi công cụ.",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "Thu thập chi tiết bắt đầu sau một số sự kiện; không thể khôi phục thống kê văn bản và công cụ trước đó.",
+    "The client did not receive the complete response.": "Máy khách chưa nhận đầy đủ phản hồi.",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 chỉ lưu yêu cầu lỗi; 100 lưu mọi yêu cầu thành công. Lần thử lại bị lỗi và chẩn đoán tạm thời luôn được giữ. Yêu cầu ngoài mẫu sử dụng phát hiện lỗi nhẹ.",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "Nhanh ưu tiên giảm CPU và bộ nhớ; tiêu chuẩn ưu tiên nén. Cấu hình high và best cũ dùng mức tiêu chuẩn. Áp dụng cho bản ghi mới trong cơ sở dữ liệu quan hệ.",
     "Enable request tracing": "Bật theo dõi yêu cầu",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "Tắt và lưu sẽ dừng ghi siêu dữ liệu dấu vết mới. Việc xem dấu vết hiện có, nhật ký sử dụng và tính phí không bị ảnh hưởng.",
     "Request trace settings": "Cài đặt theo dõi yêu cầu",

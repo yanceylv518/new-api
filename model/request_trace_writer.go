@@ -15,13 +15,17 @@ import (
 )
 
 const (
-	requestTraceQueueRows    = 8192
-	requestTraceQueueBytes   = 16 << 20
-	requestTraceBatchRows    = 128
-	requestTraceBatchBytes   = 1 << 20
-	requestTraceWorkers      = 2
-	requestTraceWriteTimeout = 3 * time.Second
+	requestTraceQueueRows     = 8192
+	requestTraceQueueBytes    = 16 << 20
+	requestTraceReservedRows  = requestTraceQueueRows / 8
+	requestTraceReservedBytes = requestTraceQueueBytes / 8
+	requestTraceBatchRows     = 128
+	requestTraceBatchBytes    = 1 << 20
+	requestTraceWorkers       = 2
+	requestTraceWriteTimeout  = 3 * time.Second
 )
+
+var ErrRequestTraceDropped = errors.New("request trace queue is unavailable or full")
 
 type requestTracePending struct {
 	userID int
@@ -50,7 +54,9 @@ var requestTraceWriteCounters struct {
 	enqueued             atomic.Int64
 	persisted            atomic.Int64
 	failed               atomic.Int64
-	fallback             atomic.Int64
+	dropped              atomic.Int64
+	droppedPriority      atomic.Int64
+	droppedRegular       atomic.Int64
 	retries              atomic.Int64
 	inFlight             atomic.Int64
 	collected            atomic.Int64
@@ -64,17 +70,21 @@ var requestTraceWriteCounters struct {
 }
 
 type RequestTraceWriterStats struct {
-	Node                     string  `json:"node"`
-	Running                  bool    `json:"running"`
-	QueuedRows               int     `json:"queued_rows"`
-	QueuedBytes              int     `json:"queued_bytes"`
-	QueueRowLimit            int     `json:"queue_row_limit"`
-	QueueByteLimit           int     `json:"queue_byte_limit"`
-	InFlightRows             int64   `json:"in_flight_rows"`
-	EnqueuedRows             int64   `json:"enqueued_rows"`
-	PersistedRows            int64   `json:"persisted_rows"`
-	FailedRows               int64   `json:"failed_rows"`
+	Node           string `json:"node"`
+	Running        bool   `json:"running"`
+	QueuedRows     int    `json:"queued_rows"`
+	QueuedBytes    int    `json:"queued_bytes"`
+	QueueRowLimit  int    `json:"queue_row_limit"`
+	QueueByteLimit int    `json:"queue_byte_limit"`
+	InFlightRows   int64  `json:"in_flight_rows"`
+	EnqueuedRows   int64  `json:"enqueued_rows"`
+	PersistedRows  int64  `json:"persisted_rows"`
+	FailedRows     int64  `json:"failed_rows"`
+	// 兼容旧状态 API；当前不再执行同步回退，该计数固定为零。
 	FallbackRows             int64   `json:"fallback_rows"`
+	DroppedRows              int64   `json:"dropped_rows"`
+	DroppedPriorityRows      int64   `json:"dropped_priority_rows"`
+	DroppedRegularRows       int64   `json:"dropped_regular_rows"`
 	Retries                  int64   `json:"retries"`
 	CollectedRequests        int64   `json:"collected_requests"`
 	SampledOutRequests       int64   `json:"sampled_out_requests"`
@@ -90,7 +100,11 @@ func StartRequestTraceWriter() {
 	requestTraceWriterState.Lock()
 	defer requestTraceWriterState.Unlock()
 	if requestTraceWriterState.writer != nil {
-		return
+		select {
+		case <-requestTraceWriterState.writer.done:
+		default:
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &requestTraceWriter{
@@ -146,6 +160,11 @@ func RecordRequestTraceCollection(sampledOut, partial bool) {
 }
 
 func SubmitRequestTraces(rows []RequestTrace) error {
+	return SubmitRequestTracesWithPriority(rows, false)
+}
+
+// 优先请求可使用预留容量；总行数/字节预算和整组准入规则保持一致。
+func SubmitRequestTracesWithPriority(rows []RequestTrace, priority bool) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -157,14 +176,13 @@ func SubmitRequestTraces(rows []RequestTrace) error {
 		for _, row := range rows {
 			bytes += len(row.Data)
 		}
-		w.mu.Lock()
-		if !w.accepting {
-			w.mu.Unlock()
-			requestTraceWriteCounters.failed.Add(int64(len(rows)))
-			requestTraceWriteCounters.lastFailure.Store(time.Now().Unix())
-			return errors.New("request trace writer is shutting down")
+		rowLimit, byteLimit := requestTraceQueueRows, requestTraceQueueBytes
+		if !priority {
+			rowLimit -= requestTraceReservedRows
+			byteLimit -= requestTraceReservedBytes
 		}
-		if len(rows) <= requestTraceBatchRows && bytes <= requestTraceBatchBytes && w.rows+len(rows) <= requestTraceQueueRows && w.bytes+bytes <= requestTraceQueueBytes {
+		w.mu.Lock()
+		if w.accepting && len(rows) <= requestTraceBatchRows && bytes <= requestTraceBatchBytes && w.rows+len(rows) <= rowLimit && w.bytes+bytes <= byteLimit {
 			// 队列取得元数据行所有权；不保留上下文、正文或采集器。
 			owned := append([]RequestTrace(nil), rows...)
 			select {
@@ -185,11 +203,14 @@ func SubmitRequestTraces(rows []RequestTrace) error {
 		}
 		w.mu.Unlock()
 	}
-	// 内存预算耗尽时施加限时背压，不为每个请求创建额外 goroutine。
-	requestTraceWriteCounters.fallback.Add(int64(len(rows)))
-	ctx, cancel := context.WithTimeout(context.Background(), requestTraceWriteTimeout)
-	defer cancel()
-	return writeRequestTraceBatch(ctx, rows)
+	// 追踪尽力写入；拥塞时丢弃并计数，数据库变慢不再阻塞请求协程。
+	requestTraceWriteCounters.dropped.Add(int64(len(rows)))
+	if priority {
+		requestTraceWriteCounters.droppedPriority.Add(int64(len(rows)))
+	} else {
+		requestTraceWriteCounters.droppedRegular.Add(int64(len(rows)))
+	}
+	return ErrRequestTraceDropped
 }
 
 func HasPendingRequestTrace(requestID string, userID int, admin bool) bool {
@@ -210,7 +231,9 @@ func GetRequestTraceWriterStats() RequestTraceWriterStats {
 	stats := RequestTraceWriterStats{
 		Node: common.NodeName, QueueRowLimit: requestTraceQueueRows, QueueByteLimit: requestTraceQueueBytes,
 		InFlightRows: c.inFlight.Load(), EnqueuedRows: c.enqueued.Load(), PersistedRows: c.persisted.Load(), FailedRows: c.failed.Load(),
-		FallbackRows: c.fallback.Load(), Retries: c.retries.Load(), CollectedRequests: c.collected.Load(),
+		Retries: c.retries.Load(), CollectedRequests: c.collected.Load(),
+		DroppedRows:         c.dropped.Load(),
+		DroppedPriorityRows: c.droppedPriority.Load(), DroppedRegularRows: c.droppedRegular.Load(),
 		SampledOutRequests: c.sampledOut.Load(), PartialRequests: c.partial.Load(), WriteBatches: c.batches.Load(),
 		LastWriteMilliseconds: float64(c.lastWriteNanoseconds.Load()) / float64(time.Millisecond),
 		LastSuccessAt:         c.lastSuccess.Load(), LastFailureAt: c.lastFailure.Load(),
@@ -246,6 +269,12 @@ func (w *requestTraceWriter) complete(rows []RequestTrace) {
 }
 
 func (w *requestTraceWriter) run() {
+	var compressor common.RequestTraceCompressor
+	defer func() {
+		if err := compressor.Close(); err != nil {
+			common.SysError("close request trace compressor: " + err.Error())
+		}
+	}()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	batch := make([]RequestTrace, 0, requestTraceBatchRows)
@@ -254,7 +283,7 @@ func (w *requestTraceWriter) run() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := writeRequestTraceBatch(w.ctx, batch); err != nil {
+		if err := writeRequestTraceBatch(w.ctx, batch, &compressor); err != nil {
 			common.SysError(fmt.Sprintf("request trace batch write failed: rows=%d request_id=%s: %v", len(batch), batch[0].RequestId, err))
 		}
 		w.complete(batch)
@@ -293,7 +322,7 @@ func (w *requestTraceWriter) run() {
 	}
 }
 
-func writeRequestTraceBatch(parent context.Context, rows []RequestTrace) error {
+func writeRequestTraceBatch(parent context.Context, rows []RequestTrace, compressor *common.RequestTraceCompressor) error {
 	counters := &requestTraceWriteCounters
 	counters.inFlight.Add(int64(len(rows)))
 	defer counters.inFlight.Add(-int64(len(rows)))
@@ -304,7 +333,7 @@ func writeRequestTraceBatch(parent context.Context, rows []RequestTrace) error {
 		}
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(parent, requestTraceWriteTimeout)
-		err = RecordRequestTraces(ctx, rows)
+		err = recordRequestTraces(ctx, rows, compressor)
 		cancel()
 		elapsed := time.Since(started).Nanoseconds()
 		counters.batches.Add(1)

@@ -63,7 +63,8 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
   const [keysOpen, setKeysOpen] = useState(false)
   const summary = props.record?.trace
   const admin = props.isAdmin ? props.record?.admin_info : undefined
-  const shape = admin?.shape
+  const summaryMetadata = admin?.metadata_level === 'summary'
+  const shape = summaryMetadata ? undefined : admin?.shape
   const upstream = admin?.upstream
   const response = admin?.resp
   let endMarkerLabel = t('End marker missing')
@@ -153,6 +154,15 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     tool_limit: t('Tool-call capture limit reached'),
     invalid_tool_name: t('Tool name is invalid or too long'),
     invalid_tool_index: t('Tool-call index is invalid'),
+    capture_upgraded: t(
+      'Detailed capture started after earlier events; earlier text and tool statistics are unavailable.'
+    ),
+    client_delivery_incomplete: t(
+      'The client did not receive the complete response.'
+    ),
+    upstream_read_error: t(
+      'The upstream response could not be read completely.'
+    ),
   }
   const parameters = [
     shape?.max_tokens !== undefined ? `max_tokens=${shape.max_tokens}` : '',
@@ -535,6 +545,7 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
             }
           />
           {response &&
+            !summaryMetadata &&
             !response.metadata_incomplete &&
             (!failed ||
               response.content_chars > 0 ||
@@ -574,57 +585,64 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
               value={response.reasoning_tokens.toLocaleString()}
             />
           )}
-          {!!response?.tool_calls && (
-            <DetailRow
-              label={<span className='block leading-5'>{t('Tool calls')}</span>}
-              value={
-                <div className='flex min-w-0 flex-col gap-1.5'>
-                  <ScrollArea
-                    role='region'
-                    aria-label={t('Tool calls')}
-                    className='w-full [&_[data-slot=scroll-area-viewport]]:max-h-32'
-                  >
-                    <ul className='m-0 flex min-w-0 list-none flex-wrap items-start gap-x-3 gap-y-1.5 p-0 pr-3'>
-                      {toolCallsByName.map(([name, count]) => (
-                        <li
-                          key={name}
-                          className='flex max-w-full min-w-0 items-start gap-1.5'
-                        >
-                          <span className='min-w-0 font-mono leading-5 break-all'>
-                            {name}
-                          </span>
-                          <Badge
-                            variant='secondary'
-                            className='min-w-6 tabular-nums'
+          {!summaryMetadata &&
+            !response?.incomplete_reasons?.includes('capture_upgraded') &&
+            !!response?.tool_calls && (
+              <DetailRow
+                label={
+                  <span className='block leading-5'>{t('Tool calls')}</span>
+                }
+                value={
+                  <div className='flex min-w-0 flex-col gap-1.5'>
+                    <ScrollArea
+                      role='region'
+                      aria-label={t('Tool calls')}
+                      className='w-full [&_[data-slot=scroll-area-viewport]]:max-h-32'
+                    >
+                      <ul className='m-0 flex min-w-0 list-none flex-wrap items-start gap-x-3 gap-y-1.5 p-0 pr-3'>
+                        {toolCallsByName.map(([name, count]) => (
+                          <li
+                            key={name}
+                            className='flex max-w-full min-w-0 items-start gap-1.5'
                           >
-                            {count.toLocaleString()}
-                          </Badge>
-                        </li>
-                      ))}
-                      {unnamedToolCalls > 0 && (
-                        <li
-                          className='text-muted-foreground flex max-w-full min-w-0 items-start gap-1.5'
-                          title={t('{{count}} calls without a recorded name', {
-                            count: unnamedToolCalls,
-                          })}
-                        >
-                          <span className='min-w-0 leading-5'>
-                            {t('Not recorded')}
-                          </span>
-                          <Badge
-                            variant='secondary'
-                            className='min-w-6 tabular-nums'
+                            <span className='min-w-0 font-mono leading-5 break-all'>
+                              {name}
+                            </span>
+                            <Badge
+                              variant='secondary'
+                              className='min-w-6 tabular-nums'
+                            >
+                              {count.toLocaleString()}
+                            </Badge>
+                          </li>
+                        ))}
+                        {unnamedToolCalls > 0 && (
+                          <li
+                            className='text-muted-foreground flex max-w-full min-w-0 items-start gap-1.5'
+                            title={t(
+                              '{{count}} calls without a recorded name',
+                              {
+                                count: unnamedToolCalls,
+                              }
+                            )}
                           >
-                            {unnamedToolCalls.toLocaleString()}
-                          </Badge>
-                        </li>
-                      )}
-                    </ul>
-                  </ScrollArea>
-                </div>
-              }
-            />
-          )}
+                            <span className='min-w-0 leading-5'>
+                              {t('Not recorded')}
+                            </span>
+                            <Badge
+                              variant='secondary'
+                              className='min-w-6 tabular-nums'
+                            >
+                              {unnamedToolCalls.toLocaleString()}
+                            </Badge>
+                          </li>
+                        )}
+                      </ul>
+                    </ScrollArea>
+                  </div>
+                }
+              />
+            )}
           {response?.refused && (
             <DetailRow label={t('Refused')} value={t('Yes')} />
           )}
@@ -684,17 +702,25 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
               }
             />
           )}
-          {response?.metadata_incomplete && (
+          {summaryMetadata && (
             <p className='text-muted-foreground text-xs'>
-              {response.incomplete_reasons?.length
-                ? response.incomplete_reasons
-                    .map((reason) => incompleteReasonLabels[reason] ?? reason)
-                    .join(' · ')
-                : t(
-                    'Response metadata is partial because an event was unavailable or exceeded the capture limit.'
-                  )}
+              {t(
+                'Summary mode does not collect character counts or tool-call statistics.'
+              )}
             </p>
           )}
+          {response?.metadata_incomplete &&
+            (!summaryMetadata || !!response.incomplete_reasons?.length) && (
+              <p className='text-muted-foreground text-xs'>
+                {response.incomplete_reasons?.length
+                  ? response.incomplete_reasons
+                      .map((reason) => incompleteReasonLabels[reason] ?? reason)
+                      .join(' · ')
+                  : t(
+                      'Response metadata is partial because an event was unavailable or exceeded the capture limit.'
+                    )}
+              </p>
+            )}
           {truncated && (
             <Alert className='border-warning/30 bg-warning/10 text-warning mt-1 py-1.5'>
               <AlertDescription className='text-warning text-xs'>

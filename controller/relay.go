@@ -96,6 +96,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			if trace := common.GetRequestTrace(c); trace != nil {
 				trace.Failed = true
+				if trace.ClientObserver != nil {
+					trace.ClientObserver.ObserveClientError()
+				}
 			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(common.MaskCredentials(newAPIError.Error(), common.GetContextKeyString(c, constant.ContextKeyChannelKey)))))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))

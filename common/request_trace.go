@@ -76,7 +76,12 @@ func ParseRequestTraceConfig(value string) (RequestTraceConfig, error) {
 	if config.Level != "off" && config.Level != "errors" && config.Level != "all" {
 		return config, errors.New("invalid request trace level")
 	}
-	if _, ok := requestTraceStorageEncoders[config.CompressionLevel]; !ok {
+	switch config.CompressionLevel {
+	case "high", "best":
+		// 旧配置映射到保留的标准档，已保存的数据仍按原格式解码。
+		config.CompressionLevel = "standard"
+	case "fast", "standard":
+	default:
 		return config, errors.New("invalid request trace compression level")
 	}
 	if config.SuccessSampleRate < 0 || config.SuccessSampleRate > 100 {
@@ -231,6 +236,7 @@ type RequestTraceClient struct {
 }
 
 type RequestTraceAdmin struct {
+	MetadataLevel         TraceMetadataLevel   `json:"metadata_level,omitempty"`
 	ShapeIncomplete       bool                 `json:"shape_incomplete,omitempty"`
 	ShapeIncompleteReason string               `json:"shape_incomplete_reason,omitempty"`
 	ChannelID             int                  `json:"channel_id,omitempty"`
@@ -244,6 +250,56 @@ type RequestTraceData struct {
 	Version   int                 `json:"version,omitempty"`
 	Trace     RequestTraceSummary `json:"trace"`
 	AdminInfo *RequestTraceAdmin  `json:"admin_info,omitempty"`
+}
+
+// 摘要存储省略未采集字段；详情读取仍用 RequestTraceData 还原既有 API 结构。
+func MarshalRequestTraceStorageData(data RequestTraceData) ([]byte, error) {
+	admin := data.AdminInfo
+	if admin == nil || admin.MetadataLevel != TraceMetadataSummary {
+		return Marshal(data)
+	}
+	type summaryUpstream struct {
+		Status             int    `json:"status,omitempty"`
+		HeaderMilliseconds int64  `json:"header_ms,omitempty"`
+		Milliseconds       *int64 `json:"ms,omitempty"`
+		RequestID          string `json:"request_id,omitempty"`
+		ErrorType          string `json:"error_type,omitempty"`
+		ErrorCode          string `json:"error_code,omitempty"`
+	}
+	type summaryResponse struct {
+		Error                 bool     `json:"error,omitempty"`
+		ContentType           string   `json:"content_type,omitempty"`
+		Chunks                int64    `json:"chunks,omitempty"`
+		LastChunkMilliseconds int64    `json:"last_chunk_ms,omitempty"`
+		Done                  bool     `json:"done,omitempty"`
+		EndMarker             string   `json:"end_marker,omitempty"`
+		UsageChunk            bool     `json:"usage_chunk,omitempty"`
+		MetadataIncomplete    bool     `json:"metadata_incomplete,omitempty"`
+		IncompleteReasons     []string `json:"incomplete_reasons,omitempty"`
+		EndMarkerPolicy       string   `json:"end_marker_policy,omitempty"`
+	}
+	type summaryAdmin struct {
+		MetadataLevel         TraceMetadataLevel `json:"metadata_level"`
+		ChannelID             int                `json:"channel_id,omitempty"`
+		Shape                 *RequestTraceShape `json:"shape,omitempty"`
+		ShapeIncomplete       bool               `json:"shape_incomplete,omitempty"`
+		ShapeIncompleteReason string             `json:"shape_incomplete_reason,omitempty"`
+		Upstream              summaryUpstream    `json:"upstream"`
+		Response              summaryResponse    `json:"resp"`
+	}
+	return Marshal(struct {
+		Version   int                 `json:"version,omitempty"`
+		Trace     RequestTraceSummary `json:"trace"`
+		AdminInfo summaryAdmin        `json:"admin_info"`
+	}{
+		Version: data.Version, Trace: data.Trace,
+		AdminInfo: summaryAdmin{
+			MetadataLevel: admin.MetadataLevel, ChannelID: admin.ChannelID, Shape: admin.Shape,
+			ShapeIncomplete: admin.ShapeIncomplete, ShapeIncompleteReason: admin.ShapeIncompleteReason,
+			Upstream: summaryUpstream{Status: admin.Upstream.Status, HeaderMilliseconds: admin.Upstream.HeaderMilliseconds, Milliseconds: admin.Upstream.Milliseconds, RequestID: admin.Upstream.RequestID, ErrorType: admin.Upstream.ErrorType, ErrorCode: admin.Upstream.ErrorCode},
+			Response: summaryResponse{Error: admin.Response.Error, ContentType: admin.Response.ContentType, Chunks: admin.Response.Chunks, LastChunkMilliseconds: admin.Response.LastChunkMilliseconds, Done: admin.Response.Done, EndMarker: admin.Response.EndMarker, UsageChunk: admin.Response.UsageChunk, MetadataIncomplete: admin.Response.MetadataIncomplete, IncompleteReasons: admin.Response.IncompleteReasons, EndMarkerPolicy: admin.Response.EndMarkerPolicy},
+		},
+	})
 }
 
 type RequestTraceAttempt struct {
@@ -260,6 +316,7 @@ type RequestTraceAttempt struct {
 type RequestTraceCollector struct {
 	sync.Mutex
 	Config                RequestTraceConfig
+	SampledSuccess        bool
 	Started               time.Time
 	Client                RequestTraceClient
 	RequestBytes          *int64
@@ -277,6 +334,24 @@ func GetRequestTrace(c *gin.Context) *RequestTraceCollector {
 	value, _ := c.Get(RequestTraceContextKey)
 	trace, _ := value.(*RequestTraceCollector)
 	return trace
+}
+
+// 仅由已确认原样转发响应的路径调用，协议名称相同不足以证明没有改写。
+func ReuseUpstreamRequestTrace(c *gin.Context, response *http.Response) {
+	trace := GetRequestTrace(c)
+	if trace == nil || trace.ClientObserver == nil || response == nil {
+		return
+	}
+	if body, ok := response.Body.(*TraceResponseBody); ok {
+		trace.ClientObserver.ReuseUpstream(body.Observer)
+	}
+}
+
+func (t *RequestTraceCollector) ResponseMetadataLevel(channelID int, status int) TraceMetadataLevel {
+	if (t.Config.Level == "all" && t.SampledSuccess) || t.Config.DiagnoseChannel(channelID) || status >= 400 {
+		return TraceMetadataFull
+	}
+	return TraceMetadataSummary
 }
 
 func SetRequestTraceStage(c *gin.Context, stage string) {

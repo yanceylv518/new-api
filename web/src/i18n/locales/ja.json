@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "上流の応答を最後まで読み取れませんでした。",
+    "Trace rows dropped for failed or diagnostic requests": "失敗・診断リクエストで破棄されたトレース行",
+    "Trace rows dropped for regular requests": "通常リクエストで破棄されたトレース行",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "キュー容量の一部は失敗・診断リクエスト用に確保されます。利用可能な容量がなくなると、優先トレースも破棄される場合があります。",
+    "Dropped trace rows": "破棄したトレース行数",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "カウンターはこのインスタンスに限定され、再起動でリセットします。待機行には書き込み中の行を含みます。キューが満杯の場合、新しいメタデータを破棄してリクエストのブロックを避けます。異常終了時は未保存のトレースが失われる場合があります。",
+    "Summary mode does not collect character counts or tool-call statistics.": "概要モードでは文字数とツール呼び出し統計を収集しません。",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "詳細収集の開始前に受信したイベントの文字数とツール統計は復元できません。",
+    "The client did not receive the complete response.": "クライアントは応答を最後まで受信しませんでした。",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 は失敗のみ、100 はすべての成功を保存します。失敗した再試行と一時診断は常に保存します。サンプル対象外のリクエストは軽量なエラー検出を使用します。",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "高速は CPU とメモリの節約、標準は圧縮率を優先します。旧 high と best の設定は標準として扱います。関係データベースの新しい記録に適用します。",
     "Enable request tracing": "リクエストトレースを有効化",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "無効にして保存すると、新しいトレースメタデータの記録を停止します。既存トレースの閲覧、利用ログ、課金には影響しません。",
     "Request trace settings": "リクエストトレース設定",

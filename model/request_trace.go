@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -30,7 +31,13 @@ type RequestTraceView struct {
 	common.RequestTraceData
 }
 
-func RecordRequestTraces(ctx context.Context, rows []RequestTrace) error {
+func RecordRequestTraces(ctx context.Context, rows []RequestTrace) (err error) {
+	var compressor common.RequestTraceCompressor
+	defer func() { err = errors.Join(err, compressor.Close()) }()
+	return recordRequestTraces(ctx, rows, &compressor)
+}
+
+func recordRequestTraces(ctx context.Context, rows []RequestTrace, compressor *common.RequestTraceCompressor) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -40,7 +47,10 @@ func RecordRequestTraces(ctx context.Context, rows []RequestTrace) error {
 	}
 	stored := append([]RequestTrace(nil), rows...)
 	for index := range stored {
-		encoded, err := common.EncodeRequestTraceStorage(stored[index].Data)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		encoded, err := compressor.Encode(stored[index].Data)
 		if err != nil {
 			return fmt.Errorf("encode request trace: %w", err)
 		}

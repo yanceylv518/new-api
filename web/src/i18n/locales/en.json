@@ -1,5 +1,16 @@
 {
   "translation": {
+    "The upstream response could not be read completely.": "The upstream response could not be read completely.",
+    "Trace rows dropped for failed or diagnostic requests": "Trace rows dropped for failed or diagnostic requests",
+    "Trace rows dropped for regular requests": "Trace rows dropped for regular requests",
+    "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.": "Some queue capacity is reserved for failed or diagnostic requests. Priority traces can still be dropped when available capacity is exhausted.",
+    "Dropped trace rows": "Dropped trace rows",
+    "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.": "Counters are local to this instance and reset on restart. Pending rows include writes in flight. A full queue drops new trace metadata without blocking requests. Pending in-memory traces may be lost if the process crashes.",
+    "Summary mode does not collect character counts or tool-call statistics.": "Summary mode does not collect character counts or tool-call statistics.",
+    "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.": "Detailed capture started after earlier events; earlier text and tool statistics are unavailable.",
+    "The client did not receive the complete response.": "The client did not receive the complete response.",
+    "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.": "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Unsampled requests use lightweight error detection.",
+    "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.": "Fast minimizes CPU and memory use; standard prioritizes compression. Legacy high and best settings use standard. Applies to new relational database records.",
     "Enable request tracing": "Enable request tracing",
     "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.",
     "Request trace settings": "Request trace settings",
