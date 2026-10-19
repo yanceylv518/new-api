@@ -58,6 +58,7 @@ func (w *traceResponseWriter) WriteString(data string) (int, error) {
 }
 
 func RequestTrace() gin.HandlerFunc {
+	recoverPanic := RelayPanicRecover()
 	return func(c *gin.Context) {
 		config := common.GetRequestTraceConfig()
 		path := c.Request.URL.Path
@@ -83,7 +84,8 @@ func RequestTrace() gin.HandlerFunc {
 			// Gin 归池前不清空 Keys，收尾完成后解除对事件缓存的引用。
 			c.Set(common.RequestTraceContextKey, nil)
 		}()
-		c.Next()
+		// 在采集器存活期间恢复下游 panic，错误响应写出后再整理元数据。
+		recoverPanic(c)
 		observer.Finish()
 		response, clientMetadata, clientReason := observer.Snapshot()
 		failed := trace.Failed || response.Error || c.Writer.Status() >= 400 || clientMetadata.ErrorType != ""

@@ -456,6 +456,93 @@ func TestRequestTraceResponseController(t *testing.T) {
 	}
 }
 
+func TestRequestTracePanicPersistence(t *testing.T) {
+	for _, tc := range []struct {
+		name, level                string
+		userID, rows, status       int
+		attempt, stream, anonymous bool
+	}{
+		{name: "summary before dispatch", level: "errors", userID: 11, rows: 1, status: 500},
+		{name: "full before dispatch", level: "all", userID: 11, rows: 1, status: 500},
+		{name: "active attempt", level: "errors", userID: 11, rows: 1, status: 500, attempt: true},
+		{name: "headers already sent", level: "errors", userID: 11, rows: 1, status: 200, attempt: true, stream: true},
+		{name: "off", level: "off", userID: 11, status: 500},
+		{name: "anonymous disabled", level: "errors", status: 500},
+		{name: "anonymous enabled", level: "errors", rows: 1, status: 500, anonymous: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupRequestTraceDatabase(t)
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: tc.level, PreChannelErrors: true, AnonymousErrors: tc.anonymous, SuccessSampleRate: 0})))
+			app := gin.New()
+			app.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, recovered any) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"type": "new_api_panic", "message": fmt.Sprint(recovered)}})
+				c.Abort()
+			}))
+			cleaned := false
+			app.Use(func(c *gin.Context) {
+				original := c.Writer
+				defer func() {
+					assert.Nil(t, common.GetRequestTrace(c))
+					assert.Same(t, original, c.Writer)
+					storage, _ := c.Get(common.KeyBodyStorage)
+					assert.Nil(t, storage)
+					cleaned = true
+				}()
+				c.Next()
+			}, middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+			app.POST("/v1/chat/completions", func(c *gin.Context) {
+				c.Set("id", tc.userID)
+				_, err := common.GetBodyStorage(c)
+				require.NoError(t, err)
+				if tc.attempt {
+					trace := common.GetRequestTrace(c)
+					attempt := trace.StartAttempt(0, 7, c.Request)
+					attempt.Upstream.Status = http.StatusOK
+					attempt.Observer = common.NewTraceBodyObserverWithMode(trace.Started, trace.ResponseMetadataLevel(7, http.StatusOK))
+					common.SetRequestTraceStage(c, "upstream")
+				}
+				if tc.stream {
+					c.Header("Content-Type", "text/event-stream")
+					_, err := c.Writer.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"private-response\"}}]}\n\n")
+					require.NoError(t, err)
+					c.Writer.Flush()
+				}
+				panic("private-panic-payload")
+			})
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"private-input"}]}`)))
+			assert.Equal(t, tc.status, recorder.Code)
+			assert.True(t, cleaned)
+			awaitRequestTraceWrites(t)
+			var stored []model.RequestTrace
+			require.NoError(t, db.Where("request_id = ?", recorder.Header().Get(common.RequestIdKey)).Find(&stored).Error)
+			require.Len(t, stored, tc.rows)
+			if tc.rows == 0 {
+				return
+			}
+			encoded, err := common.DecodeRequestTraceStorage(stored[0].Data)
+			require.NoError(t, err)
+			assert.NotContains(t, encoded, "private-")
+			var data common.RequestTraceData
+			require.NoError(t, common.UnmarshalJsonStr(encoded, &data))
+			assert.Equal(t, "failed", data.Trace.Outcome)
+			assert.Equal(t, tc.status, data.Trace.Status)
+			assert.EqualValues(t, recorder.Body.Len(), data.Trace.ResponseBytes)
+			require.NotNil(t, data.AdminInfo)
+			assert.Equal(t, common.TraceMetadataFull, data.AdminInfo.MetadataLevel)
+			assert.True(t, data.AdminInfo.Response.Error)
+			require.NotNil(t, data.AdminInfo.Shape)
+			assert.EqualValues(t, 1, data.AdminInfo.Shape.Messages)
+			if tc.stream {
+				assert.False(t, data.AdminInfo.Response.Done)
+				assert.Contains(t, data.AdminInfo.Response.IncompleteReasons, "capture_upgraded")
+			} else {
+				assert.Equal(t, "new_api_panic", data.Trace.ClientErrorType)
+			}
+		})
+	}
+}
+
 func TestRequestTraceMiddlewareModes(t *testing.T) {
 	cases := []struct {
 		name, level                                     string

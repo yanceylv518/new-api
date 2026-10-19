@@ -11,9 +11,19 @@ import (
 func BodyStorageCleanup() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
+			panicValue := recover()
 			if trace := common.GetRequestTrace(c); trace != nil {
+				if panicValue != nil {
+					trace.Failed = true
+					if trace.ClientObserver != nil {
+						trace.ClientObserver.ObserveClientError()
+					}
+				}
 				if trace.ClientObserver != nil {
-					trace.ClientObserver.Finish()
+					// panic 的恢复响应尚未写出，观察器由追踪收尾阶段结束。
+					if panicValue == nil {
+						trace.ClientObserver.Finish()
+					}
 					trace.Failed = trace.Failed || trace.ClientObserver.HasError()
 				}
 				detailed := (trace.Config.Level == "all" && trace.SampledSuccess) || trace.Failed || c.Writer.Status() >= 400
@@ -37,6 +47,9 @@ func BodyStorageCleanup() gin.HandlerFunc {
 
 			// 清理文件缓存（URL 下载的文件等）
 			service.CleanupFileSources(c)
+			if panicValue != nil {
+				panic(panicValue)
+			}
 		}()
 		c.Next()
 	}
