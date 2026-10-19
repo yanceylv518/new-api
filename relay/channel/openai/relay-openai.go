@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
@@ -174,7 +175,16 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		if shouldSendLastResp {
-			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+			clientData := lastStreamData
+			if containStreamUsage && !info.ShouldIncludeUsage {
+				// 仅调整客户端事件，计费后处理继续读取原始 usage 帧。
+				var err error
+				clientData, err = sjson.Delete(clientData, "usage")
+				if err != nil {
+					return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+				}
+			}
+			_ = sendStreamData(c, info, clientData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
 	}
 

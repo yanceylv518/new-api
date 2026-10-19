@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -1083,6 +1084,74 @@ func TestRequestTraceSamplingAndDiagnostics(t *testing.T) {
 	}
 	assert.Greater(t, selected, 0)
 	assert.Less(t, selected, 100)
+}
+
+func TestRequestTraceChatTerminalUsage(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, tc := range []struct {
+		name, reason            string
+		delta                   gin.H
+		includeUsage, usageOnly bool
+	}{
+		{name: "finish reason without usage requested", reason: "stop", delta: gin.H{}},
+		{name: "tool invocation without usage requested", reason: "tool_calls", delta: gin.H{"tool_calls": []gin.H{{"index": 0, "id": "call-test", "type": "function", "function": gin.H{"name": "search", "arguments": "{}"}}}}},
+		{name: "refusal without usage requested", delta: gin.H{"refusal": "declined"}},
+		{name: "role without usage requested", delta: gin.H{"role": "assistant"}},
+		{name: "usage requested", reason: "stop", delta: gin.H{}, includeUsage: true},
+		{name: "standalone usage omitted", usageOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			choices := []gin.H{}
+			if !tc.usageOnly {
+				choice := gin.H{"index": 0, "delta": tc.delta}
+				if tc.reason != "" {
+					choice["finish_reason"] = tc.reason
+				}
+				choices = append(choices, choice)
+			}
+			payload := common.GetJsonString(gin.H{"id": "test-frame", "model": "mock-model", "choices": choices, "usage": gin.H{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}})
+			app := gin.New()
+			app.POST("/v1/chat/completions", func(c *gin.Context) {
+				info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions, IsStream: true, ShouldIncludeUsage: tc.includeUsage, ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "mock-model"}}
+				response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: " + payload + "\n\ndata: [DONE]\n\n"))}
+				usage, apiError := openai.OaiStreamHandler(c, info, response)
+				require.Nil(t, apiError)
+				require.NotNil(t, usage)
+				assert.Equal(t, 2, usage.PromptTokens)
+				assert.Equal(t, 3, usage.CompletionTokens)
+			})
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`)))
+			assert.Equal(t, 1, strings.Count(recorder.Body.String(), "data: [DONE]"))
+			frames := 0
+			for _, line := range strings.Split(recorder.Body.String(), "\n") {
+				if !strings.HasPrefix(line, "data: {") {
+					continue
+				}
+				frames++
+				var frame map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(strings.TrimPrefix(line, "data: "), &frame))
+				_, hasUsage := frame["usage"]
+				assert.Equal(t, tc.includeUsage, hasUsage)
+				if !tc.usageOnly {
+					encodedChoices := common.GetJsonString(frame["choices"])
+					for key := range tc.delta {
+						assert.Contains(t, encodedChoices, `"`+key+`"`)
+					}
+					if tc.reason != "" {
+						assert.Contains(t, encodedChoices, tc.reason)
+					}
+				}
+			}
+			if tc.usageOnly {
+				assert.Zero(t, frames)
+			} else {
+				assert.Equal(t, 1, frames)
+			}
+		})
+	}
 }
 
 func TestRequestTraceRootStatusAuthorization(t *testing.T) {
