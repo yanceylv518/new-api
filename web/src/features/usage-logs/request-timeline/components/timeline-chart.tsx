@@ -16,17 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import {
-  getCoreRowModel,
-  getPaginationRowModel,
-  useReactTable,
-  type ColumnDef,
-} from '@tanstack/react-table'
 import { ChevronDown } from 'lucide-react'
 import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { DataTablePagination } from '@/components/data-table'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
@@ -155,11 +148,6 @@ function TimelineBar(props: {
   )
 }
 
-type ChartRow = { node: TimelineNode; depth: number }
-const CHART_COLUMNS: ColumnDef<ChartRow>[] = [
-  { id: 'stage', accessorFn: (row) => row.node.label },
-]
-
 const TimelineChartRow = memo(function TimelineChartRow(props: {
   node: TimelineNode
   depth: number
@@ -260,14 +248,6 @@ export function TimelineChart(props: TimelineChartProps) {
     () => flattenTimeline(props.groups, props.collapsed),
     [props.groups, props.collapsed]
   )
-  const table = useReactTable({
-    data: rows,
-    columns: CHART_COLUMNS,
-    getRowId: (row) => row.node.id,
-    getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize: 50 } },
-  })
   const window = props.segments[0]
   const ticks = [
     ...new Set([
@@ -321,9 +301,14 @@ export function TimelineChart(props: TimelineChartProps) {
         <span className='text-warning'>┊ {t('Upstream first byte')}</span>
         <span className='text-success'>┊ {t('First payload write')}</span>
       </div>
-      <div className='overflow-hidden rounded-lg border'>
+      <div
+        className='focus-visible:ring-ring/50 max-h-[min(50dvh,28rem)] overflow-auto overscroll-contain rounded-lg border outline-none focus-visible:ring-[3px]'
+        role='region'
+        aria-label={t('Waterfall')}
+        tabIndex={0}
+      >
         <div
-          className={cn(ROW_GRID, 'bg-muted/60 py-2 text-xs')}
+          className={cn(ROW_GRID, 'bg-muted sticky top-0 z-10 py-2 text-xs')}
           aria-hidden='true'
         >
           <span className='text-muted-foreground hidden sm:block'>
@@ -348,16 +333,16 @@ export function TimelineChart(props: TimelineChartProps) {
           </span>
         </div>
         <ul aria-label={t('Request stages')}>
-          {table.getRowModel().rows.map(({ original }) => (
+          {rows.map(({ node, depth }) => (
             <TimelineChartRow
-              key={original.node.id}
-              node={original.node}
-              depth={original.depth}
+              key={node.id}
+              node={node}
+              depth={depth}
               segments={props.segments}
               total={props.total}
               markers={props.markers}
-              selected={props.selectedId === original.node.id}
-              expanded={!props.collapsed.has(original.node.id)}
+              selected={props.selectedId === node.id}
+              expanded={!props.collapsed.has(node.id)}
               onSelect={props.onSelect}
               onToggle={props.onToggle}
             />
@@ -369,7 +354,6 @@ export function TimelineChart(props: TimelineChartProps) {
           )}
         </p>
       </div>
-      <DataTablePagination table={table} compact />
     </section>
   )
 }
