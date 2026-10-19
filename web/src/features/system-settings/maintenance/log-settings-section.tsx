@@ -466,38 +466,38 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
               setTimelineOpen(value.includes('request-timeline'))
             }
             data-settings-form-span='full'
-            className='min-w-0 rounded-lg border px-4'
+            className='min-w-0 rounded-lg border px-4 pt-4'
           >
+            <FormField
+              control={form.control}
+              name='RequestTraceEnabled'
+              render={({ field }) => (
+                <SettingsSwitchItem>
+                  <SettingsSwitchContent>
+                    <FormLabel>{t('Collect request timelines')}</FormLabel>
+                    <FormDescription>
+                      {t(
+                        'Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.'
+                      )}
+                    </FormDescription>
+                  </SettingsSwitchContent>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      disabled={form.formState.isSubmitting}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </SettingsSwitchItem>
+              )}
+            />
             <SettingsAccordion
               value='request-timeline'
               title={t('Request timeline')}
+              className='mt-4'
             >
               <div className='flex flex-col gap-6'>
-                <FormField
-                  control={form.control}
-                  name='RequestTraceEnabled'
-                  render={({ field }) => (
-                    <SettingsSwitchItem>
-                      <SettingsSwitchContent>
-                        <FormLabel>{t('Collect request timelines')}</FormLabel>
-                        <FormDescription>
-                          {t(
-                            'Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.'
-                          )}
-                        </FormDescription>
-                      </SettingsSwitchContent>
-                      <FormControl>
-                        <Switch
-                          checked={field.value}
-                          onCheckedChange={field.onChange}
-                          disabled={form.formState.isSubmitting}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </SettingsSwitchItem>
-                  )}
-                />
-
                 <FormField
                   control={form.control}
                   name='RequestTraceCompressionLevel'
