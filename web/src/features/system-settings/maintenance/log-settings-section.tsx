@@ -24,6 +24,7 @@ import { toast } from 'sonner'
 import * as z from 'zod'
 
 import { DateTimePicker } from '@/components/datetime-picker'
+import { Accordion } from '@/components/ui/accordion'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -69,6 +70,7 @@ import {
   getSystemTask,
   startLogCleanupTask,
 } from '../api'
+import { SettingsAccordion } from '../components/settings-accordion'
 import {
   SettingsControlGroup,
   SettingsForm,
@@ -82,6 +84,7 @@ import type { LogCleanupTask, UpdateOptionRequest } from '../types'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTraceEnabled: z.boolean(),
   RequestTraceCompressionLevel: z.enum([
     'fastest',
     'default',
@@ -94,6 +97,7 @@ type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultTraceEnabled: boolean
   defaultCompressionLevel: LogSettingsFormValues['RequestTraceCompressionLevel']
 }
 
@@ -155,10 +159,12 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: props.defaultEnabled,
+      RequestTraceEnabled: props.defaultTraceEnabled,
       RequestTraceCompressionLevel: props.defaultCompressionLevel,
     },
   })
 
+  const [timelineOpen, setTimelineOpen] = useState(false)
   const [purgeDate, setPurgeDate] = useState<Date | undefined>(() =>
     getDateDaysAgo(30)
   )
@@ -185,11 +191,17 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
     form.reset(
       {
         LogConsumeEnabled: props.defaultEnabled,
+        RequestTraceEnabled: props.defaultTraceEnabled,
         RequestTraceCompressionLevel: props.defaultCompressionLevel,
       },
       { keepDirtyValues: true }
     )
-  }, [props.defaultEnabled, props.defaultCompressionLevel, form])
+  }, [
+    props.defaultEnabled,
+    props.defaultTraceEnabled,
+    props.defaultCompressionLevel,
+    form,
+  ])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -276,6 +288,12 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
       updates.push({
         key: 'LogConsumeEnabled',
         value: values.LogConsumeEnabled,
+      })
+    }
+    if (values.RequestTraceEnabled !== props.defaultTraceEnabled) {
+      updates.push({
+        key: 'request_trace.enabled',
+        value: values.RequestTraceEnabled,
       })
     }
     if (values.RequestTraceCompressionLevel !== props.defaultCompressionLevel) {
@@ -402,62 +420,106 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
             )}
           />
 
-          <FormField
-            control={form.control}
-            name='RequestTraceCompressionLevel'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Request timeline compression')}</FormLabel>
-                <Select
-                  items={[
-                    { value: 'fastest', label: t('Fastest (recommended)') },
-                    { value: 'default', label: t('Default compression') },
-                    { value: 'better', label: t('Higher compression') },
-                    { value: 'best', label: t('Maximum compression') },
-                  ]}
-                  value={field.value}
-                  onValueChange={field.onChange}
-                  disabled={form.formState.isSubmitting}
-                >
-                  <FormControl>
-                    <SelectTrigger className='w-full sm:w-64'>
-                      <SelectValue />
-                    </SelectTrigger>
-                  </FormControl>
-                  <SelectContent alignItemWithTrigger={false}>
-                    <SelectGroup>
-                      <SelectItem value='fastest'>
-                        {t('Fastest (recommended)')}
-                      </SelectItem>
-                      <SelectItem value='default'>
-                        {t('Default compression')}
-                      </SelectItem>
-                      <SelectItem value='better'>
-                        {t('Higher compression')}
-                      </SelectItem>
-                      <SelectItem value='best'>
-                        {t('Maximum compression')}
-                      </SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                <FormDescription>
-                  {t(
-                    'For relational log databases. ClickHouse stores JSON with native ZSTD(1) compression.'
-                  )}{' '}
-                  {t(
-                    'Compression is lossless. Short timelines stay uncompressed when that is smaller.'
-                  )}{' '}
-                  {t(
-                    'Changes apply to newly written timelines. Higher compression uses more CPU and memory.'
+          <Accordion
+            value={timelineOpen ? ['request-timeline'] : []}
+            onValueChange={(value) =>
+              setTimelineOpen(value.includes('request-timeline'))
+            }
+            data-settings-form-span='full'
+            className='min-w-0 rounded-lg border px-4'
+          >
+            <SettingsAccordion
+              value='request-timeline'
+              title={t('Request timeline')}
+            >
+              <div className='flex flex-col gap-6'>
+                <FormField
+                  control={form.control}
+                  name='RequestTraceEnabled'
+                  render={({ field }) => (
+                    <SettingsSwitchItem>
+                      <SettingsSwitchContent>
+                        <FormLabel>{t('Collect request timelines')}</FormLabel>
+                        <FormDescription>
+                          {t(
+                            'Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.'
+                          )}
+                        </FormDescription>
+                      </SettingsSwitchContent>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </SettingsSwitchItem>
                   )}
-                </FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+                />
 
-          <RequestTimelineWriterStatusPanel />
+                <FormField
+                  control={form.control}
+                  name='RequestTraceCompressionLevel'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Request timeline compression')}</FormLabel>
+                      <Select
+                        items={[
+                          {
+                            value: 'fastest',
+                            label: t('Fastest (recommended)'),
+                          },
+                          { value: 'default', label: t('Default compression') },
+                          { value: 'better', label: t('Higher compression') },
+                          { value: 'best', label: t('Maximum compression') },
+                        ]}
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={form.formState.isSubmitting}
+                      >
+                        <FormControl>
+                          <SelectTrigger className='w-full sm:w-64'>
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent alignItemWithTrigger={false}>
+                          <SelectGroup>
+                            <SelectItem value='fastest'>
+                              {t('Fastest (recommended)')}
+                            </SelectItem>
+                            <SelectItem value='default'>
+                              {t('Default compression')}
+                            </SelectItem>
+                            <SelectItem value='better'>
+                              {t('Higher compression')}
+                            </SelectItem>
+                            <SelectItem value='best'>
+                              {t('Maximum compression')}
+                            </SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        {t(
+                          'For relational log databases. ClickHouse stores JSON with native ZSTD(1) compression.'
+                        )}{' '}
+                        {t(
+                          'Compression is lossless. Short timelines stay uncompressed when that is smaller.'
+                        )}{' '}
+                        {t(
+                          'Changes apply to newly written timelines. Higher compression uses more CPU and memory.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                {timelineOpen && <RequestTimelineWriterStatusPanel embedded />}
+              </div>
+            </SettingsAccordion>
+          </Accordion>
 
           <SettingsControlGroup className='space-y-3'>
             <div>

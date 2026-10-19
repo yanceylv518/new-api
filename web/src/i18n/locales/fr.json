@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "Collecter les chronologies des requêtes",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "S’applique aux nouvelles requêtes après enregistrement. La désactivation laisse se terminer les requêtes déjà suivies et les écritures en attente ; les chronologies existantes restent accessibles.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Les totaux acceptés, écrits, en échec et abandonnés comptent des enregistrements. Les échecs sont définitifs pour le lot ; les reprises comptent les appels répétés d’écriture de lot.",
     "Checking briefly for a newly written timeline...": "Recherche temporaire d’une chronologie nouvellement écrite…",
     "Automatic rechecks finished. You can refresh manually.": "Les nouvelles recherches automatiques sont terminées. Vous pouvez actualiser manuellement.",

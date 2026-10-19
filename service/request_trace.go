@@ -39,7 +39,6 @@ type pendingRequestTrace struct {
 }
 
 type RequestTraceWriter struct {
-	enabled        bool
 	mu             sync.RWMutex
 	stopped        bool
 	queue          chan *pendingRequestTrace
@@ -77,8 +76,7 @@ var activeRequestTraceWriter *RequestTraceWriter
 func StartRequestTraceWriter() *RequestTraceWriter {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &RequestTraceWriter{
-		enabled: common.GetEnvOrDefaultBool("REQUEST_TRACE_ENABLED", true),
-		queue:   make(chan *pendingRequestTrace, requestTraceQueueCapacity), done: make(chan struct{}),
+		queue: make(chan *pendingRequestTrace, requestTraceQueueCapacity), done: make(chan struct{}),
 		cleanupDone: make(chan struct{}), cancel: cancel,
 		nodeID: common.GetNodeIdentity().Name, startedAtUS: time.Now().UnixMicro(),
 	}
@@ -88,10 +86,11 @@ func StartRequestTraceWriter() *RequestTraceWriter {
 	return w
 }
 
-func (w *RequestTraceWriter) Enabled() bool { return w.enabled }
+func (w *RequestTraceWriter) Enabled() bool { return system_setting.IsRequestTraceEnabled() }
 
 func (w *RequestTraceWriter) Enqueue(record *requesttrace.Record) {
-	if record == nil || !w.enabled {
+	// 开关只在请求入口采样，关闭后仍接收此前已开始采集的请求。
+	if record == nil {
 		return
 	}
 	encoded, err := common.Marshal(record.Data)
@@ -404,13 +403,14 @@ type RequestTraceWriterStatus struct {
 func GetRequestTraceWriterStatus() RequestTraceWriterStatus {
 	w := activeRequestTraceWriter
 	if w == nil {
-		return RequestTraceWriterStatus{QueueCapacity: requestTraceQueueCapacity, RetentionDays: model.RequestTraceRetentionDays()}
+		return RequestTraceWriterStatus{Enabled: system_setting.IsRequestTraceEnabled(), QueueCapacity: requestTraceQueueCapacity, RetentionDays: model.RequestTraceRetentionDays()}
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	pending := min(len(w.queue), w.pendingCount)
+	enabled := w.Enabled()
 	status := RequestTraceWriterStatus{
-		Initialized: true, Enabled: w.enabled, Accepting: w.enabled && !w.stopped,
+		Initialized: true, Enabled: enabled, Accepting: enabled && !w.stopped,
 		NodeID: w.nodeID, StartedAtUS: w.startedAtUS, QueueCapacity: requestTraceQueueCapacity,
 		Accepted: w.accepted, Processing: w.pendingCount - pending - w.buffered - w.writing,
 		Buffered: w.buffered, Writing: w.writing, Outstanding: w.pendingCount, Pending: pending,

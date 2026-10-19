@@ -251,9 +251,24 @@ function WriterStatusContent() {
   )
 }
 
-export function RequestTimelineWriterStatusPanel() {
+export function RequestTimelineWriterStatusPanel(props: {
+  embedded?: boolean
+}) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
+  if (props.embedded) {
+    return (
+      <section
+        className='border-t pt-4'
+        aria-label={t('Timeline collection and storage status')}
+      >
+        <h4 className='text-sm font-medium'>
+          {t('Timeline collection and storage status')}
+        </h4>
+        <WriterStatusContent />
+      </section>
+    )
+  }
   return (
     <Collapsible open={open} onOpenChange={setOpen} className='border-y py-3'>
       <CollapsibleTrigger

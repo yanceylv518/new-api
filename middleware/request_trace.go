@@ -13,12 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func RequestTraceHandler(next http.Handler, enabled bool, submit func(*requesttrace.Record)) http.Handler {
-	if !enabled {
-		return next
-	}
+func RequestTraceHandler(next http.Handler, enabled func() bool, submit func(*requesttrace.Record)) http.Handler {
 	node := common.GetNodeIdentity().Name
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		collector := requesttrace.New(common.NewRequestId(), node, r.Method, start)
 		r = r.WithContext(requesttrace.WithCollector(r.Context(), collector))

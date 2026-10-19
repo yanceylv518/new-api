@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "リクエストのタイムラインを収集",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "保存後の新しいリクエストに適用されます。収集を無効にしても、追跡開始済みのリクエストとキュー内の書き込みは完了し、既存のタイムラインは引き続き参照できます。",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "受付、書き込み、失敗、破棄の累計は記録の件数です。失敗はバッチの最終的な失敗を指し、再試行はバッチ書き込みの再呼び出し回数です。",
     "Checking briefly for a newly written timeline...": "新しく書き込まれたタイムラインを短時間再確認しています…",
     "Automatic rechecks finished. You can refresh manually.": "自動再確認が終了しました。手動で更新できます。",

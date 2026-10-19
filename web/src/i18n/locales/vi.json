@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "Thu thập dòng thời gian yêu cầu",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Áp dụng cho yêu cầu mới sau khi lưu. Khi tắt thu thập, các yêu cầu đang được theo dõi và các bản ghi trong hàng đợi vẫn hoàn tất; dòng thời gian đã lưu vẫn có thể xem.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Tổng nhận, ghi, thất bại và bỏ tính theo số bản ghi. Thất bại là lỗi cuối cùng của lô; số lần thử lại tính theo các lần gọi ghi lô lặp lại.",
     "Checking briefly for a newly written timeline...": "Đang kiểm tra lại trong thời gian ngắn để tìm dòng thời gian mới ghi…",
     "Automatic rechecks finished. You can refresh manually.": "Đã kết thúc kiểm tra tự động. Bạn có thể làm mới thủ công.",

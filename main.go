@@ -215,7 +215,7 @@ func main() {
 	traceWriter := service.StartRequestTraceWriter()
 	srv := &http.Server{
 		Addr:    ":" + port,
-		Handler: middleware.RequestTraceHandler(server, traceWriter.Enabled(), traceWriter.Enqueue),
+		Handler: middleware.RequestTraceHandler(server, traceWriter.Enabled, traceWriter.Enqueue),
 	}
 
 	go func() {

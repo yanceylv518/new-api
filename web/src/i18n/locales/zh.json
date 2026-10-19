@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "采集请求时间线",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "保存后对新请求生效。关闭采集后，已开始追踪的请求和队列中的写入仍会完成；历史时间线仍可查询。",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "入队、写入、失败和丢弃均按记录条数累计。失败指批次最终写入失败涉及的记录，重试按重复批次写入调用次数统计。",
     "Checking briefly for a newly written timeline...": "暂时重查新写入的时间线…",
     "Automatic rechecks finished. You can refresh manually.": "自动重查已结束，可手动刷新。",

@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "Collect request timelines",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.",
     "Checking briefly for a newly written timeline...": "Checking briefly for a newly written timeline...",
     "Automatic rechecks finished. You can refresh manually.": "Automatic rechecks finished. You can refresh manually.",

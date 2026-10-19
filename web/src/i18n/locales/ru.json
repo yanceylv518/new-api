@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "Собирать хронологии запросов",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Применяется к новым запросам после сохранения. Отключение позволяет завершить уже отслеживаемые запросы и запись из очереди; существующие хронологии остаются доступны.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Итоги приёма, записи, ошибок и отбрасывания считают записи. Ошибки означают окончательный отказ пакета; повторы считают повторные вызовы записи пакета.",
     "Checking briefly for a newly written timeline...": "Краткая повторная проверка новой записи хронологии…",
     "Automatic rechecks finished. You can refresh manually.": "Автоматические проверки завершены. Можно обновить вручную.",

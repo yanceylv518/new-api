@@ -98,6 +98,7 @@ const OPERATIONS_SECTIONS = [
     build: (settings: OperationsSettings) => (
       <LogSettingsSection
         defaultEnabled={Boolean(settings.LogConsumeEnabled)}
+        defaultTraceEnabled={settings['request_trace.enabled']}
         defaultCompressionLevel={settings['request_trace.compression_level']}
       />
     ),

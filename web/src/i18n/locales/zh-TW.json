@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Collect request timelines": "採集請求時間線",
+    "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "儲存後對新請求生效。關閉採集後，已開始追蹤的請求與佇列中的寫入仍會完成；歷史時間線仍可查詢。",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "入列、寫入、失敗和捨棄均按紀錄筆數累計。失敗指批次最終寫入失敗涉及的紀錄，重試按重複批次寫入呼叫次數統計。",
     "Checking briefly for a newly written timeline...": "暫時重新查詢新寫入的時間線…",
     "Automatic rechecks finished. You can refresh manually.": "自動重新查詢已結束，可手動重新整理。",

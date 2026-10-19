@@ -184,6 +184,9 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
+	requestTraceEnabled := common.GetEnvOrDefaultBool("REQUEST_TRACE_ENABLED", true)
+	system_setting.SetRequestTraceEnabled(requestTraceEnabled)
+	common.OptionMap[system_setting.RequestTraceEnabledOptionKey] = strconv.FormatBool(requestTraceEnabled)
 	common.OptionMap[system_setting.RequestTraceCompressionOptionKey] = system_setting.DefaultRequestTraceCompressionLevel
 
 	// 自动添加所有注册的模型配置
@@ -215,6 +218,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		return system_setting.ValidateRequestTraceEnabled(value)
+	}
 	if key == system_setting.RequestTraceCompressionOptionKey {
 		return system_setting.ValidateRequestTraceCompressionLevel(value)
 	}
@@ -234,7 +240,7 @@ func UpdateOption(key string, value string) error {
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
 	}
-	if key == system_setting.RequestTraceCompressionOptionKey {
+	if key == system_setting.RequestTraceCompressionOptionKey || key == system_setting.RequestTraceEnabledOptionKey {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if err := validateOptionValue(key, value); err != nil {
@@ -294,6 +300,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		if err := system_setting.ValidateRequestTraceEnabled(value); err != nil {
+			return err
+		}
+	}
 	if key == system_setting.RequestTraceCompressionOptionKey {
 		if err := system_setting.ValidateRequestTraceCompressionLevel(value); err != nil {
 			return err
@@ -308,6 +319,10 @@ func updateOptionMap(key string, value string) (err error) {
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		system_setting.SetRequestTraceEnabled(value == "true")
+		return nil
+	}
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
