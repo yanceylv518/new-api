@@ -417,6 +417,45 @@ func TestRequestTraceCollectorLifecycle(t *testing.T) {
 	}
 }
 
+func TestRequestTraceResponseController(t *testing.T) {
+	previous := common.GetRequestTraceConfig()
+	t.Cleanup(func() {
+		require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(previous)))
+	})
+	for _, level := range []string{"off", "errors", "all"} {
+		t.Run(level, func(t *testing.T) {
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", fmt.Sprintf(`{"level":%q}`, level)))
+			checked := make(chan []error, 1)
+			app := gin.New()
+			app.Use(middleware.RequestId(), middleware.RequestTrace())
+			app.POST("/v1/chat/completions", func(c *gin.Context) {
+				controller := http.NewResponseController(c.Writer)
+				checked <- []error{
+					controller.SetWriteDeadline(time.Now().Add(5 * time.Second)),
+					controller.SetReadDeadline(time.Now().Add(5 * time.Second)),
+					controller.EnableFullDuplex(),
+					controller.Flush(),
+				}
+				c.String(http.StatusOK, "ok")
+			})
+			server := httptest.NewServer(app)
+			t.Cleanup(server.Close)
+			client := server.Client()
+			client.Timeout = 5 * time.Second
+			response, err := client.Post(server.URL+"/v1/chat/completions", "application/json", nil)
+			require.NoError(t, err)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, response.Body.Close())
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusOK, response.StatusCode)
+			assert.Equal(t, "ok", string(body))
+			for index, err := range <-checked {
+				assert.NoError(t, err, "HTTP capability %s", []string{"write deadline", "read deadline", "full duplex", "flush"}[index])
+			}
+		})
+	}
+}
+
 func TestRequestTraceMiddlewareModes(t *testing.T) {
 	cases := []struct {
 		name, level                                     string

@@ -19,6 +19,10 @@ type traceResponseWriter struct {
 	contentTypeSet bool
 }
 
+func (w *traceResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *traceResponseWriter) prepare() {
 	if !w.contentTypeSet {
 		w.contentType = w.Header().Get("Content-Type")
