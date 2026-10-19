@@ -242,7 +242,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
-			observedAtUS := trace.OffsetUS()
+			// 空行仍执行取消检查和超时续期，只跳过不会入库的时间采样。
+			var observedAtUS int64
+			if trace != nil && len(scanner.Bytes()) > 0 {
+				observedAtUS = trace.OffsetUS()
+			}
 			// 检查是否需要停止
 			select {
 			case <-stopChan:
