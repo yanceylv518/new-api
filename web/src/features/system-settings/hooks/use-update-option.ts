@@ -48,7 +48,7 @@ export function useUpdateOption() {
       if (data.success) {
         // Always refresh system-options
         queryClient.invalidateQueries({ queryKey: ['system-options'] })
-        if (variables.key === 'request_trace.enabled') {
+        if (variables.key.startsWith('request_trace.')) {
           queryClient.invalidateQueries({
             queryKey: ['request-timeline-writer-status'],
           })

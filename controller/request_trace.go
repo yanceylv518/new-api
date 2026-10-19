@@ -94,15 +94,12 @@ func getRequestTrace(c *gin.Context, admin bool) {
 		if entry.SchemaVersion != requesttrace.SchemaVersion {
 			result.Detail.Status = "unsupported_version"
 		} else {
-			var data requesttrace.Data
-			raw, err := service.DecodeRequestTraceData(entry.TraceData)
+			data, err := service.DecodeRequestTrace(entry.TraceData)
 			if err != nil {
 				result.Detail.Status = "invalid_data"
 				common.SysError("request trace decoding failed (request_id=" + entry.RequestId + "): " + err.Error())
-			} else if err := common.Unmarshal(raw, &data); err != nil || data.Phases == nil || data.Attempts == nil || data.Errors == nil || data.Capture.Missing == nil {
-				result.Detail.Status = "invalid_data"
 			} else {
-				result.Detail.Timeline = &data
+				result.Detail.Timeline = data
 			}
 		}
 	}

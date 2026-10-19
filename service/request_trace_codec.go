@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -78,8 +79,33 @@ func (c *requestTraceCompressor) Close() error {
 	return err
 }
 
-// DecodeRequestTraceData 兼容原始 JSON；压缩记录恢复为同一份 JSON 后再交给原有版本校验。
+// DecodeRequestTrace 直接恢复公开时间线，避免详情查询重复编码和解码。
+func DecodeRequestTrace(stored string) (*requesttrace.Data, error) {
+	raw, err := decodeRequestTracePayload(stored)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := decodeRequestTraceJSON(raw)
+	return data, err
+}
+
+// DecodeRequestTraceData 将紧凑格式恢复为公开 JSON，历史原文保留字节不变。
 func DecodeRequestTraceData(stored string) ([]byte, error) {
+	raw, err := decodeRequestTracePayload(stored)
+	if err != nil {
+		return nil, err
+	}
+	data, compact, err := decodeRequestTraceJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !compact {
+		return raw, nil
+	}
+	return common.Marshal(data)
+}
+
+func decodeRequestTracePayload(stored string) ([]byte, error) {
 	if len(stored) == 0 || len(stored) > maxRequestTraceBytes {
 		return nil, errors.New("request trace data exceeds size limit or is empty")
 	}

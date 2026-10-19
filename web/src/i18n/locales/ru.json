@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "Выборка успешных хронологий (%)",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 сохраняет все успешные запросы. Ошибки, неполные записи, повторные попытки и запросы с превышением порогов обходят выборку. Применяется к запросам, начатым после сохранения.",
+    "Non-streaming duration threshold (ms)": "Порог длительности непотокового запроса (мс)",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "Сохранять непотоковые запросы с серверной длительностью не ниже порога. 0 отключает правило; обычная длительность потока его не запускает.",
+    "Entry-to-upstream-first-byte threshold (ms)": "Порог от входа до первого байта провайдера (мс)",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "Сохранять запросы, если первый байт последней попытки достигает этого смещения от входа в шлюз, включая подготовку и повторы. 0 отключает правило.",
+    "Reserved payload bytes": "Зарезервировано байтов данных",
+    "Payload byte budget": "Бюджет данных в байтах",
+    "Excluded by success sampling": "Исключено выборкой успешных запросов",
+    "Payload budget exceeded": "Превышен бюджет данных",
     "Collect request timelines": "Собирать хронологии запросов",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Применяется к новым запросам после сохранения. Отключение позволяет завершить уже отслеживаемые запросы и запись из очереди; существующие хронологии остаются доступны.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Итоги приёма, записи, ошибок и отбрасывания считают записи. Ошибки означают окончательный отказ пакета; повторы считают повторные вызовы записи пакета.",

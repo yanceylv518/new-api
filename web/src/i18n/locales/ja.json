@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "成功リクエストのタイムライン収集率（%）",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 は成功した全リクエストを保持します。エラー、不完全な記録、再試行、設定したしきい値以上のリクエストは抽出対象から除外されません。保存後に開始するリクエストに適用されます。",
+    "Non-streaming duration threshold (ms)": "非ストリーミング処理時間のしきい値（ミリ秒）",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "サーバー処理時間がこの値以上の非ストリーミングリクエストを保持します。0 は無効です。通常のストリーミング生成時間では適用されません。",
+    "Entry-to-upstream-first-byte threshold (ms)": "入口から上流の最初のバイトまでのしきい値（ミリ秒）",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "最終試行の上流の最初のバイトが、ゲートウェイ入口からこの時間以上経過したリクエストを保持します。準備と再試行も含まれます。0 は無効です。",
+    "Reserved payload bytes": "予約済みペイロードバイト数",
+    "Payload byte budget": "ペイロードのバイト上限",
+    "Excluded by success sampling": "成功サンプリングによる除外",
+    "Payload budget exceeded": "ペイロード上限超過",
     "Collect request timelines": "リクエストのタイムラインを収集",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "保存後の新しいリクエストに適用されます。収集を無効にしても、追跡開始済みのリクエストとキュー内の書き込みは完了し、既存のタイムラインは引き続き参照できます。",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "受付、書き込み、失敗、破棄の累計は記録の件数です。失敗はバッチの最終的な失敗を指し、再試行はバッチ書き込みの再呼び出し回数です。",

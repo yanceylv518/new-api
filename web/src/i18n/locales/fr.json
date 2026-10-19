@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "Échantillonnage des chronologies réussies (%)",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 conserve tous les succès. Les erreurs, captures partielles, reprises et requêtes dépassant un seuil configuré échappent à l’échantillonnage. S’applique aux requêtes démarrant après l’enregistrement.",
+    "Non-streaming duration threshold (ms)": "Seuil de durée hors streaming (ms)",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "Conserve les requêtes hors streaming atteignant cette durée serveur. 0 désactive cette règle ; la durée normale du streaming ne la déclenche pas.",
+    "Entry-to-upstream-first-byte threshold (ms)": "Seuil entre l’entrée et le premier octet amont (ms)",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "Conserve les requêtes dont le premier octet amont de la dernière tentative atteint ce délai depuis l’entrée, préparation et reprises comprises. 0 désactive cette règle.",
+    "Reserved payload bytes": "Octets de charge utile réservés",
+    "Payload byte budget": "Budget de charge utile en octets",
+    "Excluded by success sampling": "Exclus par échantillonnage des succès",
+    "Payload budget exceeded": "Budget de charge utile dépassé",
     "Collect request timelines": "Collecter les chronologies des requêtes",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "S’applique aux nouvelles requêtes après enregistrement. La désactivation laisse se terminer les requêtes déjà suivies et les écritures en attente ; les chronologies existantes restent accessibles.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Les totaux acceptés, écrits, en échec et abandonnés comptent des enregistrements. Les échecs sont définitifs pour le lot ; les reprises comptent les appels répétés d’écriture de lot.",

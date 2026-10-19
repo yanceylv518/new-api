@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "Successful timeline sampling (%)",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.",
+    "Non-streaming duration threshold (ms)": "Non-streaming duration threshold (ms)",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.",
+    "Entry-to-upstream-first-byte threshold (ms)": "Entry-to-upstream-first-byte threshold (ms)",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.",
+    "Reserved payload bytes": "Reserved payload bytes",
+    "Payload byte budget": "Payload byte budget",
+    "Excluded by success sampling": "Excluded by success sampling",
+    "Payload budget exceeded": "Payload budget exceeded",
     "Collect request timelines": "Collect request timelines",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.",

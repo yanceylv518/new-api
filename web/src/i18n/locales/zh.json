@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "成功请求时间线采样率（%）",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 表示保留全部成功请求。错误、采集不完整、重试和达到配置阈值的请求不参与概率采样。保存后对新开始的请求生效。",
+    "Non-streaming duration threshold (ms)": "非流式总耗时阈值（毫秒）",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "保留服务端总耗时达到此值的非流式请求。0 表示关闭此规则；正常流式生成时长不触发此规则。",
+    "Entry-to-upstream-first-byte threshold (ms)": "入口至上游首字节阈值（毫秒）",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "保留最终尝试的上游首字节相对网关入口偏移达到此值的请求，包含前期准备和重试耗时。0 表示关闭此规则。",
+    "Reserved payload bytes": "待完成记录预留载荷字节数",
+    "Payload byte budget": "载荷字节预算",
+    "Excluded by success sampling": "成功采样主动排除",
+    "Payload budget exceeded": "超出载荷预算",
     "Collect request timelines": "采集请求时间线",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "保存后对新请求生效。关闭采集后，已开始追踪的请求和队列中的写入仍会完成；历史时间线仍可查询。",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "入队、写入、失败和丢弃均按记录条数累计。失败指批次最终写入失败涉及的记录，重试按重复批次写入调用次数统计。",

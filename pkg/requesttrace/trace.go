@@ -101,6 +101,7 @@ type Data struct {
 }
 
 type Record struct {
+	SamplingPolicy                SamplingPolicy
 	RequestID                     string
 	UserID                        *int64
 	TokenID                       *int64
@@ -142,9 +143,16 @@ type Span struct {
 
 func New(requestID, nodeID, method string, start time.Time) *Collector {
 	return &Collector{start: start, current: -1, record: Record{
-		RequestID: requestID, NodeID: nodeID, StartedAtUS: start.UnixMicro(), SchemaVersion: SchemaVersion,
+		SamplingPolicy: SamplingPolicy{SuccessRate: 100},
+		RequestID:      requestID, NodeID: nodeID, StartedAtUS: start.UnixMicro(), SchemaVersion: SchemaVersion,
 		Data: Data{MeasurementVersion: 2, Method: method, Phases: []Phase{}, Attempts: []Attempt{}, Errors: []Failure{}, Capture: Coverage{Missing: []string{}}},
 	}}
+}
+
+func (c *Collector) SetSamplingPolicy(policy SamplingPolicy) {
+	c.mu.Lock()
+	c.record.SamplingPolicy = policy
+	c.mu.Unlock()
 }
 
 func WithCollector(ctx context.Context, collector *Collector) context.Context {

@@ -72,8 +72,8 @@ func (c *Collector) HTTPRequest(req *http.Request, proxy bool) (*http.Request, *
 		GetConn: func(string) { observation.event("get_conn", false) },
 		GotConn: func(info httptrace.GotConnInfo) {
 			now := c.OffsetUS()
-			observation.update(func(exchange *Exchange) { reused := info.Reused; exchange.Reused = &reused })
-			observation.eventAt("got_conn", false, now)
+			reused := info.Reused
+			observation.eventAt("got_conn", false, now, &reused)
 		},
 		DNSStart:          func(httptrace.DNSStartInfo) { observation.event("dns_start", false) },
 		DNSDone:           func(info httptrace.DNSDoneInfo) { observation.event("dns_done", info.Err != nil) },
@@ -102,21 +102,29 @@ func (o *HTTPObservation) update(update func(*Exchange)) {
 }
 
 func (o *HTTPObservation) event(name string, failed bool) {
-	o.eventAt(name, failed, o.collector.OffsetUS())
+	o.eventAt(name, failed, o.collector.OffsetUS(), nil)
 }
 
-func (o *HTTPObservation) eventAt(name string, failed bool, now int64) {
-	o.update(func(exchange *Exchange) {
-		if name == "first_byte" && (exchange.FirstByteUS == nil || now < *exchange.FirstByteUS) {
-			exchange.FirstByteUS = &now
-		}
-		if len(exchange.Events) < maxEvents && o.collector.events < 512 {
-			exchange.Events = append(exchange.Events, Event{Sequence: o.collector.events + 1, Name: name, OffsetUS: now, Failed: failed})
-			o.collector.events++
-		} else {
-			o.collector.record.Data.Capture.Truncated = true
-		}
-	})
+func (o *HTTPObservation) eventAt(name string, failed bool, now int64, reused *bool) {
+	c := o.collector
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	exchange := &c.record.Data.Attempts[o.attempt].Exchanges[o.exchange]
+	if reused != nil {
+		exchange.Reused = reused
+	}
+	if name == "first_byte" && (exchange.FirstByteUS == nil || now < *exchange.FirstByteUS) {
+		exchange.FirstByteUS = &now
+	}
+	if len(exchange.Events) < maxEvents && c.events < 512 {
+		exchange.Events = append(exchange.Events, Event{Sequence: c.events + 1, Name: name, OffsetUS: now, Failed: failed})
+		c.events++
+	} else {
+		c.record.Data.Capture.Truncated = true
+	}
 }
 
 func (o *HTTPObservation) Response(resp *http.Response, err error) {
@@ -124,30 +132,31 @@ func (o *HTTPObservation) Response(resp *http.Response, err error) {
 		return
 	}
 	now := o.collector.OffsetUS()
-	if err != nil || resp == nil {
-		o.update(func(exchange *Exchange) {
-			exchange.EndUS = &now
-			exchange.EndReason = "request_error"
-			var timeout interface{ Timeout() bool }
-			if errors.Is(err, context.Canceled) {
-				exchange.EndReason = "request_canceled"
-			} else if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
-				exchange.EndReason = "request_timeout"
-			}
-		})
+	c := o.collector
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
 		return
 	}
-	o.update(func(exchange *Exchange) {
-		exchange.HeadersUS, exchange.Status, exchange.Protocol = &now, resp.StatusCode, resp.Proto
-		contentType, _, _ := strings.Cut(strings.ToLower(resp.Header.Get("Content-Type")), ";")
-		contentType = strings.TrimSpace(contentType)
-		exchange.EventStream = contentType == "text/event-stream" || contentType == "application/vnd.amazon.eventstream"
-	})
+	exchange := &c.record.Data.Attempts[o.attempt].Exchanges[o.exchange]
+	if err != nil || resp == nil {
+		exchange.EndUS = &now
+		exchange.EndReason = "request_error"
+		var timeout interface{ Timeout() bool }
+		if errors.Is(err, context.Canceled) {
+			exchange.EndReason = "request_canceled"
+		} else if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+			exchange.EndReason = "request_timeout"
+		}
+		return
+	}
+	exchange.HeadersUS, exchange.Status, exchange.Protocol = &now, resp.StatusCode, resp.Proto
+	contentType, _, _ := strings.Cut(strings.ToLower(resp.Header.Get("Content-Type")), ";")
+	contentType = strings.TrimSpace(contentType)
+	exchange.EventStream = contentType == "text/event-stream" || contentType == "application/vnd.amazon.eventstream"
 	if resp.Body == nil {
-		o.update(func(exchange *Exchange) {
-			exchange.EndUS = &now
-			exchange.EndReason = "empty_body"
-		})
+		exchange.EndUS = &now
+		exchange.EndReason = "empty_body"
 		return
 	}
 	resp.Body = &observedBody{ReadCloser: resp.Body, observation: o}

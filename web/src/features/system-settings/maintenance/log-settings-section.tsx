@@ -85,6 +85,9 @@ import type { LogCleanupTask, UpdateOptionRequest } from '../types'
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
   RequestTraceEnabled: z.boolean(),
+  RequestTraceSuccessSampleRate: z.number().int().min(0).max(100),
+  RequestTraceSlowRequestMS: z.number().int().min(0).max(86400000),
+  RequestTraceSlowFirstByteMS: z.number().int().min(0).max(86400000),
   RequestTraceCompressionLevel: z.enum([
     'fastest',
     'default',
@@ -98,6 +101,9 @@ type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
   defaultTraceEnabled: boolean
+  defaultSuccessSampleRate?: number
+  defaultSlowRequestMS?: number
+  defaultSlowFirstByteMS?: number
   defaultCompressionLevel: LogSettingsFormValues['RequestTraceCompressionLevel']
 }
 
@@ -160,6 +166,9 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
     defaultValues: {
       LogConsumeEnabled: props.defaultEnabled,
       RequestTraceEnabled: props.defaultTraceEnabled,
+      RequestTraceSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
+      RequestTraceSlowRequestMS: props.defaultSlowRequestMS ?? 0,
+      RequestTraceSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
       RequestTraceCompressionLevel: props.defaultCompressionLevel,
     },
   })
@@ -192,6 +201,9 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
       {
         LogConsumeEnabled: props.defaultEnabled,
         RequestTraceEnabled: props.defaultTraceEnabled,
+        RequestTraceSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
+        RequestTraceSlowRequestMS: props.defaultSlowRequestMS ?? 0,
+        RequestTraceSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
         RequestTraceCompressionLevel: props.defaultCompressionLevel,
       },
       { keepDirtyValues: true }
@@ -199,6 +211,9 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
   }, [
     props.defaultEnabled,
     props.defaultTraceEnabled,
+    props.defaultSuccessSampleRate,
+    props.defaultSlowRequestMS,
+    props.defaultSlowFirstByteMS,
     props.defaultCompressionLevel,
     form,
   ])
@@ -300,6 +315,31 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
       updates.push({
         key: 'request_trace.compression_level',
         value: values.RequestTraceCompressionLevel,
+      })
+    }
+    if (
+      values.RequestTraceSuccessSampleRate !==
+      (props.defaultSuccessSampleRate ?? 100)
+    ) {
+      updates.push({
+        key: 'request_trace.success_sample_rate',
+        value: values.RequestTraceSuccessSampleRate,
+      })
+    }
+    if (
+      values.RequestTraceSlowRequestMS !== (props.defaultSlowRequestMS ?? 0)
+    ) {
+      updates.push({
+        key: 'request_trace.slow_request_ms',
+        value: values.RequestTraceSlowRequestMS,
+      })
+    }
+    if (
+      values.RequestTraceSlowFirstByteMS !== (props.defaultSlowFirstByteMS ?? 0)
+    ) {
+      updates.push({
+        key: 'request_trace.slow_first_byte_ms',
+        value: values.RequestTraceSlowFirstByteMS,
       })
     }
     try {
@@ -516,6 +556,99 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
                   )}
                 />
 
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSuccessSampleRate'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Successful timeline sampling (%)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={100}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          '100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSlowRequestMS'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Non-streaming duration threshold (ms)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={86400000}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSlowFirstByteMS'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Entry-to-upstream-first-byte threshold (ms)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={86400000}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
                 {timelineOpen && <RequestTimelineWriterStatusPanel embedded />}
               </div>
             </SettingsAccordion>

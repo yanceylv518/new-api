@@ -9,19 +9,22 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/requesttrace"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 )
 
 func RequestTraceHandler(next http.Handler, enabled func() bool, submit func(*requesttrace.Record)) http.Handler {
 	node := common.GetNodeIdentity().Name
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !enabled() {
+		if !enabled() || !requesttrace.IsRelayPath(r.URL.Path) && jsplugin.IsReservedRoutePath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		start := time.Now()
 		collector := requesttrace.New(common.NewRequestId(), node, r.Method, start)
+		collector.SetSamplingPolicy(system_setting.GetRequestTraceSamplingPolicy())
 		r = r.WithContext(requesttrace.WithCollector(r.Context(), collector))
 		stopCancelObservation := context.AfterFunc(r.Context(), func() { collector.ObserveCancel(r.Context().Err()) })
 		defer func() { stopCancelObservation(); submit(collector.Freeze(0, r.Context().Err())) }()
@@ -39,7 +42,7 @@ func RequestTraceContext() gin.HandlerFunc {
 		c.Writer = &requestTraceResponseWriter{ResponseWriter: c.Writer, collector: collector}
 		defer func() {
 			route := c.FullPath()
-			if c.GetString(RouteTagKey) == "relay" || strings.HasPrefix(route, "/v1/") || strings.HasPrefix(route, "/v1beta/") || strings.HasPrefix(route, "/pg/") || strings.Contains(route, "/mj/") {
+			if c.GetString(RouteTagKey) == "relay" || requesttrace.IsRelayPath(route) {
 				collector.Enable(route, requestTraceKind(route))
 			}
 			collector.Status(c.Writer.Status())

@@ -26,6 +26,7 @@ const (
 	requestTraceQueueCapacity        = 512
 	requestTraceBatchSize            = 64
 	maxRequestTraceBatchBytes        = 1 << 20
+	maxRequestTracePendingBytes      = 16 << 20
 	requestTraceFlushInterval        = 250 * time.Millisecond
 	requestTraceCleanupIdleInterval  = 10 * time.Minute
 	requestTraceCleanupBatchInterval = 100 * time.Millisecond
@@ -47,6 +48,7 @@ type RequestTraceWriter struct {
 	cancel         context.CancelFunc
 	written        atomic.Int64
 	dropped        atomic.Int64
+	sampledOut     atomic.Int64
 	failed         atomic.Int64
 	cleanupDeleted atomic.Int64
 	cleanupFailed  atomic.Int64
@@ -56,6 +58,8 @@ type RequestTraceWriter struct {
 	startedAtUS         int64
 	accepted            int64
 	pendingSince        [requestTraceQueueCapacity + requestTraceBatchSize + 1]time.Time
+	pendingSizes        [requestTraceQueueCapacity + requestTraceBatchSize + 1]int
+	pendingBytes        int
 	pendingHead         int
 	pendingCount        int
 	buffered            int
@@ -63,6 +67,7 @@ type RequestTraceWriter struct {
 	retries             int64
 	droppedEncoding     int64
 	droppedQueueFull    int64
+	droppedByteLimit    int64
 	droppedStopped      int64
 	droppedShutdown     int64
 	lastWrittenAtUS     int64
@@ -93,20 +98,52 @@ func (w *RequestTraceWriter) Enqueue(record *requesttrace.Record) {
 	if record == nil {
 		return
 	}
-	encoded, err := common.Marshal(record.Data)
+	if !record.SamplingPolicy.Keep(record) {
+		w.sampledOut.Add(1)
+		return
+	}
+	// 只提前拒绝已确定无法接收的状态；编码期间状态会变，入队时仍须精确复核。
+	w.mu.Lock()
+	rejected, logQueueFull := true, false
+	switch {
+	case w.stopped:
+		w.droppedStopped++
+	case w.pendingBytes >= maxRequestTracePendingBytes:
+		w.droppedByteLimit++
+	case len(w.queue) == cap(w.queue):
+		w.droppedQueueFull++
+		logQueueFull = w.dropped.Load()%100 == 0
+	default:
+		rejected = false
+	}
+	if rejected {
+		w.dropped.Add(1)
+	}
+	w.mu.Unlock()
+	if rejected {
+		if logQueueFull {
+			common.SysError("request trace queue full; records dropped")
+		}
+		return
+	}
+	stored := newStoredRequestTrace(record.Data)
+	encoded, err := common.Marshal(stored)
 	if err == nil && len(encoded) > maxRequestTraceBytes {
 		record.Data.Capture.Truncated, record.CaptureStatus = true, "partial"
+		stored.Capture.Truncated = true
 		for i := range record.Data.Attempts {
 			for j := range record.Data.Attempts[i].Exchanges {
 				record.Data.Attempts[i].Exchanges[j].Events = nil
+				stored.Attempts[i].Exchanges[j].Events = nil
 			}
 		}
-		encoded, err = common.Marshal(record.Data)
+		encoded, err = common.Marshal(stored)
 		if err == nil && len(encoded) > maxRequestTraceBytes {
 			for i := range record.Data.Attempts {
 				record.Data.Attempts[i].Exchanges = nil
+				stored.Attempts[i].Exchanges = nil
 			}
-			encoded, err = common.Marshal(record.Data)
+			encoded, err = common.Marshal(stored)
 		}
 	}
 	if err != nil || len(encoded) > maxRequestTraceBytes {
@@ -133,10 +170,20 @@ func (w *RequestTraceWriter) Enqueue(record *requesttrace.Record) {
 		w.mu.Unlock()
 		return
 	}
-	logQueueFull := false
+	// 预算覆盖排队、编码和 SQL 重试中的记录，直到批次结束才释放。
+	if len(encoded) > maxRequestTracePendingBytes-w.pendingBytes {
+		w.dropped.Add(1)
+		w.droppedByteLimit++
+		w.mu.Unlock()
+		return
+	}
+	logQueueFull = false
 	select {
 	case w.queue <- entry:
-		w.pendingSince[(w.pendingHead+w.pendingCount)%len(w.pendingSince)] = time.Now()
+		slot := (w.pendingHead + w.pendingCount) % len(w.pendingSince)
+		w.pendingSince[slot] = time.Now()
+		w.pendingSizes[slot] = len(encoded)
+		w.pendingBytes += len(encoded)
 		w.pendingCount++
 		w.accepted++
 	default:
@@ -214,6 +261,8 @@ func (w *RequestTraceWriter) run(ctx context.Context) {
 			w.dropped.Add(int64(w.pendingCount))
 			w.droppedShutdown += int64(w.pendingCount)
 			clear(w.pendingSince[:])
+			clear(w.pendingSizes[:])
+			w.pendingBytes = 0
 			w.pendingHead, w.pendingCount = 0, 0
 			w.buffered, w.writing = 0, 0
 			w.mu.Unlock()
@@ -312,6 +361,8 @@ func (w *RequestTraceWriter) finishBatch(count int, started time.Time, success b
 		w.lastFailedAtUS = now.UnixMicro()
 	}
 	for i := 0; i < count; i++ {
+		w.pendingBytes -= w.pendingSizes[w.pendingHead]
+		w.pendingSizes[w.pendingHead] = 0
 		w.pendingSince[w.pendingHead] = time.Time{}
 		w.pendingHead = (w.pendingHead + 1) % len(w.pendingSince)
 		w.pendingCount--
@@ -374,6 +425,9 @@ type RequestTraceWriterStatus struct {
 	Pending                int    `json:"pending"`
 	Written                int64  `json:"written"`
 	Dropped                int64  `json:"dropped"`
+	SampledOut             int64  `json:"sampled_out"`
+	PendingPayloadBytes    int    `json:"pending_payload_bytes"`
+	PayloadBudgetBytes     int    `json:"payload_budget_bytes"`
 	Failed                 int64  `json:"failed"`
 	RetentionDays          int    `json:"retention_days"`
 	CleanupDeleted         int64  `json:"cleanup_deleted"`
@@ -392,6 +446,7 @@ type RequestTraceWriterStatus struct {
 	Retries                int64  `json:"retries"`
 	DroppedEncoding        int64  `json:"dropped_encoding"`
 	DroppedQueueFull       int64  `json:"dropped_queue_full"`
+	DroppedByteLimit       int64  `json:"dropped_byte_limit"`
 	DroppedStopped         int64  `json:"dropped_stopped"`
 	DroppedShutdown        int64  `json:"dropped_shutdown"`
 	LastWrittenAtUS        *int64 `json:"last_written_at_us"`
@@ -403,7 +458,7 @@ type RequestTraceWriterStatus struct {
 func GetRequestTraceWriterStatus() RequestTraceWriterStatus {
 	w := activeRequestTraceWriter
 	if w == nil {
-		return RequestTraceWriterStatus{Enabled: system_setting.IsRequestTraceEnabled(), QueueCapacity: requestTraceQueueCapacity, RetentionDays: model.RequestTraceRetentionDays()}
+		return RequestTraceWriterStatus{Enabled: system_setting.IsRequestTraceEnabled(), QueueCapacity: requestTraceQueueCapacity, PayloadBudgetBytes: maxRequestTracePendingBytes, RetentionDays: model.RequestTraceRetentionDays()}
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -415,9 +470,11 @@ func GetRequestTraceWriterStatus() RequestTraceWriterStatus {
 		Accepted: w.accepted, Processing: w.pendingCount - pending - w.buffered - w.writing,
 		Buffered: w.buffered, Writing: w.writing, Outstanding: w.pendingCount, Pending: pending,
 		Written: w.written.Load(), Dropped: w.dropped.Load(), Failed: w.failed.Load(), RetentionDays: model.RequestTraceRetentionDays(),
+		SampledOut: w.sampledOut.Load(), PendingPayloadBytes: w.pendingBytes, PayloadBudgetBytes: maxRequestTracePendingBytes,
 		CleanupDeleted: w.cleanupDeleted.Load(), CleanupFailed: w.cleanupFailed.Load(), CleanupPending: w.cleanupPending.Load(),
 		Retries: w.retries, DroppedEncoding: w.droppedEncoding, DroppedQueueFull: w.droppedQueueFull,
-		DroppedStopped: w.droppedStopped, DroppedShutdown: w.droppedShutdown, LastBatchSize: w.lastBatchSize,
+		DroppedByteLimit: w.droppedByteLimit,
+		DroppedStopped:   w.droppedStopped, DroppedShutdown: w.droppedShutdown, LastBatchSize: w.lastBatchSize,
 	}
 	if w.pendingCount > 0 {
 		age := time.Since(w.pendingSince[w.pendingHead]).Microseconds()

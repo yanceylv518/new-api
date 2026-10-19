@@ -15,9 +15,9 @@ const requestTraceTableName = "request_trace_timeline"
 
 // RequestTrace 的列集合固定；新增采集内容只扩展带版本的 TraceData。
 type RequestTrace struct {
-	Id                            int64   `json:"id" gorm:"primaryKey;autoIncrement;index:idx_request_traces_started,priority:2;index:idx_request_traces_user_started,priority:3"`
+	Id                            int64   `json:"id" gorm:"primaryKey;autoIncrement;index:idx_request_traces_started,priority:2"`
 	RequestId                     string  `json:"request_id" gorm:"type:varchar(64);not null;uniqueIndex:idx_request_traces_request_id"`
-	UserId                        *int64  `json:"user_id" gorm:"type:bigint;index:idx_request_traces_user_started,priority:1"`
+	UserId                        *int64  `json:"user_id" gorm:"type:bigint"`
 	TokenId                       *int64  `json:"token_id" gorm:"type:bigint"`
 	ModelName                     *string `json:"model_name" gorm:"type:text"`
 	GroupName                     *string `json:"group_name" gorm:"type:text"`
@@ -26,7 +26,7 @@ type RequestTrace struct {
 	IsStream                      *bool   `json:"is_stream"`
 	HTTPStatus                    *int    `json:"http_status" gorm:"column:http_status;type:integer"`
 	Outcome                       string  `json:"outcome" gorm:"type:varchar(32);not null"`
-	StartedAtUS                   int64   `json:"started_at_us" gorm:"column:started_at_us;type:bigint;not null;index:idx_request_traces_started,priority:1;index:idx_request_traces_user_started,priority:2"`
+	StartedAtUS                   int64   `json:"started_at_us" gorm:"column:started_at_us;type:bigint;not null;index:idx_request_traces_started,priority:1"`
 	FinishedAtUS                  int64   `json:"finished_at_us" gorm:"column:finished_at_us;type:bigint;not null"`
 	DurationUS                    int64   `json:"duration_us" gorm:"column:duration_us;type:bigint;not null"`
 	FinalAttemptFirstByteOffsetUS *int64  `json:"final_attempt_first_byte_offset_us" gorm:"column:final_attempt_first_byte_offset_us;type:bigint"`
@@ -155,11 +155,17 @@ func MigrateRequestTraces() error {
 			}
 		}
 	} else {
-		for _, index := range []string{"idx_request_traces_request_id", "idx_request_traces_started", "idx_request_traces_user_started"} {
+		for _, index := range []string{"idx_request_traces_request_id", "idx_request_traces_started"} {
 			if !LOG_DB.Migrator().HasIndex(&RequestTrace{}, index) {
 				if err := LOG_DB.Migrator().CreateIndex(&RequestTrace{}, index); err != nil && !LOG_DB.Migrator().HasIndex(&RequestTrace{}, index) {
 					return err
 				}
+			}
+		}
+		const obsoleteIndex = "idx_request_traces_user_started"
+		if LOG_DB.Migrator().HasIndex(&RequestTrace{}, obsoleteIndex) {
+			if err := LOG_DB.Migrator().DropIndex(&RequestTrace{}, obsoleteIndex); err != nil && LOG_DB.Migrator().HasIndex(&RequestTrace{}, obsoleteIndex) {
+				return fmt.Errorf("remove unused timeline index: %w", err)
 			}
 		}
 	}

@@ -91,6 +91,20 @@ function WriterStatusContent() {
     { label: t('Outstanding timelines'), value: String(status.outstanding) },
     { label: t('Queue capacity'), value: String(status.queue_capacity) },
     {
+      label: t('Reserved payload bytes'),
+      value:
+        status.pending_payload_bytes === undefined
+          ? '—'
+          : String(status.pending_payload_bytes),
+    },
+    {
+      label: t('Payload byte budget'),
+      value:
+        status.payload_budget_bytes === undefined
+          ? '—'
+          : String(status.payload_budget_bytes),
+    },
+    {
       label: t('Oldest outstanding wait'),
       value: formatTraceDuration(status.oldest_outstanding_age_us),
     },
@@ -108,6 +122,10 @@ function WriterStatusContent() {
   ]
   const counters = [
     { label: t('Accepted since startup'), value: status.accepted },
+    {
+      label: t('Excluded by success sampling'),
+      value: status.sampled_out ?? '—',
+    },
     { label: t('Written since startup'), value: status.written },
     { label: t('Failed writes since startup'), value: status.failed },
     { label: t('Dropped since startup'), value: status.dropped },
@@ -118,6 +136,10 @@ function WriterStatusContent() {
   const drops = [
     { label: t('Encoding or size limit'), value: status.dropped_encoding },
     { label: t('Queue full'), value: status.dropped_queue_full },
+    {
+      label: t('Payload budget exceeded'),
+      value: status.dropped_byte_limit ?? '—',
+    },
     { label: t('Writer already stopped'), value: status.dropped_stopped },
     { label: t('Shutdown deadline'), value: status.dropped_shutdown },
   ]

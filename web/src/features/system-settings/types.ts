@@ -358,6 +358,9 @@ export type OperationsSettings = {
   WorkerAllowHttpImageRequestEnabled: boolean
   LogConsumeEnabled: boolean
   'request_trace.enabled': boolean
+  'request_trace.success_sample_rate': number
+  'request_trace.slow_request_ms': number
+  'request_trace.slow_first_byte_ms': number
   'request_trace.compression_level': 'fastest' | 'default' | 'better' | 'best'
   'performance_setting.disk_cache_enabled': boolean
   'performance_setting.disk_cache_threshold_mb': number

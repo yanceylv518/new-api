@@ -99,6 +99,9 @@ const OPERATIONS_SECTIONS = [
       <LogSettingsSection
         defaultEnabled={Boolean(settings.LogConsumeEnabled)}
         defaultTraceEnabled={settings['request_trace.enabled']}
+        defaultSuccessSampleRate={settings['request_trace.success_sample_rate']}
+        defaultSlowRequestMS={settings['request_trace.slow_request_ms']}
+        defaultSlowFirstByteMS={settings['request_trace.slow_first_byte_ms']}
         defaultCompressionLevel={settings['request_trace.compression_level']}
       />
     ),

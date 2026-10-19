@@ -1,5 +1,15 @@
 {
   "translation": {
+    "Successful timeline sampling (%)": "Tỷ lệ lấy mẫu dòng thời gian thành công (%)",
+    "100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.": "100 giữ mọi yêu cầu thành công. Lỗi, bản ghi không đầy đủ, yêu cầu thử lại và yêu cầu đạt ngưỡng cấu hình được giữ ngoài lấy mẫu. Áp dụng cho yêu cầu bắt đầu sau khi lưu.",
+    "Non-streaming duration threshold (ms)": "Ngưỡng thời gian yêu cầu không truyền luồng (ms)",
+    "Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.": "Giữ yêu cầu không truyền luồng có thời gian máy chủ đạt ngưỡng này. 0 tắt quy tắc; thời gian tạo luồng thông thường không kích hoạt quy tắc.",
+    "Entry-to-upstream-first-byte threshold (ms)": "Ngưỡng từ đầu vào đến byte đầu tiên thượng nguồn (ms)",
+    "Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.": "Giữ yêu cầu có byte đầu tiên của lần thử cuối đạt độ lệch này từ đầu vào cổng, gồm thời gian chuẩn bị và thử lại. 0 tắt quy tắc.",
+    "Reserved payload bytes": "Số byte tải dữ liệu đã dành",
+    "Payload byte budget": "Ngân sách byte tải dữ liệu",
+    "Excluded by success sampling": "Loại theo lấy mẫu thành công",
+    "Payload budget exceeded": "Vượt ngân sách tải dữ liệu",
     "Collect request timelines": "Thu thập dòng thời gian yêu cầu",
     "Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.": "Áp dụng cho yêu cầu mới sau khi lưu. Khi tắt thu thập, các yêu cầu đang được theo dõi và các bản ghi trong hàng đợi vẫn hoàn tất; dòng thời gian đã lưu vẫn có thể xem.",
     "Accepted, written, failed, and dropped totals count records. Failures are final batch failures; retries count repeated batch write calls.": "Tổng nhận, ghi, thất bại và bỏ tính theo số bản ghi. Thất bại là lỗi cuối cùng của lô; số lần thử lại tính theo các lần gọi ghi lô lặp lại.",
