@@ -52,7 +52,8 @@ export const defaultRequestTraceConfig: z.infer<
 
 export const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
-  RequestTraceLevel: z.enum(['off', 'errors', 'all']),
+  RequestTraceEnabled: z.boolean(),
+  RequestTraceLevel: z.enum(['errors', 'all']),
   RequestTracePreChannelErrorsEnabled: z.boolean(),
   RequestTraceAnonymousErrorsEnabled: z.boolean(),
   RequestTraceUpstreamRequestIdHeaders: z.string(),

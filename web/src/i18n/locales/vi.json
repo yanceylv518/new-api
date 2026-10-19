@@ -1,5 +1,8 @@
 {
   "translation": {
+    "Enable request tracing": "Bật theo dõi yêu cầu",
+    "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "Tắt và lưu sẽ dừng ghi siêu dữ liệu dấu vết mới. Việc xem dấu vết hiện có, nhật ký sử dụng và tính phí không bị ảnh hưởng.",
+    "Request trace settings": "Cài đặt theo dõi yêu cầu",
     "Successful request sample rate (%)": "Tỷ lệ lấy mẫu yêu cầu thành công (%)",
     "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.": "0 chỉ lưu yêu cầu lỗi; 100 lưu mọi yêu cầu thành công. Lần thử lại bị lỗi và chẩn đoán tạm thời luôn được giữ. Lấy mẫu giảm ghi dữ liệu nhưng không bỏ qua phân tích phản hồi.",
     "Request trace retention (days)": "Thời gian lưu dấu vết (ngày)",

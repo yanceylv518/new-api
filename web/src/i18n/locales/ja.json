@@ -1,5 +1,8 @@
 {
   "translation": {
+    "Enable request tracing": "リクエストトレースを有効化",
+    "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "無効にして保存すると、新しいトレースメタデータの記録を停止します。既存トレースの閲覧、利用ログ、課金には影響しません。",
+    "Request trace settings": "リクエストトレース設定",
     "Successful request sample rate (%)": "成功リクエストのサンプリング率（%）",
     "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.": "0 は失敗のみ、100 はすべての成功を保存します。失敗した再試行と一時診断は常に保存します。サンプリングは書き込みを減らしますが、応答の解析は省略しません。",
     "Request trace retention (days)": "リクエストトレースの保持日数",

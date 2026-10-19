@@ -1,5 +1,8 @@
 {
   "translation": {
+    "Enable request tracing": "Enable request tracing",
+    "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.",
+    "Request trace settings": "Request trace settings",
     "Successful request sample rate (%)": "Successful request sample rate (%)",
     "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.": "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.",
     "Request trace retention (days)": "Request trace retention (days)",

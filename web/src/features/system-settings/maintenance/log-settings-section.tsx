@@ -18,12 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
 import { DateTimePicker } from '@/components/datetime-picker'
+import { Accordion } from '@/components/ui/accordion'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -69,6 +70,7 @@ import {
   getSystemTask,
   startLogCleanupTask,
 } from '../api'
+import { SettingsAccordion } from '../components/settings-accordion'
 import {
   SettingsControlGroup,
   SettingsForm,
@@ -176,7 +178,8 @@ export function LogSettingsSection({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
-      RequestTraceLevel: defaultTraceConfig?.level ?? 'errors',
+      RequestTraceEnabled: defaultTraceConfig.level !== 'off',
+      RequestTraceLevel: defaultTraceConfig.level === 'all' ? 'all' : 'errors',
       RequestTracePreChannelErrorsEnabled:
         defaultTraceConfig?.pre_channel_errors_enabled ?? true,
       RequestTraceAnonymousErrorsEnabled:
@@ -191,6 +194,12 @@ export function LogSettingsSection({
       RequestTraceDiagnosticExpiresAt: defaultTraceConfig.diagnostic_expires_at,
     },
   })
+
+  const traceEnabled = useWatch({
+    control: form.control,
+    name: 'RequestTraceEnabled',
+  })
+  const [traceSettingsOpen, setTraceSettingsOpen] = useState(false)
 
   const [purgeDate, setPurgeDate] = useState<Date | undefined>(() =>
     getDateDaysAgo(30)
@@ -217,7 +226,11 @@ export function LogSettingsSection({
   useEffect(() => {
     form.reset({
       LogConsumeEnabled: defaultEnabled,
-      RequestTraceLevel: defaultTraceConfig?.level ?? 'errors',
+      RequestTraceEnabled: defaultTraceConfig.level !== 'off',
+      RequestTraceLevel:
+        defaultTraceConfig.level === 'off'
+          ? form.getValues('RequestTraceLevel')
+          : defaultTraceConfig.level,
       RequestTracePreChannelErrorsEnabled:
         defaultTraceConfig?.pre_channel_errors_enabled ?? true,
       RequestTraceAnonymousErrorsEnabled:
@@ -320,6 +333,7 @@ export function LogSettingsSection({
       .filter(Boolean)
     const headers = upstreamRequestIDHeadersSchema.safeParse(headerNames)
     if (!headers.success) {
+      setTraceSettingsOpen(true)
       form.setError(
         'RequestTraceUpstreamRequestIdHeaders',
         {
@@ -343,6 +357,7 @@ export function LogSettingsSection({
       !z.array(z.number().int().positive()).max(16).safeParse(channelIDs)
         .success
     ) {
+      setTraceSettingsOpen(true)
       form.setError(
         'RequestTraceDiagnosticChannels',
         {
@@ -365,6 +380,7 @@ export function LogSettingsSection({
         values.RequestTraceDiagnosticExpiresAt > now + 86400 ||
         (diagnosticChanged && values.RequestTraceDiagnosticExpiresAt <= now))
     ) {
+      setTraceSettingsOpen(true)
       form.setError(
         'RequestTraceDiagnosticExpiresAt',
         {
@@ -384,7 +400,7 @@ export function LogSettingsSection({
         if (!response.success) return
       }
       const config = {
-        level: values.RequestTraceLevel,
+        level: values.RequestTraceEnabled ? values.RequestTraceLevel : 'off',
         pre_channel_errors_enabled: values.RequestTracePreChannelErrorsEnabled,
         anonymous_errors_enabled: values.RequestTraceAnonymousErrorsEnabled,
         upstream_request_id_headers: [
@@ -425,6 +441,10 @@ export function LogSettingsSection({
       // useUpdateOption 统一展示保存错误，保留输入以便重试。
     }
   }
+
+  const handleSave = form.handleSubmit(onSubmit, () => {
+    setTraceSettingsOpen(true)
+  })
 
   const handleRequestCleanLogs = () => {
     if (!purgeTimestamp) {
@@ -499,9 +519,9 @@ export function LogSettingsSection({
   return (
     <SettingsSection title={t('Log Maintenance')}>
       <Form {...form}>
-        <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
+        <SettingsForm onSubmit={handleSave}>
           <SettingsPageFormActions
-            onSave={form.handleSubmit(onSubmit)}
+            onSave={handleSave}
             isSaving={updateOption.isPending}
             saveLabel='Save log settings'
           />
@@ -532,106 +552,14 @@ export function LogSettingsSection({
           <SettingsControlGroup className='space-y-3'>
             <FormField
               control={form.control}
-              name='RequestTraceLevel'
-              render={({ field }) => (
-                <FormItem className='space-y-2'>
-                  <FormLabel>{t('Request trace level')}</FormLabel>
-                  <FormDescription>
-                    {t(
-                      'Store request and response metadata separately. Message bodies and response text are never stored.'
-                    )}
-                  </FormDescription>
-                  <Select
-                    items={[
-                      { value: 'off', label: t('Off') },
-                      { value: 'errors', label: t('Detailed failures only') },
-                      { value: 'all', label: t('All requests in detail') },
-                    ]}
-                    value={field.value}
-                    onValueChange={field.onChange}
-                    disabled={updateOption.isPending}
-                  >
-                    <FormControl>
-                      <SelectTrigger className='w-full sm:w-56'>
-                        <SelectValue />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectGroup>
-                        <SelectItem value='off'>{t('Off')}</SelectItem>
-                        <SelectItem value='errors'>
-                          {t('Detailed failures only')}
-                        </SelectItem>
-                        <SelectItem value='all'>
-                          {t('All requests in detail')}
-                        </SelectItem>
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name='RequestTraceCompressionLevel'
-              render={({ field }) => (
-                <FormItem className='space-y-2'>
-                  <FormLabel>{t('Compression level')}</FormLabel>
-                  <FormDescription>
-                    {t(
-                      'Applies to new request trace metadata in relational databases. Higher compression uses more CPU.'
-                    )}
-                  </FormDescription>
-                  <Select
-                    items={[
-                      { value: 'fast', label: t('Fast (recommended)') },
-                      { value: 'standard', label: t('Standard compression') },
-                      { value: 'high', label: t('Higher compression') },
-                      { value: 'best', label: t('Maximum compression') },
-                    ]}
-                    value={field.value}
-                    onValueChange={field.onChange}
-                    disabled={updateOption.isPending}
-                  >
-                    <FormControl>
-                      <SelectTrigger className='w-full sm:w-56'>
-                        <SelectValue />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectGroup>
-                        <SelectItem value='fast'>
-                          {t('Fast (recommended)')}
-                        </SelectItem>
-                        <SelectItem value='standard'>
-                          {t('Standard compression')}
-                        </SelectItem>
-                        <SelectItem value='high'>
-                          {t('Higher compression')}
-                        </SelectItem>
-                        <SelectItem value='best'>
-                          {t('Maximum compression')}
-                        </SelectItem>
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name='RequestTracePreChannelErrorsEnabled'
+              name='RequestTraceEnabled'
               render={({ field }) => (
                 <SettingsSwitchItem>
                   <SettingsSwitchContent>
-                    <FormLabel>
-                      {t('Record failures before upstream dispatch')}
-                    </FormLabel>
+                    <FormLabel>{t('Enable request tracing')}</FormLabel>
                     <FormDescription>
                       {t(
-                        'Record validation, rate limit and channel selection failures attributed to an authenticated user.'
+                        'Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.'
                       )}
                     </FormDescription>
                   </SettingsSwitchContent>
@@ -639,85 +567,222 @@ export function LogSettingsSection({
                     <Switch
                       checked={field.value}
                       onCheckedChange={field.onChange}
-                      disabled={
-                        form.watch('RequestTraceLevel') === 'off' ||
-                        updateOption.isPending
-                      }
-                    />
-                  </FormControl>
-                </SettingsSwitchItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name='RequestTraceAnonymousErrorsEnabled'
-              render={({ field }) => (
-                <SettingsSwitchItem>
-                  <SettingsSwitchContent>
-                    <FormLabel>
-                      {t('Record unauthenticated failures')}
-                    </FormLabel>
-                    <FormDescription>
-                      {t(
-                        'These records have no user owner and are visible only to administrators.'
-                      )}
-                    </FormDescription>
-                  </SettingsSwitchContent>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                      disabled={
-                        form.watch('RequestTraceLevel') === 'off' ||
-                        updateOption.isPending
-                      }
-                    />
-                  </FormControl>
-                </SettingsSwitchItem>
-              )}
-            />
-          </SettingsControlGroup>
-          <RequestTracePolicyControls
-            form={form}
-            disabled={updateOption.isPending}
-          />
-          <SettingsControlGroup>
-            <FormField
-              control={form.control}
-              name='RequestTraceUpstreamRequestIdHeaders'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>
-                    {t('Upstream request ID response headers')}
-                  </FormLabel>
-                  <FormDescription>
-                    {t(
-                      'One header name per line, in priority order. Custom headers take precedence over defaults. Leave blank to use defaults. Applies even when request tracing is off.'
-                    )}
-                    <span className='mt-1 block'>
-                      {t('Default response headers: {{headers}}', {
-                        headers:
-                          'X-Oneapi-Request-Id, X-Request-Id, Request-Id, X-Amzn-RequestId, X-Goog-Request-Id',
-                      })}
-                    </span>
-                  </FormDescription>
-                  <FormControl>
-                    <Textarea
-                      {...field}
-                      placeholder={'X-Custom-Request-Id\nX-Trace-Id'}
-                      className='font-mono text-xs'
-                      maxLength={
-                        MAX_REQUEST_ID_HEADERS *
-                        (MAX_REQUEST_ID_HEADER_LENGTH + 1)
-                      }
-                      rows={3}
                       disabled={updateOption.isPending}
                     />
                   </FormControl>
                   <FormMessage />
-                </FormItem>
+                </SettingsSwitchItem>
               )}
             />
+            <Accordion
+              value={traceSettingsOpen ? ['request-trace'] : []}
+              onValueChange={(value) =>
+                setTraceSettingsOpen(value.includes('request-trace'))
+              }
+            >
+              <SettingsAccordion
+                value='request-trace'
+                title={t('Request trace settings')}
+              >
+                <div className='space-y-3'>
+                  <SettingsControlGroup className='space-y-3'>
+                    <FormField
+                      control={form.control}
+                      name='RequestTraceLevel'
+                      render={({ field }) => (
+                        <FormItem className='space-y-2'>
+                          <FormLabel>{t('Request trace level')}</FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Store request and response metadata separately. Message bodies and response text are never stored.'
+                            )}
+                          </FormDescription>
+                          <Select
+                            items={[
+                              {
+                                value: 'errors',
+                                label: t('Detailed failures only'),
+                              },
+                              {
+                                value: 'all',
+                                label: t('All requests in detail'),
+                              },
+                            ]}
+                            value={field.value}
+                            onValueChange={field.onChange}
+                            disabled={!traceEnabled || updateOption.isPending}
+                          >
+                            <FormControl>
+                              <SelectTrigger className='w-full sm:w-56'>
+                                <SelectValue />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectGroup>
+                                <SelectItem value='errors'>
+                                  {t('Detailed failures only')}
+                                </SelectItem>
+                                <SelectItem value='all'>
+                                  {t('All requests in detail')}
+                                </SelectItem>
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='RequestTraceCompressionLevel'
+                      render={({ field }) => (
+                        <FormItem className='space-y-2'>
+                          <FormLabel>{t('Compression level')}</FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Applies to new request trace metadata in relational databases. Higher compression uses more CPU.'
+                            )}
+                          </FormDescription>
+                          <Select
+                            items={[
+                              { value: 'fast', label: t('Fast (recommended)') },
+                              {
+                                value: 'standard',
+                                label: t('Standard compression'),
+                              },
+                              { value: 'high', label: t('Higher compression') },
+                              {
+                                value: 'best',
+                                label: t('Maximum compression'),
+                              },
+                            ]}
+                            value={field.value}
+                            onValueChange={field.onChange}
+                            disabled={updateOption.isPending}
+                          >
+                            <FormControl>
+                              <SelectTrigger className='w-full sm:w-56'>
+                                <SelectValue />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectGroup>
+                                <SelectItem value='fast'>
+                                  {t('Fast (recommended)')}
+                                </SelectItem>
+                                <SelectItem value='standard'>
+                                  {t('Standard compression')}
+                                </SelectItem>
+                                <SelectItem value='high'>
+                                  {t('Higher compression')}
+                                </SelectItem>
+                                <SelectItem value='best'>
+                                  {t('Maximum compression')}
+                                </SelectItem>
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='RequestTracePreChannelErrorsEnabled'
+                      render={({ field }) => (
+                        <SettingsSwitchItem>
+                          <SettingsSwitchContent>
+                            <FormLabel>
+                              {t('Record failures before upstream dispatch')}
+                            </FormLabel>
+                            <FormDescription>
+                              {t(
+                                'Record validation, rate limit and channel selection failures attributed to an authenticated user.'
+                              )}
+                            </FormDescription>
+                          </SettingsSwitchContent>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                              disabled={!traceEnabled || updateOption.isPending}
+                            />
+                          </FormControl>
+                        </SettingsSwitchItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='RequestTraceAnonymousErrorsEnabled'
+                      render={({ field }) => (
+                        <SettingsSwitchItem>
+                          <SettingsSwitchContent>
+                            <FormLabel>
+                              {t('Record unauthenticated failures')}
+                            </FormLabel>
+                            <FormDescription>
+                              {t(
+                                'These records have no user owner and are visible only to administrators.'
+                              )}
+                            </FormDescription>
+                          </SettingsSwitchContent>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                              disabled={!traceEnabled || updateOption.isPending}
+                            />
+                          </FormControl>
+                        </SettingsSwitchItem>
+                      )}
+                    />
+                  </SettingsControlGroup>
+                  <RequestTracePolicyControls
+                    form={form}
+                    disabled={updateOption.isPending}
+                  />
+                  <SettingsControlGroup>
+                    <FormField
+                      control={form.control}
+                      name='RequestTraceUpstreamRequestIdHeaders'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Upstream request ID response headers')}
+                          </FormLabel>
+                          <FormDescription>
+                            {t(
+                              'One header name per line, in priority order. Custom headers take precedence over defaults. Leave blank to use defaults. Applies even when request tracing is off.'
+                            )}
+                            <span className='mt-1 block'>
+                              {t('Default response headers: {{headers}}', {
+                                headers:
+                                  'X-Oneapi-Request-Id, X-Request-Id, Request-Id, X-Amzn-RequestId, X-Goog-Request-Id',
+                              })}
+                            </span>
+                          </FormDescription>
+                          <FormControl>
+                            <Textarea
+                              {...field}
+                              placeholder={'X-Custom-Request-Id\nX-Trace-Id'}
+                              className='font-mono text-xs'
+                              maxLength={
+                                MAX_REQUEST_ID_HEADERS *
+                                (MAX_REQUEST_ID_HEADER_LENGTH + 1)
+                              }
+                              rows={3}
+                              disabled={updateOption.isPending}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </SettingsControlGroup>
+                  {traceSettingsOpen && <RequestTraceStatus />}
+                </div>
+              </SettingsAccordion>
+            </Accordion>
           </SettingsControlGroup>
           <SettingsControlGroup className='space-y-3'>
             <div>
@@ -794,8 +859,6 @@ export function LogSettingsSection({
           </SettingsControlGroup>
         </SettingsForm>
       </Form>
-
-      <RequestTraceStatus />
 
       <Separator />
 

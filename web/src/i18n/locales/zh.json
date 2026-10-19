@@ -1,5 +1,8 @@
 {
   "translation": {
+    "Enable request tracing": "启用请求追踪",
+    "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "关闭并保存后停止新增追踪元数据，历史追踪查看、用量日志和计费不受影响。",
+    "Request trace settings": "请求追踪设置",
     "Successful request sample rate (%)": "成功请求采样率（%）",
     "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.": "0 仅保存失败请求，100 保存全部成功请求。失败重试和临时诊断始终保留；采样减少落库，不会跳过响应解析。",
     "Request trace retention (days)": "请求追踪保留天数",

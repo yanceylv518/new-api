@@ -1,5 +1,8 @@
 {
   "translation": {
+    "Enable request tracing": "Включить трассировку запросов",
+    "Disabling this and saving stops new trace metadata. Existing trace access, usage logs and billing are unaffected.": "После отключения и сохранения новые метаданные трассировки не записываются. Просмотр существующих трассировок, журналы использования и тарификация не меняются.",
+    "Request trace settings": "Настройки трассировки запросов",
     "Successful request sample rate (%)": "Доля выборки успешных запросов (%)",
     "0 saves failures only; 100 saves every successful request. Failed retries and temporary diagnostics are always kept. Sampling reduces storage writes, not response parsing.": "0 сохраняет только ошибки, 100 — все успешные запросы. Неудачные повторы и временная диагностика сохраняются всегда. Выборка уменьшает число записей, но не объём разбора ответов.",
     "Request trace retention (days)": "Срок хранения трассировок (дни)",
