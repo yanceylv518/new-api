@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 
 import type { RequestTimelineData } from '../api'
-import { getOutcomeLabel, getStageText } from './timeline-text'
+import { getAttemptLabel, getOutcomeLabel, getStageText } from './timeline-text'
 
 export type TraceAttempt = RequestTimelineData['attempts'][number]
 export type TraceExchange = NonNullable<TraceAttempt['exchanges']>[number]
@@ -92,8 +92,8 @@ function exchangeNode(
   const id = `exchange-${attempt.index}-${exchange.index}`
   const base = { attempt, exchange, network, children: [] }
   let connectionLabel = t('Connection')
-  if (exchange.reused === false) connectionLabel = t('Connect · new')
-  if (exchange.reused === true) connectionLabel = t('Connect · reused')
+  if (exchange.reused === false) connectionLabel = t('New connection')
+  if (exchange.reused === true) connectionLabel = t('Existing connection')
   const steps: TimelineNode[] = [
     {
       ...base,
@@ -258,10 +258,7 @@ export function buildTimelineGroups(
   if (before.length > 0) {
     groups.push({
       id: 'gateway',
-      label:
-        attempts.length > 0
-          ? t('Gateway preparation')
-          : t('Gateway processing'),
+      label: attempts.length > 0 ? t('Prepare request') : t('Process request'),
       description: t(
         'Gateway preparation before the first channel call. Nested stages overlap and must not be added together.'
       ),
@@ -284,10 +281,7 @@ export function buildTimelineGroups(
     const succeeded = attempt.outcome === 'success'
     groups.push({
       id: `attempt-${attempt.index}`,
-      label: t('Attempt {{index}} · Channel {{channel}}', {
-        index: attempt.index,
-        channel: `#${attempt.channel_id}`,
-      }),
+      label: getAttemptLabel(t, attempt.index),
       description: succeeded
         ? t('This attempt produced the final result.')
         : t(
@@ -295,7 +289,7 @@ export function buildTimelineGroups(
           ),
       start: Math.min(attempt.start_us, ...nodes.map((node) => node.start)),
       end: attempt.end_us,
-      kind: succeeded ? 'gateway' : 'failed',
+      kind: succeeded ? 'upstream' : 'failed',
       derived: true,
       attempt,
       status: {
@@ -308,7 +302,7 @@ export function buildTimelineGroups(
   if (after.length > 0) {
     groups.push({
       id: 'wrap-up',
-      label: t('Wrap-up'),
+      label: t('Finish request'),
       description: t('Work done after every attempt ended.'),
       start: Math.min(...after.map((node) => node.start)),
       end: after.some((node) => node.end === null)

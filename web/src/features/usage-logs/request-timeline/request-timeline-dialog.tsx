@@ -93,11 +93,6 @@ export function RequestTimelineDialog(props: {
         props.onOpenChange(open)
       }}
       title={searchable ? t('Find request timeline') : t('Request timeline')}
-      description={
-        searchable
-          ? t('Look up a request even when it has no usage log.')
-          : t('Time spent in each stage, measured from gateway entry.')
-      }
       contentClassName='min-w-0 overflow-hidden max-sm:max-h-[calc(100dvh-1.5rem)] max-sm:w-[calc(100vw-1.5rem)] max-sm:max-w-[calc(100vw-1.5rem)] max-sm:p-4 sm:max-w-4xl lg:max-w-5xl'
       contentHeight='min(80dvh, 860px)'
       bodyClassName='pr-2 sm:pr-4'

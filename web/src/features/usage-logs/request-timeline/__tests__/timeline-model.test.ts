@@ -121,7 +121,7 @@ describe('request timeline grouping', () => {
     }
     const groups = buildTimelineGroups(t, data, 8900)
 
-    expect(groups.map((group) => group.label)).toEqual(['Gateway processing'])
+    expect(groups.map((group) => group.label)).toEqual(['Process request'])
     expect(getChannelStart(data)).toBeNull()
   })
 })

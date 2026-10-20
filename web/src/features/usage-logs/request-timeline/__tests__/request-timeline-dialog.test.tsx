@@ -114,23 +114,30 @@ describe('request timeline dialog', () => {
     expect(requestedUrls).toEqual([])
   })
 
-  test('an administrator can collapse an attempt to hide its steps', async () => {
+  test('an administrator can select a retry from the request flow', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
-    const toggle = within(stages).getByRole('button', {
-      name: 'Collapse Attempt 2 · Channel #27',
+    const retry = within(stages).getByRole('button', {
+      name: /^Retry 1/,
     })
-    expect(within(stages).getAllByText('Wait for response')).toHaveLength(1)
+    expect(within(stages).getAllByRole('button')).toHaveLength(3)
+    expect(
+      screen.queryByRole('region', { name: 'Selected stage' })
+    ).not.toBeInTheDocument()
 
-    await userEvent.click(toggle)
+    await userEvent.click(retry)
 
     expect(
-      within(stages).getByRole('button', {
-        name: 'Expand Attempt 2 · Channel #27',
-      })
-    ).toHaveAttribute('aria-expanded', 'false')
+      within(screen.getByRole('region', { name: 'Selected stage' })).getByRole(
+        'heading',
+        {
+          name: 'Retry 1',
+        }
+      )
+    ).toBeInTheDocument()
+    expect(retry).toHaveAttribute('aria-pressed', 'true')
     expect(
-      within(stages).queryByText('Wait for response')
+      within(stages).queryByRole('button', { name: /^(Collapse|Expand)/ })
     ).not.toBeInTheDocument()
     expect(requestedUrls).toEqual(['/api/request-traces/req_retry_1'])
   })
@@ -140,15 +147,15 @@ describe('request timeline dialog', () => {
     const stages = await screen.findByRole('list', { name: 'Request stages' })
 
     await userEvent.click(
-      within(stages).getAllByRole('button', { name: 'Channel handling' })[0]
+      within(stages).getByRole('button', { name: /^Call model/ })
     )
 
     const inspector = screen.getByRole('region', { name: 'Selected stage' })
     expect(
-      within(inspector).getByRole('heading', { name: 'Channel handling' })
+      within(inspector).getByRole('heading', { name: 'Call model' })
     ).toBeInTheDocument()
     expect(
-      within(stages).getAllByRole('button', { name: 'Channel handling' })[0]
+      within(stages).getByRole('button', { name: /^Call model/ })
     ).toHaveAttribute('aria-pressed', 'true')
   })
 

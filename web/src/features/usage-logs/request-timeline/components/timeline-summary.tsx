@@ -81,13 +81,15 @@ export function TimelineHeader(props: {
       )}
       {detail && detail.attempt_count > 1 && (
         <StatusBadge
-          label={t('{{count}} attempts', { count: detail.attempt_count })}
+          label={t('Retried {{count}} times', {
+            count: detail.attempt_count - 1,
+          })}
           variant='warning'
           copyable={false}
         />
       )}
       {summary.capture_status !== 'complete' && (
-        <StatusBadge label={t('Partial capture')} copyable={false} />
+        <StatusBadge label={t('Some details are missing')} copyable={false} />
       )}
       <Button
         variant='ghost'
@@ -108,7 +110,6 @@ export function TimelineHeader(props: {
 function Metric(props: {
   label: string
   value: number | null
-  hint: string
   swatch?: string
 }) {
   return (
@@ -122,7 +123,6 @@ function Metric(props: {
       <dd className='overflow-x-auto font-mono text-lg font-semibold whitespace-nowrap tabular-nums'>
         {formatTraceDuration(props.value)}
       </dd>
-      <dd className='text-muted-foreground text-xs'>{props.hint}</dd>
     </div>
   )
 }
@@ -146,34 +146,26 @@ export function TimelineMetrics(props: {
         <Metric
           label={t('Server processing time')}
           value={props.summary.duration_us}
-          hint={t('Until gateway processing ended')}
         />
         <Metric
-          label={t('First payload write')}
+          label={t('First output')}
           value={props.summary.first_payload_write_offset_us}
-          hint={t(
-            'First non-heartbeat Write returned bytes; client receipt is not confirmed'
-          )}
           swatch={TIMELINE_KIND_BG.response}
         />
         {detail && (
           <>
             <Metric
-              label={t('Final attempt first byte')}
-              value={detail.final_attempt_first_byte_offset_us}
-              hint={
-                detail.attempt_count > 0
-                  ? t(
-                      'First HTTP response-header byte within the last channel attempt; offset from entry'
-                    )
-                  : t('No upstream attempt was made')
+              label={
+                detail.attempt_count > 1
+                  ? t('Final response received')
+                  : t('First response received')
               }
+              value={detail.final_attempt_first_byte_offset_us}
               swatch={TIMELINE_KIND_BG.upstream}
             />
             <Metric
-              label={t('Before first attempt')}
+              label={t('Prepare request')}
               value={props.channelStart}
-              hint={t('Authentication, distribution and billing')}
               swatch={TIMELINE_KIND_BG.gateway}
             />
           </>
@@ -191,11 +183,6 @@ export function TimelineMetrics(props: {
           <span className='font-mono break-all'>
             {formatTraceTimestamp(props.summary.finished_at_us)}
           </span>
-        </p>
-        <p>
-          {t(
-            'Milliseconds retain all three decimal places (1 µs). Elapsed time uses a monotonic clock; server completion does not confirm client delivery.'
-          )}
         </p>
       </div>
     </>
@@ -220,12 +207,12 @@ export function TimelineUserSplit(props: { summary: TraceSummary }) {
           </div>
           <div className='text-muted-foreground flex justify-between gap-3 text-xs'>
             <span>
-              {t('Before first write: {{time}}', {
+              {t('Before first output: {{time}}', {
                 time: formatTraceDuration(firstWrite),
               })}
             </span>
             <span>
-              {t('After first write: {{time}}', {
+              {t('After first output: {{time}}', {
                 time: formatTraceDuration(
                   props.summary.duration_us - firstWrite
                 ),
@@ -235,9 +222,7 @@ export function TimelineUserSplit(props: { summary: TraceSummary }) {
         </>
       )}
       <p className='text-muted-foreground text-sm'>
-        {t(
-          'Times start when the request enters the gateway. The end of processing does not confirm the client received everything. Stage details are available to administrators.'
-        )}
+        {t('Times are recorded by the server.')}
       </p>
     </div>
   )

@@ -27,97 +27,97 @@ export interface TraceText {
 export function getStageText(t: TFunction): Record<string, TraceText> {
   return {
     auth: {
-      label: t('Authentication'),
+      label: t('Verify identity'),
       description: t('Looks up the token and checks the user and group.'),
     },
     rate_limit: {
-      label: t('Rate limit'),
+      label: t('Check limits'),
       description: t('Checks the model request rate limit.'),
     },
     distribute: {
-      label: t('Distribution'),
+      label: t('Choose channel'),
       description: t(
         'Resolves the model and picks the first channel. Reading the request body happens inside this step.'
       ),
     },
     request_body: {
-      label: t('Request body read'),
+      label: t('Receive request'),
       description: t(
         'Reads the request body from the client. A slow client upload makes this longer without the gateway being slow.'
       ),
     },
     validate: {
-      label: t('Request validation'),
+      label: t('Check request'),
       description: t('Parses and validates the request parameters.'),
     },
     pricing_prepare: {
-      label: t('Pricing preparation'),
+      label: t('Calculate cost'),
       description: t(
         'Runs content checks, estimates tokens and calculates the price.'
       ),
     },
     precharge: {
-      label: t('Precharge'),
+      label: t('Reserve quota'),
       description: t(
         'Reserves quota through Redis or the database. This is the preparation step most likely to slow down.'
       ),
     },
     channel_select: {
-      label: t('Channel selection'),
+      label: t('Choose channel'),
       description: t(
         'Picks a channel by group and affinity. A retry selects again after the previous attempt ends.'
       ),
     },
     channel_handler: {
-      label: t('Channel handling'),
+      label: t('Call model'),
       description: t(
         'The whole handling of this attempt, including every step below. It is not the upstream time.'
       ),
     },
     request_prepare: {
-      label: t('Request preparation'),
+      label: t('Prepare request'),
       description: t(
         'Converts the request to the upstream format and serializes it.'
       ),
     },
     response_handle: {
-      label: t('Response processing'),
+      label: t('Process response'),
       description: t(
         'Reads the upstream response, converts it and writes it to the client. For streams it runs alongside receiving the response.'
       ),
     },
     settlement: {
-      label: t('Settlement and usage log (legacy)'),
+      label: t('Billing and logs'),
       description: t(
         'Legacy inclusive stage: quota calculation, settlement and usage logging.'
       ),
     },
     usage_finalize: {
-      label: t('Usage finalization'),
+      label: t('Calculate usage'),
       description: t(
         'Calculates usage and includes the settlement and usage log sub-stages. Do not add their durations together.'
       ),
     },
     billing_settle: {
-      label: t('Settlement'),
+      label: t('Finish billing'),
       description: t(
         'Charges or refunds the difference from the precharge based on actual usage.'
       ),
     },
     consume_log: {
-      label: t('Usage log recording'),
+      label: t('Save usage log'),
       description: t('Builds and writes the usage log.'),
     },
     error_log: {
-      label: t('Error log recording'),
+      label: t('Save error log'),
       description: t('Writes the error log.'),
     },
     log_insert: {
-      label: t('Log database insert'),
+      label: t('Save log'),
       description: t('Time spent on the log INSERT itself.'),
     },
     websocket_handshake: {
-      label: t('WebSocket handshake'),
+      label: t('Connect to service'),
       description: t('Opens the WebSocket connection to the upstream.'),
     },
   }
@@ -129,9 +129,31 @@ export function getOutcomeLabel(t: TFunction, outcome: string): string {
     failed: t('Failed'),
     canceled: t('Canceled'),
     timeout: t('Timeout'),
-    panic: t('Panic'),
+    panic: t('Unexpected error'),
   }
   return labels[outcome] ?? outcome
+}
+
+export function getAttemptLabel(t: TFunction, index: number): string {
+  return index === 1
+    ? t('Call model')
+    : t('Retry {{index}}', { index: index - 1 })
+}
+
+export function getNetworkEventLabel(t: TFunction, name: string): string {
+  const labels: Record<string, string> = {
+    get_conn: t('Waiting for a connection'),
+    got_conn: t('Connection ready'),
+    dns_start: t('Looking up service address'),
+    dns_done: t('Service address lookup finished'),
+    connect_start: t('Connect to service'),
+    connect_done: t('Connection attempt finished'),
+    tls_start: t('Secure connection'),
+    tls_done: t('Secure connection setup finished'),
+    wrote_request: t('Request send finished'),
+    first_byte: t('First response received'),
+  }
+  return labels[name] ?? name
 }
 
 /** capture.missing 原因代码的说明；缺失不代表耗时为零。 */
@@ -171,8 +193,8 @@ export function getStreamEndLabel(t: TFunction, end: string): string {
     timeout: t('Timeout'),
     eof: t('Upstream closed'),
     scanner_error: t('Read error'),
-    handler_stop: t('Stopped by the handler'),
-    panic: t('Panic'),
+    handler_stop: t('Processing stopped'),
+    panic: t('Unexpected error'),
   }
   return labels[end] ?? end
 }

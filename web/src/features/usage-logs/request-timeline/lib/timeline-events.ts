@@ -19,7 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 
 import type { RequestTimelineData, RequestTimelineResult } from '../api'
-import { getStageText } from './timeline-text'
+import {
+  getAttemptLabel,
+  getNetworkEventLabel,
+  getStageText,
+} from './timeline-text'
 
 export interface TraceEventRow {
   id: string
@@ -78,10 +82,7 @@ export function buildTraceEvents(
   })
   for (const attempt of data.attempts) {
     const nodeId = `attempt-${attempt.index}`
-    const attemptLabel = t('Attempt {{index}} · Channel {{channel}}', {
-      index: attempt.index,
-      channel: `#${attempt.channel_id}`,
-    })
+    const attemptLabel = getAttemptLabel(t, attempt.index)
     rows.push({
       id: `${nodeId}-start`,
       label: `${attemptLabel} · ${t('Start')}`,
@@ -106,7 +107,7 @@ export function buildTraceEvents(
       const code = `${nodeId} / HTTP ${exchange.index}`
       rows.push({
         id: `${exchangeId}-start`,
-        label: t('HTTP request started'),
+        label: `${attemptLabel} · ${t('Send request')}`,
         code,
         start: exchange.start_us,
         end: null,
@@ -115,7 +116,7 @@ export function buildTraceEvents(
       if (exchange.headers_us !== null) {
         rows.push({
           id: `${exchangeId}-headers`,
-          label: t('Response headers observed'),
+          label: `${attemptLabel} · ${t('Response ready')}`,
           code,
           start: exchange.headers_us,
           end: null,
@@ -125,7 +126,7 @@ export function buildTraceEvents(
       if (exchange.end_us !== null) {
         rows.push({
           id: `${exchangeId}-end`,
-          label: t('Response body ended'),
+          label: `${attemptLabel} · ${t('Response finished')}`,
           code: `${code} / ${exchange.end_reason ?? ''}`,
           start: exchange.end_us,
           end: null,
@@ -135,7 +136,7 @@ export function buildTraceEvents(
       for (const event of exchange.events ?? []) {
         rows.push({
           id: `${exchangeId}-event-${event.sequence}`,
-          label: event.name,
+          label: `${attemptLabel} · ${getNetworkEventLabel(t, event.name)}`,
           code: `${code} / #${event.sequence}`,
           start: event.offset_us,
           end: null,

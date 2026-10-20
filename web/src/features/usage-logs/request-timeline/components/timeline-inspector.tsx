@@ -24,14 +24,12 @@ import type { TimelineNode } from '../lib/timeline-model'
 import { formatTraceBytes, formatTraceDuration } from '../lib/timeline-scale'
 import {
   getBodyEndLabel,
+  getNetworkEventLabel,
   getOutcomeLabel,
   getStreamEndLabel,
 } from '../lib/timeline-text'
 
-export function TimelineInspector(props: {
-  node: TimelineNode
-  total: number
-}) {
+export function TimelineInspector(props: { node: TimelineNode }) {
   const { t } = useTranslation()
   const node = props.node
   const duration = node.end === null ? null : node.end - node.start
@@ -40,22 +38,17 @@ export function TimelineInspector(props: {
     [
       t('End'),
       node.end === null
-        ? t('Not observed')
+        ? t('Not recorded')
         : `+${formatTraceDuration(node.end)}`,
     ],
     [
       t('Duration'),
       duration === null ? t('Unknown') : formatTraceDuration(duration),
     ],
-    [
-      t('Measurement'),
-      node.derived ? t('Derived group span') : t('Observed boundary'),
-    ],
   ]
-  if (node.stage) facts.push([t('Stage code'), node.stage])
   const exchange = node.exchange
   if (exchange) {
-    let connection = t('Not observed')
+    let connection = t('Not recorded')
     if (exchange.reused !== null) {
       connection = exchange.reused ? t('Reused') : t('New')
     }
@@ -67,18 +60,18 @@ export function TimelineInspector(props: {
       ],
       [t('Connection'), connection],
       [t('Proxy'), exchange.proxy ? t('Configured') : t('Not configured')],
-      [t('Bytes read'), formatTraceBytes(exchange.bytes_read)],
+      [t('Response size'), formatTraceBytes(exchange.bytes_read)],
       [
-        t('Body end'),
+        t('End reason'),
         exchange.end_reason
           ? getBodyEndLabel(t, exchange.end_reason)
-          : t('Not observed'),
+          : t('Not recorded'),
       ]
     )
     for (const [key, label] of [
-      ['dns', 'DNS'],
-      ['tcp', 'TCP'],
-      ['tls', 'TLS'],
+      ['dns', t('Service address lookup')],
+      ['tcp', t('Connect to service')],
+      ['tls', t('Secure connection')],
     ] as const) {
       const span = node.network?.[key]
       if (span) facts.push([label, formatTraceDuration(span[1] - span[0])])
@@ -89,24 +82,25 @@ export function TimelineInspector(props: {
     facts.push(
       [t('Channel'), `#${attempt.channel_id}`],
       [t('Result'), getOutcomeLabel(t, attempt.outcome)],
-      [t('Upstream requests'), String(attempt.exchanges?.length ?? 0)]
+      [t('Service calls'), String(attempt.exchanges?.length ?? 0)]
     )
     if (attempt.stream) {
       facts.push(
-        [t('Observed data lines'), String(attempt.stream.count)],
+        [t('Received data entries'), String(attempt.stream.count)],
         [
-          t('Largest observed line gap'),
+          t('Longest response pause'),
           formatTraceDuration(
             attempt.stream.count > 1 ? attempt.stream.max_gap_us : null
           ),
         ],
-        [t('Stream end'), getStreamEndLabel(t, attempt.stream.end)]
+        [t('End reason'), getStreamEndLabel(t, attempt.stream.end)]
       )
     }
   }
 
   return (
     <section
+      id='timeline-selection'
       className='space-y-3 rounded-lg border p-3 sm:p-4'
       aria-live='polite'
       aria-label={t('Selected stage')}
@@ -134,9 +128,6 @@ export function TimelineInspector(props: {
           </div>
         ))}
       </dl>
-      {node.description && (
-        <p className='text-muted-foreground text-sm'>{node.description}</p>
-      )}
       {exchange && (exchange.events?.length ?? 0) > 0 && (
         <ul className='flex flex-wrap gap-1.5' aria-label={t('Network events')}>
           {exchange.events?.map((event) => (
@@ -147,7 +138,8 @@ export function TimelineInspector(props: {
                 event.failed ? 'text-destructive' : 'text-muted-foreground'
               )}
             >
-              {event.name} +{formatTraceDuration(event.offset_us)}
+              {getNetworkEventLabel(t, event.name)} +
+              {formatTraceDuration(event.offset_us)}
             </li>
           ))}
         </ul>

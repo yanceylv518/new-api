@@ -93,55 +93,40 @@ function TimelineStages(props: {
       }))
     return { groups, index, stages }
   }, [t, props.data, props.total])
-  const finalAttempt = props.data.attempts.at(-1)
-  const finalExchange = finalAttempt?.exchanges?.at(-1)
-  const waitId = [
-    'exchange',
-    finalAttempt?.index,
-    finalExchange?.index,
-    'wait',
-  ].join('-')
-  const defaultId = model.index.get(waitId)?.id ?? model.groups[0]?.id ?? null
-  const [selectedId, setSelectedId] = useState<string | null>(defaultId)
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(
-    () =>
-      new Set(
-        model.groups
-          .filter((group) => group.attempt && group.attempt !== finalAttempt)
-          .map((group) => group.id)
-      )
-  )
+  const [selectedId, setSelectedId] = useState<string | null>(null)
   const [view, setView] = useState('waterfall')
-  const [window, setWindow] = useState<{ start: number; end: number } | null>(
-    null
-  )
-  const selected =
-    model.index.get(selectedId ?? '') ?? model.index.get(defaultId ?? '')
+  const selected = model.index.get(selectedId ?? '')
   const segments = useMemo(
-    () => buildTimelineSegments(props.total, window),
-    [props.total, window]
+    () => buildTimelineSegments(props.total),
+    [props.total]
   )
   const firstByte =
     props.result.detail?.final_attempt_first_byte_offset_us ?? null
   const firstWrite = props.result.summary?.first_payload_write_offset_us ?? null
+  const retried = (props.result.detail?.attempt_count ?? 0) > 1
   const markers = useMemo(
     () =>
       [
-        { value: firstByte, className: 'border-warning' },
-        { value: firstWrite, className: 'border-success' },
-      ].filter((marker): marker is { value: number; className: string } =>
-        Number.isFinite(marker.value)
+        {
+          value: firstByte,
+          label: retried
+            ? t('Final response received')
+            : t('First response received'),
+          className: 'border-warning',
+        },
+        {
+          value: firstWrite,
+          label: t('First output'),
+          className: 'border-success',
+        },
+      ].filter(
+        (
+          marker
+        ): marker is { value: number; label: string; className: string } =>
+          Number.isFinite(marker.value)
       ),
-    [firstByte, firstWrite]
+    [t, firstByte, firstWrite, retried]
   )
-  const toggle = useCallback((id: string) => {
-    setCollapsed((previous) => {
-      const next = new Set(previous)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }, [])
   return (
     <>
       <Tabs
@@ -156,9 +141,9 @@ function TimelineStages(props: {
           aria-label={t('Timeline view')}
           className='max-w-full flex-wrap group-data-horizontal/tabs:h-auto'
         >
-          <TabsTrigger value='waterfall'>{t('Waterfall')}</TabsTrigger>
+          <TabsTrigger value='waterfall'>{t('Timeline')}</TabsTrigger>
           <TabsTrigger value='stages'>{t('Stage details')}</TabsTrigger>
-          <TabsTrigger value='events'>{t('Event list')}</TabsTrigger>
+          <TabsTrigger value='events'>{t('Request events')}</TabsTrigger>
         </TabsList>
         <TabsContent value='waterfall'>
           {view === 'waterfall' && (
@@ -168,17 +153,7 @@ function TimelineStages(props: {
               total={props.total}
               markers={markers}
               selectedId={selected?.id ?? null}
-              collapsed={collapsed}
               onSelect={setSelectedId}
-              onToggle={toggle}
-              focused={window !== null}
-              canFocus={selected?.end != null && selected.end > selected.start}
-              onFocus={() => {
-                if (selected?.end != null && selected.end > selected.start) {
-                  setWindow({ start: selected.start, end: selected.end })
-                }
-              }}
-              onReset={() => setWindow(null)}
             />
           )}
         </TabsContent>
@@ -197,7 +172,7 @@ function TimelineStages(props: {
           )}
         </TabsContent>
       </Tabs>
-      {selected && <TimelineInspector node={selected} total={props.total} />}
+      {selected && <TimelineInspector node={selected} />}
       <TimelineAttempts attempts={props.data.attempts} />
     </>
   )

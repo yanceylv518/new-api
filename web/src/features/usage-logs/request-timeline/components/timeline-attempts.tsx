@@ -37,11 +37,11 @@ export const TimelineAttempts = memo(function TimelineAttempts(props: {
   attempts: TraceAttempt[]
 }) {
   const { t } = useTranslation()
-  if (props.attempts.length === 0) return null
+  if (props.attempts.length < 2) return null
   return (
     <section className='min-w-0 space-y-2' aria-labelledby='timeline-attempts'>
       <h3 id='timeline-attempts' className='text-sm font-semibold'>
-        {t('Channel attempts')}
+        {t('Retry history')}
       </h3>
       <div className='overflow-x-auto rounded-lg border'>
         <Table>
@@ -52,10 +52,10 @@ export const TimelineAttempts = memo(function TimelineAttempts(props: {
               <TableHead>{t('Result')}</TableHead>
               <TableHead>{t('Status')}</TableHead>
               <TableHead>{t('Connection')}</TableHead>
-              <TableHead>{t('First byte from entry')}</TableHead>
-              <TableHead>{t('Bytes read')}</TableHead>
-              <TableHead>{t('Observed data lines')}</TableHead>
-              <TableHead>{t('Largest observed line gap')}</TableHead>
+              <TableHead>{t('First response received')}</TableHead>
+              <TableHead>{t('Response size')}</TableHead>
+              <TableHead>{t('Received data entries')}</TableHead>
+              <TableHead>{t('Longest response pause')}</TableHead>
               <TableHead>{t('Duration')}</TableHead>
             </TableRow>
           </TableHeader>

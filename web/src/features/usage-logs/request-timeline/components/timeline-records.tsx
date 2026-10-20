@@ -63,15 +63,8 @@ export const TimelineRecords = memo(function TimelineRecords(props: {
         },
       },
       {
-        id: 'code',
-        header: t('Source'),
-        cell: (row) => (
-          <code className='text-muted-foreground text-xs'>{row.code}</code>
-        ),
-      },
-      {
         id: 'start',
-        header: events ? t('Offset from entry') : t('Start'),
+        header: events ? t('Time since request start') : t('Start'),
         cell: (row) => (
           <span className='font-mono whitespace-nowrap'>
             {formatTraceDuration(row.start)}
@@ -87,7 +80,7 @@ export const TimelineRecords = memo(function TimelineRecords(props: {
           cell: (row) => (
             <span className='font-mono whitespace-nowrap'>
               {row.end === null
-                ? t('Not observed')
+                ? t('Not recorded')
                 : formatTraceDuration(row.end)}
             </span>
           ),
@@ -109,20 +102,11 @@ export const TimelineRecords = memo(function TimelineRecords(props: {
   }, [t, events, onSelect])
   return (
     <div className='min-w-0 space-y-3'>
-      <p className='text-muted-foreground text-xs'>
-        {props.events
-          ? t(
-              'Events are ordered by observed offset. Equal timestamps do not establish an order between concurrent callbacks.'
-            )
-          : t(
-              'All offsets start at gateway entry. Parent stages include their children; durations must not be added together.'
-            )}
-      </p>
       <StaticDataTable
         className='focus-visible:ring-ring/50 max-h-[min(50dvh,28rem)] overflow-auto overscroll-contain outline-none focus-visible:ring-[3px] [&>[data-slot=table-container]]:overflow-visible'
         containerProps={{
           role: 'region',
-          'aria-label': events ? t('Event list') : t('Stage details'),
+          'aria-label': events ? t('Request events') : t('Stage details'),
           tabIndex: 0,
         }}
         columns={columns}
@@ -130,7 +114,7 @@ export const TimelineRecords = memo(function TimelineRecords(props: {
         getRowKey={(row) => row.id}
         getRowClassName={(row) => (row.failed ? 'bg-destructive/5' : undefined)}
         emptyContent={t('No data available')}
-        tableClassName='min-w-[42rem] [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10 [&_thead]:bg-background'
+        tableClassName='min-w-[32rem] [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10 [&_thead]:bg-background'
       />
     </div>
   )

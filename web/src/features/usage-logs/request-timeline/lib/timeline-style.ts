@@ -26,13 +26,5 @@ export const TIMELINE_KIND_BG: Record<TimelineKind, string> = {
   failed: 'bg-destructive',
 }
 
-export const TIMELINE_KIND_TEXT: Record<TimelineKind, string> = {
-  gateway: 'text-info',
-  upstream: 'text-warning',
-  response: 'text-success',
-  log: 'text-muted-foreground',
-  failed: 'text-destructive',
-}
-
 export const HATCH =
   'bg-[image:repeating-linear-gradient(135deg,transparent_0_3px,rgb(255_255_255/0.45)_3px_5px)]'
