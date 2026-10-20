@@ -75,7 +75,7 @@ export function getStageText(t: TFunction): Record<string, TraceText> {
       ),
     },
     request_prepare: {
-      label: t('Prepare request'),
+      label: t('Convert request'),
       description: t(
         'Converts the request to the upstream format and serializes it.'
       ),

@@ -122,7 +122,7 @@ function exchangeNode(
     {
       ...base,
       id: `${id}-wait`,
-      label: t('Wait for response'),
+      label: t('Upstream processing'),
       description: t(
         'From the request being written to the response arriving, including network round trips and upstream queueing. The first byte is not the first token.'
       ),

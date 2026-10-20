@@ -107,17 +107,10 @@ export function TimelineHeader(props: {
   )
 }
 
-function Metric(props: {
-  label: string
-  value: number | null
-  swatch?: string
-}) {
+function Metric(props: { label: string; value: number | null }) {
   return (
     <div className='min-w-0 py-2.5 sm:px-4 sm:first:pl-0 sm:[&+&]:border-l'>
-      <dt className='text-muted-foreground flex items-center gap-1.5 text-xs whitespace-nowrap'>
-        {props.swatch && (
-          <i className={cn('size-2 rounded-sm', props.swatch)} />
-        )}
+      <dt className='text-muted-foreground text-xs whitespace-nowrap'>
         {props.label}
       </dt>
       <dd className='overflow-x-auto font-mono text-lg font-semibold whitespace-nowrap tabular-nums'>
@@ -137,23 +130,16 @@ export function TimelineMetrics(props: {
   const detail = props.admin ? props.result.detail : null
   return (
     <>
+      {/* 按发生先后排列，与时间线上的段边界一一对应 */}
       <dl
         className={cn(
           'grid grid-cols-2 border-y',
           detail ? 'sm:grid-cols-4' : 'sm:grid-cols-2'
         )}
       >
-        <Metric
-          label={t('Server processing time')}
-          value={props.summary.duration_us}
-        />
-        <Metric
-          label={t('First output')}
-          value={props.summary.first_payload_write_offset_us}
-          swatch={TIMELINE_KIND_BG.response}
-        />
         {detail && (
           <>
+            <Metric label={t('Prepare request')} value={props.channelStart} />
             <Metric
               label={
                 detail.attempt_count > 1
@@ -161,15 +147,17 @@ export function TimelineMetrics(props: {
                   : t('First response received')
               }
               value={detail.final_attempt_first_byte_offset_us}
-              swatch={TIMELINE_KIND_BG.upstream}
-            />
-            <Metric
-              label={t('Prepare request')}
-              value={props.channelStart}
-              swatch={TIMELINE_KIND_BG.gateway}
             />
           </>
         )}
+        <Metric
+          label={t('First output')}
+          value={props.summary.first_payload_write_offset_us}
+        />
+        <Metric
+          label={t('Server processing time')}
+          value={props.summary.duration_us}
+        />
       </dl>
       <div className='text-muted-foreground grid min-w-0 gap-1 text-xs'>
         <p>

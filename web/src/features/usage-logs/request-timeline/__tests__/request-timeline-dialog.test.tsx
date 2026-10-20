@@ -114,49 +114,97 @@ describe('request timeline dialog', () => {
     expect(requestedUrls).toEqual([])
   })
 
-  test('an administrator can select a retry from the request flow', async () => {
+  test('the timeline lists one stage per key-moment segment and opens no lens by default', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
-    const retry = within(stages).getByRole('button', {
-      name: /^Retry 1/,
-    })
-    expect(within(stages).getAllByRole('button')).toHaveLength(3)
+    const buttons = within(stages).getAllByRole('button')
+
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      expect.stringMatching(/^Prepare request/),
+      expect.stringMatching(/^Attempt 1: Failed/),
+      expect.stringMatching(/^Wait for response/),
+      expect.stringMatching(/^Wait for output/),
+      expect.stringMatching(/^Stream output/),
+      expect.stringMatching(/^Finish request/),
+    ])
+    expect(buttons[1]).toHaveTextContent('503')
     expect(
       screen.queryByRole('region', { name: 'Selected stage' })
-    ).not.toBeInTheDocument()
-
-    await userEvent.click(retry)
-
-    expect(
-      within(screen.getByRole('region', { name: 'Selected stage' })).getByRole(
-        'heading',
-        {
-          name: 'Retry 1',
-        }
-      )
-    ).toBeInTheDocument()
-    expect(retry).toHaveAttribute('aria-pressed', 'true')
-    expect(
-      within(stages).queryByRole('button', { name: /^(Collapse|Expand)/ })
     ).not.toBeInTheDocument()
     expect(requestedUrls).toEqual(['/api/request-traces/req_retry_1'])
   })
 
-  test('selecting a stage shows its details in the inspector', async () => {
+  test('selecting a failed attempt opens the lens with its upstream steps and selecting it again closes it', async () => {
+    renderDialog({ requestId: 'req_retry_1', admin: true })
+    const stages = await screen.findByRole('list', { name: 'Request stages' })
+    const failed = within(stages).getByRole('button', {
+      name: /^Attempt 1: Failed/,
+    })
+
+    await userEvent.click(failed)
+
+    const lens = screen.getByRole('region', { name: 'Selected stage' })
+    expect(
+      within(lens).getByRole('heading', { name: 'Attempt 1: Failed' })
+    ).toBeInTheDocument()
+    const steps = within(lens).getByRole('list', { name: 'Stage details' })
+    expect(within(steps).getByText('Upstream processing')).toBeInTheDocument()
+    expect(within(steps).getByText('Choose channel')).toBeInTheDocument()
+    expect(failed).toHaveAttribute('aria-pressed', 'true')
+
+    await userEvent.click(failed)
+
+    expect(
+      screen.queryByRole('region', { name: 'Selected stage' })
+    ).not.toBeInTheDocument()
+    expect(failed).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  test('the preparation lens lists the gateway steps and the time they do not cover', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
 
     await userEvent.click(
-      within(stages).getByRole('button', { name: /^Call model/ })
+      within(stages).getByRole('button', { name: /^Prepare request/ })
     )
 
-    const inspector = screen.getByRole('region', { name: 'Selected stage' })
+    const steps = within(
+      screen.getByRole('region', { name: 'Selected stage' })
+    ).getByRole('list', { name: 'Stage details' })
+    expect(within(steps).getByText('Verify identity')).toBeInTheDocument()
+    expect(within(steps).getByText('Reserve quota')).toBeInTheDocument()
     expect(
-      within(inspector).getByRole('heading', { name: 'Call model' })
+      within(steps).getByText('Not covered').closest('li')
+    ).toHaveTextContent('4.740 ms')
+  })
+
+  test('selecting a row in stage details shows that stage instead of the lens', async () => {
+    renderDialog({ requestId: 'req_retry_1', admin: true })
+    await screen.findByRole('list', { name: 'Request stages' })
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Stage details' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Reserve quota' }))
+
+    expect(
+      within(screen.getByRole('region', { name: 'Selected stage' })).getByRole(
+        'heading',
+        { name: 'Reserve quota' }
+      )
     ).toBeInTheDocument()
-    expect(
-      within(stages).getByRole('button', { name: /^Call model/ })
-    ).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('the metrics are listed in the order the moments happen', async () => {
+    renderDialog({ requestId: 'req_retry_1', admin: true })
+    await screen.findByRole('list', { name: 'Request stages' })
+
+    expect(screen.getAllByRole('term').map((term) => term.textContent)).toEqual(
+      [
+        'Prepare request',
+        'Final response received',
+        'First output',
+        'Server processing time',
+      ]
+    )
   })
 
   test('a regular user sees the summary but no stage details', async () => {
