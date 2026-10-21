@@ -140,25 +140,15 @@ export function getAttemptLabel(t: TFunction, index: number): string {
     : t('Retry {{index}}', { index: index - 1 })
 }
 
-export function getNetworkEventLabel(t: TFunction, name: string): string {
-  const labels: Record<string, string> = {
-    get_conn: t('Waiting for a connection'),
-    got_conn: t('Connection ready'),
-    dns_start: t('Looking up service address'),
-    dns_done: t('Service address lookup finished'),
-    connect_start: t('Connect to service'),
-    connect_done: t('Connection attempt finished'),
-    tls_start: t('Secure connection'),
-    tls_done: t('Secure connection setup finished'),
-    wrote_request: t('Request send finished'),
-    first_byte: t('First response received'),
-  }
-  return labels[name] ?? name
-}
-
 /** capture.missing 原因代码的说明；缺失不代表耗时为零。 */
 export function getMissingText(t: TFunction, reason: string): string {
   const reasons: Record<string, string> = {
+    forwarding_end_not_observed: t(
+      'The response forwarding end was not recorded.'
+    ),
+    upstream_first_byte_not_observed: t(
+      'The upstream first response byte was not recorded.'
+    ),
     upstream_body_not_closed: t(
       'The upstream response body was not closed, so the end of receiving the response is unknown.'
     ),

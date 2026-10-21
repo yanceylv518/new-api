@@ -84,9 +84,9 @@ func requestTraceStorageObservations() requesttrace.Data {
 		Phases: []requesttrace.Phase{{Name: "auth", StartUS: 0, EndUS: &zero}, {Name: "unfinished", StartUS: 12}},
 		Attempts: []requesttrace.Attempt{{Index: 1, ChannelID: 42, StartUS: 0, EndUS: &last, Outcome: "success",
 			Exchanges: []requesttrace.Exchange{{Index: 1, Kind: "http", StartUS: 0, HeadersUS: &zero, FirstByteUS: &zero, EndUS: &last,
-				Status: 200, Protocol: "HTTP/2.0", EventStream: true, Proxy: true, Reused: &notReused, BytesRead: 1234, EndReason: "eof",
+				Status: 200, Protocol: "HTTP/2.0", EventStream: true, Proxy: true, Reused: &notReused, BytesRead: common.GetPointer(int64(1234)), EndReason: "eof",
 				Events: []requesttrace.Event{{Sequence: 7, Name: "get_conn", OffsetUS: 0}, {Sequence: 11, Name: "connect_done", OffsetUS: 7, Failed: true}}},
-				{Index: 2, Kind: "http", StartUS: 5, Reused: nil, BytesRead: 0, Events: []requesttrace.Event{}}},
+				{Index: 2, Kind: "http", StartUS: 5, Reused: nil, BytesRead: &zero, Events: []requesttrace.Event{}}},
 			Stream: &requesttrace.Stream{FirstUS: &zero, LastUS: &last, Count: 9, MaxGapUS: 31, End: "done", Failed: true}}},
 		Response: requesttrace.Response{BytesWritten: 456, LastWriteUS: &zero, CancelUS: &last, WriteFailed: true, Hijacked: true},
 		Capture:  requesttrace.Coverage{Truncated: true, Missing: []string{"unfinished_phase"}},
@@ -185,8 +185,8 @@ func TestRequestTraceStorageKeepsIndependentRecords(t *testing.T) {
 					{Index: 1, ChannelID: 42, StartUS: 0, Outcome: "failed"},
 					{Index: 2, ChannelID: 43, StartUS: 1, Outcome: "failed", Exchanges: []requesttrace.Exchange{}},
 					{Index: 3, ChannelID: 44, StartUS: 2, Outcome: "success", Exchanges: []requesttrace.Exchange{
-						{Index: 1, Kind: "http", StartUS: 2, BytesRead: 0},
-						{Index: 2, Kind: "http", StartUS: 3, BytesRead: 0, Events: []requesttrace.Event{}},
+						{Index: 1, Kind: "http", StartUS: 2, BytesRead: common.GetPointer(int64(0))},
+						{Index: 2, Kind: "http", StartUS: 3, BytesRead: common.GetPointer(int64(0)), Events: []requesttrace.Event{}},
 					}},
 				}
 			case "many_phases":
@@ -218,6 +218,8 @@ func TestRequestTraceWriterTrimmingAndBudget(t *testing.T) {
 			collector := requesttrace.New("trim-fixture", "node", "POST", time.Now())
 			collector.Enable("/v1/chat/completions", "chat")
 			collector.BeginAttempt(1)
+			collector.StartUpstream("http", false)
+			collector.ForwardingDone(nil)
 			collector.EndAttempt("success")
 			record := collector.Freeze(200, nil)
 			require.NotNil(t, record)

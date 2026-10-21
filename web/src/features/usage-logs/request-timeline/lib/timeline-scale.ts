@@ -18,26 +18,28 @@ For commercial licensing, please contact support@quantumnous.com
 */
 /**
  * 按耗时分配宽度：按比例不足 minWidth 的段固定为 minWidth，其余段按耗时比例分剩下的宽度。
- * minWidth 为 0 时就是纯比例。
+ * 最小宽度不超过每段均分的宽度；minWidth 为 0 时就是纯比例。
  */
 export function allocateWidths(
   durations: number[],
   width: number,
   minWidth: number
 ): number[] {
+  if (durations.length === 0) return []
+  const minimumWidth = Math.min(minWidth, width / durations.length)
   const fixed = durations.map(() => false)
   for (let pass = 0; pass <= durations.length; pass++) {
     const freeDuration = durations.reduce(
       (sum, duration, i) => (fixed[i] ? sum : sum + duration),
       0
     )
-    const freeWidth = width - fixed.filter(Boolean).length * minWidth
+    const freeWidth = width - fixed.filter(Boolean).length * minimumWidth
     let changed = false
     durations.forEach((duration, i) => {
       if (fixed[i]) return
       if (
         freeDuration <= 0 ||
-        (duration / freeDuration) * freeWidth < minWidth
+        (duration / freeDuration) * freeWidth < minimumWidth
       ) {
         fixed[i] = true
         changed = true
@@ -45,11 +47,11 @@ export function allocateWidths(
     })
     if (!changed) {
       return durations.map((duration, i) =>
-        fixed[i] ? minWidth : (duration / freeDuration) * freeWidth
+        fixed[i] ? minimumWidth : (duration / freeDuration) * freeWidth
       )
     }
   }
-  return durations.map(() => minWidth)
+  return durations.map(() => minimumWidth)
 }
 
 /** 首尾相接的段在横轴上的位置，以及把时刻换算成横坐标的函数。 */
@@ -166,7 +168,8 @@ export function formatTraceShare(part: number, total: number): string {
   return `${percent.toFixed(1)}%`
 }
 
-export function formatTraceBytes(bytes: number): string {
+export function formatTraceBytes(bytes: number | null): string {
+  if (bytes === null) return '—'
   return `${bytes} B`
 }
 

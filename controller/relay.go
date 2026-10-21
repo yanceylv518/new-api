@@ -89,7 +89,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		var err error
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			trace.Fail("failed", "websocket_handshake", "upgrade_failed")
+			trace.Fail("failed")
 			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
 			return
 		}
@@ -106,7 +106,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			} else if errors.Is(newAPIError, context.DeadlineExceeded) || errors.As(newAPIError, &timeout) && timeout.Timeout() {
 				outcome = "timeout"
 			}
-			trace.Fail(outcome, "relay", "request_failed")
+			trace.Fail(outcome)
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(common.MaskCredentials(newAPIError.Error(), common.GetContextKeyString(c, constant.ContextKeyChannelKey)))))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
@@ -125,9 +125,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
-	validationPhase := trace.Begin("validate")
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
-	validationPhase.End()
 	if err != nil {
 		// Map "request body too large" to 413 so clients can handle it correctly
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
@@ -144,8 +142,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 	trace.Describe(relayInfo.OriginModelName, relayInfo.UsingGroup, &relayInfo.IsStream)
-	preparePhase := trace.Begin("pricing_prepare")
-	defer preparePhase.End()
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
@@ -175,7 +171,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.SetEstimatePromptTokens(tokens)
 
 	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
-	preparePhase.End()
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
@@ -186,9 +181,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if priceData.FreeModel {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
 	} else {
-		prechargePhase := trace.Begin("precharge")
 		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
-		prechargePhase.End()
 		relayInfo.ReservedDiscountAmounts = priceData.DiscountAmounts
 		if newAPIError != nil {
 			return
@@ -218,12 +211,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
-		var selectionPhase *requesttrace.Span
-		if relayInfo.ChannelMeta != nil {
-			selectionPhase = trace.Begin("channel_select")
-		}
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
-		selectionPhase.End()
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
@@ -247,7 +235,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 		trace.BeginAttempt(channel.Id)
-		attemptPhase := trace.Begin("channel_handler")
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -259,7 +246,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		default:
 			newAPIError = relayHandler(c, relayInfo)
 		}
-		attemptPhase.End()
 		trace.Describe(relayInfo.OriginModelName, relayInfo.UsingGroup, &relayInfo.IsStream)
 
 		if newAPIError == nil {
@@ -702,9 +688,7 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		trace.BeginAttempt(channel.Id)
-		attemptPhase := trace.Begin("channel_handler")
 		result, taskErr = submit(c, relayInfo)
-		attemptPhase.End()
 		if taskErr == nil {
 			trace.EndAttempt("success")
 		} else {

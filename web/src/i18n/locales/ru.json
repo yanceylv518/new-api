@@ -1,5 +1,7 @@
 {
   "translation": {
+    "The response forwarding end was not recorded.": "Время окончания передачи ответа не записано.",
+    "The upstream first response byte was not recorded.": "Время получения первого байта ответа от сервиса не записано.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -5587,7 +5589,7 @@
     "This Telegram account is not linked. Sign in using another method and link it first.": "Этот аккаунт Telegram не привязан. Войдите другим способом и привяжите его.",
     "This Telegram binding request has expired or has already been used.": "Этот запрос на привязку Telegram истёк или уже был использован.",
     "This tier catches any request that did not match earlier tiers.": "Этот уровень обрабатывает все запросы, которые не совпали с предыдущими уровнями.",
-    "This time is spent inside the upstream; no finer steps are recorded.": "Это время уходит на стороне провайдера; более подробные шаги не записываются.",
+    "No further breakdown is available for this stage.": "Более подробная разбивка времени этого этапа недоступна.",
     "this token group": "эта группа токенов",
     "This Uptime Kuma group will be removed from the list.": "Эта группа Uptime Kuma будет удалена из списка.",
     "This user account is disabled.": "Эта учётная запись пользователя отключена.",

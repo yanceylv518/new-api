@@ -220,9 +220,7 @@ export function TimelineLens(props: {
         )}
         {props.steps.length === 0 && segment.kind === 'think' && (
           <p className='text-muted-foreground text-sm'>
-            {t(
-              'This time is spent inside the upstream; no finer steps are recorded.'
-            )}
+            {t('No further breakdown is available for this stage.')}
           </p>
         )}
       </div>

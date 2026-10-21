@@ -19,7 +19,12 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 
 import type { RequestTimelineData } from '../api'
-import type { TimelineKind, TimelineNode, TraceAttempt } from './timeline-model'
+import {
+  getAttemptResponseOffset,
+  type TimelineKind,
+  type TimelineNode,
+  type TraceAttempt,
+} from './timeline-model'
 import { getOutcomeLabel } from './timeline-text'
 
 export type SegmentKind = 'gateway' | 'wait' | 'think' | 'flow' | 'failed'
@@ -106,6 +111,7 @@ export function buildRequestSegments(
   const attempts = data.attempts
   const final = attempts.at(-1)
   const succeeded = final?.outcome === 'success'
+  const fourPoints = (data.measurement_version ?? 1) >= 3
   const segments: RequestSegment[] = []
   let cursor: number | null = 0
   const push = (segment: Omit<RequestSegment, 'start'>) => {
@@ -134,7 +140,11 @@ export function buildRequestSegments(
       key: 'process',
       kind: 'gateway',
       label: t('Process request'),
-      end: input.total,
+      end:
+        fourPoints &&
+        data.capture.missing.includes('forwarding_end_not_observed')
+          ? null
+          : input.total,
     })
   } else {
     push({
@@ -148,12 +158,14 @@ export function buildRequestSegments(
       failed(attempt, attempts[index + 1].start_us)
     })
     if (succeeded) {
-      const firstWrite = input.firstWrite
-      // 首次响应晚于首次输出属于异常顺序，按缺失处理，避免切出负耗时
-      const firstByte =
-        input.firstByte !== null &&
-        (firstWrite === null || input.firstByte <= firstWrite)
-          ? input.firstByte
+      const firstByte = input.firstByte
+      // 首次输出属于整条请求，不能用前一次调用的输出划分最后一次调用。
+      const firstWrite =
+        input.firstWrite !== null &&
+        input.firstWrite >= final.start_us &&
+        input.firstWrite <= (final.end_us ?? input.total) &&
+        (firstByte === null || input.firstWrite >= firstByte)
+          ? input.firstWrite
           : null
       if (firstByte !== null) {
         push({
@@ -200,15 +212,16 @@ export function buildRequestSegments(
           end: data.response.last_write_us ?? final.end_us,
           attempt: final,
         })
-      } else if (firstByte === null) {
-        push({
-          key: 'wait',
-          kind: 'wait',
-          label: t('Wait for response'),
-          end: data.response.last_write_us ?? firstWrite,
-          attempt: final,
-        })
       } else {
+        if (firstByte === null) {
+          push({
+            key: 'wait',
+            kind: 'wait',
+            label: t('Wait for output'),
+            end: firstWrite,
+            attempt: final,
+          })
+        }
         // 非流式一次写回完整结果：读取、转换和写出都算到最后一次写出，之后才是完成处理
         push({
           key: 'receive',
@@ -289,12 +302,53 @@ export function buildRequestSegments(
   }
   moments.push({
     key: 'end',
-    label: t('Server processing ended'),
+    label: fourPoints ? t('Output finished') : t('Server processing ended'),
     at: input.total,
     rank: 2,
     major: true,
     failed: false,
   })
+  if (fourPoints) {
+    moments.splice(0, moments.length, {
+      key: 'entry',
+      label: t('Request entry'),
+      at: 0,
+      rank: 0,
+      major: true,
+      failed: false,
+    })
+    for (const attempt of attempts) {
+      moments.push({
+        key: `attempt-${attempt.index}-start`,
+        label: t('Send request'),
+        at: attempt.start_us,
+        rank: 1,
+        major: true,
+        failed: false,
+      })
+      const response = getAttemptResponseOffset(attempt, data.capture.truncated)
+      if (response !== null) {
+        moments.push({
+          key: `attempt-${attempt.index}-response`,
+          label: t('First response received'),
+          at: response,
+          rank: 2,
+          major: true,
+          failed: false,
+        })
+      }
+    }
+    if (!data.capture.missing.includes('forwarding_end_not_observed')) {
+      moments.push({
+        key: 'end',
+        label: t('Output finished'),
+        at: input.total,
+        rank: 3,
+        major: true,
+        failed: false,
+      })
+    }
+  }
   return {
     segments,
     moments: moments

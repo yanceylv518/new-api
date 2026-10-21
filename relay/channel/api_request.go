@@ -376,9 +376,6 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
 	trace := requesttrace.FromContext(c.Request.Context())
 	trace.EnsureAttempt(info.ChannelId)
-	trace.Missing("websocket_network_events")
-	phase := trace.Begin("websocket_handshake")
-	defer phase.End()
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -398,7 +395,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	observation := trace.StartUpstream("websocket", info.ChannelSetting.Proxy != "")
+	targetConn, response, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	observation.Response(response, err)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), err)
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
-	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -216,8 +215,6 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
-	phase := requesttrace.FromRequest(ctx.Request).Begin("usage_finalize")
-	defer phase.End()
 	settleUserModelDiscount(ctx, relayInfo, float64(usage.InputTokens), float64(usage.OutputTokens), float64(usage.InputTokenDetails.CachedTokens))
 
 	var tieredResult *billingexpr.TieredResult
@@ -356,8 +353,6 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
-	phase := requesttrace.FromRequest(ctx.Request).Begin("usage_finalize")
-	defer phase.End()
 	settleUserModelDiscount(ctx, relayInfo, float64(usage.PromptTokens), float64(usage.CompletionTokens), float64(usage.PromptTokensDetails.CachedTokens))
 
 	var tieredUsedVars map[string]bool

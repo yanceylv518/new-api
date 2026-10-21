@@ -13,7 +13,7 @@ import (
 
 const requestTraceTableName = "request_trace_timeline"
 
-// RequestTrace 的列集合固定；新增采集内容只扩展带版本的 TraceData。
+// RequestTrace 调整列时须显式迁移并保留历史数据；TraceData 按版本兼容旧格式。
 type RequestTrace struct {
 	Id                            int64   `json:"id" gorm:"primaryKey;autoIncrement;index:idx_request_traces_started,priority:2"`
 	RequestId                     string  `json:"request_id" gorm:"type:varchar(64);not null;uniqueIndex:idx_request_traces_request_id"`

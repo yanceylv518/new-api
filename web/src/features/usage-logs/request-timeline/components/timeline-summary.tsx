@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 import type { RequestTimelineResult } from '../api'
+import { getAttemptResponseOffset } from '../lib/timeline-model'
 import {
   formatTraceDuration,
   formatTraceTimestamp,
@@ -128,6 +129,35 @@ export function TimelineMetrics(props: {
 }) {
   const { t } = useTranslation()
   const detail = props.admin ? props.result.detail : null
+  const fourPoints = (detail?.timeline?.measurement_version ?? 1) >= 3
+  const finalAttempt = detail?.timeline?.attempts.at(-1)
+  const firstResponse = fourPoints
+    ? getAttemptResponseOffset(
+        finalAttempt,
+        detail?.timeline?.capture.truncated,
+        detail?.attempt_count
+      )
+    : (detail?.final_attempt_first_byte_offset_us ?? null)
+  const wait =
+    firstResponse !== null && finalAttempt
+      ? firstResponse - finalAttempt.start_us
+      : null
+  const endRecorded = !detail?.timeline?.capture.missing.includes(
+    'forwarding_end_not_observed'
+  )
+  let responseLabel = t('First response received')
+  let responseDuration = firstResponse
+  let receiveDuration = props.summary.first_payload_write_offset_us
+  if (fourPoints) {
+    responseLabel = t('Wait for response')
+    responseDuration = wait
+    receiveDuration =
+      firstResponse !== null && endRecorded
+        ? props.summary.duration_us - firstResponse
+        : null
+  } else if (detail && detail.attempt_count > 1) {
+    responseLabel = t('Final response received')
+  }
   return (
     <>
       {/* 按发生先后排列，与时间线上的段边界一一对应 */}
@@ -140,23 +170,16 @@ export function TimelineMetrics(props: {
         {detail && (
           <>
             <Metric label={t('Prepare request')} value={props.channelStart} />
-            <Metric
-              label={
-                detail.attempt_count > 1
-                  ? t('Final response received')
-                  : t('First response received')
-              }
-              value={detail.final_attempt_first_byte_offset_us}
-            />
+            <Metric label={responseLabel} value={responseDuration} />
           </>
         )}
         <Metric
-          label={t('First output')}
-          value={props.summary.first_payload_write_offset_us}
+          label={fourPoints ? t('Receive response') : t('First output')}
+          value={receiveDuration}
         />
         <Metric
           label={t('Server processing time')}
-          value={props.summary.duration_us}
+          value={endRecorded ? props.summary.duration_us : null}
         />
       </dl>
       <div className='text-muted-foreground grid min-w-0 gap-1 text-xs'>
@@ -167,9 +190,11 @@ export function TimelineMetrics(props: {
           </span>
         </p>
         <p>
-          {t('Server processing ended')} ·{' '}
+          {fourPoints ? t('Output finished') : t('Server processing ended')} ·{' '}
           <span className='font-mono break-all'>
-            {formatTraceTimestamp(props.summary.finished_at_us)}
+            {endRecorded
+              ? formatTraceTimestamp(props.summary.finished_at_us)
+              : t('Not recorded')}
           </span>
         </p>
       </div>

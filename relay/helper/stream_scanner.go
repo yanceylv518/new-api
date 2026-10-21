@@ -84,8 +84,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	trace := requesttrace.FromContext(c.Request.Context())
-	streamTiming := requesttrace.Stream{}
-	var firstEventUS, lastEventUS int64
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -242,11 +240,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
-			// 空行仍执行取消检查和超时续期，只跳过不会入库的时间采样。
-			var observedAtUS int64
-			if trace != nil && len(scanner.Bytes()) > 0 {
-				observedAtUS = trace.OffsetUS()
-			}
 			// 检查是否需要停止
 			select {
 			case <-stopChan:
@@ -272,19 +265,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				continue
 			}
 			if !strings.HasPrefix(data, "[DONE]") {
-				if trace != nil {
-					now := observedAtUS
-					if streamTiming.FirstUS == nil {
-						firstEventUS = now
-						streamTiming.FirstUS = &firstEventUS
-					}
-					if streamTiming.LastUS != nil && now-*streamTiming.LastUS > streamTiming.MaxGapUS {
-						streamTiming.MaxGapUS = now - *streamTiming.LastUS
-					}
-					lastEventUS = now
-					streamTiming.LastUS = &lastEventUS
-					streamTiming.Count++
-				}
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
 
@@ -324,9 +304,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
-	streamTiming.End = string(info.StreamStatus.EndReason)
-	streamTiming.Failed = !info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors()
-	trace.SetStream(streamTiming)
+	trace.SetStreamResult(string(info.StreamStatus.EndReason), !info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors())
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {

@@ -26,8 +26,7 @@ func RequestTraceHandler(next http.Handler, enabled func() bool, submit func(*re
 		collector := requesttrace.New(common.NewRequestId(), node, r.Method, start)
 		collector.SetSamplingPolicy(system_setting.GetRequestTraceSamplingPolicy())
 		r = r.WithContext(requesttrace.WithCollector(r.Context(), collector))
-		stopCancelObservation := context.AfterFunc(r.Context(), func() { collector.ObserveCancel(r.Context().Err()) })
-		defer func() { stopCancelObservation(); submit(collector.Freeze(0, r.Context().Err())) }()
+		defer func() { submit(collector.Freeze(0, r.Context().Err())) }()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -39,13 +38,14 @@ func RequestTraceContext() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		c.Writer = &requestTraceResponseWriter{ResponseWriter: c.Writer, collector: collector}
+		c.Writer = &requestTraceResponseWriter{ResponseWriter: c.Writer, collector: collector, context: c.Request.Context()}
 		defer func() {
 			route := c.FullPath()
 			if c.GetString(RouteTagKey) == "relay" || requesttrace.IsRelayPath(route) {
 				collector.Enable(route, requestTraceKind(route))
 			}
 			collector.Status(c.Writer.Status())
+			collector.FinishResponse(c.Writer.Size(), c.Request.Context().Err())
 		}()
 		c.Next()
 	}
@@ -81,23 +81,26 @@ func requestTraceKind(route string) string {
 type requestTraceResponseWriter struct {
 	gin.ResponseWriter
 	collector *requesttrace.Collector
+	context   context.Context
 }
 
 func (w *requestTraceResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
-	w.collector.Write(n, err, true)
+	w.collector.Write(n, err, w.context)
 	return n, err
 }
 
 func (w *requestTraceResponseWriter) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
-	w.collector.Write(n, err, true)
+	w.collector.Write(n, err, w.context)
 	return n, err
 }
 
 func (w *requestTraceResponseWriter) WriteHeartbeat(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
-	w.collector.Write(n, err, false)
+	if err != nil {
+		w.collector.Write(0, err, w.context)
+	}
 	return n, err
 }
 
@@ -106,7 +109,7 @@ func (w *requestTraceResponseWriter) Flush() { _ = w.FlushError() }
 func (w *requestTraceResponseWriter) FlushError() error {
 	err := http.NewResponseController(w.ResponseWriter).Flush()
 	if err != nil {
-		w.collector.Write(0, err, false)
+		w.collector.Write(0, err, w.context)
 	}
 	return err
 }

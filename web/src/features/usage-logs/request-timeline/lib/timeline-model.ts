@@ -209,6 +209,68 @@ export function buildTimelineGroups(
   data: RequestTimelineData,
   total: number
 ): TimelineNode[] {
+  if ((data.measurement_version ?? 1) >= 3) {
+    const nodes: TimelineNode[] = []
+    const first = data.attempts[0]
+    const firstStart = first?.start_us ?? total
+    nodes.push({
+      id: 'gateway',
+      label: first ? t('Prepare request') : t('Process request'),
+      description: '',
+      start: 0,
+      end:
+        !first && data.capture.missing.includes('forwarding_end_not_observed')
+          ? null
+          : firstStart,
+      kind: 'gateway',
+      children: [],
+    })
+    for (const attempt of data.attempts) {
+      const exchange = attempt.exchanges?.at(-1)
+      const response = getAttemptResponseOffset(attempt, data.capture.truncated)
+      const succeeded = attempt.outcome === 'success'
+      const children: TimelineNode[] = []
+      children.push({
+        id: `attempt-${attempt.index}-wait`,
+        label: t('Wait for response'),
+        description: '',
+        start: attempt.start_us,
+        end: response ?? attempt.end_us,
+        kind: succeeded ? 'upstream' : 'failed',
+        attempt,
+        children: [],
+      })
+      if (response !== null) {
+        children.push({
+          id: `attempt-${attempt.index}-response`,
+          label: t('Receive response'),
+          description: '',
+          start: response,
+          end: attempt.end_us,
+          kind: succeeded ? 'response' : 'failed',
+          attempt,
+          children: [],
+        })
+      }
+      nodes.push({
+        id: `attempt-${attempt.index}`,
+        label: getAttemptLabel(t, attempt.index),
+        description: '',
+        start: attempt.start_us,
+        end: attempt.end_us,
+        kind: succeeded ? 'upstream' : 'failed',
+        derived: true,
+        attempt,
+        exchange,
+        status: {
+          label: getOutcomeLabel(t, attempt.outcome),
+          failed: !succeeded,
+        },
+        children,
+      })
+    }
+    return nodes
+  }
   const stageText = getStageText(t)
   const attempts = data.attempts
   const firstAttemptStart = attempts[0]?.start_us ?? null
@@ -314,6 +376,21 @@ export function buildTimelineGroups(
     })
   }
   return groups
+}
+
+/** 缺失的首字节不替代为其他调用、握手或响应头就绪时间。 */
+export function getAttemptResponseOffset(
+  attempt: TraceAttempt | undefined,
+  truncated = false,
+  expectedIndex?: number
+): number | null {
+  if (truncated) return null
+  if (expectedIndex !== undefined && attempt?.index !== expectedIndex) {
+    return null
+  }
+  const exchange = attempt?.exchanges?.at(-1)
+  if (!exchange) return null
+  return exchange.first_byte_us
 }
 
 /** 首次尝试的直接观测起点，首次选渠属于之前的网关准备。 */

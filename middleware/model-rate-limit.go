@@ -11,7 +11,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/common/limiter"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/setting"
 
 	"github.com/gin-gonic/gin"
@@ -80,8 +79,6 @@ func recordRedisRequest(ctx context.Context, rdb *redis.Client, key string, maxC
 // Redis限流处理器
 func redisRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		phase := requesttrace.FromContext(c.Request.Context()).Begin("rate_limit")
-		defer phase.End()
 		userId := strconv.Itoa(c.GetInt("id"))
 		ctx := context.Background()
 		rdb := common.RDB
@@ -124,7 +121,6 @@ func redisRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) g
 		}
 
 		// 4. 处理请求
-		phase.End()
 		c.Next()
 
 		// 5. 如果请求成功，记录成功请求
@@ -139,8 +135,6 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 	inMemoryRateLimiter.Init(time.Duration(setting.ModelRequestRateLimitDurationMinutes) * time.Minute)
 
 	return func(c *gin.Context) {
-		phase := requesttrace.FromContext(c.Request.Context()).Begin("rate_limit")
-		defer phase.End()
 		userId := strconv.Itoa(c.GetInt("id"))
 		totalKey := ModelRequestRateLimitCountMark + userId
 		successKey := ModelRequestRateLimitSuccessCountMark + userId
@@ -162,7 +156,6 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 		}
 
 		// 3. 处理请求
-		phase.End()
 		c.Next()
 
 		// 4. 如果请求成功，记录到实际的成功请求计数中

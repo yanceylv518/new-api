@@ -178,19 +178,13 @@ describe('request timeline dialog', () => {
     ).toHaveTextContent('4.740 ms')
   })
 
-  test('selecting a row in stage details shows that stage instead of the lens', async () => {
+  test('shows the timeline directly without view tabs or detail tables', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     await screen.findByRole('list', { name: 'Request stages' })
 
-    await userEvent.click(screen.getByRole('tab', { name: 'Stage details' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Reserve quota' }))
-
-    expect(
-      within(screen.getByRole('region', { name: 'Selected stage' })).getByRole(
-        'heading',
-        { name: 'Reserve quota' }
-      )
-    ).toBeInTheDocument()
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 
   test('the metrics are listed in the order the moments happen', async () => {

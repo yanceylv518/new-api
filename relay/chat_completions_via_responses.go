@@ -74,9 +74,6 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 }
 
 func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request any) (*dto.Usage, *types.NewAPIError) {
-	trace := requesttrace.FromContext(c.Request.Context())
-	preparePhase := trace.Begin("request_prepare")
-	defer preparePhase.End()
 	paramOverrideApplied := false
 	if chatRequest, ok := request.(*dto.GeneralOpenAIRequest); ok {
 		chatJSON, err := common.Marshal(chatRequest)
@@ -112,10 +109,10 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 	if !ok {
 		return nil, types.NewError(fmt.Errorf("expected OpenAI responses request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
-	return relayResponsesRequest(c, info, adaptor, responsesReq, paramOverrideApplied, preparePhase)
+	return relayResponsesRequest(c, info, adaptor, responsesReq, paramOverrideApplied)
 }
 
-func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool, preparePhase *requesttrace.Span) (*dto.Usage, *types.NewAPIError) {
+func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (*dto.Usage, *types.NewAPIError) {
 	trace := requesttrace.FromContext(c.Request.Context())
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
@@ -158,7 +155,6 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	var requestBody io.Reader = body
 
 	var httpResp *http.Response
-	preparePhase.End()
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
@@ -180,9 +176,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 
 	if upstreamStream && clientStream {
-		responsePhase := trace.Begin("response_handle")
+		trace.BeginForwarding()
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
-		responsePhase.End()
+		trace.ForwardingDone(c.Request.Context().Err())
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return nil, newApiErr
@@ -191,9 +187,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 	if upstreamStream {
 		info.IsStream = false
-		responsePhase := trace.Begin("response_handle")
+		trace.BeginForwarding()
 		usage, newApiErr := openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
-		responsePhase.End()
+		trace.ForwardingDone(c.Request.Context().Err())
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return nil, newApiErr
@@ -201,9 +197,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		return usage, nil
 	}
 
-	responsePhase := trace.Begin("response_handle")
+	trace.BeginForwarding()
 	usage, newApiErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)
-	responsePhase.End()
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newApiErr != nil {
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr

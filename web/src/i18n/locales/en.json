@@ -1,5 +1,7 @@
 {
   "translation": {
+    "The response forwarding end was not recorded.": "The response forwarding end was not recorded.",
+    "The upstream first response byte was not recorded.": "The upstream first response byte was not recorded.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -5587,7 +5589,7 @@
     "This Telegram account is not linked. Sign in using another method and link it first.": "This Telegram account is not linked. Sign in using another method and link it first.",
     "This Telegram binding request has expired or has already been used.": "This Telegram binding request has expired or has already been used.",
     "This tier catches any request that did not match earlier tiers.": "This tier catches any request that did not match earlier tiers.",
-    "This time is spent inside the upstream; no finer steps are recorded.": "This time is spent inside the upstream; no finer steps are recorded.",
+    "No further breakdown is available for this stage.": "No further breakdown is available for this stage.",
     "this token group": "this token group",
     "This Uptime Kuma group will be removed from the list.": "This Uptime Kuma group will be removed from the list.",
     "This user account is disabled.": "This user account is disabled.",

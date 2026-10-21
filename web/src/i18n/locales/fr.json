@@ -1,5 +1,7 @@
 {
   "translation": {
+    "The response forwarding end was not recorded.": "La fin du transfert de la réponse n’a pas été enregistrée.",
+    "The upstream first response byte was not recorded.": "La réception du premier octet de la réponse en amont n’a pas été enregistrée.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -5587,7 +5589,7 @@
     "This Telegram account is not linked. Sign in using another method and link it first.": "Ce compte Telegram n’est pas lié. Connectez-vous autrement pour le lier.",
     "This Telegram binding request has expired or has already been used.": "Cette demande de liaison Telegram a expiré ou a déjà été utilisée.",
     "This tier catches any request that did not match earlier tiers.": "Ce palier récupère toute requête qui ne correspond à aucun palier précédent.",
-    "This time is spent inside the upstream; no finer steps are recorded.": "Ce temps est passé côté amont ; aucune étape plus fine n'est enregistrée.",
+    "No further breakdown is available for this stage.": "Aucun détail supplémentaire n’est disponible pour cette étape.",
     "this token group": "ce groupe de jetons",
     "This Uptime Kuma group will be removed from the list.": "Ce groupe Uptime Kuma sera retiré de la liste.",
     "This user account is disabled.": "Ce compte utilisateur est désactivé.",

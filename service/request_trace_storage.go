@@ -49,7 +49,7 @@ type storedTraceExchange struct {
 	EventStream bool               `json:"t,omitempty"`
 	Proxy       bool               `json:"x,omitempty"`
 	Reused      *bool              `json:"r,omitempty"`
-	BytesRead   int64              `json:"n"`
+	BytesRead   *int64             `json:"n,omitempty"`
 	EndReason   string             `json:"z,omitempty"`
 	Events      []storedTraceEvent `json:"v"`
 }
@@ -312,14 +312,14 @@ func decodeRequestTraceJSON(raw []byte) (*requesttrace.Data, bool, error) {
 			entry.Exchanges = make([]requesttrace.Exchange, len(attempt.Exchanges))
 		}
 		for j, exchange := range attempt.Exchanges {
-			if exchange.Index == nil || exchange.Kind == nil || exchange.StartUS == nil || exchange.BytesRead == nil {
+			if exchange.Index == nil || exchange.Kind == nil || exchange.StartUS == nil || stored.MeasurementVersion < 3 && exchange.BytesRead == nil {
 				return nil, true, invalid
 			}
 			wire := &entry.Exchanges[j]
 			*wire = requesttrace.Exchange{Index: *exchange.Index, Kind: *exchange.Kind, StartUS: *exchange.StartUS,
 				HeadersUS: exchange.HeadersUS, FirstByteUS: exchange.FirstByteUS, EndUS: exchange.EndUS,
 				Status: exchange.Status, Protocol: exchange.Protocol, EventStream: exchange.EventStream,
-				Proxy: exchange.Proxy, Reused: exchange.Reused, BytesRead: *exchange.BytesRead, EndReason: exchange.EndReason}
+				Proxy: exchange.Proxy, Reused: exchange.Reused, BytesRead: exchange.BytesRead, EndReason: exchange.EndReason}
 			if exchange.Events != nil {
 				wire.Events = make([]requesttrace.Event, len(exchange.Events))
 			}

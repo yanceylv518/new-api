@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -11,11 +12,8 @@ import (
 const SchemaVersion = 1
 
 const (
-	maxPhases            = 96
-	maxAttempts          = 64
-	maxExchanges         = 16
-	maxEvents            = 64
-	initialPhaseCapacity = 8
+	maxAttempts  = 64
+	maxExchanges = 16
 )
 
 type contextKey struct{}
@@ -46,7 +44,7 @@ type Exchange struct {
 	EventStream bool    `json:"event_stream"`
 	Proxy       bool    `json:"proxy"`
 	Reused      *bool   `json:"reused"`
-	BytesRead   int64   `json:"bytes_read"`
+	BytesRead   *int64  `json:"bytes_read"`
 	EndReason   string  `json:"end_reason,omitempty"`
 	Events      []Event `json:"events"`
 }
@@ -130,22 +128,18 @@ type Collector struct {
 	closed         bool
 	enabled        bool
 	current        int
-	events         int
-	lastWriteUS    int64
-	firstPayloadUS int64
+	attemptOutcome string
+	forwarding     atomic.Bool
+	forwardedUS    *int64
+	forwardedErr   error
 	record         Record
-}
-
-type Span struct {
-	collector *Collector
-	index     int
 }
 
 func New(requestID, nodeID, method string, start time.Time) *Collector {
 	return &Collector{start: start, current: -1, record: Record{
 		SamplingPolicy: SamplingPolicy{SuccessRate: 100},
 		RequestID:      requestID, NodeID: nodeID, StartedAtUS: start.UnixMicro(), SchemaVersion: SchemaVersion,
-		Data: Data{MeasurementVersion: 2, Method: method, Phases: []Phase{}, Attempts: []Attempt{}, Errors: []Failure{}, Capture: Coverage{Missing: []string{}}},
+		Data: Data{MeasurementVersion: 3, Method: method, Phases: []Phase{}, Attempts: []Attempt{}, Errors: []Failure{}, Capture: Coverage{Missing: []string{}}},
 	}}
 }
 
@@ -280,50 +274,10 @@ func (c *Collector) Describe(modelName, groupName string, stream *bool) {
 	}
 }
 
-func (c *Collector) Begin(name string) *Span {
-	if c == nil {
-		return nil
-	}
-	now := c.OffsetUS()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	if len(c.record.Data.Phases) >= maxPhases {
-		c.record.Data.Capture.Truncated = true
-		return nil
-	}
-	if cap(c.record.Data.Phases) == 0 {
-		c.record.Data.Phases = make([]Phase, 0, initialPhaseCapacity)
-	}
-	index := len(c.record.Data.Phases)
-	attemptIndex := 0
-	if c.current >= 0 && c.record.Data.Attempts[c.current].EndUS == nil {
-		attemptIndex = c.record.AttemptCount
-	}
-	c.record.Data.Phases = append(c.record.Data.Phases, Phase{Name: name, Attempt: attemptIndex, StartUS: now})
-	return &Span{collector: c, index: index}
-}
-
-func (s *Span) End() {
-	if s == nil {
-		return
-	}
-	c := s.collector
-	now := c.OffsetUS()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed && c.record.Data.Phases[s.index].EndUS == nil {
-		c.record.Data.Phases[s.index].EndUS = &now
-	}
-}
-
 func (c *Collector) BeginAttempt(channelID int) {
 	if c == nil {
 		return
 	}
-	now := c.OffsetUS()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -333,55 +287,47 @@ func (c *Collector) BeginAttempt(channelID int) {
 	id := int64(channelID)
 	c.record.FinalChannelID = &id
 	c.current = -1
-	if len(c.record.Data.Attempts) >= maxAttempts {
-		c.record.Data.Capture.Truncated = true
-		return
-	}
-	c.current = len(c.record.Data.Attempts)
-	c.record.Data.Attempts = append(c.record.Data.Attempts, Attempt{
-		Index: c.record.AttemptCount, ChannelID: id, StartUS: now, Exchanges: []Exchange{},
-	})
+	c.attemptOutcome = ""
+	c.forwardedUS = nil
+	c.forwardedErr = nil
 }
 
 func (c *Collector) EndAttempt(outcome string) {
 	if c == nil {
 		return
 	}
-	now := c.OffsetUS()
+	c.forwarding.Store(false)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || c.current < 0 {
+	if c.closed {
+		return
+	}
+	if c.current < 0 {
+		if c.attemptOutcome == "" {
+			c.attemptOutcome = outcome
+		}
 		return
 	}
 	attempt := &c.record.Data.Attempts[c.current]
-	if attempt.EndUS == nil {
-		if outcome == "success" && attempt.Stream != nil && attempt.Stream.Failed {
-			outcome = "failed"
-		}
-		if outcome == "failed" {
-			if len(attempt.Exchanges) > 0 {
-				switch attempt.Exchanges[len(attempt.Exchanges)-1].EndReason {
-				case "request_timeout", "read_timeout":
-					outcome = "timeout"
-				case "request_canceled", "read_canceled":
-					outcome = "canceled"
-				}
-			}
-			if attempt.Stream != nil && attempt.Stream.Failed {
-				switch attempt.Stream.End {
-				case "timeout":
-					outcome = "timeout"
-				case "client_gone":
-					outcome = "canceled"
-				}
+	if attempt.Outcome == "" || attempt.Outcome == "success" {
+		if outcome == "failed" && len(attempt.Exchanges) > 0 {
+			switch attempt.Exchanges[len(attempt.Exchanges)-1].EndReason {
+			case "request_timeout":
+				outcome = "timeout"
+			case "request_canceled":
+				outcome = "canceled"
 			}
 		}
-		attempt.EndUS = &now
 		attempt.Outcome = outcome
 	}
+	if outcome != "success" && attempt.EndUS == nil {
+		now := c.OffsetUS()
+		attempt.EndUS = &now
+	}
+	c.attemptOutcome = attempt.Outcome
 }
 
-func (c *Collector) SetStream(stream Stream) {
+func (c *Collector) SetStreamResult(end string, failed bool) {
 	if c == nil {
 		return
 	}
@@ -390,12 +336,22 @@ func (c *Collector) SetStream(stream Stream) {
 	if c.closed {
 		return
 	}
-	if c.current >= 0 {
-		c.record.Data.Attempts[c.current].Stream = &stream
+	if failed {
+		outcome := "failed"
+		switch end {
+		case "timeout":
+			outcome = "timeout"
+		case "client_gone":
+			outcome = "canceled"
+		}
+		c.attemptOutcome = outcome
+		if c.current >= 0 {
+			c.record.Data.Attempts[c.current].Outcome = outcome
+		}
 	}
 }
 
-func (c *Collector) Fail(outcome, stage, code string) {
+func (c *Collector) Fail(outcome string) {
 	if c == nil {
 		return
 	}
@@ -405,22 +361,6 @@ func (c *Collector) Fail(outcome, stage, code string) {
 		return
 	}
 	c.record.Outcome = outcome
-	if len(c.record.Data.Errors) < 32 {
-		c.record.Data.Errors = append(c.record.Data.Errors, Failure{Stage: stage, Code: code, OffsetUS: c.OffsetUS()})
-	} else {
-		c.record.Data.Capture.Truncated = true
-	}
-}
-
-func (c *Collector) Missing(reason string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed {
-		c.missing(reason)
-	}
 }
 
 func (c *Collector) missing(reason string) {
@@ -434,31 +374,70 @@ func (c *Collector) missing(reason string) {
 	}
 }
 
-func (c *Collector) Write(n int, err error, payload bool) {
+func (c *Collector) Write(n int, err error, ctx context.Context) {
+	if c == nil {
+		return
+	}
+	// 常规转发由响应处理器统一结束，逐块写出不再取时或加锁。
+	if err == nil {
+		if n > 0 && !c.forwarding.Load() {
+			c.ForwardingDone(ctx.Err())
+		}
+		return
+	}
+	if !c.forwarding.Load() {
+		c.ForwardingDone(ctx.Err())
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.record.Data.Response.WriteFailed = true
+	if c.record.Outcome == "" || c.record.Outcome == "success" {
+		c.record.Outcome = "failed"
+	}
+}
+
+func (c *Collector) BeginForwarding() {
+	if c != nil {
+		c.forwarding.Store(true)
+	}
+}
+
+// ForwardingDone 必须在响应处理结束、结算和日志之前调用；不表示客户端已收到数据。
+func (c *Collector) ForwardingDone(ctxErr error) {
 	if c == nil {
 		return
 	}
 	now := c.OffsetUS()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if !c.closed {
+		c.forwardedUS = &now
+		c.forwardedErr = ctxErr
+		if c.current >= 0 {
+			c.record.Data.Attempts[c.current].EndUS = &now
+		}
+	}
+	c.forwarding.Store(false)
+}
+
+func (c *Collector) FinishResponse(size int, ctxErr error) {
+	if c == nil {
 		return
 	}
-	if n > 0 {
-		c.record.Data.Response.BytesWritten += int64(n)
-		if c.record.Data.Response.LastWriteUS == nil || now > c.lastWriteUS {
-			c.lastWriteUS = now
-			c.record.Data.Response.LastWriteUS = &c.lastWriteUS
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		if size >= 0 {
+			c.record.Data.Response.BytesWritten = int64(size)
 		}
-		if payload && (c.record.FirstPayloadWriteOffsetUS == nil || now < c.firstPayloadUS) {
-			c.firstPayloadUS = now
-			c.record.FirstPayloadWriteOffsetUS = &c.firstPayloadUS
-		}
-	}
-	if err != nil {
-		c.record.Data.Response.WriteFailed = true
-		if c.record.Outcome == "" || c.record.Outcome == "success" {
-			c.record.Outcome = "failed"
+		// 没有响应正文时，以处理器交还响应控制权为终点，不覆盖已完成的转发。
+		if c.forwardedUS == nil && size <= 0 {
+			now := c.OffsetUS()
+			c.forwardedUS = &now
+			c.forwardedErr = ctxErr
 		}
 	}
 }
@@ -475,18 +454,6 @@ func (c *Collector) Hijack() {
 	}
 }
 
-func (c *Collector) ObserveCancel(err error) {
-	if c == nil || err == nil {
-		return
-	}
-	now := c.OffsetUS()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed && (c.record.Data.Response.CancelUS == nil || now < *c.record.Data.Response.CancelUS) {
-		c.record.Data.Response.CancelUS = &now
-	}
-}
-
 func (c *Collector) Freeze(status int, ctxErr error) *Record {
 	if c == nil {
 		return nil
@@ -500,7 +467,27 @@ func (c *Collector) Freeze(status int, ctxErr error) *Record {
 	if !c.enabled {
 		return nil
 	}
-	duration := c.OffsetUS()
+	duration := int64(0)
+	if c.forwardedUS != nil {
+		duration = *c.forwardedUS
+	} else {
+		c.missing("forwarding_end_not_observed")
+		for _, attempt := range c.record.Data.Attempts {
+			duration = max(duration, attempt.StartUS)
+			if attempt.EndUS != nil {
+				duration = max(duration, *attempt.EndUS)
+			}
+			for _, exchange := range attempt.Exchanges {
+				duration = max(duration, exchange.StartUS)
+				if exchange.FirstByteUS != nil {
+					duration = max(duration, *exchange.FirstByteUS)
+				}
+				if exchange.EndUS != nil {
+					duration = max(duration, *exchange.EndUS)
+				}
+			}
+		}
+	}
 	// 墙钟终点由同一次单调耗时推导，避免系统校时使起止差与耗时矛盾。
 	c.record.DurationUS = duration
 	c.record.FinishedAtUS = c.record.StartedAtUS + duration
@@ -511,10 +498,10 @@ func (c *Collector) Freeze(status int, ctxErr error) *Record {
 		value := status
 		c.record.HTTPStatus = &value
 	}
+	if c.forwardedUS != nil {
+		ctxErr = c.forwardedErr
+	}
 	if ctxErr != nil {
-		if c.record.Data.Response.CancelUS == nil {
-			c.missing("cancel_time_not_observed")
-		}
 		if c.record.Outcome != "panic" {
 			c.record.Outcome = "canceled"
 			if ctxErr == context.DeadlineExceeded {
@@ -531,7 +518,6 @@ func (c *Collector) Freeze(status int, ctxErr error) *Record {
 	for i := range c.record.Data.Attempts {
 		attempt := &c.record.Data.Attempts[i]
 		if attempt.EndUS == nil {
-			c.missing("unfinished_attempt")
 			if attempt.Outcome == "" {
 				attempt.Outcome = c.record.Outcome
 			}
@@ -539,44 +525,29 @@ func (c *Collector) Freeze(status int, ctxErr error) *Record {
 		if len(attempt.Exchanges) == 0 {
 			c.missing("upstream_transport")
 		}
-		for _, exchange := range attempt.Exchanges {
-			if exchange.EndUS == nil {
-				c.missing("upstream_body_not_closed")
-			}
-		}
-		for _, exchange := range attempt.Exchanges {
-			if exchange.EventStream && exchange.Status >= 200 && exchange.Status < 300 && attempt.Stream == nil {
-				c.missing("stream_events")
-			}
-		}
 		if attempt.Index == c.record.AttemptCount {
-			// 每次尝试单独判定，避免已恢复的重试留下全局失败状态。
-			if c.record.Outcome == "success" || c.record.Outcome == "failed" {
-				switch attempt.Outcome {
-				case "failed", "timeout", "canceled":
-					c.record.Outcome = attempt.Outcome
-				}
-			}
-			for _, exchange := range attempt.Exchanges {
-				if exchange.FirstByteUS != nil && (c.record.FinalAttemptFirstByteOffsetUS == nil || *exchange.FirstByteUS < *c.record.FinalAttemptFirstByteOffsetUS) {
-					c.record.FinalAttemptFirstByteOffsetUS = exchange.FirstByteUS
+			if !c.record.Data.Capture.Truncated && len(attempt.Exchanges) > 0 {
+				exchange := attempt.Exchanges[len(attempt.Exchanges)-1]
+				c.record.FinalAttemptFirstByteOffsetUS = exchange.FirstByteUS
+				if exchange.Status > 0 && exchange.FirstByteUS == nil && exchange.HeadersUS == nil {
+					c.missing("upstream_first_byte_not_observed")
 				}
 			}
 		}
 	}
-	for _, phase := range c.record.Data.Phases {
-		if phase.EndUS == nil {
-			c.missing("unfinished_phase")
+	if attempts := c.record.Data.Attempts; c.record.AttemptCount > 0 && (len(attempts) == 0 || attempts[len(attempts)-1].Index != c.record.AttemptCount) {
+		c.missing("upstream_transport")
+	}
+	// 即使调用明细达到上限，最终业务失败也必须保留。
+	if c.record.Outcome == "success" || c.record.Outcome == "failed" {
+		switch c.attemptOutcome {
+		case "failed", "timeout", "canceled":
+			c.record.Outcome = c.attemptOutcome
 		}
 	}
 	c.record.CaptureStatus = "complete"
 	if len(c.record.Data.Capture.Missing) > 0 || c.record.Data.Capture.Truncated {
 		c.record.CaptureStatus = "partial"
-	}
-	if c.record.FirstPayloadWriteOffsetUS != nil {
-		// 摘要会独立排队，内部字段指针会使整份采集器随队列记录一起滞留。
-		offset := *c.record.FirstPayloadWriteOffsetUS
-		c.record.FirstPayloadWriteOffsetUS = &offset
 	}
 	return &c.record
 }

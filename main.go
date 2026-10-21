@@ -184,7 +184,7 @@ func main() {
 	}
 	server.Use(middleware.RequestTraceContext())
 	server.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
-		requesttrace.FromContext(c.Request.Context()).Fail("panic", "handler", "panic")
+		requesttrace.FromContext(c.Request.Context()).Fail("panic")
 		common.SysLog(fmt.Sprintf("panic detected: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -192,6 +192,7 @@ func main() {
 				"type":    "new_api_panic",
 			},
 		})
+		requesttrace.FromContext(c.Request.Context()).ForwardingDone(c.Request.Context().Err())
 	}))
 	// This will cause SSE not to work!!!
 	//server.Use(gzip.Gzip(gzip.DefaultCompression))

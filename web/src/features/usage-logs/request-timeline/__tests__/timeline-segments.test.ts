@@ -223,7 +223,7 @@ describe('request timeline segment steps', () => {
     ])
   })
 
-  test('waiting for output happens inside the upstream and has no finer steps', () => {
+  test('waiting for output has no recorded finer steps', () => {
     expect(stepsOf(singleStreamResult(), 'think')).toEqual([])
   })
 })

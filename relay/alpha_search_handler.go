@@ -21,8 +21,6 @@ import (
 
 func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	trace := requesttrace.FromContext(c.Request.Context())
-	preparePhase := trace.Begin("request_prepare")
-	defer preparePhase.End()
 	info.InitChannelMeta(c)
 
 	switch info.ChannelType {
@@ -78,7 +76,6 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 	}
 	adaptor.Init(info)
 
-	preparePhase.End()
 	resp, err := adaptor.DoRequest(c, info, body)
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
@@ -101,9 +98,9 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 		c.Writer.Header().Set("Content-Type", contentType)
 	}
 	c.Writer.WriteHeader(httpResp.StatusCode)
-	responsePhase := trace.Begin("response_handle")
+	trace.BeginForwarding()
 	_, copyErr := io.Copy(c.Writer, httpResp.Body)
-	responsePhase.End()
+	trace.ForwardingDone(c.Request.Context().Err())
 	if copyErr != nil {
 		return types.NewError(copyErr, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 	}

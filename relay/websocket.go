@@ -36,9 +36,10 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 		defer info.TargetWs.Close()
 	}
 
-	responsePhase := requesttrace.FromContext(c.Request.Context()).Begin("response_handle")
+	trace := requesttrace.FromContext(c.Request.Context())
+	trace.BeginForwarding()
 	usage, newAPIError := adaptor.DoResponse(c, nil, info)
-	responsePhase.End()
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)

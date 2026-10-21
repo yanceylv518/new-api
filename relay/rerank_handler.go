@@ -20,8 +20,6 @@ import (
 
 func RerankHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	trace := requesttrace.FromContext(c.Request.Context())
-	preparePhase := trace.Begin("request_prepare")
-	defer preparePhase.End()
 	info.InitChannelMeta(c)
 
 	rerankReq, ok := info.Request.(*dto.RerankRequest)
@@ -81,7 +79,6 @@ func RerankHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		requestBody = body
 	}
 
-	preparePhase.End()
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
@@ -99,9 +96,9 @@ func RerankHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		}
 	}
 
-	responsePhase := trace.Begin("response_handle")
+	trace.BeginForwarding()
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
-	responsePhase.End()
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)

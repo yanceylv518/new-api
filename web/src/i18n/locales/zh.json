@@ -1,5 +1,7 @@
 {
   "translation": {
+    "The response forwarding end was not recorded.": "未记录到响应转发结束时间。",
+    "The upstream first response byte was not recorded.": "未记录到上游响应首字节时间。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -5587,7 +5589,7 @@
     "This Telegram account is not linked. Sign in using another method and link it first.": "此 Telegram 账号尚未绑定，请先通过其他方式登录并绑定。",
     "This Telegram binding request has expired or has already been used.": "此 Telegram 绑定请求已过期或已使用。",
     "This tier catches any request that did not match earlier tiers.": "此阶梯会兜底处理未匹配前面阶梯的请求。",
-    "This time is spent inside the upstream; no finer steps are recorded.": "这段时间花在上游内部，没有更细的记录。",
+    "No further breakdown is available for this stage.": "此阶段暂无更细的耗时记录。",
     "this token group": "此令牌分组",
     "This Uptime Kuma group will be removed from the list.": "此 Uptime Kuma 分组将从列表中移除。",
     "This user account is disabled.": "此用户账户已被禁用。",

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/pkg/errors"
 
 	"github.com/gin-gonic/gin"
@@ -65,8 +64,6 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 	maxBytes := int64(maxMB) << 20
 
 	contentLength := c.Request.ContentLength
-	phase := requesttrace.FromContext(c.Request.Context()).Begin("request_body")
-	defer phase.End()
 
 	// 使用新的存储系统
 	storage, err := CreateBodyStorageFromReader(c.Request.Body, contentLength, maxBytes)

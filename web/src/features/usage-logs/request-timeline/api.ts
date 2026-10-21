@@ -46,7 +46,7 @@ const exchange = z.object({
   event_stream: z.boolean().optional(),
   proxy: z.boolean(),
   reused: z.boolean().nullable(),
-  bytes_read: z.number(),
+  bytes_read: z.number().nullable(),
   end_reason: z.string().optional(),
   events: z.array(event).nullable(),
 })

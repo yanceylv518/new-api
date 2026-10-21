@@ -25,7 +25,6 @@ import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -34,21 +33,18 @@ import {
   type RequestTimelineData,
   type RequestTimelineResult,
 } from './api'
-import { TimelineAttempts } from './components/timeline-attempts'
 import { TimelineChart } from './components/timeline-chart'
-import { TimelineInspector } from './components/timeline-inspector'
 import { TimelineIssues } from './components/timeline-issues'
 import { TimelineLens } from './components/timeline-lens'
-import { TimelineRecords } from './components/timeline-records'
 import {
   TimelineHeader,
   TimelineMetrics,
   TimelineUserSplit,
 } from './components/timeline-summary'
-import { buildTraceEvents, type TraceEventRow } from './lib/timeline-events'
 import {
   buildTimelineGroups,
   flattenTimeline,
+  getAttemptResponseOffset,
   getChannelStart,
 } from './lib/timeline-model'
 import {
@@ -58,50 +54,27 @@ import {
 
 const EMPTY_TIMELINE_RECHECK_DELAYS = [500, 1000, 2000] as const
 
-function TimelineEvents(props: {
-  result: RequestTimelineResult
-  data: RequestTimelineData
-  onSelect: (id: string) => void
-}) {
-  const { t } = useTranslation()
-  const rows = useMemo(
-    () =>
-      props.result.summary
-        ? buildTraceEvents(t, props.data, props.result.summary)
-        : [],
-    [t, props.data, props.result.summary]
-  )
-  return <TimelineRecords rows={rows} events onSelect={props.onSelect} />
-}
-
-/**
- * 所有视图共用阶段模型和索引。时间线按关键时刻切段，选中一段时用放大镜展开；
- * 两个表格视图选中一行时显示阶段详情；事件列表只在其视图挂载时才投影。
- */
+/** 按关键时刻切段，点选一段时展开其已有记录。 */
 function TimelineStages(props: {
   result: RequestTimelineResult
   data: RequestTimelineData
   total: number
 }) {
   const { t } = useTranslation()
-  const model = useMemo(() => {
+  const index = useMemo(() => {
     const groups = buildTimelineGroups(t, props.data, props.total)
     const rows = flattenTimeline(groups, new Set())
-    const index = new Map(rows.map(({ node }) => [node.id, node]))
-    const stages: TraceEventRow[] = rows
-      .filter(({ node }) => !node.derived)
-      .map(({ node }) => ({
-        id: node.id,
-        label: node.label,
-        code: node.stage ?? node.id,
-        start: node.start,
-        end: node.end,
-        nodeId: node.id,
-      }))
-    return { index, stages }
+    return new Map(rows.map(({ node }) => [node.id, node]))
   }, [t, props.data, props.total])
-  const firstByte =
+  let firstByte =
     props.result.detail?.final_attempt_first_byte_offset_us ?? null
+  if ((props.data.measurement_version ?? 1) >= 3) {
+    firstByte = getAttemptResponseOffset(
+      props.data.attempts.at(-1),
+      props.data.capture.truncated,
+      props.result.detail?.attempt_count
+    )
+  }
   const firstWrite = props.result.summary?.first_payload_write_offset_us ?? null
   const stream = props.result.summary?.is_stream === true
   const timeline = useMemo(
@@ -114,17 +87,12 @@ function TimelineStages(props: {
       }),
     [t, props.data, props.total, firstByte, firstWrite, stream]
   )
-  const [selectedId, setSelectedId] = useState<string | null>(null)
   const [segmentKey, setSegmentKey] = useState<string | null>(null)
-  const [view, setView] = useState('waterfall')
-  const selected = model.index.get(selectedId ?? '')
   const segment = timeline.segments.find((item) => item.key === segmentKey)
   const steps = useMemo(
     () =>
-      segment
-        ? buildSegmentSteps(segment, props.data, model.index, props.total)
-        : [],
-    [segment, props.data, model.index, props.total]
+      segment ? buildSegmentSteps(segment, props.data, index, props.total) : [],
+    [segment, props.data, index, props.total]
   )
   // 再次点选同一段收起放大镜
   const toggleSegment = useCallback(
@@ -132,64 +100,23 @@ function TimelineStages(props: {
     []
   )
   return (
-    <>
-      <Tabs
-        value={view}
-        onValueChange={(value) => {
-          if (typeof value === 'string') {
-            setView(value)
-          }
-        }}
-      >
-        <TabsList
-          aria-label={t('Timeline view')}
-          className='max-w-full flex-wrap group-data-horizontal/tabs:h-auto'
-        >
-          <TabsTrigger value='waterfall'>{t('Timeline')}</TabsTrigger>
-          <TabsTrigger value='stages'>{t('Stage details')}</TabsTrigger>
-          <TabsTrigger value='events'>{t('Request events')}</TabsTrigger>
-        </TabsList>
-        <TabsContent value='waterfall'>
-          {view === 'waterfall' && (
-            <div className='space-y-4'>
-              <TimelineChart
-                segments={timeline.segments}
-                moments={timeline.moments}
-                total={props.total}
-                selectedKey={segment?.key ?? null}
-                onSelect={toggleSegment}
-              />
-              {segment && (
-                <TimelineLens
-                  segment={segment}
-                  steps={steps}
-                  total={props.total}
-                  stream={stream}
-                />
-              )}
-            </div>
-          )}
-        </TabsContent>
-        <TabsContent value='stages'>
-          {view === 'stages' && (
-            <TimelineRecords rows={model.stages} onSelect={setSelectedId} />
-          )}
-        </TabsContent>
-        <TabsContent value='events'>
-          {view === 'events' && (
-            <TimelineEvents
-              result={props.result}
-              data={props.data}
-              onSelect={setSelectedId}
-            />
-          )}
-        </TabsContent>
-      </Tabs>
-      {view !== 'waterfall' && selected && (
-        <TimelineInspector node={selected} />
+    <div className='space-y-4'>
+      <TimelineChart
+        segments={timeline.segments}
+        moments={timeline.moments}
+        total={props.total}
+        selectedKey={segment?.key ?? null}
+        onSelect={toggleSegment}
+      />
+      {segment && (
+        <TimelineLens
+          segment={segment}
+          steps={steps}
+          total={props.total}
+          stream={stream}
+        />
       )}
-      <TimelineAttempts attempts={props.data.attempts} />
-    </>
+    </div>
   )
 }
 

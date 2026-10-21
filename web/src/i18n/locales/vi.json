@@ -1,5 +1,7 @@
 {
   "translation": {
+    "The response forwarding end was not recorded.": "Chưa ghi nhận thời điểm chuyển tiếp phản hồi kết thúc.",
+    "The upstream first response byte was not recorded.": "Chưa ghi nhận thời điểm nhận byte phản hồi đầu tiên từ dịch vụ.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -5587,7 +5589,7 @@
     "This Telegram account is not linked. Sign in using another method and link it first.": "Tài khoản Telegram này chưa được liên kết. Hãy đăng nhập bằng cách khác rồi liên kết tài khoản.",
     "This Telegram binding request has expired or has already been used.": "Yêu cầu liên kết Telegram này đã hết hạn hoặc đã được sử dụng.",
     "This tier catches any request that did not match earlier tiers.": "Tầng này bắt mọi yêu cầu không khớp với các tầng trước.",
-    "This time is spent inside the upstream; no finer steps are recorded.": "Thời gian này nằm ở phía dịch vụ; không có bước chi tiết hơn được ghi nhận.",
+    "No further breakdown is available for this stage.": "Chưa có chi tiết thời gian cụ thể hơn cho giai đoạn này.",
     "this token group": "nhóm token này",
     "This Uptime Kuma group will be removed from the list.": "Nhóm Uptime Kuma này sẽ bị xóa khỏi danh sách.",
     "This user account is disabled.": "Tài khoản người dùng này đã bị vô hiệu hóa.",

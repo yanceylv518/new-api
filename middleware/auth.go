@@ -47,12 +47,6 @@ func validUserInfo(username string, role int) bool {
 
 func authHelper(c *gin.Context, minRole int) {
 	trace := requesttrace.FromContext(c.Request.Context())
-	phase := trace.Begin("auth")
-	defer func() {
-		if phase != nil {
-			phase.End()
-		}
-	}()
 	if _, started := c.Get(accessTokenAuditContextKey); !started {
 		defer finishAccessTokenAudit(c)
 	}
@@ -75,8 +69,6 @@ func authHelper(c *gin.Context, minRole int) {
 	}
 	setDashboardAuthContext(c, user, identity, useAccessToken)
 	trace.Identify(user.Id, 0)
-	phase.End()
-	phase = nil
 
 	// 管理/root 写操作审计兜底：内聚在鉴权链路里，保证任何经过 AdminAuth/RootAuth
 	// 的写接口都会自动留痕（无需在路由上单独挂审计中间件，避免漏挂）。
@@ -372,12 +364,6 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		trace := requesttrace.FromContext(c.Request.Context())
-		phase := trace.Begin("auth")
-		defer func() {
-			if phase != nil {
-				phase.End()
-			}
-		}()
 		// 先检测是否为ws
 		if c.Request.Header.Get("Sec-WebSocket-Protocol") != "" {
 			// Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.sk-xxx, openai-beta.realtime-v1
@@ -507,8 +493,6 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 		trace.Identify(token.UserId, token.Id)
-		phase.End()
-		phase = nil
 		c.Next()
 	}
 }
