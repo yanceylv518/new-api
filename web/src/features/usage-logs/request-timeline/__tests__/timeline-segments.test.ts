@@ -20,7 +20,11 @@ import type { TFunction } from 'i18next'
 import { describe, expect, test } from 'vitest'
 
 import type { RequestTimelineData, RequestTimelineResult } from '../api'
-import { buildTimelineGroups, flattenTimeline } from '../lib/timeline-model'
+import {
+  buildTimelineGroups,
+  flattenTimeline,
+  getAttemptResponseOffset,
+} from '../lib/timeline-model'
 import {
   buildRequestSegments,
   buildSegmentSteps,
@@ -171,6 +175,88 @@ describe('request timeline segments', () => {
     const { segments } = cut(result, { firstByte: null, firstWrite: 900 })
 
     expect(spans(segments)).toEqual([['process', 0, 4_701_926]])
+  })
+})
+
+describe('four-point timeline', () => {
+  function fourPointResult() {
+    const result = singleStreamResult()
+    const data = timelineOf(result)
+    if (!result.summary || !result.detail) throw new Error('missing fixture')
+    const end = 4_688_913
+    result.summary.duration_us = end
+    result.summary.finished_at_us = result.summary.started_at_us + end
+    result.summary.first_payload_write_offset_us = null
+    data.measurement_version = 3
+    data.phases = []
+    data.response.last_write_us = null
+    data.response.cancel_observed_us = null
+    for (const attempt of data.attempts) {
+      attempt.end_us = end
+      attempt.stream = undefined
+      for (const exchange of attempt.exchanges ?? []) {
+        exchange.headers_us = null
+        exchange.end_us = null
+        exchange.bytes_read = null
+        exchange.events = []
+      }
+    }
+    return result
+  }
+
+  test('uses exactly preparation, waiting and forwarding without billing stages', () => {
+    const result = fourPointResult()
+
+    expect(spans(cut(result).segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['wait', 14_592, 1_774_477],
+      ['receive', 1_774_477, 4_688_913],
+    ])
+    expect(cut(result).moments.map((moment) => moment.at)).toEqual([
+      0, 14_592, 1_774_477, 4_688_913,
+    ])
+  })
+
+  test('does not replace an absent first byte with response headers or zero', () => {
+    const result = fourPointResult()
+    const data = timelineOf(result)
+    const attempt = data.attempts[0]
+    const exchange = attempt.exchanges?.[0]
+    if (!result.detail || !exchange) throw new Error('missing fixture')
+    exchange.first_byte_us = null
+    exchange.headers_us = 100_000
+    result.detail.final_attempt_first_byte_offset_us = null
+
+    expect(getAttemptResponseOffset(attempt)).toBeNull()
+    expect(spans(cut(result).segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['call', 14_592, 4_688_913],
+    ])
+  })
+
+  test('an unknown forwarding end has no finish marker or fabricated duration', () => {
+    const result = fourPointResult()
+    const data = timelineOf(result)
+    if (!result.summary) throw new Error('missing fixture')
+    result.summary.duration_us = 1_774_477
+    data.capture.missing = ['forwarding_end_not_observed']
+    data.attempts[0].end_us = null
+
+    const timeline = cut(result)
+    expect(timeline.segments.at(-1)).toMatchObject({
+      key: 'receive',
+      start: 1_774_477,
+      end: null,
+    })
+    expect(timeline.moments.map((moment) => moment.key)).not.toContain('end')
+  })
+
+  test('a retry that never reached upstream cannot borrow the previous response', () => {
+    const attempt = timelineOf(fourPointResult()).attempts[0]
+
+    expect(getAttemptResponseOffset(attempt, false, 1)).toBe(1_774_477)
+    expect(getAttemptResponseOffset(attempt, false, 2)).toBeNull()
+    expect(getAttemptResponseOffset(attempt, true, 1)).toBeNull()
   })
 })
 
