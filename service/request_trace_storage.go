@@ -3,6 +3,8 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"slices"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/requesttrace"
@@ -90,25 +92,64 @@ type storedTraceFailure struct {
 	OffsetUS int64  `json:"t"`
 }
 
-func newStoredRequestTrace(data requesttrace.Data) storedRequestTrace {
-	stored := storedRequestTrace{
+type requestTraceEncodeBuffer struct {
+	data      storedRequestTrace
+	phases    []storedTracePhase
+	attempts  []storedTraceAttempt
+	exchanges []storedTraceExchange
+	events    []storedTraceEvent
+	failures  []storedTraceFailure
+}
+
+const (
+	maxCachedTracePhases    = 32
+	maxCachedTraceAttempts  = 4
+	maxCachedTraceExchanges = 8
+	maxCachedTraceEvents    = 64
+	maxCachedTraceFailures  = 8
+)
+
+var requestTraceEncodeBuffers = sync.Pool{New: func() any {
+	return &requestTraceEncodeBuffer{
+		exchanges: []storedTraceExchange{}, events: []storedTraceEvent{},
+	}
+}}
+
+func encodeRequestTraceJSON(data requesttrace.Data) ([]byte, error) {
+	buffer := requestTraceEncodeBuffers.Get().(*requestTraceEncodeBuffer)
+	defer buffer.release()
+	exchangeCount, eventCount := 0, 0
+	for _, attempt := range data.Attempts {
+		exchangeCount += len(attempt.Exchanges)
+		for _, exchange := range attempt.Exchanges {
+			eventCount += len(exchange.Events)
+		}
+	}
+	buffer.phases = slices.Grow(buffer.phases[:0], len(data.Phases))[:len(data.Phases)]
+	buffer.attempts = slices.Grow(buffer.attempts[:0], len(data.Attempts))[:len(data.Attempts)]
+	buffer.exchanges = slices.Grow(buffer.exchanges[:0], exchangeCount)[:exchangeCount]
+	buffer.events = slices.Grow(buffer.events[:0], eventCount)[:eventCount]
+	buffer.failures = slices.Grow(buffer.failures[:0], len(data.Errors))[:len(data.Errors)]
+	buffer.data = storedRequestTrace{
 		Version: 1, MeasurementVersion: data.MeasurementVersion, Method: data.Method, Route: data.Route,
 		Response: storedTraceResponse(data.Response), Capture: storedTraceCoverage(data.Capture),
-		Phases: make([]storedTracePhase, len(data.Phases)), Attempts: make([]storedTraceAttempt, len(data.Attempts)),
-		Errors: make([]storedTraceFailure, len(data.Errors)),
+		Phases: buffer.phases, Attempts: buffer.attempts, Errors: buffer.failures,
 	}
 	for i, phase := range data.Phases {
-		stored.Phases[i] = storedTracePhase(phase)
+		buffer.phases[i] = storedTracePhase(phase)
 	}
 	for i, failure := range data.Errors {
-		stored.Errors[i] = storedTraceFailure(failure)
+		buffer.failures[i] = storedTraceFailure(failure)
 	}
+	exchangeOffset, eventOffset := 0, 0
 	for i, attempt := range data.Attempts {
-		entry := &stored.Attempts[i]
+		entry := &buffer.attempts[i]
 		*entry = storedTraceAttempt{Index: attempt.Index, ChannelID: attempt.ChannelID, StartUS: attempt.StartUS,
 			EndUS: attempt.EndUS, Outcome: attempt.Outcome, Stream: (*storedTraceStream)(attempt.Stream)}
 		if attempt.Exchanges != nil {
-			entry.Exchanges = make([]storedTraceExchange, len(attempt.Exchanges))
+			end := exchangeOffset + len(attempt.Exchanges)
+			entry.Exchanges = buffer.exchanges[exchangeOffset:end:end]
+			exchangeOffset = end
 		}
 		for j, exchange := range attempt.Exchanges {
 			wire := &entry.Exchanges[j]
@@ -117,14 +158,31 @@ func newStoredRequestTrace(data requesttrace.Data) storedRequestTrace {
 				Status: exchange.Status, Protocol: exchange.Protocol, EventStream: exchange.EventStream,
 				Proxy: exchange.Proxy, Reused: exchange.Reused, BytesRead: exchange.BytesRead, EndReason: exchange.EndReason}
 			if exchange.Events != nil {
-				wire.Events = make([]storedTraceEvent, len(exchange.Events))
+				end := eventOffset + len(exchange.Events)
+				wire.Events = buffer.events[eventOffset:end:end]
+				eventOffset = end
 			}
 			for k, event := range exchange.Events {
 				wire.Events[k] = storedTraceEvent(event)
 			}
 		}
 	}
-	return stored
+	// Marshal 返回独立字节；工作区只在本次同步编码期间持有冻结记录的引用。
+	return common.Marshal(&buffer.data)
+}
+
+func (b *requestTraceEncodeBuffer) release() {
+	// 超大记录仍完整编码，只限制工作区复用，避免偶发重试长期撑大池内对象。
+	if cap(b.phases) > maxCachedTracePhases || cap(b.attempts) > maxCachedTraceAttempts || cap(b.exchanges) > maxCachedTraceExchanges || cap(b.events) > maxCachedTraceEvents || cap(b.failures) > maxCachedTraceFailures {
+		return
+	}
+	b.data = storedRequestTrace{}
+	clear(b.phases)
+	clear(b.attempts)
+	clear(b.exchanges)
+	clear(b.events)
+	clear(b.failures)
+	requestTraceEncodeBuffers.Put(b)
 }
 
 // 读取侧用指针区分必填标量的缺失与真实零值，不改变写入侧的分配成本。

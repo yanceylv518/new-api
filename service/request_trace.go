@@ -126,24 +126,20 @@ func (w *RequestTraceWriter) Enqueue(record *requesttrace.Record) {
 		}
 		return
 	}
-	stored := newStoredRequestTrace(record.Data)
-	encoded, err := common.Marshal(stored)
+	encoded, err := encodeRequestTraceJSON(record.Data)
 	if err == nil && len(encoded) > maxRequestTraceBytes {
 		record.Data.Capture.Truncated, record.CaptureStatus = true, "partial"
-		stored.Capture.Truncated = true
 		for i := range record.Data.Attempts {
 			for j := range record.Data.Attempts[i].Exchanges {
 				record.Data.Attempts[i].Exchanges[j].Events = nil
-				stored.Attempts[i].Exchanges[j].Events = nil
 			}
 		}
-		encoded, err = common.Marshal(stored)
+		encoded, err = encodeRequestTraceJSON(record.Data)
 		if err == nil && len(encoded) > maxRequestTraceBytes {
 			for i := range record.Data.Attempts {
 				record.Data.Attempts[i].Exchanges = nil
-				stored.Attempts[i].Exchanges = nil
 			}
-			encoded, err = common.Marshal(stored)
+			encoded, err = encodeRequestTraceJSON(record.Data)
 		}
 	}
 	if err != nil || len(encoded) > maxRequestTraceBytes {
