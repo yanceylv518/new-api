@@ -247,6 +247,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		if shouldSendLastResp {
 			clientData := lastStreamData
+			clientDecoded := lastDecoded
 			if containStreamUsage && !info.ShouldIncludeUsage {
 				// 仅调整客户端事件，计费后处理继续读取原始 usage 帧。
 				var err error
@@ -254,8 +255,13 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				if err != nil {
 					return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 				}
+				if lastDecoded != nil {
+					clientResponse := *lastDecoded
+					clientResponse.Usage = nil
+					clientDecoded = &clientResponse
+				}
 			}
-			_ = sendStreamData(c, info, clientData, lastDecoded, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+			_ = sendStreamData(c, info, clientData, clientDecoded, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
 	}
 
