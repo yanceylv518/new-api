@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -20,18 +21,35 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
+type openAIStreamChunk struct {
+	dto.ChatCompletionsStreamResponse
+	Error any `json:"error"`
+	Type  any `json:"type"`
+}
+
+func (chunk *openAIStreamChunk) TraceResponseValue() any {
+	return &chunk.ChatCompletionsStreamResponse
+}
+
+func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, decoded *dto.ChatCompletionsStreamResponse, forceFormat bool, thinkToContent bool) error {
 	if data == "" {
 		return nil
 	}
 
 	if !forceFormat && !thinkToContent {
+		if decoded != nil {
+			return helper.DecodedStringData(c, data, decoded)
+		}
 		return helper.StringData(c, data)
 	}
 
 	var lastStreamResponse dto.ChatCompletionsStreamResponse
-	if err := common.UnmarshalJsonStr(data, &lastStreamResponse); err != nil {
-		return err
+	if decoded != nil {
+		lastStreamResponse = *decoded.Copy()
+	} else {
+		if err := common.UnmarshalJsonStr(data, &lastStreamResponse); err != nil {
+			return err
+		}
 	}
 
 	if !thinkToContent {
@@ -119,12 +137,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var usage = &dto.Usage{}
 	var lastStreamData string
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
+	var lastDecoded *dto.ChatCompletionsStreamResponse
+	var secondLastDecoded *dto.ChatCompletionsStreamResponse
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 
+	common.UseDecodedRequestTrace(c, resp)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if lastStreamData != "" {
-			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+			if err := HandleStreamFormat(c, info, lastStreamData, lastDecoded, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
 				sr.Error(err)
 			}
@@ -132,20 +153,51 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		if len(data) > 0 {
 			if lastStreamData != "" {
 				secondLastStreamData = lastStreamData
+				secondLastDecoded = lastDecoded
 			}
 
 			lastStreamData = data
-			collectStreamFunctionCallNames(data, seenStreamToolCalls, &streamFunctionCallNames)
-			if err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount); err != nil {
-				logger.LogError(c, "error processing stream token data: "+err.Error())
-				sr.Error(err)
+			lastDecoded = nil
+			var decodeErr error
+			if info.RelayMode == relayconstant.RelayModeCompletions {
+				var chunk dto.CompletionsStreamResponse
+				decodeErr = common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &chunk)
+				if decodeErr == nil {
+					processCompletionsStreamResponse(chunk, &responseTextBuilder)
+				}
+			} else {
+				var chunk openAIStreamChunk
+				decodeErr = common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &chunk)
+				if decodeErr == nil {
+					lastDecoded = &chunk.ChatCompletionsStreamResponse
+					_, validType := chunk.Type.(string)
+					if chunk.Type == nil || validType {
+						collectStreamFunctionCallNames(lastDecoded.Choices, seenStreamToolCalls, &streamFunctionCallNames)
+					}
+					_ = ProcessStreamResponse(*lastDecoded, &responseTextBuilder, &toolCount)
+				}
+			}
+			if decodeErr != nil || info.RelayMode == relayconstant.RelayModeCompletions {
+				// 异常字段不能改变原先独立提取工具计费信息的行为，Completions 保留兼容路径。
+				var metadata struct {
+					Choices []dto.ChatCompletionsStreamResponseChoice `json:"choices"`
+					Error   any                                       `json:"error"`
+					Type    string                                    `json:"type"`
+				}
+				if common.UnmarshalJsonStr(data, &metadata) == nil {
+					collectStreamFunctionCallNames(metadata.Choices, seenStreamToolCalls, &streamFunctionCallNames)
+				}
+			}
+			if decodeErr != nil {
+				logger.LogError(c, "error processing stream token data: "+decodeErr.Error())
+				sr.Error(decodeErr)
 			}
 		}
 	})
 
 	// 处理最后的响应
 	shouldSendLastResp := true
-	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+	if err := handleLastResponse(lastStreamData, lastDecoded, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
 		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 	}
@@ -154,14 +206,20 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	// 仅当最后一个事件没有有效usage时，回退到倒数第二个事件的完整快照。
 	usageFrame := lastStreamData
 	if !containStreamUsage && secondLastStreamData != "" {
-		var streamResp struct {
-			Usage *dto.Usage `json:"usage"`
+		var previousUsage *dto.Usage
+		if secondLastDecoded != nil {
+			previousUsage = secondLastDecoded.Usage
+		} else {
+			var fallback struct {
+				Usage *dto.Usage `json:"usage"`
+			}
+			if common.UnmarshalJsonStr(secondLastStreamData, &fallback) == nil {
+				previousUsage = fallback.Usage
+			}
 		}
-		err := common.Unmarshal([]byte(secondLastStreamData), &streamResp)
-		if err == nil && streamResp.Usage != nil &&
-			streamResp.Usage.PromptTokens > 0 &&
-			(streamResp.Usage.CompletionTokens > 0 || streamResp.Usage.TotalTokens > 0) {
-			usage = dto.MergeUsageNonZero(usage, streamResp.Usage)
+		if previousUsage != nil && previousUsage.PromptTokens > 0 &&
+			(previousUsage.CompletionTokens > 0 || previousUsage.TotalTokens > 0) {
+			usage = dto.MergeUsageNonZero(usage, previousUsage)
 			containStreamUsage = true
 			usageFrame = secondLastStreamData
 
@@ -184,7 +242,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 				}
 			}
-			_ = sendStreamData(c, info, clientData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+			_ = sendStreamData(c, info, clientData, lastDecoded, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
 	}
 
@@ -199,17 +257,13 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
-	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+	HandleFinalResponse(c, info, lastStreamData, lastDecoded, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
 }
 
-func collectStreamFunctionCallNames(data string, seen map[string]struct{}, names *[]string) {
-	var streamResponse dto.ChatCompletionsStreamResponse
-	if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-		return
-	}
-	for _, choice := range streamResponse.Choices {
+func collectStreamFunctionCallNames(choices []dto.ChatCompletionsStreamResponseChoice, seen map[string]struct{}, names *[]string) {
+	for _, choice := range choices {
 		for i, tc := range choice.Delta.ToolCalls {
 			name := strings.TrimSpace(tc.Function.Name)
 			if name == "" {
@@ -250,6 +304,9 @@ func collectStreamFunctionCallNames(data string, seen map[string]struct{}, names
 
 func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
+	if info.ChannelType != constant.ChannelTypeOpenRouter || !info.ChannelOtherSettings.IsOpenRouterEnterprise() {
+		common.UseDecodedRequestTrace(c, resp)
+	}
 
 	var simpleResponse dto.OpenAITextResponse
 	responseBody, err := io.ReadAll(resp.Body)
@@ -273,7 +330,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		}
 	}
 
-	err = common.Unmarshal(responseBody, &simpleResponse)
+	err = common.UnmarshalRequestTraceResponse(c, responseBody, &simpleResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}

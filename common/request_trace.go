@@ -166,7 +166,6 @@ func GetUpstreamRequestID(headers http.Header) string {
 type RequestTraceSummary struct {
 	Milliseconds    int64   `json:"ms"`
 	RequestBytes    *int64  `json:"req_bytes,omitempty"`
-	ResponseBytes   int64   `json:"resp_bytes"`
 	Status          int     `json:"status"`
 	FinishReason    *string `json:"finish_reason,omitempty"`
 	Stage           string  `json:"stage,omitempty"`
@@ -187,28 +186,21 @@ type RequestTraceShape struct {
 	MaxTokens      *int64   `json:"max_tokens,omitempty"`
 	Temperature    *float64 `json:"temperature,omitempty"`
 	IncludeUsage   bool     `json:"include_usage,omitempty"`
-	Keys           []string `json:"keys,omitempty"`
 }
 
 type RequestTraceResponse struct {
-	Error                 bool                `json:"error,omitempty"`
-	ContentType           string              `json:"content_type,omitempty"`
-	ContentCharacters     int64               `json:"content_chars"`
-	ReasoningCharacters   int64               `json:"reasoning_chars"`
-	ReasoningTokens       *int64              `json:"reasoning_tokens,omitempty"`
-	ReasoningOutputTokens *int64              `json:"reasoning_output_tokens,omitempty"`
-	ToolCalls             int64               `json:"tool_calls,omitempty"`
-	ToolCallsByName       map[string]int64    `json:"tool_calls_by_name,omitempty"`
-	Refused               bool                `json:"refused,omitempty"`
-	Chunks                int64               `json:"chunks,omitempty"`
-	LastChunkMilliseconds int64               `json:"last_chunk_ms,omitempty"`
-	Done                  bool                `json:"done"`
-	EndMarker             string              `json:"end_marker,omitempty"`
-	UsageChunk            bool                `json:"usage_chunk"`
-	Keys                  map[string][]string `json:"keys,omitempty"`
-	MetadataIncomplete    bool                `json:"metadata_incomplete,omitempty"`
-	IncompleteReasons     []string            `json:"incomplete_reasons,omitempty"`
-	EndMarkerPolicy       string              `json:"end_marker_policy,omitempty"`
+	Error                 bool             `json:"error,omitempty"`
+	ContentType           string           `json:"-"`
+	ReasoningTokens       *int64           `json:"reasoning_tokens,omitempty"`
+	ReasoningOutputTokens *int64           `json:"reasoning_output_tokens,omitempty"`
+	ToolCalls             int64            `json:"tool_calls,omitempty"`
+	ToolCallsByName       map[string]int64 `json:"tool_calls_by_name,omitempty"`
+	Refused               bool             `json:"refused,omitempty"`
+	Done                  bool             `json:"done"`
+	EndMarker             string           `json:"end_marker,omitempty"`
+	MetadataIncomplete    bool             `json:"metadata_incomplete,omitempty"`
+	IncompleteReasons     []string         `json:"incomplete_reasons,omitempty"`
+	EndMarkerPolicy       string           `json:"end_marker_policy,omitempty"`
 }
 
 type RequestTraceUpstream struct {
@@ -267,16 +259,12 @@ func MarshalRequestTraceStorageData(data RequestTraceData) ([]byte, error) {
 		ErrorCode          string `json:"error_code,omitempty"`
 	}
 	type summaryResponse struct {
-		Error                 bool     `json:"error,omitempty"`
-		ContentType           string   `json:"content_type,omitempty"`
-		Chunks                int64    `json:"chunks,omitempty"`
-		LastChunkMilliseconds int64    `json:"last_chunk_ms,omitempty"`
-		Done                  bool     `json:"done,omitempty"`
-		EndMarker             string   `json:"end_marker,omitempty"`
-		UsageChunk            bool     `json:"usage_chunk,omitempty"`
-		MetadataIncomplete    bool     `json:"metadata_incomplete,omitempty"`
-		IncompleteReasons     []string `json:"incomplete_reasons,omitempty"`
-		EndMarkerPolicy       string   `json:"end_marker_policy,omitempty"`
+		Error              bool     `json:"error,omitempty"`
+		Done               bool     `json:"done,omitempty"`
+		EndMarker          string   `json:"end_marker,omitempty"`
+		MetadataIncomplete bool     `json:"metadata_incomplete,omitempty"`
+		IncompleteReasons  []string `json:"incomplete_reasons,omitempty"`
+		EndMarkerPolicy    string   `json:"end_marker_policy,omitempty"`
 	}
 	type summaryAdmin struct {
 		MetadataLevel         TraceMetadataLevel `json:"metadata_level"`
@@ -297,7 +285,7 @@ func MarshalRequestTraceStorageData(data RequestTraceData) ([]byte, error) {
 			MetadataLevel: admin.MetadataLevel, ChannelID: admin.ChannelID, Shape: admin.Shape,
 			ShapeIncomplete: admin.ShapeIncomplete, ShapeIncompleteReason: admin.ShapeIncompleteReason,
 			Upstream: summaryUpstream{Status: admin.Upstream.Status, HeaderMilliseconds: admin.Upstream.HeaderMilliseconds, Milliseconds: admin.Upstream.Milliseconds, RequestID: admin.Upstream.RequestID, ErrorType: admin.Upstream.ErrorType, ErrorCode: admin.Upstream.ErrorCode},
-			Response: summaryResponse{Error: admin.Response.Error, ContentType: admin.Response.ContentType, Chunks: admin.Response.Chunks, LastChunkMilliseconds: admin.Response.LastChunkMilliseconds, Done: admin.Response.Done, EndMarker: admin.Response.EndMarker, UsageChunk: admin.Response.UsageChunk, MetadataIncomplete: admin.Response.MetadataIncomplete, IncompleteReasons: admin.Response.IncompleteReasons, EndMarkerPolicy: admin.Response.EndMarkerPolicy},
+			Response: summaryResponse{Error: admin.Response.Error, Done: admin.Response.Done, EndMarker: admin.Response.EndMarker, MetadataIncomplete: admin.Response.MetadataIncomplete, IncompleteReasons: admin.Response.IncompleteReasons, EndMarkerPolicy: admin.Response.EndMarkerPolicy},
 		},
 	})
 }
@@ -390,7 +378,7 @@ func (t *RequestTraceCollector) FinishAttempt(attempt int) {
 func (t *RequestTraceCollector) CaptureRequest(storage BodyStorage, detailed bool) {
 	size := storage.Size()
 	t.RequestBytes = &size
-	if !detailed {
+	if !detailed || t.Shape != nil {
 		return
 	}
 	if size > TraceMetadataMaxBytes {

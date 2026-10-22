@@ -406,7 +406,11 @@ function BillingBreakdown(props: {
   )
 }
 
-function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
+function TokenBreakdown(props: {
+  log: UsageLog
+  other: LogOtherData
+  reasoningTokens?: number
+}) {
   const { t } = useTranslation()
   const { log, other } = props
 
@@ -416,7 +420,10 @@ function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
   const cacheWrite = other.cache_creation_tokens || 0
   const cacheWrite5m = other.cache_creation_tokens_5m || 0
   const cacheWrite1h = other.cache_creation_tokens_1h || 0
-  const hasTokens = promptTokens > 0 || completionTokens > 0
+  const hasTokens =
+    promptTokens > 0 ||
+    completionTokens > 0 ||
+    props.reasoningTokens !== undefined
 
   if (!hasTokens) return null
 
@@ -427,6 +434,13 @@ function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
     label: t('Output Tokens'),
     value: completionTokens.toLocaleString(),
   })
+
+  if (props.reasoningTokens !== undefined) {
+    rows.push({
+      label: t('Reasoning Tokens'),
+      value: props.reasoningTokens.toLocaleString(),
+    })
+  }
 
   if (cacheRead > 0) {
     rows.push({
@@ -517,6 +531,9 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
     props.log.created_at
   )
   const finalTrace = traceQuery.data?.at(-1)
+  const reasoningTokens = props.isAdmin
+    ? finalTrace?.admin_info?.resp.reasoning_tokens
+    : undefined
   const responseMilliseconds = finalTrace?.trace.ms
   const responseSeconds =
     responseMilliseconds !== undefined
@@ -1204,9 +1221,14 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
           )}
 
         {/* Token breakdown (for consume/error types with token data) */}
-        {isDisplayableType(props.log.type) && other && (
-          <TokenBreakdown log={props.log} other={other} />
-        )}
+        {isDisplayableType(props.log.type) &&
+          (other || reasoningTokens !== undefined) && (
+            <TokenBreakdown
+              log={props.log}
+              other={other ?? {}}
+              reasoningTokens={reasoningTokens}
+            />
+          )}
 
         {/* Billing breakdown (consume type) */}
         {isConsume && other && !isViolation && (

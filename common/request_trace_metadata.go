@@ -2,7 +2,6 @@ package common
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"errors"
 	"io"
 	"math"
@@ -18,10 +17,8 @@ import (
 
 const TraceMetadataMaxBytes = 1 << 20
 const traceSummaryMaxBytes = 64 << 10
-const traceMaxKeys = 32
 const traceMaxToolCalls = 256
 const traceMaxToolNameBytes = 128
-const traceMaxCachedPayloads = 64
 const traceMaxCachedStrings = 256
 
 type TraceMetadataLevel string
@@ -34,20 +31,6 @@ const (
 var errTraceRequestTooLarge = errors.New("request trace shape exceeds capture limit")
 var errTraceRequestInvalidJSON = errors.New("request trace shape is not valid JSON")
 
-type traceKeyLayer uint8
-
-const (
-	traceKeysRoot traceKeyLayer = iota
-	traceKeysError
-	traceKeysUsage
-	traceKeysChoices
-	traceKeysMessage
-	traceKeysCandidates
-	traceKeyLayerCount
-)
-
-var traceKeyLayerNames = [traceKeyLayerCount]string{"root", "error", "usage", "choices", "message", "candidates"}
-
 type traceUpstreamFields uint16
 
 const (
@@ -58,6 +41,7 @@ const (
 	traceFieldServiceTier
 	traceFieldErrorType
 	traceFieldErrorCode
+	traceFieldReasoning
 )
 
 type traceToolCall struct {
@@ -68,16 +52,12 @@ type traceToolCall struct {
 }
 
 type tracePayloadResponse struct {
-	ContentCharacters     int64
-	ReasoningCharacters   int64
 	ReasoningTokens       *int64
 	ReasoningOutputTokens *int64
-	Chunks                int64
 	EndMarker             string
 	Error                 bool
 	Refused               bool
 	Done                  bool
-	UsageChunk            bool
 	MetadataIncomplete    bool
 	IncompleteReasons     []string
 	EndMarkerPolicy       string
@@ -94,14 +74,9 @@ type tracePayloadUpstream struct {
 	ErrorCode   string
 }
 
-type tracePayloadKeys struct {
-	names []string
-}
-
 type tracePayloadMetadata struct {
 	response      tracePayloadResponse
 	upstream      tracePayloadUpstream
-	keys          [traceKeyLayerCount]*tracePayloadKeys
 	finishReason  *string
 	fields        traceUpstreamFields
 	errorStatus   *string
@@ -119,25 +94,8 @@ type tracePayloadParser struct {
 
 type traceParseWorkspace struct {
 	sync.Mutex
-	shared   bool
-	payloads map[tracePayloadKey]*traceCachedPayload
-	order    []tracePayloadKey
-	head     int
-	count    int
-	bytes    int
-	strings  map[traceStringKey]string
-	lastKeys [traceKeyLayerCount]*tracePayloadKeys
-	parser   tracePayloadParser
-}
-
-type tracePayloadKey struct {
-	digest [sha256.Size]byte
-	stream bool
-}
-
-type traceCachedPayload struct {
-	metadata tracePayloadMetadata
-	bytes    int
+	strings map[traceStringKey]string
+	parser  tracePayloadParser
 }
 
 type traceStringKey struct {
@@ -164,48 +122,15 @@ func (workspace *traceParseWorkspace) metadataString(value string, limit int) st
 	return cleaned
 }
 
-func (workspace *traceParseWorkspace) parse(data []byte, stream, summary, store bool) tracePayloadMetadata {
+func (workspace *traceParseWorkspace) parse(data []byte, stream, summary bool) tracePayloadMetadata {
 	workspace.Lock()
 	defer workspace.Unlock()
-	var key tracePayloadKey
-	if workspace.shared && !summary {
-		key = tracePayloadKey{digest: sha256.Sum256(data), stream: stream}
-		if cached, found := workspace.payloads[key]; found {
-			return cached.metadata
-		}
-	}
-	// 请求内只复用解析元数据；摘要事件不计算哈希，不保留事件正文。
 	parser := &workspace.parser
 	*parser = tracePayloadParser{stream: stream, summary: summary, parsing: workspace}
 	parser.parsePayload(data)
 	metadata := parser.tracePayloadMetadata
-	if workspace.shared && !summary && store && len(data) <= TraceMetadataMaxBytes {
-		if workspace.payloads == nil {
-			workspace.payloads = make(map[tracePayloadKey]*traceCachedPayload)
-			workspace.order = make([]tracePayloadKey, traceMaxCachedPayloads)
-		}
-		for workspace.count > 0 && (workspace.count == traceMaxCachedPayloads || workspace.bytes+len(data) > TraceMetadataMaxBytes) {
-			oldest := workspace.order[workspace.head]
-			workspace.bytes -= workspace.payloads[oldest].bytes
-			delete(workspace.payloads, oldest)
-			workspace.head = (workspace.head + 1) % traceMaxCachedPayloads
-			workspace.count--
-		}
-		workspace.payloads[key] = &traceCachedPayload{metadata: metadata, bytes: len(data)}
-		workspace.order[(workspace.head+workspace.count)%traceMaxCachedPayloads] = key
-		workspace.count++
-		workspace.bytes += len(data)
-	}
+	*parser = tracePayloadParser{}
 	return metadata
-}
-
-func traceFieldNames(value gjson.Result) []string {
-	keys := make([]string, 0)
-	value.ForEach(func(key, _ gjson.Result) bool {
-		keys = append(keys, TraceMetadataString(key.String(), 64))
-		return len(keys) < traceMaxKeys
-	})
-	return keys
 }
 
 func readRequestTraceShape(reader io.Reader) (*RequestTraceShape, error) {
@@ -220,14 +145,18 @@ func readRequestTraceShape(reader io.Reader) (*RequestTraceShape, error) {
 		return nil, errTraceRequestInvalidJSON
 	}
 	r := gjson.ParseBytes(data)
-	shape := &RequestTraceShape{Keys: traceFieldNames(r)}
-	for _, key := range []string{"messages", "contents", "input"} {
+	shape := &RequestTraceShape{}
+	for _, key := range []string{"messages", "contents", "input", "prompt"} {
 		value := r.Get(key)
 		if value.IsArray() {
-			value.ForEach(func(_, _ gjson.Result) bool {
-				shape.Messages++
-				return true
-			})
+			if key == "prompt" && value.Get("0").Type == gjson.Number {
+				shape.Messages = 1
+			} else {
+				value.ForEach(func(_, _ gjson.Result) bool {
+					shape.Messages++
+					return true
+				})
+			}
 			break
 		}
 	}
@@ -254,28 +183,47 @@ func readRequestTraceShape(reader io.Reader) (*RequestTraceShape, error) {
 			return true
 		})
 	}
-	if r.Get("input").Type == gjson.String {
+	if r.Get("input").Type == gjson.String || r.Get("prompt").Type == gjson.String {
 		shape.Messages = 1
 	}
-	shape.System = r.Get("system").Exists() || r.Get("systemInstruction").Exists() || r.Get("system_instruction").Exists()
+	for _, key := range []string{"system", "systemInstruction", "system_instruction", "instructions"} {
+		if value := r.Get(key); value.Exists() && value.Type != gjson.Null {
+			shape.System = true
+			break
+		}
+	}
 	choice := r.Get("tool_choice")
+	if !choice.Exists() {
+		choice = r.Get("function_call")
+		if choice.IsObject() {
+			shape.ToolChoice = "function"
+		}
+	}
 	if choice.IsObject() {
 		choice = choice.Get("type")
 	}
-	shape.ToolChoice = TraceMetadataString(choice.String(), 64)
+	if !choice.Exists() {
+		choice = r.Get("toolConfig.functionCallingConfig.mode")
+	}
+	if !choice.Exists() {
+		choice = r.Get("tool_config.function_calling_config.mode")
+	}
+	if shape.ToolChoice == "" {
+		shape.ToolChoice = strings.ToLower(TraceMetadataString(choice.String(), 64))
+	}
 	switch shape.ToolChoice {
 	case "", "auto", "none", "required", "any", "tool", "function":
 	default:
 		shape.ToolChoice = "unknown"
 	}
-	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "generationConfig.maxOutputTokens"} {
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "generationConfig.maxOutputTokens", "generation_config.max_output_tokens"} {
 		if value := r.Get(key); value.Type == gjson.Number {
 			n := value.Int()
 			shape.MaxTokens = &n
 			break
 		}
 	}
-	for _, key := range []string{"temperature", "generationConfig.temperature"} {
+	for _, key := range []string{"temperature", "generationConfig.temperature", "generation_config.temperature"} {
 		if value := r.Get(key); value.Type == gjson.Number {
 			n := value.Float()
 			if !math.IsNaN(n) && !math.IsInf(n, 0) {
@@ -285,7 +233,7 @@ func readRequestTraceShape(reader io.Reader) (*RequestTraceShape, error) {
 		}
 	}
 	shape.IncludeUsage = r.Get("stream_options.include_usage").Bool()
-	for _, key := range []string{"messages", "contents", "input", "system", "systemInstruction", "system_instruction", "prompt"} {
+	for _, key := range []string{"messages", "contents", "input", "system", "systemInstruction", "system_instruction", "instructions", "prompt"} {
 		traceCountRequestContent(r.Get(key), shape, 0)
 	}
 	return shape, nil
@@ -327,7 +275,10 @@ func traceCountRequestContent(value gjson.Result, shape *RequestTraceShape, dept
 	case media == "file" || media == "input_file" || media == "document" || mime != "":
 		shape.Files++
 		return
-	case media == "tool_use" || media == "tool_result" || media == "function_call" || media == "function_call_output":
+	case media == "tool_use" || media == "function_call":
+		return
+	case media == "function_call_output":
+		traceCountRequestContent(value.Get("output"), shape, depth+1)
 		return
 	}
 	for _, key := range []string{"content", "parts", "text"} {
@@ -340,20 +291,21 @@ func traceCountRequestContent(value gjson.Result, shape *RequestTraceShape, dept
 // 解析缓冲只在请求处理中存在；超限时丢弃缓冲并标记统计不完整，落库结构没有正文字段。
 type TraceBodyObserver struct {
 	sync.Mutex
-	started       time.Time
 	buffer        []byte
 	event         []byte
 	stream        bool
 	finished      bool
 	finishedAt    time.Time
 	skippingLine  bool
-	bytes         int64
+	observed      bool
 	response      RequestTraceResponse
 	upstream      RequestTraceUpstream
 	finishReason  *string
 	toolCalls     map[string]traceToolCall
 	workspace     *traceParseWorkspace
-	cachePayloads bool
+	decoded       bool
+	pendingDone   bool
+	contentLength int64
 	level         TraceMetadataLevel
 	summaryEvents int64
 	source        *TraceBodyObserver
@@ -363,8 +315,9 @@ func NewTraceBodyObserver(started time.Time) *TraceBodyObserver {
 	return NewTraceBodyObserverWithMode(started, TraceMetadataFull)
 }
 
-func NewTraceBodyObserverWithMode(started time.Time, level TraceMetadataLevel) *TraceBodyObserver {
-	return &TraceBodyObserver{started: started, level: level}
+// 保留时间参数以兼容既有调用，观察器不再统计分片时间。
+func NewTraceBodyObserverWithMode(_ time.Time, level TraceMetadataLevel) *TraceBodyObserver {
+	return &TraceBodyObserver{level: level}
 }
 
 func (o *TraceBodyObserver) NewRelatedObserver() *TraceBodyObserver {
@@ -383,12 +336,15 @@ func (o *TraceBodyObserver) relatedObserver(level TraceMetadataLevel) *TraceBody
 	if o.workspace == nil {
 		o.workspace = &traceParseWorkspace{}
 	}
-	o.workspace.Lock()
-	o.workspace.shared = true
-	o.workspace.Unlock()
-	observer := NewTraceBodyObserverWithMode(o.started, level)
-	observer.workspace, observer.cachePayloads = o.workspace, true
+	observer := NewTraceBodyObserverWithMode(time.Time{}, level)
+	observer.workspace = o.workspace
 	return observer
+}
+
+// IsEventStreamContentType 匹配媒体类型，忽略大小写及后面的参数。
+func IsEventStreamContentType(contentType string) bool {
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	return strings.EqualFold(strings.TrimSpace(mediaType), "text/event-stream")
 }
 
 func (o *TraceBodyObserver) Prepare(contentType string, contentLength int64) {
@@ -396,16 +352,10 @@ func (o *TraceBodyObserver) Prepare(contentType string, contentLength int64) {
 	defer o.Unlock()
 	if contentType != "" {
 		o.response.ContentType = TraceMetadataString(contentType, 128)
-		o.stream = strings.Contains(contentType, "text/event-stream")
+		o.stream = IsEventStreamContentType(contentType)
 	}
-	if !o.stream && contentLength > 0 && o.source == nil {
-		limit := o.bufferLimit()
-		if contentLength > int64(limit) {
-			o.markIncomplete("size_limit")
-			return
-		}
-		o.buffer = make([]byte, 0, int(contentLength))
-	}
+	// 延迟到第一次实际观察字节时分配，协议处理器接管采集后无需第二份正文缓冲。
+	o.contentLength = contentLength
 }
 
 func (o *TraceBodyObserver) MetadataLevel() TraceMetadataLevel {
@@ -429,7 +379,7 @@ func (o *TraceBodyObserver) promoteToFull() {
 		return
 	}
 	if o.summaryEvents > 0 {
-		// 升级前没有保存正文，不能补算已略过事件的字符和工具数量。
+		// 升级前没有保存正文，无法补齐此前略过的工具调用。
 		o.markIncomplete("capture_upgraded")
 	}
 	o.level = TraceMetadataFull
@@ -439,20 +389,10 @@ func (o *TraceBodyObserver) ReuseUpstream(source *TraceBodyObserver) {
 	if source == nil || source == o {
 		return
 	}
-	source.Lock()
-	workspace := source.workspace
-	source.Unlock()
 	o.Lock()
 	defer o.Unlock()
-	if !o.finished && o.response.Chunks == 0 && len(o.buffer) == 0 && len(o.event) == 0 {
+	if !o.finished && !o.observed && len(o.buffer) == 0 && len(o.event) == 0 {
 		o.source = source
-		if workspace != nil && workspace == o.workspace {
-			workspace.Lock()
-			workspace.shared = false
-			workspace.payloads, workspace.order = nil, nil
-			workspace.head, workspace.count, workspace.bytes = 0, 0, 0
-			workspace.Unlock()
-		}
 	}
 }
 
@@ -468,7 +408,7 @@ func (o *TraceBodyObserver) ObserveClientError() {
 	defer o.Unlock()
 	if o.source != nil {
 		o.source = nil
-		if o.bytes > 0 {
+		if o.observed {
 			o.markIncomplete("capture_upgraded")
 		}
 	}
@@ -493,6 +433,9 @@ func (o *TraceBodyObserver) bufferLimit() int {
 
 func (o *TraceBodyObserver) appendBuffer(data []byte) {
 	if capacity := len(o.buffer) + len(data); capacity > cap(o.buffer) {
+		if cap(o.buffer) == 0 && !o.stream && o.contentLength > 0 {
+			capacity = max(capacity, int(min(o.contentLength, int64(o.bufferLimit()))))
+		}
 		capacity = min(o.bufferLimit(), max(capacity, max(4096, cap(o.buffer)*2)))
 		grown := make([]byte, len(o.buffer), capacity)
 		copy(grown, o.buffer)
@@ -507,7 +450,7 @@ func (o *TraceBodyObserver) Observe(data []byte, contentType string) {
 	if o.finished {
 		return
 	}
-	o.bytes += int64(len(data))
+	o.observed = o.observed || len(data) > 0
 	o.observe(data, contentType)
 }
 
@@ -517,8 +460,8 @@ func (o *TraceBodyObserver) ObserveString(data string, contentType string) {
 	if o.finished {
 		return
 	}
-	o.bytes += int64(len(data))
-	if o.source != nil {
+	o.observed = o.observed || len(data) > 0
+	if o.source != nil || o.decoded {
 		return
 	}
 	// 仅在本次调用内读取；缓冲区与保留的元数据均取得自己的拷贝。
@@ -526,12 +469,12 @@ func (o *TraceBodyObserver) ObserveString(data string, contentType string) {
 }
 
 func (o *TraceBodyObserver) observe(data []byte, contentType string) {
-	if o.source != nil {
+	if o.source != nil || o.decoded {
 		return
 	}
 	if o.response.ContentType == "" && contentType != "" {
 		o.response.ContentType = TraceMetadataString(contentType, 128)
-		o.stream = strings.Contains(contentType, "text/event-stream")
+		o.stream = IsEventStreamContentType(contentType)
 	}
 	if !o.stream {
 		if o.response.MetadataIncomplete {
@@ -631,10 +574,15 @@ func (o *TraceBodyObserver) Finish() {
 	} else if !o.response.MetadataIncomplete && len(o.buffer) > 0 {
 		o.consumePayload(o.buffer)
 	}
+	if o.pendingDone {
+		o.response.Done, o.response.EndMarker, o.response.EndMarkerPolicy = true, "[DONE]", "required"
+	}
 	o.buffer = nil
 	o.event = nil
 	o.finished = true
-	o.finishedAt = time.Now()
+	if o.finishedAt.IsZero() {
+		o.finishedAt = time.Now()
+	}
 }
 
 func (o *TraceBodyObserver) FinishedAt() time.Time {
@@ -683,6 +631,9 @@ func (o *TraceBodyObserver) Snapshot() (RequestTraceResponse, RequestTraceUpstre
 	}
 	defer o.Unlock()
 	response := o.response
+	if o.pendingDone {
+		response.Done, response.EndMarker, response.EndMarkerPolicy = true, "[DONE]", "required"
+	}
 	for _, tool := range o.toolCalls {
 		if tool.invalidName {
 			continue
@@ -697,12 +648,6 @@ func (o *TraceBodyObserver) Snapshot() (RequestTraceResponse, RequestTraceUpstre
 		response.ToolCallsByName[name]++
 	}
 	return response, o.upstream, o.finishReason
-}
-
-func (o *TraceBodyObserver) Size() int64 {
-	o.Lock()
-	defer o.Unlock()
-	return o.bytes
 }
 
 // HasError 读取已解析的错误状态；收尾时先 Finish，避免遗漏最后一个事件。
@@ -720,57 +665,14 @@ func (o *TraceBodyObserver) HasIncompleteMetadata() bool {
 	return incomplete || (source != nil && source.HasIncompleteMetadata())
 }
 
-func (o *tracePayloadParser) fieldNames(layer traceKeyLayer, value gjson.Result) {
-	if o.summary || !value.IsObject() {
-		return
-	}
-	var keys []string
-	if current := o.keys[layer]; current != nil {
-		keys = current.names
-	}
-	if len(keys) >= traceMaxKeys {
-		return
-	}
-	var names [traceMaxKeys]string
-	count := copy(names[:], keys)
-	visited := 0
-	value.ForEach(func(keyValue, _ gjson.Result) bool {
-		key := o.parsing.metadataString(keyValue.String(), 64)
-		visited++
-		found := false
-		for _, existing := range names[:count] {
-			if existing == key {
-				found = true
-				break
-			}
-		}
-		if !found && count < traceMaxKeys {
-			names[count] = key
-			count++
-		}
-		return visited < traceMaxKeys && count < traceMaxKeys
-	})
-	if o.keys[layer] != nil && slices.Equal(keys, names[:count]) {
-		return
-	}
-	// 同层字段列表只读复用，不保留事件内容。
-	if last := o.parsing.lastKeys[layer]; last != nil && slices.Equal(last.names, names[:count]) {
-		o.keys[layer] = last
-		return
-	}
-	keys = make([]string, count)
-	copy(keys, names[:count])
-	o.keys[layer] = &tracePayloadKeys{names: keys}
-	o.parsing.lastKeys[layer] = o.keys[layer]
-}
-
 func (o *tracePayloadParser) captureTool(key string, name gjson.Result, nameDelta bool) {
 	if len(o.tools) >= traceMaxToolCalls {
 		o.markIncomplete("tool_limit")
 		return
 	}
 	tool := traceToolCall{key: key, nameDelta: nameDelta}
-	if name.Exists() {
+	// 流式参数片段可能用 null 占位，此时保留此前收到的工具名。
+	if name.Exists() && (!nameDelta || name.Type != gjson.Null) {
 		tool.invalidName = name.Type != gjson.String || len(name.Str) > traceMaxToolNameBytes
 		if tool.invalidName {
 			o.markIncomplete("invalid_tool_name")
@@ -813,10 +715,8 @@ func traceSummaryNeedsParsing(data []byte) bool {
 			keyLength = len(`"finishReason"`)
 		case bytes.HasPrefix(rest, []byte(`"stop_reason"`)):
 			keyLength = len(`"stop_reason"`)
-		case bytes.HasPrefix(rest, []byte(`"usage"`)):
-			keyLength = len(`"usage"`)
-		case bytes.HasPrefix(rest, []byte(`"usageMetadata"`)):
-			keyLength = len(`"usageMetadata"`)
+		case bytes.HasPrefix(rest, []byte(`"blockReason"`)):
+			keyLength = len(`"blockReason"`)
 		case bytes.HasPrefix(rest, []byte(`"message_stop"`)),
 			bytes.HasPrefix(rest, []byte(`"response.completed"`)),
 			bytes.HasPrefix(rest, []byte(`"response.done"`)),
@@ -847,27 +747,24 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 	summary := o.level == TraceMetadataSummary
 	if summary && o.stream && !traceSummaryNeedsParsing(data) {
 		o.summaryEvents++
-		o.response.Chunks++
-		o.response.LastChunkMilliseconds = time.Since(o.started).Milliseconds()
 		return
 	}
 	if o.workspace == nil {
 		o.workspace = &traceParseWorkspace{}
 	}
-	metadata := o.workspace.parse(data, o.stream, summary, o.cachePayloads)
+	metadata := o.workspace.parse(data, o.stream, summary)
 	if summary && (metadata.response.Error || metadata.response.EndMarker == "response.incomplete") {
 		o.promoteToFull()
-		metadata = o.workspace.parse(data, o.stream, false, o.cachePayloads)
+		metadata = o.workspace.parse(data, o.stream, false)
 	} else if summary {
 		o.summaryEvents++
 	}
-	if summary && o.stream && metadata.response.Chunks == 0 && !bytes.Equal(data, []byte("[DONE]")) {
-		metadata.response.Chunks = 1
-	}
+	o.mergeMetadata(metadata)
+}
+
+func (o *TraceBodyObserver) mergeMetadata(metadata tracePayloadMetadata) {
 	response := metadata.response
 	o.response.Error = o.response.Error || response.Error
-	o.response.ContentCharacters += response.ContentCharacters
-	o.response.ReasoningCharacters += response.ReasoningCharacters
 	if response.ReasoningTokens != nil {
 		if o.response.ReasoningTokens == nil || *o.response.ReasoningTokens != *response.ReasoningTokens {
 			tokens := *response.ReasoningTokens
@@ -885,7 +782,6 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 	if response.EndMarker != "" {
 		o.response.EndMarker = response.EndMarker
 	}
-	o.response.UsageChunk = o.response.UsageChunk || response.UsageChunk
 	o.response.MetadataIncomplete = o.response.MetadataIncomplete || response.MetadataIncomplete
 	for _, reason := range response.IncompleteReasons {
 		o.response.IncompleteReasons = traceIncompleteReason(o.response.IncompleteReasons, reason)
@@ -893,43 +789,10 @@ func (o *TraceBodyObserver) consumePayload(data []byte) {
 	if response.EndMarkerPolicy != "" {
 		o.response.EndMarkerPolicy = response.EndMarkerPolicy
 	}
-	if response.Chunks > 0 {
-		o.response.Chunks++
-		o.response.LastChunkMilliseconds = time.Since(o.started).Milliseconds()
-	}
-	for index, fields := range metadata.keys {
-		if fields == nil {
-			continue
-		}
-		layer, keys := traceKeyLayerNames[index], fields.names
-		if o.response.Keys == nil {
-			o.response.Keys = make(map[string][]string)
-		}
-		current := o.response.Keys[layer]
-		if len(current) > 0 && slices.Equal(current, keys) {
-			continue
-		}
-		for _, key := range keys {
-			if len(current) >= traceMaxKeys {
-				break
-			}
-			found := false
-			for _, existing := range current {
-				if existing == key {
-					found = true
-					break
-				}
-			}
-			if !found {
-				current = append(current, key)
-			}
-		}
-		o.response.Keys[layer] = current
-	}
 	for _, tool := range metadata.tools {
 		if o.stream && strings.HasPrefix(tool.key, "gemini:") {
 			// 不同 Gemini 事件可在相同 parts 下标返回不同完整工具调用。
-			tool.key += ":" + strconv.FormatInt(o.response.Chunks, 10)
+			tool.key += ":" + strconv.FormatInt(o.response.ToolCalls, 10)
 		}
 		current, exists := o.toolCalls[tool.key]
 		if !exists {
@@ -1009,33 +872,27 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	}
 	choices := r.Get("choices")
 	candidates := r.Get("candidates")
-	if o.stream {
-		o.response.Chunks = 1
-	}
-	o.fieldNames(traceKeysRoot, r)
 	kind := r.Get("type").String()
+	gemini := candidates.IsArray() || (kind == "" && !choices.IsArray() && (r.Get("usageMetadata").IsObject() || r.Get("promptFeedback").IsObject()))
 	if o.stream {
 		switch {
-		case candidates.IsArray():
+		case gemini:
 			o.response.EndMarkerPolicy = "not_applicable"
 		case choices.IsArray(), strings.HasPrefix(kind, "response."), strings.HasPrefix(kind, "message_"), strings.HasPrefix(kind, "content_block_"):
 			o.response.EndMarkerPolicy = "required"
 		}
 	}
-	if kind == "" && !choices.IsArray() && !candidates.IsArray() && !r.Get("output").IsArray() && !r.Get("error").IsObject() {
+	if kind == "" && !choices.IsArray() && !gemini && !r.Get("output").IsArray() && !r.Get("error").IsObject() && r.Get("error").Type != gjson.String {
 		o.markIncomplete("unsupported_format")
 	}
 	root := r
-	nestedRoot := false
 	if kind == "message_start" {
 		if message := r.Get("message"); message.IsObject() {
 			root = message
-			nestedRoot = true
 		}
 	}
 	if response := r.Get("response"); response.IsObject() {
 		root = response
-		nestedRoot = true
 	}
 	for _, field := range []struct {
 		key    string
@@ -1064,7 +921,6 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	}
 	if err := root.Get("error"); err.IsObject() {
 		o.response.Error = true
-		o.fieldNames(traceKeysError, err)
 		if value := err.Get("type"); value.Type == gjson.String {
 			o.upstream.ErrorType = o.parsing.metadataString(value.String(), 128)
 			o.fields |= traceFieldErrorType
@@ -1080,6 +936,8 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 			o.upstream.ErrorCode = o.parsing.metadataString(value.String(), 128)
 			o.fields |= traceFieldErrorCode
 		}
+	} else if err.Type == gjson.String {
+		o.response.Error = true
 	}
 	if kind == "error" {
 		o.errorEvent = true
@@ -1092,63 +950,14 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 			o.fields |= traceFieldErrorCode
 		}
 	}
-	usage := root.Get("usage")
-	hasUsage := usage.IsObject()
-	if !hasUsage && nestedRoot {
-		hasUsage = r.Get("usage").IsObject()
-	}
-	if hasUsage || r.Get("usageMetadata").IsObject() {
-		o.response.UsageChunk = true
-		o.fieldNames(traceKeysUsage, usage)
-	}
-	for _, fields := range []struct{ reasoning, output string }{
-		{"usage.completion_tokens_details.reasoning_tokens", "usage.completion_tokens"},
-		{"usage.output_tokens_details.reasoning_tokens", "usage.output_tokens"},
-		{"usageMetadata.thoughtsTokenCount", ""},
-	} {
-		if value := root.Get(fields.reasoning); value.Type == gjson.Number && value.Int() >= 0 {
-			n := value.Int()
-			o.response.ReasoningTokens = &n
-			// 仅将同一 usage 中标准 details 对应的输出总量用于“其中推理”展示。
-			if fields.output != "" {
-				if output := root.Get(fields.output); output.Type == gjson.Number && output.Int() >= n {
-					total := output.Int()
-					o.response.ReasoningOutputTokens = &total
-				}
-			}
-			break
-		}
-	}
+	o.captureReasoningTokens(root.Get("usage"), root.Get("usageMetadata"))
 	if choices.IsArray() {
 		choices.ForEach(func(_, choice gjson.Result) bool {
-			o.fieldNames(traceKeysChoices, choice)
-			if text := choice.Get("text"); text.Type == gjson.String {
-				o.response.ContentCharacters += int64(utf8.RuneCountInString(text.String()))
-			}
-			if reason := choice.Get("finish_reason"); reason.Type == gjson.String {
-				s := o.parsing.metadataString(reason.String(), 128)
-				o.finishReason = &s
-			}
+			o.setFinishReason(choice.Get("finish_reason"))
 			message := choice.Get("message")
 			delta := choice.Get("delta")
 			if delta.IsObject() {
 				message = delta
-			}
-			o.fieldNames(traceKeysMessage, message)
-			if content := message.Get("content"); content.Type == gjson.String {
-				o.response.ContentCharacters += int64(utf8.RuneCountInString(content.String()))
-			} else if content.IsArray() {
-				content.ForEach(func(_, part gjson.Result) bool {
-					if text := part.Get("text"); text.Type == gjson.String {
-						o.response.ContentCharacters += int64(utf8.RuneCountInString(text.String()))
-					}
-					return true
-				})
-			}
-			for _, key := range []string{"reasoning_content", "reasoning"} {
-				if text := message.Get(key); text.Type == gjson.String {
-					o.response.ReasoningCharacters += int64(utf8.RuneCountInString(text.String()))
-				}
 			}
 			if refusal := message.Get("refusal"); refusal.Type == gjson.String && refusal.String() != "" {
 				o.response.Refused = true
@@ -1180,16 +989,9 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 		})
 	}
 	for _, source := range []gjson.Result{root.Get("stop_reason"), r.Get("delta.stop_reason")} {
-		if source.Type == gjson.String {
-			s := o.parsing.metadataString(source.String(), 128)
-			o.finishReason = &s
-		}
+		o.setFinishReason(source)
 	}
 	if kind == "message" || kind == "message_start" || kind == "message_delta" || kind == "content_block_start" || kind == "content_block_delta" {
-		if kind == "content_block_delta" {
-			o.response.ContentCharacters += int64(utf8.RuneCountInString(r.Get("delta.text").String()))
-			o.response.ReasoningCharacters += int64(utf8.RuneCountInString(r.Get("delta.thinking").String()))
-		}
 		if kind == "content_block_start" {
 			o.countContentBlock(r.Get("content_block"), "claude:"+o.toolIndex(r.Get("index")))
 		}
@@ -1200,7 +1002,7 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 			})
 		}
 	}
-	if kind == "message_stop" || kind == "response.completed" {
+	if kind == "message_stop" || kind == "response.completed" || kind == "response.done" {
 		o.response.Done = true
 		o.response.EndMarker = strings.Clone(kind)
 	}
@@ -1215,20 +1017,8 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	}
 	if candidates.IsArray() {
 		candidates.ForEach(func(index, candidate gjson.Result) bool {
-			o.fieldNames(traceKeysCandidates, candidate)
-			if reason := candidate.Get("finishReason"); reason.Type == gjson.String {
-				s := o.parsing.metadataString(reason.String(), 128)
-				o.finishReason = &s
-			}
+			o.setFinishReason(candidate.Get("finishReason"))
 			candidate.Get("content.parts").ForEach(func(partIndex, part gjson.Result) bool {
-				if text := part.Get("text"); text.Type == gjson.String {
-					n := int64(utf8.RuneCountInString(text.String()))
-					if part.Get("thought").Bool() {
-						o.response.ReasoningCharacters += n
-					} else {
-						o.response.ContentCharacters += n
-					}
-				}
 				if part.Get("functionCall").IsObject() {
 					key := "gemini:" + index.String() + ":" + partIndex.String()
 					o.captureTool(key, part.Get("functionCall.name"), false)
@@ -1238,18 +1028,15 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 			return true
 		})
 	}
+	if gemini {
+		o.captureGeminiBlockReason(r)
+	}
 	if strings.HasPrefix(kind, "response.") {
-		if kind == "response.output_text.delta" {
-			o.response.ContentCharacters += int64(utf8.RuneCountInString(r.Get("delta").String()))
-		}
-		if kind == "response.reasoning_text.delta" || kind == "response.reasoning_summary_text.delta" {
-			o.response.ReasoningCharacters += int64(utf8.RuneCountInString(r.Get("delta").String()))
-		}
 		if kind == "response.refusal.delta" {
 			o.response.Refused = true
 		}
-		if (kind == "response.output_item.added" || kind == "response.output_item.done") && r.Get("item.type").String() == "function_call" {
-			o.captureTool("responses:"+o.toolIndex(r.Get("output_index")), r.Get("item.name"), false)
+		if kind == "response.output_item.added" || kind == "response.output_item.done" {
+			o.captureResponsesTool("responses:"+o.toolIndex(r.Get("output_index")), r.Get("item"))
 		}
 	}
 	if status := root.Get("status").String(); status == "completed" || status == "incomplete" || status == "failed" {
@@ -1259,28 +1046,20 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 		reason := strings.Clone(status)
 		if detail := root.Get("incomplete_details.reason"); detail.Type == gjson.String && detail.String() != "" {
 			reason += ":" + o.parsing.metadataString(detail.String(), 128)
+			o.response.Refused = o.response.Refused || detail.Str == "content_filter"
 		}
 		o.finishReason = &reason
 	}
-	if !o.stream || kind == "response.completed" || kind == "response.incomplete" || kind == "response.failed" {
+	if !o.stream || kind == "response.completed" || kind == "response.done" || kind == "response.incomplete" || kind == "response.failed" {
 		root.Get("output").ForEach(func(index, output gjson.Result) bool {
-			if output.Get("type").String() == "function_call" {
-				o.captureTool("responses:"+index.String(), output.Get("name"), false)
-			}
+			o.captureResponsesTool("responses:"+index.String(), output)
 			if o.stream {
 				return true
 			}
 			output.Get("content").ForEach(func(_, part gjson.Result) bool {
-				if part.Get("type").String() == "output_text" {
-					o.response.ContentCharacters += int64(utf8.RuneCountInString(part.Get("text").String()))
-				}
 				if part.Get("type").String() == "refusal" {
 					o.response.Refused = true
 				}
-				return true
-			})
-			output.Get("summary").ForEach(func(_, part gjson.Result) bool {
-				o.response.ReasoningCharacters += int64(utf8.RuneCountInString(part.Get("text").String()))
 				return true
 			})
 			return true
@@ -1289,14 +1068,75 @@ func (o *tracePayloadParser) parsePayload(data []byte) {
 	}
 }
 
+func (o *tracePayloadParser) captureReasoningTokens(usage, gemini gjson.Result) {
+	for _, field := range []struct {
+		source            gjson.Result
+		reasoning, output string
+	}{
+		{usage, "completion_tokens_details.reasoning_tokens", "completion_tokens"},
+		{usage, "output_tokens_details.reasoning_tokens", "output_tokens"},
+		{gemini, "thoughtsTokenCount", ""},
+		{usage, "reasoning_tokens", ""},
+	} {
+		value := field.source.Get(field.reasoning)
+		if value.Type != gjson.Number {
+			continue
+		}
+		n, err := strconv.ParseInt(value.Raw, 10, 64)
+		if err != nil || n < 0 {
+			continue
+		}
+		o.response.ReasoningTokens = &n
+		// 仅将同一 usage 中标准 details 对应的输出总量用于“其中推理”展示。
+		if field.output != "" {
+			if output := field.source.Get(field.output); output.Type == gjson.Number && output.Int() >= n {
+				total := output.Int()
+				o.response.ReasoningOutputTokens = &total
+			}
+		}
+		break
+	}
+}
+
 func (o *tracePayloadParser) countContentBlock(block gjson.Result, key string) {
 	switch block.Get("type").String() {
-	case "text":
-		o.response.ContentCharacters += int64(utf8.RuneCountInString(block.Get("text").String()))
-	case "thinking":
-		o.response.ReasoningCharacters += int64(utf8.RuneCountInString(block.Get("thinking").String()))
 	case "tool_use", "server_tool_use":
 		o.captureTool(key, block.Get("name"), false)
+	}
+}
+
+func (o *tracePayloadParser) captureResponsesTool(key string, output gjson.Result) {
+	kind := output.Get("type").String()
+	name := output.Get("name")
+	switch kind {
+	case "function_call", "custom_tool_call", "mcp_call":
+	case "web_search_call", "file_search_call", "image_generation_call", "computer_call", "code_interpreter_call", "local_shell_call":
+		name = gjson.Result{Type: gjson.String, Str: kind}
+	default:
+		return
+	}
+	o.captureTool(key, name, false)
+}
+
+func (o *tracePayloadParser) setFinishReason(reason gjson.Result) {
+	if reason.Type != gjson.String {
+		return
+	}
+	value := o.parsing.metadataString(reason.String(), 128)
+	o.finishReason = &value
+	switch reason.Str {
+	case "content_filter", "refusal", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION", "IMAGE_SAFETY":
+		o.response.Refused = true
+	}
+}
+
+func (o *tracePayloadParser) captureGeminiBlockReason(value gjson.Result) {
+	blocked := value.Get("promptFeedback.blockReason")
+	if blocked.Type == gjson.String && blocked.Str != "" && blocked.Str != "BLOCK_REASON_UNSPECIFIED" {
+		o.response.Refused = true
+		if o.finishReason == nil {
+			o.setFinishReason(blocked)
+		}
 	}
 }
 
@@ -1309,7 +1149,6 @@ func (o *tracePayloadParser) parseSummary(value gjson.Result) {
 	}
 	kind := value.Get("type").String()
 	if o.stream {
-		o.response.Chunks = 1
 		if strings.HasPrefix(kind, "response.") || strings.HasPrefix(kind, "message_") || value.Get("choices").IsArray() {
 			o.response.EndMarkerPolicy = "required"
 		}
@@ -1322,28 +1161,28 @@ func (o *tracePayloadParser) parseSummary(value gjson.Result) {
 		}
 		o.upstream.ErrorCode = o.parsing.metadataString(problem.Get("code").String(), 128)
 		o.fields |= traceFieldErrorType | traceFieldErrorCode
+	} else if problem.Type == gjson.String {
+		o.response.Error = true
 	}
 	if kind == "error" || kind == "response.failed" || root.Get("status").String() == "failed" {
 		o.response.Error = true
 	}
-	setReason := func(reason gjson.Result) {
-		if reason.Type == gjson.String {
-			text := o.parsing.metadataString(reason.String(), 128)
-			o.finishReason = &text
-		}
-	}
 	value.Get("choices").ForEach(func(_, choice gjson.Result) bool {
-		setReason(choice.Get("finish_reason"))
+		o.setFinishReason(choice.Get("finish_reason"))
 		return true
 	})
-	setReason(root.Get("stop_reason"))
-	setReason(value.Get("delta.stop_reason"))
+	o.setFinishReason(root.Get("stop_reason"))
+	o.setFinishReason(value.Get("delta.stop_reason"))
 	if candidates := value.Get("candidates"); candidates.IsArray() {
 		o.response.EndMarkerPolicy = "not_applicable"
 		candidates.ForEach(func(_, candidate gjson.Result) bool {
-			setReason(candidate.Get("finishReason"))
+			o.setFinishReason(candidate.Get("finishReason"))
 			return true
 		})
+	}
+	if value.Get("promptFeedback").IsObject() {
+		o.response.EndMarkerPolicy = "not_applicable"
+		o.captureGeminiBlockReason(value)
 	}
 	switch kind {
 	case "message_stop", "response.completed", "response.done", "response.failed", "response.incomplete":
@@ -1353,10 +1192,11 @@ func (o *tracePayloadParser) parseSummary(value gjson.Result) {
 	if status := root.Get("status"); status.Type == gjson.String {
 		switch status.Str {
 		case "completed", "failed", "incomplete":
-			setReason(status)
+			o.setFinishReason(status)
 			if detail := root.Get("incomplete_details.reason"); detail.Type == gjson.String && detail.Str != "" {
 				reason := status.Str + ":" + o.parsing.metadataString(detail.Str, 128)
 				o.finishReason = &reason
+				o.response.Refused = o.response.Refused || detail.Str == "content_filter"
 			}
 		}
 	}
@@ -1364,7 +1204,6 @@ func (o *tracePayloadParser) parseSummary(value gjson.Result) {
 		reason := strings.Clone(strings.TrimPrefix(kind, "response."))
 		o.finishReason = &reason
 	}
-	o.response.UsageChunk = root.Get("usage").IsObject() || value.Get("usageMetadata").IsObject()
 	if !o.stream {
 		o.response.Done = true
 	}
@@ -1385,13 +1224,13 @@ func (body *TraceResponseBody) Read(data []byte) (int, error) {
 		if !errors.Is(err, io.EOF) {
 			body.Observer.readFailed()
 		}
-		body.Observer.Finish()
+		body.Observer.finishRead()
 	}
 	return n, err
 }
 
 func (body *TraceResponseBody) Close() error {
 	err := body.ReadCloser.Close()
-	body.Observer.Finish()
+	body.Observer.finishRead()
 	return err
 }

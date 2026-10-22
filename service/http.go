@@ -46,8 +46,6 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 		return
 	}
 
-	body := io.NopCloser(bytes.NewBuffer(data))
-
 	// We shouldn't set the header before we parse the response body, because the parse part may fail.
 	// And then we will have to send an error response, but in this case, the header has already been set.
 	// So the httpClient will be confused by the response.
@@ -71,7 +69,13 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 		c.Writer.WriteHeader(http.StatusOK)
 	}
 
-	_, err := io.Copy(c.Writer, body)
+	var err error
+	if writer, ok := c.Writer.(interface{ WriteTraceResponse([]byte) (int, error) }); ok {
+		_, err = writer.WriteTraceResponse(data)
+	} else {
+		body := io.NopCloser(bytes.NewBuffer(data))
+		_, err = io.Copy(c.Writer, body)
+	}
 	if err != nil {
 		logger.LogError(c, fmt.Sprintf("failed to copy response body: %s", err.Error()))
 	}

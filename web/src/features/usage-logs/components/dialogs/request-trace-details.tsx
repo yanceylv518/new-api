@@ -16,8 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { ChevronRight } from 'lucide-react'
-import { memo, useMemo, useState } from 'react'
+import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ErrorState } from '@/components/error-state'
@@ -26,19 +25,13 @@ import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 
 import type { UsageLog } from '../../data/schema'
-import {
-  formatTraceTime,
-  type RequestTrace,
-  type useRequestTraces,
+import type {
+  RequestTrace,
+  useRequestTraces,
 } from '../../hooks/use-request-traces'
 import { parseLogOther } from '../../lib/format'
 import { DetailRow, DetailSection } from './log-detail-layout'
@@ -53,14 +46,12 @@ interface TraceAttemptDetailsProps {
   record?: RequestTrace
   log: UsageLog
   isAdmin: boolean
-  previous?: boolean
 }
 
 const TraceAttemptDetails = memo(function TraceAttemptDetails(
   props: TraceAttemptDetailsProps
 ) {
   const { t } = useTranslation()
-  const [keysOpen, setKeysOpen] = useState(false)
   const summary = props.record?.trace
   const admin = props.isAdmin ? props.record?.admin_info : undefined
   const summaryMetadata = admin?.metadata_level === 'summary'
@@ -90,22 +81,21 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
       toolCallsByName.reduce((total, [, count]) => total + count, 0)
   )
   const client = admin?.client
-  const other = useMemo(
-    () => (props.previous ? null : parseLogOther(props.log.other)),
-    [props.previous, props.log.other]
-  )
+  const other = useMemo(() => parseLogOther(props.log.other), [props.log.other])
   const failed =
-    (!props.previous && props.log.type === 5) ||
+    props.log.type === 5 ||
     summary?.outcome === 'failed' ||
     summary?.outcome === 'cancelled' ||
     (summary?.status ?? 0) >= 400 ||
     !!response?.error ||
     !!upstream?.error_type ||
     ['failed', 'error', 'ERROR'].includes(summary?.finish_reason ?? '')
-  const truncated =
-    summary?.finish_reason !== undefined &&
-    (['length', 'max_tokens', 'MAX_TOKENS'].includes(summary.finish_reason) ||
-      summary.finish_reason.startsWith('incomplete'))
+  const truncated = [
+    'length',
+    'max_tokens',
+    'MAX_TOKENS',
+    'incomplete:max_output_tokens',
+  ].includes(summary?.finish_reason ?? '')
   const toolFinish = ['tool_calls', 'tool_use'].includes(
     summary?.finish_reason ?? ''
   )
@@ -121,7 +111,10 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     response?.refused ||
     [
       'content_filter',
+      'refusal',
+      'incomplete:content_filter',
       'SAFETY',
+      'IMAGE_SAFETY',
       'BLOCKLIST',
       'PROHIBITED_CONTENT',
       'SPII',
@@ -135,6 +128,12 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     finishVariant = 'red'
   } else if (truncated) {
     finishLabel = t('Truncated')
+    finishVariant = 'orange'
+  } else if (
+    summary?.finish_reason === 'incomplete' ||
+    summary?.finish_reason?.startsWith('incomplete:')
+  ) {
+    finishLabel = t('Incomplete')
     finishVariant = 'orange'
   } else if (toolFinish) {
     finishLabel = t('Tool call')
@@ -175,10 +174,6 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     shape?.audios ? `${t('Audio')} ${shape.audios}` : '',
     shape?.files ? `${t('Files')} ${shape.files}` : '',
   ].filter(Boolean)
-  const layers = Object.entries(response?.keys ?? {}).filter(
-    ([, keys]) => keys.length
-  )
-  const layerCount = layers.length + (shape?.keys?.length ? 1 : 0)
   if (
     !summary &&
     !(
@@ -320,38 +315,6 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
               )}
             </>
           )}
-          {(client?.ua || client?.anthropic_version) && (
-            <DetailRow
-              label={t('Client')}
-              value={[
-                client.ua,
-                client.anthropic_version
-                  ? `anthropic-version ${client.anthropic_version}`
-                  : '',
-              ]
-                .filter(Boolean)
-                .join(' · ')}
-              mono
-            />
-          )}
-          {!!shape?.keys?.length && (
-            <DetailRow
-              label={t('Top-level fields')}
-              value={
-                <div className='flex min-w-0 flex-wrap gap-1'>
-                  {shape.keys.map((key) => (
-                    <Badge
-                      key={key}
-                      variant='outline'
-                      className='h-auto max-w-full rounded-sm px-1 font-mono text-[11px] break-all whitespace-normal'
-                    >
-                      {key}
-                    </Badge>
-                  ))}
-                </div>
-              }
-            />
-          )}
           {admin?.shape_incomplete && (
             <p className='text-muted-foreground text-xs'>
               {admin.shape_incomplete_reason
@@ -371,68 +334,16 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           upstream.request_id ||
           upstream.error_type) && (
           <DetailSection label={t('Upstream')}>
-            {props.record && (props.previous || props.record.attempt > 0) && (
-              <DetailRow
-                label={t('Attempt')}
-                value={[
-                  t('Attempt {{number}}', { number: props.record.attempt + 1 }),
-                  other?.admin_info?.use_channel?.length
-                    ? other.admin_info.use_channel
-                        .map((channel) => `#${channel}`)
-                        .join(' → ')
-                    : '',
-                ]
-                  .filter(Boolean)
-                  .join(' · ')}
-              />
-            )}
-            {(props.previous || (props.record?.attempt ?? 0) > 0) &&
-              !!admin?.channel_id && (
-                <DetailRow
-                  label={t('Channel')}
-                  value={`#${admin.channel_id}`}
-                  mono
-                />
-              )}
             <DetailRow
               label={t('Status')}
-              value={[
-                upstream.status,
-                upstream.proto,
-                t('Response headers: {{time}}', {
-                  time: formatTraceTime(upstream.header_ms),
-                }),
-              ]
+              value={[upstream.status, upstream.proto]
                 .filter((value) => value !== undefined && value !== '')
                 .join(' · ')}
             />
-            {props.previous && summary && (
-              <DetailRow
-                label={
-                  upstream.ms !== undefined
-                    ? t('Attempt duration')
-                    : t('Request elapsed time')
-                }
-                value={formatTraceTime(upstream.ms ?? summary.ms)}
-              />
-            )}
-            {!props.previous && upstream.ms !== undefined && (
-              <DetailRow
-                label={t('Attempt duration')}
-                value={formatTraceTime(upstream.ms)}
-              />
-            )}
             {upstream.req_bytes !== undefined && (
               <DetailRow
                 label={t('Sent size')}
                 value={formatTraceBytes(upstream.req_bytes)}
-              />
-            )}
-            {props.previous && upstream.request_id && (
-              <DetailRow
-                label={t('Upstream Request ID')}
-                value={upstream.request_id}
-                mono
               />
             )}
             {upstream.resp_id && (
@@ -530,61 +441,6 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
               }
             />
           )}
-          <DetailRow
-            label={t('Response body')}
-            value={
-              <>
-                {formatTraceBytes(summary.resp_bytes)}
-                {response?.content_type && (
-                  <span className='text-muted-foreground'>
-                    {' '}
-                    · {response.content_type}
-                  </span>
-                )}
-              </>
-            }
-          />
-          {response &&
-            !summaryMetadata &&
-            !response.metadata_incomplete &&
-            (!failed ||
-              response.content_chars > 0 ||
-              response.reasoning_chars > 0 ||
-              response.reasoning_tokens !== undefined) && (
-              <DetailRow
-                label={t('Output')}
-                value={
-                  <>
-                    <span
-                      className={
-                        response.content_chars === 0 && !failed
-                          ? 'text-destructive'
-                          : undefined
-                      }
-                    >
-                      {t('Body: {{count}} characters', {
-                        count: response.content_chars,
-                      })}
-                    </span>
-                    {response.reasoning_chars > 0 && (
-                      <>
-                        {' '}
-                        ·{' '}
-                        {t('Reasoning: {{count}} characters', {
-                          count: response.reasoning_chars,
-                        })}
-                      </>
-                    )}
-                  </>
-                }
-              />
-            )}
-          {response?.reasoning_tokens !== undefined && (
-            <DetailRow
-              label={t('Reported reasoning tokens')}
-              value={response.reasoning_tokens.toLocaleString()}
-            />
-          )}
           {!summaryMetadata &&
             !response?.incomplete_reasons?.includes('capture_upgraded') &&
             !!response?.tool_calls && (
@@ -646,69 +502,26 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           {response?.refused && (
             <DetailRow label={t('Refused')} value={t('Yes')} />
           )}
-          {response?.chunks !== undefined && (
-            <DetailRow
-              label={t('Streaming')}
-              value={
-                <span className='inline-flex flex-wrap gap-x-1'>
-                  {t('{{count}} events', { count: response.chunks })}
-                  {!props.previous && !!other?.frt && (
-                    <>
-                      {' '}
-                      ·{' '}
-                      {t('First: {{time}}', {
-                        time: formatTraceTime(other.frt),
-                      })}
-                    </>
-                  )}
-                  {response.last_chunk_ms !== undefined && (
-                    <>
-                      {' '}
-                      ·{' '}
-                      {t('Last: {{time}}', {
-                        time: formatTraceTime(response.last_chunk_ms),
-                      })}
-                    </>
-                  )}
+          {response &&
+            (response.end_marker ||
+              response.end_marker_policy ||
+              props.log.is_stream) && (
+              <DetailRow
+                label={t('End marker')}
+                value={
                   <span
-                    className={
-                      response.usage_chunk ? undefined : 'text-destructive'
-                    }
+                    className={cn(
+                      response.end_marker && 'font-mono',
+                      !response.done &&
+                        response.end_marker_policy === 'required' &&
+                        'text-destructive'
+                    )}
                   >
-                    {' '}
-                    ·{' '}
-                    {response.usage_chunk
-                      ? t('Usage event received')
-                      : t('Usage event missing')}
+                    {endMarkerLabel}
                   </span>
-                </span>
-              }
-            />
-          )}
-          {response?.chunks !== undefined && (
-            <DetailRow
-              label={t('End marker')}
-              value={
-                <span
-                  className={cn(
-                    response.end_marker && 'font-mono',
-                    !response.done &&
-                      response.end_marker_policy === 'required' &&
-                      'text-destructive'
-                  )}
-                >
-                  {endMarkerLabel}
-                </span>
-              }
-            />
-          )}
-          {summaryMetadata && (
-            <p className='text-muted-foreground text-xs'>
-              {t(
-                'Summary mode does not collect character counts or tool-call statistics.'
-              )}
-            </p>
-          )}
+                }
+              />
+            )}
           {response?.metadata_incomplete &&
             (!summaryMetadata || !!response.incomplete_reasons?.length) && (
               <p className='text-muted-foreground text-xs'>
@@ -724,69 +537,11 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
           {truncated && (
             <Alert className='border-warning/30 bg-warning/10 text-warning mt-1 py-1.5'>
               <AlertDescription className='text-warning text-xs'>
-                {response &&
-                !response.metadata_incomplete &&
-                response.content_chars === 0 &&
-                !!response.reasoning_tokens
-                  ? t(
-                      'The output limit was used entirely for reasoning; no body text was returned.'
-                    )
-                  : t('Output was truncated at the configured limit.')}
+                {t('Output was truncated at the configured limit.')}
               </AlertDescription>
             </Alert>
           )}
         </DetailSection>
-      )}
-      {admin && layerCount > 0 && (
-        <Collapsible
-          open={keysOpen}
-          onOpenChange={setKeysOpen}
-          className='min-w-0 space-y-1.5'
-        >
-          <div className='flex flex-wrap items-center gap-2'>
-            <CollapsibleTrigger className='group inline-flex cursor-pointer items-center gap-1 text-xs font-semibold'>
-              <ChevronRight
-                className='text-muted-foreground size-3 transition-transform group-aria-expanded:rotate-90'
-                aria-hidden='true'
-              />
-              {t('Field-name fingerprint')}
-            </CollapsibleTrigger>
-            <span className='text-muted-foreground text-xs'>
-              {t('{{count}} layers', { count: layerCount })}
-            </span>
-          </div>
-          <div className='bg-muted/30 min-w-0 rounded-md border p-2.5 max-sm:p-2'>
-            {!keysOpen && (
-              <p className='text-muted-foreground text-xs'>
-                {t('Expand to view field names at each layer')}
-              </p>
-            )}
-            <CollapsibleContent className='space-y-1'>
-              {(shape?.keys?.length
-                ? [[t('Request'), shape.keys] as const, ...layers]
-                : layers
-              ).map(([layer, keys]) => (
-                <DetailRow
-                  key={layer}
-                  label={layer}
-                  value={
-                    <div className='flex min-w-0 flex-wrap gap-1'>
-                      {keys.map((key) => (
-                        <Badge
-                          key={key}
-                          variant='outline'
-                          className='h-auto max-w-full rounded-sm px-1 font-mono text-[11px] break-all whitespace-normal'
-                        >
-                          {key}
-                        </Badge>
-                      ))}
-                    </div>
-                  }
-                />
-              ))}
-            </CollapsibleContent>
-          </div>
-        </Collapsible>
       )}
     </div>
   )
@@ -800,7 +555,6 @@ export function RequestTraceDetails(props: {
   const { t } = useTranslation()
   const records = props.query.data ?? []
   const finalRecord = records.at(-1)
-  const previous = props.isAdmin ? records.slice(0, -1) : []
   return (
     <>
       <TraceAttemptDetails
@@ -846,30 +600,6 @@ export function RequestTraceDetails(props: {
             </Button>
           </div>
         )}
-      {previous.length > 0 && (
-        <Collapsible className='min-w-0 space-y-2'>
-          <CollapsibleTrigger className='group inline-flex cursor-pointer items-center gap-1 text-xs font-semibold'>
-            <ChevronRight
-              className='text-muted-foreground size-3 transition-transform group-aria-expanded:rotate-90'
-              aria-hidden='true'
-            />
-            {t('Previous upstream attempts ({{count}})', {
-              count: previous.length,
-            })}
-          </CollapsibleTrigger>
-          <CollapsibleContent className='space-y-3'>
-            {previous.map((record) => (
-              <TraceAttemptDetails
-                key={record.attempt}
-                record={record}
-                log={props.log}
-                isAdmin
-                previous
-              />
-            ))}
-          </CollapsibleContent>
-        </Collapsible>
-      )}
     </>
   )
 }

@@ -7,7 +7,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -18,25 +17,27 @@ import (
 )
 
 // 辅助函数
-func HandleStreamFormat(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
+func HandleStreamFormat(c *gin.Context, info *relaycommon.RelayInfo, data string, decoded *dto.ChatCompletionsStreamResponse, forceFormat bool, thinkToContent bool) error {
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:
 		info.SendResponseCount++
-		return sendStreamData(c, info, data, forceFormat, thinkToContent)
+		return sendStreamData(c, info, data, decoded, forceFormat, thinkToContent)
 	case types.RelayFormatClaude:
 		info.SendResponseCount++
-		return handleClaudeFormat(c, data, info)
+		return handleClaudeFormat(c, data, decoded, info)
 	case types.RelayFormatGemini:
 		// The stateful relaykit path owns its chunk counter so multi-hop and
 		// direct conversions observe the same stream state semantics.
-		return handleGeminiFormat(c, data, info)
+		return handleGeminiFormat(c, data, decoded, info)
 	}
 	return nil
 }
 
-func handleClaudeFormat(c *gin.Context, data string, info *relaycommon.RelayInfo) error {
+func handleClaudeFormat(c *gin.Context, data string, decoded *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) error {
 	var streamResponse dto.ChatCompletionsStreamResponse
-	if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
+	if decoded != nil {
+		streamResponse = *decoded.Copy()
+	} else if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
 		return err
 	}
 
@@ -57,9 +58,11 @@ func handleClaudeFormat(c *gin.Context, data string, info *relaycommon.RelayInfo
 	return nil
 }
 
-func handleGeminiFormat(c *gin.Context, data string, info *relaycommon.RelayInfo) error {
+func handleGeminiFormat(c *gin.Context, data string, decoded *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) error {
 	var streamResponse dto.ChatCompletionsStreamResponse
-	if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
+	if decoded != nil {
+		streamResponse = *decoded.Copy()
+	} else if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
 		logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
 		return err
 	}
@@ -112,8 +115,7 @@ func sendGeminiStreamResults(c *gin.Context, results []relayconvert.ResponseResu
 			logger.LogError(c, "failed to marshal gemini response: "+err.Error())
 			return err
 		}
-		c.Render(-1, common.CustomEvent{Data: "data: " + string(data)})
-		_ = helper.FlushWriter(c)
+		_ = helper.DecodedStringData(c, string(data), geminiResponse)
 	}
 	return nil
 }
@@ -135,37 +137,21 @@ func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, res
 	return nil
 }
 
-func processTokenData(relayMode int, data string, responseTextBuilder *strings.Builder, toolCount *int) error {
-	switch relayMode {
-	case relayconstant.RelayModeChatCompletions:
-		var streamResponse dto.ChatCompletionsStreamResponse
-		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			return err
-		}
-		return ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount)
-	case relayconstant.RelayModeCompletions:
-		var streamResponse dto.CompletionsStreamResponse
-		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			return err
-		}
-		processCompletionsStreamResponse(streamResponse, responseTextBuilder)
-	}
-	return nil
-}
-
 func processCompletionsStreamResponse(streamResponse dto.CompletionsStreamResponse, responseTextBuilder *strings.Builder) {
 	for _, choice := range streamResponse.Choices {
 		responseTextBuilder.WriteString(choice.Text)
 	}
 }
 
-func handleLastResponse(lastStreamData string, responseId *string, createAt *int64,
+func handleLastResponse(lastStreamData string, decoded *dto.ChatCompletionsStreamResponse, responseId *string, createAt *int64,
 	systemFingerprint *string, model *string, usage **dto.Usage,
 	containStreamUsage *bool, info *relaycommon.RelayInfo,
 	shouldSendLastResp *bool) error {
 
 	var lastStreamResponse dto.ChatCompletionsStreamResponse
-	if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &lastStreamResponse); err != nil {
+	if decoded != nil {
+		lastStreamResponse = *decoded
+	} else if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &lastStreamResponse); err != nil {
 		return err
 	}
 
@@ -185,7 +171,7 @@ func handleLastResponse(lastStreamData string, responseId *string, createAt *int
 	return nil
 }
 
-func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStreamData string,
+func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStreamData string, decoded *dto.ChatCompletionsStreamResponse,
 	responseId string, createAt int64, model string, systemFingerprint string,
 	usage *dto.Usage, containStreamUsage bool) {
 
@@ -200,7 +186,9 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 
 	case types.RelayFormatClaude:
 		var streamResponse dto.ChatCompletionsStreamResponse
-		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
+		if decoded != nil {
+			streamResponse = *decoded.Copy()
+		} else if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
 			return
 		}

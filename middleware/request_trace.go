@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ type traceResponseWriter struct {
 	observer       *common.TraceBodyObserver
 	contentType    string
 	contentTypeSet bool
+	decodedEvent   bool
+	eventError     error
 }
 
 func (w *traceResponseWriter) Unwrap() http.ResponseWriter {
@@ -27,6 +30,7 @@ func (w *traceResponseWriter) prepare() {
 	if !w.contentTypeSet {
 		w.contentType = w.Header().Get("Content-Type")
 		w.contentTypeSet = true
+		w.observer.Prepare(w.contentType, -1)
 	}
 	if w.Status() >= 400 {
 		w.observer.PromoteToFull()
@@ -37,10 +41,18 @@ func (w *traceResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	if n > 0 {
 		w.prepare()
-		w.observer.Observe(data[:n], w.contentType)
+		if !w.decodedEvent {
+			w.observer.Observe(data[:n], w.contentType)
+		}
 	}
-	if err != nil {
+	if err != nil || n != len(data) {
 		w.observer.DeliveryFailed()
+		if w.decodedEvent {
+			w.eventError = err
+			if w.eventError == nil {
+				w.eventError = io.ErrShortWrite
+			}
+		}
 	}
 	return n, err
 }
@@ -49,7 +61,56 @@ func (w *traceResponseWriter) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
 	if n > 0 {
 		w.prepare()
-		w.observer.ObserveString(data[:n], w.contentType)
+		if !w.decodedEvent {
+			w.observer.ObserveString(data[:n], w.contentType)
+		}
+	}
+	if err != nil || n != len(data) {
+		w.observer.DeliveryFailed()
+		if w.decodedEvent {
+			w.eventError = err
+			if w.eventError == nil {
+				w.eventError = io.ErrShortWrite
+			}
+		}
+	}
+	return n, err
+}
+
+func (w *traceResponseWriter) NeedsDecodedTraceEvent() bool {
+	return w.observer.NeedsDecodedEvent()
+}
+
+func (w *traceResponseWriter) WriteTraceEvent(event common.CustomEvent, value any) error {
+	data, ok := event.Data.(string)
+	if !ok || !strings.HasPrefix(data, "data:") {
+		return event.Render(w)
+	}
+	w.decodedEvent, w.eventError = true, nil
+	defer func() { w.decodedEvent = false }()
+	if err := event.Render(w); err != nil {
+		return err
+	}
+	if w.eventError != nil {
+		return w.eventError
+	}
+	w.observer.ObserveDecodedEvent(data, value)
+	return nil
+}
+
+func (w *traceResponseWriter) WriteTraceResponse(data []byte) (int, error) {
+	if common.IsEventStreamContentType(w.Header().Get("Content-Type")) {
+		return w.Write(data)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.prepare()
+	if n == len(data) {
+		w.observer.ObserveDecoded(data, nil)
+	} else if n > 0 {
+		w.observer.Observe(data[:n], w.contentType)
+	}
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
 	}
 	if err != nil {
 		w.observer.DeliveryFailed()
@@ -81,7 +142,8 @@ func RequestTrace() gin.HandlerFunc {
 		c.Writer = &traceResponseWriter{ResponseWriter: original, observer: observer}
 		defer func() {
 			c.Writer = original
-			// Gin 归池前不清空 Keys，收尾完成后解除对事件缓存的引用。
+			common.UseDecodedRequestTrace(c, nil)
+			// Gin 归池前不清空 Keys，收尾完成后解除对采集器的引用。
 			c.Set(common.RequestTraceContextKey, nil)
 		}()
 		// 在采集器存活期间恢复下游 panic，错误响应写出后再整理元数据。
@@ -131,7 +193,7 @@ func RequestTrace() gin.HandlerFunc {
 			other.SetPublic("status_code", c.Writer.Status())
 			other.SetPublic("error_type", clientMetadata.ErrorType)
 			other.SetPublic("error_code", clientMetadata.ErrorCode)
-			model.RecordErrorLog(c, userId, 0, c.GetString("original_model"), c.GetString("token_name"), "Request failed before upstream dispatch", c.GetInt("token_id"), int(time.Since(trace.Started).Seconds()), strings.Contains(response.ContentType, "text/event-stream"), c.GetString("group"), other)
+			model.RecordErrorLog(c, userId, 0, c.GetString("original_model"), c.GetString("token_name"), "Request failed before upstream dispatch", c.GetInt("token_id"), int(time.Since(trace.Started).Seconds()), common.IsEventStreamContentType(response.ContentType), c.GetString("group"), other)
 		}
 		attempts := trace.Attempts
 		if len(attempts) == 0 {
@@ -166,22 +228,25 @@ func RequestTrace() gin.HandlerFunc {
 				duration := max(int64(0), attemptFinished.Sub(attempt.Started).Milliseconds())
 				upstream.Milliseconds = &duration
 			}
-			status, responseBytes := upstream.Status, int64(0)
-			if attempt.Observer != nil {
-				responseBytes = attempt.Observer.Size()
-			}
+			status := upstream.Status
 			stage := ""
 			if attemptFailed {
 				stage = "upstream"
 			}
 			if last {
 				status = c.Writer.Status()
-				responseBytes = int64(max(0, c.Writer.Size()))
+				reasoningTokens, reasoningOutputTokens := attemptResponse.ReasoningTokens, attemptResponse.ReasoningOutputTokens
+				refused := attemptResponse.Refused
 				attemptResponse = response
+				if attempt.Observer != nil {
+					// 推理 Token 只采用上游明确上报的值，避免转换补零或丢失字段。
+					attemptResponse.ReasoningTokens, attemptResponse.ReasoningOutputTokens = reasoningTokens, reasoningOutputTokens
+					attemptResponse.Refused = attemptResponse.Refused || refused
+				}
 				if clientReason != nil {
 					reason = clientReason
 				}
-				if reason == nil && strings.Contains(response.ContentType, "text/event-stream") {
+				if reason == nil && common.IsEventStreamContentType(response.ContentType) {
 					missing := ""
 					reason = &missing
 				}
@@ -201,7 +266,7 @@ func RequestTrace() gin.HandlerFunc {
 			} else if last && !attemptFailed && reason != nil && *reason == "" {
 				outcome = "unknown"
 			}
-			data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Milliseconds: milliseconds, RequestBytes: trace.RequestBytes, ResponseBytes: responseBytes, Status: status, FinishReason: reason, Stage: stage, Outcome: outcome}}
+			data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Milliseconds: milliseconds, RequestBytes: trace.RequestBytes, Status: status, FinishReason: reason, Stage: stage, Outcome: outcome}}
 			if last {
 				data.Trace.ClientErrorType = clientMetadata.ErrorType
 			}

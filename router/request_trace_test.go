@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -92,25 +93,25 @@ func awaitRequestTraceWrites(t *testing.T) {
 func TestRequestTraceProtocolMetadata(t *testing.T) {
 	cases := []struct {
 		name, body, contentType, reason string
-		text, reasoning, tools          int64
+		tools                           int64
 		done, failed                    bool
 	}{
-		{"openai-json", `{"id":"chat-id","model":"mock-model","choices":[{"index":0,"message":{"content":"A中😊","reasoning_content":"abc","tool_calls":[{"id":"call-1","function":{"name":"tool","arguments":"private-tool-arguments"}}]},"finish_reason":"stop"}],"usage":{"completion_tokens":3}}`, "application/json", "stop", 3, 3, 1, true, false},
-		{"completions-json", `{"choices":[{"text":"abc","finish_reason":"length"}]}`, "application/json", "length", 3, 0, 0, true, false},
-		{"openai-null-tools-json", `{"choices":[{"message":{"content":"abc","tool_calls":null,"function_call":null},"finish_reason":"stop"}]}`, "application/json", "stop", 3, 0, 0, true, false},
-		{"openai-empty-function-json", `{"choices":[{"message":{"content":"abc","function_call":{"name":"","arguments":""}},"finish_reason":"stop"}]}`, "application/json", "stop", 3, 0, 0, true, false},
-		{"openai-tool-with-empty-legacy-json", `{"choices":[{"message":{"tool_calls":[{"id":"call-1","function":{"name":"tool","arguments":"{}"}}],"function_call":{"name":"","arguments":""}},"finish_reason":"tool_calls"}]}`, "application/json", "tool_calls", 0, 0, 1, true, false},
-		{"openai-empty-function-sse", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc\",\"tool_calls\":null,\"function_call\":null}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"\",\"arguments\":\"\"}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "text/event-stream", "stop", 3, 0, 0, true, false},
-		{"claude-json", `{"type":"message","id":"msg-1","content":[{"type":"text","text":"你好"},{"type":"thinking","thinking":"abc"},{"type":"tool_use","input":{"secret":"private-tool-arguments"}}],"stop_reason":"end_turn","usage":{"output_tokens":4}}`, "application/json", "end_turn", 2, 3, 1, true, false},
-		{"gemini-json", `{"candidates":[{"content":{"parts":[{"text":"你好"},{"text":"abc","thought":true},{"functionCall":{"name":"tool","args":{"secret":"private-tool-arguments"}}}]},"finishReason":"STOP"}],"usageMetadata":{"thoughtsTokenCount":2}}`, "application/json", "STOP", 2, 3, 1, true, false},
-		{"responses-json", `{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"你好"}]},{"type":"reasoning","summary":[{"text":"abc"}]},{"type":"function_call","arguments":"private-tool-arguments"}],"usage":{"output_tokens":4}}`, "application/json", "completed", 2, 3, 1, true, false},
-		{"openai-sse", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"private-tool-arguments\"}}]}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"中\",\"reasoning_content\":\"abc\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"more\"}}]}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\ndata: [DONE]\n\n", "text/event-stream", "stop", 2, 3, 1, true, false},
-		{"claude-sse", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"usage\":{\"input_tokens\":3}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"你好\",\"thinking\":\"abc\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "text/event-stream", "end_turn", 2, 3, 1, true, false},
-		{"gemini-sse", "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好\"},{\"text\":\"abc\",\"thought\":true},{\"functionCall\":{\"name\":\"tool\",\"args\":{}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"thoughtsTokenCount\":2}}\n\n", "text/event-stream", "STOP", 2, 3, 1, false, false},
-		{"responses-sse", "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"abc\"}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\",\"output\":[{\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}]}}\n\n", "text/event-stream", "completed", 2, 3, 1, true, false},
-		{"responses-stream-error", "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"private-error-original\"}\n\n", "text/event-stream", "", 0, 0, 0, false, true},
-		{"responses-stream-failed", "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"overloaded\",\"message\":\"private-error-original\"}}}\n\n", "text/event-stream", "failed", 0, 0, 0, true, true},
-		{"nested-invalid-metadata", `{"id":{"text":"private-message-body"},"error":{"type":{"message":"private-error-original"},"code":{"message":"private-error-original"},"message":"private-error-original"}}`, "application/json", "", 0, 0, 0, true, true},
+		{"openai-json", `{"id":"chat-id","model":"mock-model","choices":[{"index":0,"message":{"content":"A中😊","reasoning_content":"abc","tool_calls":[{"id":"call-1","function":{"name":"tool","arguments":"private-tool-arguments"}}]},"finish_reason":"stop"}],"usage":{"completion_tokens":3}}`, "application/json", "stop", 1, true, false},
+		{"completions-json", `{"choices":[{"text":"abc","finish_reason":"length"}]}`, "application/json", "length", 0, true, false},
+		{"openai-null-tools-json", `{"choices":[{"message":{"content":"abc","tool_calls":null,"function_call":null},"finish_reason":"stop"}]}`, "application/json", "stop", 0, true, false},
+		{"openai-empty-function-json", `{"choices":[{"message":{"content":"abc","function_call":{"name":"","arguments":""}},"finish_reason":"stop"}]}`, "application/json", "stop", 0, true, false},
+		{"openai-tool-with-empty-legacy-json", `{"choices":[{"message":{"tool_calls":[{"id":"call-1","function":{"name":"tool","arguments":"{}"}}],"function_call":{"name":"","arguments":""}},"finish_reason":"tool_calls"}]}`, "application/json", "tool_calls", 1, true, false},
+		{"openai-empty-function-sse", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc\",\"tool_calls\":null,\"function_call\":null}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"\",\"arguments\":\"\"}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "text/event-stream", "stop", 0, true, false},
+		{"claude-json", `{"type":"message","id":"msg-1","content":[{"type":"text","text":"你好"},{"type":"thinking","thinking":"abc"},{"type":"tool_use","input":{"secret":"private-tool-arguments"}}],"stop_reason":"end_turn","usage":{"output_tokens":4}}`, "application/json", "end_turn", 1, true, false},
+		{"gemini-json", `{"candidates":[{"content":{"parts":[{"text":"你好"},{"text":"abc","thought":true},{"functionCall":{"name":"tool","args":{"secret":"private-tool-arguments"}}}]},"finishReason":"STOP"}],"usageMetadata":{"thoughtsTokenCount":2}}`, "application/json", "STOP", 1, true, false},
+		{"responses-json", `{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"你好"}]},{"type":"reasoning","summary":[{"text":"abc"}]},{"type":"function_call","arguments":"private-tool-arguments"}],"usage":{"output_tokens":4}}`, "application/json", "completed", 1, true, false},
+		{"openai-sse", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"private-tool-arguments\"}}]}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"中\",\"reasoning_content\":\"abc\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"more\"}}]}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\ndata: [DONE]\n\n", "text/event-stream", "stop", 1, true, false},
+		{"claude-sse", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"usage\":{\"input_tokens\":3}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"你好\",\"thinking\":\"abc\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "text/event-stream", "end_turn", 1, true, false},
+		{"gemini-sse", "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好\"},{\"text\":\"abc\",\"thought\":true},{\"functionCall\":{\"name\":\"tool\",\"args\":{}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"thoughtsTokenCount\":2}}\n\n", "text/event-stream", "STOP", 1, false, false},
+		{"responses-sse", "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"abc\"}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\",\"output\":[{\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}]}}\n\n", "text/event-stream", "completed", 1, true, false},
+		{"responses-stream-error", "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"private-error-original\"}\n\n", "text/event-stream", "", 0, false, true},
+		{"responses-stream-failed", "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"overloaded\",\"message\":\"private-error-original\"}}}\n\n", "text/event-stream", "failed", 0, true, true},
+		{"nested-invalid-metadata", `{"id":{"text":"private-message-body"},"error":{"type":{"message":"private-error-original"},"code":{"message":"private-error-original"},"message":"private-error-original"}}`, "application/json", "", 0, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -122,27 +123,109 @@ func TestRequestTraceProtocolMetadata(t *testing.T) {
 				}
 				observer.Finish()
 				response, upstream, reason := observer.Snapshot()
-				assert.Equal(t, tc.text, response.ContentCharacters, "chunk size %d", chunkSize)
-				assert.Equal(t, tc.reasoning, response.ReasoningCharacters)
 				assert.Equal(t, tc.tools, response.ToolCalls)
 				assert.Equal(t, tc.done, response.Done)
 				assert.Equal(t, tc.failed, response.Error)
-				assert.EqualValues(t, len(tc.body), observer.Size())
 				if tc.reason != "" {
 					require.NotNil(t, reason)
 					assert.Equal(t, tc.reason, *reason)
 				}
 				encoded := common.GetJsonString(common.RequestTraceData{AdminInfo: &common.RequestTraceAdmin{Upstream: upstream, Response: response}})
+				for _, field := range []string{`"resp_bytes"`, `"content_chars"`, `"reasoning_chars"`, `"chunks"`, `"last_chunk_ms"`, `"usage_chunk"`, `"keys"`} {
+					assert.NotContains(t, encoded, field)
+				}
 				for _, secret := range []string{"private-message-body", "private-tool-arguments", "private-error-original", "你好", "A中😊"} {
 					assert.NotContains(t, encoded, secret)
 				}
 				client.Observe([]byte(tc.body), tc.contentType)
 				client.Finish()
 				forwarded, forwardedUpstream, forwardedReason := client.Snapshot()
-				response.LastChunkMilliseconds, forwarded.LastChunkMilliseconds = 0, 0
 				assert.Equal(t, response, forwarded)
 				assert.Equal(t, upstream, forwardedUpstream)
 				assert.Equal(t, reason, forwardedReason)
+			}
+		})
+	}
+}
+
+func TestRequestTraceToolNameNullDelta(t *testing.T) {
+	cases := []struct {
+		name       string
+		deltas     []string
+		body       string
+		names      map[string]int64
+		incomplete bool
+	}{
+		{
+			name: "complete name survives null argument delta",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"function":{"name":"trace_test_echo","arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"{}"}}]}`,
+			},
+			names: map[string]int64{"trace_test_echo": 1},
+		},
+		{
+			name: "fragmented name ignores null and missing name deltas",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"function":{"name":null,"arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"name":"trace_","arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"name":"test_echo","arguments":""}}]}`,
+			},
+			names: map[string]int64{"trace_test_echo": 1},
+		},
+		{
+			name: "legacy function name survives null argument delta",
+			deltas: []string{
+				`{"function_call":{"name":"trace_test_echo","arguments":""}}`,
+				`{"function_call":{"name":null,"arguments":"{}"}}`,
+			},
+			names: map[string]int64{"trace_test_echo": 1},
+		},
+		{
+			name: "non-string name delta stays invalid",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"function":{"name":"trace_test_echo","arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"name":42,"arguments":"{}"}}]}`,
+			},
+			incomplete: true,
+		},
+		{
+			name:       "non-stream null name stays invalid",
+			body:       `{"choices":[{"message":{"tool_calls":[{"function":{"name":null,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+			incomplete: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, contentType := tc.body, "application/json"
+			if len(tc.deltas) > 0 {
+				var stream strings.Builder
+				for _, delta := range tc.deltas {
+					fmt.Fprintf(&stream, "data: {\"choices\":[{\"index\":0,\"delta\":%s}]}\n\n", delta)
+				}
+				stream.WriteString("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+				body, contentType = stream.String(), "text/event-stream"
+			}
+			for _, chunkSize := range []int{1, len(body)} {
+				observer := common.NewTraceBodyObserver(time.Now())
+				for offset := 0; offset < len(body); offset += chunkSize {
+					observer.Observe([]byte(body[offset:min(offset+chunkSize, len(body))]), contentType)
+				}
+				observer.Finish()
+				response, _, reason := observer.Snapshot()
+				assert.EqualValues(t, 1, response.ToolCalls)
+				assert.Equal(t, tc.names, response.ToolCallsByName)
+				assert.Equal(t, tc.incomplete, response.MetadataIncomplete)
+				if tc.incomplete {
+					assert.Contains(t, response.IncompleteReasons, "invalid_tool_name")
+				} else {
+					assert.Empty(t, response.IncompleteReasons)
+				}
+				assert.True(t, response.Done)
+				require.NotNil(t, reason)
+				assert.Equal(t, "tool_calls", *reason)
 			}
 		})
 	}
@@ -159,16 +242,14 @@ func TestRequestTraceSharedMetadataPreservesIndependentResults(t *testing.T) {
 		upstream.Observe(second, "text/event-stream")
 		upstream.Finish()
 		response, _, _ := upstream.Snapshot()
-		require.Equal(t, []string{"content", "tool_calls", "new_field"}, response.Keys["message"])
 		assert.EqualValues(t, 1, response.ToolCalls)
 		assert.EqualValues(t, 1, response.ToolCallsByName["first"])
-		response.Keys["message"][0] = "changed-by-reader"
+		response.ToolCallsByName["first"] = 99
 
 		cachedReader.Observe(first, "text/event-stream")
 		cachedReader.Finish()
 		cachedResponse, cachedInfo, cachedReason := cachedReader.Snapshot()
-		assert.Equal(t, []string{"id", "created", "choices", "usage"}, cachedResponse.Keys["root"])
-		assert.Equal(t, []string{"content", "tool_calls"}, cachedResponse.Keys["message"])
+		assert.EqualValues(t, 1, cachedResponse.ToolCallsByName["first"])
 		require.NotNil(t, cachedResponse.ReasoningTokens)
 		assert.EqualValues(t, 3, *cachedResponse.ReasoningTokens)
 		require.NotNil(t, cachedInfo.Created)
@@ -178,34 +259,12 @@ func TestRequestTraceSharedMetadataPreservesIndependentResults(t *testing.T) {
 		client.Observe(second, "text/event-stream")
 		client.Finish()
 		clientResponse, clientInfo, clientReason := client.Snapshot()
-		assert.Equal(t, []string{"choices"}, clientResponse.Keys["root"])
-		assert.Equal(t, []string{"content", "new_field"}, clientResponse.Keys["message"])
 		assert.Nil(t, clientResponse.ReasoningTokens)
 		assert.Nil(t, clientInfo.Created)
 		assert.Empty(t, clientInfo.ResponseID)
 		assert.Zero(t, clientResponse.ToolCalls)
 		require.NotNil(t, clientReason)
 		assert.Equal(t, "length", *clientReason)
-	})
-	t.Run("field sets merge choices and retain empty objects", func(t *testing.T) {
-		client := common.NewTraceBodyObserver(time.Now())
-		upstream := client.NewRelatedObserver()
-		upstream.Observe([]byte("data: "+`{"choices":[{"index":0,"delta":{"content":"A"}},{"index":1,"delta":{"reasoning_content":"B"},"finish_reason":"stop"}],"usage":{}}`+"\n\n"), "text/event-stream")
-		upstream.Finish()
-		response, _, _ := upstream.Snapshot()
-		assert.Equal(t, []string{"index", "delta", "finish_reason"}, response.Keys["choices"])
-		assert.Equal(t, []string{"content", "reasoning_content"}, response.Keys["message"])
-		assert.Contains(t, response.Keys, "usage")
-		assert.Nil(t, response.Keys["usage"])
-		assert.EqualValues(t, 1, response.ContentCharacters)
-		assert.EqualValues(t, 1, response.ReasoningCharacters)
-
-		client.Observe([]byte("data: "+`{"choices":[{"delta":{}}]}`+"\n\n"), "text/event-stream")
-		client.Finish()
-		response, _, _ = client.Snapshot()
-		assert.Contains(t, response.Keys, "message")
-		assert.Nil(t, response.Keys["message"])
-		assert.NotContains(t, response.Keys, "usage")
 	})
 	t.Run("snapshot values do not change another observer", func(t *testing.T) {
 		client := common.NewTraceBodyObserver(time.Now())
@@ -235,16 +294,14 @@ func TestRequestTraceSharedMetadataPreservesIndependentResults(t *testing.T) {
 		upstream.Finish()
 		client.Observe([]byte(`{"type":"message","id":"client-id","content":[{"type":"text","text":"转换"}],"stop_reason":"end_turn"}`), "application/json")
 		client.Finish()
-		upstreamResponse, upstreamInfo, upstreamReason := upstream.Snapshot()
-		clientResponse, clientInfo, clientReason := client.Snapshot()
+		_, upstreamInfo, upstreamReason := upstream.Snapshot()
+		_, clientInfo, clientReason := client.Snapshot()
 		assert.Equal(t, "upstream-id", upstreamInfo.ResponseID)
 		assert.Equal(t, "upstream-model", upstreamInfo.Model)
-		assert.EqualValues(t, 8, upstreamResponse.ContentCharacters)
 		require.NotNil(t, upstreamReason)
 		assert.Equal(t, "stop", *upstreamReason)
 		assert.Equal(t, "client-id", clientInfo.ResponseID)
 		assert.Empty(t, clientInfo.Model)
-		assert.EqualValues(t, 2, clientResponse.ContentCharacters)
 		require.NotNil(t, clientReason)
 		assert.Equal(t, "end_turn", *clientReason)
 	})
@@ -282,8 +339,6 @@ func TestRequestTraceSharedMetadataPreservesIndependentResults(t *testing.T) {
 			response, info, _ := observer.Snapshot()
 			assert.True(t, response.Error)
 			assert.False(t, response.MetadataIncomplete)
-			assert.EqualValues(t, 384, response.ContentCharacters)
-			assert.EqualValues(t, 97, response.Chunks)
 			assert.EqualValues(t, 1, response.ToolCalls)
 			assert.Equal(t, "overloaded", info.ErrorType)
 			assert.NotContains(t, common.GetJsonString(response), "private-late-error")
@@ -313,7 +368,6 @@ func TestRequestTraceCaptureBoundaries(t *testing.T) {
 		observer.Finish()
 		response, _, _ := observer.Snapshot()
 		assert.True(t, response.MetadataIncomplete)
-		assert.Zero(t, response.ContentCharacters)
 	})
 	t.Run("oversized stream event recovers", func(t *testing.T) {
 		observer := common.NewTraceBodyObserver(time.Now())
@@ -321,7 +375,6 @@ func TestRequestTraceCaptureBoundaries(t *testing.T) {
 		observer.Finish()
 		response, _, _ := observer.Snapshot()
 		assert.True(t, response.MetadataIncomplete)
-		assert.EqualValues(t, 1, response.ContentCharacters)
 		assert.True(t, response.Done)
 	})
 	t.Run("independent request reader and body exclusion", func(t *testing.T) {
@@ -367,7 +420,7 @@ func TestRequestTraceCaptureBoundaries(t *testing.T) {
 		assert.Equal(t, payload, string(got))
 		require.NoError(t, body.Close())
 		response, _, _ := body.Observer.Snapshot()
-		assert.EqualValues(t, len("private-response-body"), response.ContentCharacters)
+		assert.True(t, response.Done)
 	})
 }
 
@@ -527,7 +580,6 @@ func TestRequestTracePanicPersistence(t *testing.T) {
 			require.NoError(t, common.UnmarshalJsonStr(encoded, &data))
 			assert.Equal(t, "failed", data.Trace.Outcome)
 			assert.Equal(t, tc.status, data.Trace.Status)
-			assert.EqualValues(t, recorder.Body.Len(), data.Trace.ResponseBytes)
 			require.NotNil(t, data.AdminInfo)
 			assert.Equal(t, common.TraceMetadataFull, data.AdminInfo.MetadataLevel)
 			assert.True(t, data.AdminInfo.Response.Error)
@@ -616,7 +668,6 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 			var data common.RequestTraceData
 			require.NoError(t, common.UnmarshalJsonStr(decoded, &data))
 			assert.Equal(t, tc.status, data.Trace.Status)
-			assert.EqualValues(t, recorder.Body.Len(), data.Trace.ResponseBytes)
 			require.NotNil(t, data.AdminInfo)
 			assert.Equal(t, tc.detailed, data.AdminInfo.Shape != nil)
 			if tc.detailed {
@@ -705,10 +756,11 @@ func TestRequestTraceConcurrentCollectors(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	observer.ObserveString("data: [DONE]\n\n", "text/event-stream")
 	observer.Finish()
 	response, _, _ := observer.Snapshot()
-	assert.EqualValues(t, 32, response.ContentCharacters)
-	assert.EqualValues(t, 32, response.Chunks)
+	assert.Equal(t, "[DONE]", response.EndMarker)
+	assert.True(t, response.Done)
 }
 
 func TestRequestTraceGeminiIdentifiersAndDistinctTools(t *testing.T) {
@@ -860,7 +912,6 @@ func TestRequestTraceHTTPAttemptsAndStreamingErrors(t *testing.T) {
 				require.Len(t, rows, 2)
 				require.NotNil(t, rows[0].AdminInfo)
 				assert.Equal(t, "provider-first", rows[0].AdminInfo.Upstream.RequestID)
-				assert.Greater(t, rows[0].Trace.ResponseBytes, int64(0))
 				assert.Equal(t, 502, rows[0].Trace.Status)
 				require.NotNil(t, rows[1].AdminInfo)
 				assert.Equal(t, common.TraceMetadataSummary, rows[1].AdminInfo.MetadataLevel)
@@ -1393,7 +1444,7 @@ func TestRequestTraceChatTerminalUsage(t *testing.T) {
 
 func TestRequestTraceCompactSummaryStorage(t *testing.T) {
 	level := common.TraceMetadataSummary
-	data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Status: 200, Milliseconds: 20, ResponseBytes: 50}, AdminInfo: &common.RequestTraceAdmin{MetadataLevel: level, ChannelID: 7, Client: common.RequestTraceClient{UserAgent: "client-agent", ContentType: "application/json"}, Upstream: common.RequestTraceUpstream{Status: 200, RequestID: "provider-id", HeaderMilliseconds: 4}, Response: common.RequestTraceResponse{Done: true, EndMarker: "[DONE]", UsageChunk: true, MetadataIncomplete: true}}}
+	data := common.RequestTraceData{Version: 1, Trace: common.RequestTraceSummary{Status: 200, Milliseconds: 20}, AdminInfo: &common.RequestTraceAdmin{MetadataLevel: level, ChannelID: 7, Client: common.RequestTraceClient{UserAgent: "client-agent", ContentType: "application/json"}, Upstream: common.RequestTraceUpstream{Status: 200, RequestID: "provider-id", HeaderMilliseconds: 4}, Response: common.RequestTraceResponse{Done: true, EndMarker: "[DONE]", MetadataIncomplete: true}}}
 	encoded, err := common.MarshalRequestTraceStorageData(data)
 	require.NoError(t, err)
 	for _, field := range []string{`"content_chars"`, `"reasoning_chars"`, `"client"`, `"tool_calls"`} {
@@ -1411,6 +1462,791 @@ func TestRequestTraceCompactSummaryStorage(t *testing.T) {
 	full, err := common.MarshalRequestTraceStorageData(data)
 	require.NoError(t, err)
 	assert.JSONEq(t, common.GetJsonString(data), string(full))
+}
+
+func requestTraceProtocolRequest(format types.RelayFormat) string {
+	switch format {
+	case types.RelayFormatOpenAI:
+		return `{"model":"client-model","messages":[{"role":"system","content":"S"},{"role":"user","content":"Hi中😊"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},{"type":"function","function":{"name":"unused_tool","parameters":{"type":"object"}}}],"tool_choice":"auto","max_tokens":128,"temperature":0,"stream_options":{"include_usage":true}}`
+	case types.RelayFormatOpenAIResponses:
+		return `{"model":"client-model","instructions":"S","input":[{"role":"user","content":[{"type":"input_text","text":"Hi中😊"}]}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}},{"type":"function","name":"unused_tool","parameters":{"type":"object"}}],"tool_choice":"auto","max_output_tokens":128,"temperature":0}`
+	case types.RelayFormatClaude:
+		return `{"model":"client-model","system":"S","messages":[{"role":"user","content":"Hi中😊"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}},{"name":"unused_tool","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto"},"max_tokens":128,"temperature":0}`
+	case types.RelayFormatGemini:
+		return `{"systemInstruction":{"parts":[{"text":"S"}]},"contents":[{"role":"user","parts":[{"text":"Hi中😊"}]}],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}},{"name":"unused_tool","parameters":{"type":"object"}}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"generationConfig":{"maxOutputTokens":128,"temperature":0}}`
+	}
+	return ""
+}
+
+func requestTraceProtocolPayload(format types.RelayFormat, stream bool) string {
+	var body string
+	var events []string
+	switch format {
+	case types.RelayFormatOpenAI:
+		body = `{"id":"source-id","object":"chat.completion","created":1700000000,"model":"upstream-model","system_fingerprint":"fp-source","service_tier":"priority","choices":[{"index":0,"message":{"role":"assistant","content":"ok","tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19,"completion_tokens_details":{"reasoning_tokens":3}}}`
+		events = []string{
+			`{"id":"source-id","object":"chat.completion.chunk","created":1700000000,"model":"upstream-model","system_fingerprint":"fp-source","service_tier":"priority","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"{}"}}]},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19,"completion_tokens_details":{"reasoning_tokens":3}}}`,
+		}
+	case types.RelayFormatOpenAIResponses:
+		body = `{"id":"source-id","object":"response","created_at":1700000000,"status":"completed","model":"upstream-model","service_tier":"priority","output":[{"type":"function_call","id":"fc-source","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}],"usage":{"input_tokens":10,"output_tokens":9,"total_tokens":19,"output_tokens_details":{"reasoning_tokens":3}}}`
+		events = []string{
+			`{"type":"response.created","response":{"id":"source-id","object":"response","created_at":1700000000,"status":"in_progress","model":"upstream-model","output":[]}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc-source","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc-source","delta":"{}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc-source","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}`,
+			`{"type":"response.completed","response":` + body + `}`,
+		}
+	case types.RelayFormatClaude:
+		body = `{"id":"source-id","type":"message","model":"upstream-model","role":"assistant","content":[{"type":"tool_use","id":"call_lookup","name":"lookup","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":9}}`
+		events = []string{
+			`{"type":"message_start","message":{"id":"source-id","type":"message","model":"upstream-model","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_lookup","name":"lookup","input":{}}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}`,
+			`{"type":"message_stop"}`,
+		}
+	case types.RelayFormatGemini:
+		body = `{"responseId":"source-id","modelVersion":"upstream-model","candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":19}}`
+		events = []string{body}
+	}
+	if !stream {
+		return body
+	}
+	var result strings.Builder
+	for _, event := range events {
+		fmt.Fprintf(&result, "data: %s\n\n", event)
+	}
+	if format == types.RelayFormatOpenAI {
+		result.WriteString("data: [DONE]\n\n")
+	}
+	return result.String()
+}
+
+func requestTraceProtocolRefusalPayload(format types.RelayFormat, stream bool) string {
+	var body string
+	var events []string
+	switch format {
+	case types.RelayFormatOpenAI:
+		body = `{"id":"source-id","object":"chat.completion","created":1700000000,"model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":"private-refusal-body"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19,"completion_tokens_details":{"reasoning_tokens":3}}}`
+		events = []string{
+			`{"id":"source-id","object":"chat.completion.chunk","model":"upstream-model","choices":[{"index":0,"delta":{"role":"assistant","refusal":"private-refusal-body"},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19,"completion_tokens_details":{"reasoning_tokens":3}}}`,
+		}
+	case types.RelayFormatOpenAIResponses:
+		body = `{"id":"source-id","object":"response","created_at":1700000000,"status":"completed","model":"upstream-model","output":[{"id":"msg-source","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"private-refusal-body"}]}],"usage":{"input_tokens":10,"output_tokens":9,"total_tokens":19,"output_tokens_details":{"reasoning_tokens":3}}}`
+		events = []string{
+			`{"type":"response.created","response":{"id":"source-id","object":"response","model":"upstream-model","status":"in_progress","output":[]}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg-source","type":"message","role":"assistant","content":[]}}`,
+			`{"type":"response.refusal.delta","output_index":0,"content_index":0,"item_id":"msg-source","delta":"private-refusal-body"}`,
+			`{"type":"response.completed","response":` + body + `}`,
+		}
+	case types.RelayFormatClaude:
+		body = `{"id":"source-id","type":"message","model":"upstream-model","role":"assistant","content":[{"type":"text","text":"private-refusal-body"}],"stop_reason":"refusal","usage":{"input_tokens":10,"output_tokens":9}}`
+		events = []string{
+			`{"type":"message_start","message":{"id":"source-id","type":"message","model":"upstream-model","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"private-refusal-body"}}`,
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":9}}`,
+			`{"type":"message_stop"}`,
+		}
+	case types.RelayFormatGemini:
+		body = `{"responseId":"source-id","modelVersion":"upstream-model","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"private-refusal-body"}]},"finishReason":"SAFETY"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":19}}`
+		events = []string{body}
+	}
+	if !stream {
+		return body
+	}
+	var result strings.Builder
+	for _, event := range events {
+		fmt.Fprintf(&result, "data: %s\n\n", event)
+	}
+	if format == types.RelayFormatOpenAI {
+		result.WriteString("data: [DONE]\n\n")
+	}
+	return result.String()
+}
+
+func TestRequestTraceRequestShapeFormats(t *testing.T) {
+	for _, format := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini} {
+		t.Run(string(format), func(t *testing.T) {
+			storage, err := common.CreateBodyStorage([]byte(requestTraceProtocolRequest(format)))
+			require.NoError(t, err)
+			defer storage.Close()
+			collector := &common.RequestTraceCollector{}
+			collector.CaptureRequest(storage, true)
+			require.NotNil(t, collector.Shape)
+			shape := collector.Shape
+			messages := int64(1)
+			if format == types.RelayFormatOpenAI {
+				messages = 2
+			}
+			assert.Equal(t, messages, shape.Messages)
+			assert.EqualValues(t, 5, shape.TextCharacters)
+			assert.True(t, shape.System)
+			assert.EqualValues(t, 2, shape.Tools)
+			assert.Equal(t, "auto", shape.ToolChoice)
+			require.NotNil(t, shape.MaxTokens)
+			assert.EqualValues(t, 128, *shape.MaxTokens)
+			require.NotNil(t, shape.Temperature)
+			assert.Zero(t, *shape.Temperature)
+			assert.Equal(t, format == types.RelayFormatOpenAI, shape.IncludeUsage)
+			assert.False(t, collector.ShapeIncomplete)
+		})
+	}
+}
+
+func TestRequestTraceDecodedRequestShapeParity(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		claude     bool
+	}{
+		{"chat", requestTraceProtocolRequest(types.RelayFormatOpenAI), false},
+		{"claude", requestTraceProtocolRequest(types.RelayFormatClaude), true},
+		{"media", `{"messages":[{"role":"developer","content":[{"type":"text","text":"Hi中😊"},{"type":"image_url","image_url":null},{"type":"input_audio","input_audio":{}},{"type":"file","file":{}}]},{"role":"tool","content":"result"}],"max_tokens":0,"temperature":0}`, false},
+		{"legacy", `{"prompt":["Hi","中😊"],"functions":[{"name":"lookup"}],"function_call":{"name":"lookup"},"max_completion_tokens":0}`, false},
+		{"token-prompt", `{"prompt":[1,2,3],"input":["A","B"]}`, false},
+		{"null-tools", `{"messages":[],"tools":[null,{}],"tool_choice":null,"function_call":"auto"}`, false},
+		{"compat-declarations", `{"messages":[],"tools":[{"type":"function","functionDeclarations":[{"name":"first"},{"name":"second"}]}]}`, false},
+		{"compat-system", `{"messages":[{"role":"user","content":"Hi"}],"system":"system","instructions":"instructions"}`, false},
+		{"escaped-key", `{"messa\u0067es":[{"role":"user","content":"Hi"}]}`, false},
+		{"case-key", `{"Messages":[{"role":"user","content":"Hi"}]}`, false},
+		{"duplicate-key", `{"messages":[{"content":"first"}],"messages":[{"content":"last"}]}`, false},
+		{"claude-prompt-null", `{"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"ok"}],"prompt":null}`, true},
+		{"claude-tools", `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"中😊"}]}],"system":[],"tools":[null,{"name":"lookup"}],"tool_choice":{"type":"any"},"temperature":0}`, true},
+	} {
+		for _, level := range []string{"all", "errors"} {
+			t.Run(tc.name+"/"+level, func(t *testing.T) {
+				original, err := common.CreateBodyStorage([]byte(tc.body))
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, original.Close()) })
+				want := &common.RequestTraceCollector{}
+				want.CaptureRequest(original, true)
+				context, _ := gin.CreateTestContext(httptest.NewRecorder())
+				context.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+				context.Request.Header.Set("Content-Type", "application/json")
+				trace := &common.RequestTraceCollector{Config: common.RequestTraceConfig{Level: level}, SampledSuccess: true}
+				context.Set(common.RequestTraceContextKey, trace)
+				t.Cleanup(func() { common.CleanupBodyStorage(context) })
+				var value any = &dto.GeneralOpenAIRequest{}
+				if tc.claude {
+					value = &dto.ClaudeRequest{}
+				}
+				require.NoError(t, common.UnmarshalBodyReusable(context, value))
+				if level == "errors" {
+					assert.Nil(t, trace.Shape)
+				}
+				// 转换器修改业务 DTO 后，详情仍需保留客户端原始统计。
+				switch request := value.(type) {
+				case *dto.GeneralOpenAIRequest:
+					request.Messages, request.Prompt = nil, "changed"
+					if request.Temperature != nil {
+						*request.Temperature = 1
+					}
+				case *dto.ClaudeRequest:
+					request.Messages, request.System = nil, "changed"
+				}
+				storage, err := common.GetBodyStorage(context)
+				require.NoError(t, err)
+				trace.CaptureRequest(storage, true)
+				assert.Equal(t, want.Shape, trace.Shape)
+				assert.Equal(t, want.ShapeIncomplete, trace.ShapeIncomplete)
+				assert.Equal(t, want.ShapeIncompleteReason, trace.ShapeIncompleteReason)
+				assert.NotContains(t, common.GetJsonString(trace.Shape), "changed")
+			})
+		}
+	}
+}
+
+func TestRequestTraceProtocolFieldMatrix(t *testing.T) {
+	for _, format := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", format, stream), func(t *testing.T) {
+				body := requestTraceProtocolPayload(format, stream)
+				contentType := "application/json"
+				if stream {
+					contentType = "text/event-stream"
+				}
+				for _, chunkSize := range []int{1, len(body)} {
+					observer := common.NewTraceBodyObserver(time.Now())
+					for offset := 0; offset < len(body); offset += chunkSize {
+						observer.Observe([]byte(body[offset:min(offset+chunkSize, len(body))]), contentType)
+					}
+					observer.Finish()
+					response, upstream, reason := observer.Snapshot()
+					assert.Equal(t, "source-id", upstream.ResponseID)
+					assert.Equal(t, "upstream-model", upstream.Model)
+					assert.EqualValues(t, 1, response.ToolCalls)
+					assert.Equal(t, map[string]int64{"lookup": 1}, response.ToolCallsByName)
+					assert.False(t, response.MetadataIncomplete)
+					assert.False(t, response.Error)
+					require.NotNil(t, reason)
+					reasons := map[types.RelayFormat]string{types.RelayFormatOpenAI: "tool_calls", types.RelayFormatOpenAIResponses: "completed", types.RelayFormatClaude: "tool_use", types.RelayFormatGemini: "STOP"}
+					assert.Equal(t, reasons[format], *reason)
+					if format == types.RelayFormatClaude {
+						assert.Nil(t, response.ReasoningTokens)
+					} else {
+						require.NotNil(t, response.ReasoningTokens)
+						assert.EqualValues(t, 3, *response.ReasoningTokens)
+					}
+					if format == types.RelayFormatOpenAI || format == types.RelayFormatOpenAIResponses {
+						require.NotNil(t, upstream.Created)
+						assert.EqualValues(t, 1700000000, *upstream.Created)
+						assert.Equal(t, "priority", upstream.ServiceTier)
+					}
+					if format == types.RelayFormatOpenAI {
+						assert.Equal(t, "fp-source", upstream.Fingerprint)
+					}
+					if stream {
+						markers := map[types.RelayFormat]string{types.RelayFormatOpenAI: "[DONE]", types.RelayFormatOpenAIResponses: "response.completed", types.RelayFormatClaude: "message_stop"}
+						assert.Equal(t, markers[format], response.EndMarker)
+						assert.Equal(t, format != types.RelayFormatGemini, response.Done)
+					} else {
+						assert.True(t, response.Done)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRequestTraceDecodedMetadataParity(t *testing.T) {
+	formats := []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini}
+	textFrames := map[types.RelayFormat]string{
+		types.RelayFormatOpenAI:          `{"id":"source-id","model":"upstream-model","object":"chat.completion.chunk","created":1700000000,"system_fingerprint":"fp-source","choices":[{"index":0,"delta":{"content":"ordinary text with \"error\" and tool_calls","refusal":null,"tool_calls":null},"finish_reason":null}]}`,
+		types.RelayFormatOpenAIResponses: `{"type":"response.output_text.delta","delta":"ordinary text","output_index":0,"content_index":0}`,
+		types.RelayFormatClaude:          `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ordinary text"}}`,
+		types.RelayFormatGemini:          `{"responseId":"source-id","modelVersion":"upstream-model","candidates":[{"content":{"parts":[{"text":"ordinary text"}]},"finishReason":null}]}`,
+	}
+	for _, format := range formats {
+		for _, mode := range []string{"json", "sse", "text-only", "plain-json", "plain-sse"} {
+			stream := mode != "json" && mode != "plain-json"
+			for _, level := range []common.TraceMetadataLevel{common.TraceMetadataFull, common.TraceMetadataSummary} {
+				t.Run(fmt.Sprintf("%s/%s/%s", format, mode, level), func(t *testing.T) {
+					contentType := "application/json"
+					payload := requestTraceProtocolPayload(format, stream)
+					if strings.HasPrefix(mode, "plain-") {
+						payload = strings.ReplaceAll(payload, `,"service_tier":"priority"`, "")
+						payload = strings.ReplaceAll(payload, `"name":null,`, "")
+					}
+					if stream {
+						contentType = "text/event-stream"
+						if mode == "text-only" {
+							payload = "data: " + textFrames[format] + "\n\n"
+							if format == types.RelayFormatOpenAI {
+								payload = "data: " + `{"id":null,"created":0,"system_fingerprint":null,"choices":[{"delta":{"content":"text","annotations":[{"id":"nested-id","model":"nested-model"}]},"finish_reason":null}]}` + "\n\n"
+							} else if format == types.RelayFormatGemini {
+								payload = "data: " + `{"responseId":null,"modelVersion":123,"candidates":[{"content":{"parts":[{"text":"text"}]}}]}` + "\n\n"
+							}
+						}
+						payload = "data: " + textFrames[format] + "\n\n" + payload
+					}
+					original := common.NewTraceBodyObserverWithMode(time.Now(), level)
+					original.ObserveString(payload, contentType)
+					original.Finish()
+					wantResponse, wantUpstream, wantReason := original.Snapshot()
+
+					decoded := common.NewTraceBodyObserverWithMode(time.Now(), level)
+					context, _ := gin.CreateTestContext(httptest.NewRecorder())
+					context.Set(common.RequestTraceContextKey, &common.RequestTraceCollector{})
+					response := &http.Response{Header: http.Header{"Content-Type": {contentType}}, ContentLength: int64(len(payload)), Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(payload)), Observer: decoded, ContentType: contentType}}
+					common.UseDecodedRequestTrace(context, response)
+					body, err := io.ReadAll(response.Body)
+					require.NoError(t, err)
+					require.NoError(t, response.Body.Close())
+					frames := []string{string(body)}
+					if stream {
+						frames = strings.Split(strings.TrimSpace(string(body)), "\n\n")
+						if strings.Contains(string(body), "data: [DONE]") {
+							common.RecordRequestTraceDone(response)
+						}
+					}
+					for _, frame := range frames {
+						if stream {
+							frame = strings.TrimSpace(strings.TrimPrefix(frame, "data:"))
+							if frame == "[DONE]" {
+								common.RecordRequestTraceDone(response)
+								continue
+							}
+						}
+						var value any
+						switch format {
+						case types.RelayFormatOpenAI:
+							if stream {
+								value = &dto.ChatCompletionsStreamResponse{}
+							} else {
+								value = &dto.OpenAITextResponse{}
+							}
+						case types.RelayFormatOpenAIResponses:
+							if stream {
+								value = &dto.ResponsesStreamResponse{}
+							} else {
+								value = &dto.OpenAIResponsesResponse{}
+							}
+						case types.RelayFormatClaude:
+							value = &dto.ClaudeResponse{}
+						case types.RelayFormatGemini:
+							value = &dto.GeminiChatResponse{}
+						}
+						require.NoError(t, common.UnmarshalRequestTraceResponse(context, []byte(frame), value))
+					}
+					decoded.Finish()
+					gotResponse, gotUpstream, gotReason := decoded.Snapshot()
+					assert.Equal(t, wantResponse, gotResponse)
+					assert.Equal(t, wantUpstream, gotUpstream)
+					assert.Equal(t, wantReason, gotReason)
+					assert.Equal(t, original.MetadataLevel(), decoded.MetadataLevel())
+				})
+			}
+		}
+	}
+}
+
+type requestTraceShortWriter struct {
+	*httptest.ResponseRecorder
+}
+
+func (w requestTraceShortWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	n, _ := w.ResponseRecorder.Write(data[:min(5, len(data))])
+	return n, io.ErrShortWrite
+}
+
+func TestRequestTraceDecodedDelivery(t *testing.T) {
+	previous := common.GetRequestTraceConfig()
+	require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all"}`))
+	t.Cleanup(func() {
+		require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(previous)))
+	})
+	for _, stream := range []bool{false, true} {
+		for _, short := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/short=%t", stream, short), func(t *testing.T) {
+				var observer *common.TraceBodyObserver
+				app := gin.New()
+				app.Use(middleware.RequestTrace())
+				app.POST("/v1/chat/completions", func(c *gin.Context) {
+					observer = common.GetRequestTrace(c).ClientObserver
+					if stream {
+						helper.SetEventStreamHeaders(c)
+						_ = helper.ObjectData(c, &dto.ChatCompletionsStreamResponse{Choices: []dto.ChatCompletionsStreamResponseChoice{{Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{{Function: dto.FunctionResponse{Name: "lookup"}}}}}}})
+					} else {
+						c.Header("Content-Type", "application/json")
+						service.IOCopyBytesGracefully(c, nil, []byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"lookup"}}]},"finish_reason":"tool_calls"}]}`))
+					}
+				})
+				recorder := httptest.NewRecorder()
+				var writer http.ResponseWriter = recorder
+				if short {
+					writer = requestTraceShortWriter{recorder}
+				}
+				app.ServeHTTP(writer, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+				require.NotNil(t, observer)
+				response, _, _ := observer.Snapshot()
+				assert.Equal(t, short, response.Error)
+				assert.Equal(t, short, response.MetadataIncomplete)
+				if short {
+					assert.Zero(t, response.ToolCalls)
+					assert.False(t, response.Done)
+					assert.Contains(t, response.IncompleteReasons, "client_delivery_incomplete")
+				} else {
+					assert.Equal(t, map[string]int64{"lookup": 1}, response.ToolCallsByName)
+					assert.Equal(t, !stream, response.Done)
+				}
+			})
+		}
+	}
+}
+
+func TestRequestTraceProtocolEdgeFields(t *testing.T) {
+	hosted := `{"id":"source-id","object":"response","status":"completed","output":[{"type":"web_search_call","id":"ws-1","status":"completed"},{"type":"file_search_call","id":"fs-1","status":"completed"},{"type":"image_generation_call","id":"img-1","status":"completed"},{"type":"function_call","id":"fc-1","name":"lookup","arguments":"{}"}]}`
+	hostedStream := "data: " + `{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws-1"}}` + "\n\ndata: " + `{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"completed"}}` + "\n\ndata: " + `{"type":"response.completed","response":` + hosted + `}` + "\n\n"
+	for _, tc := range []struct {
+		name, body, contentType, marker string
+		tools                           map[string]int64
+		failed, refused                 bool
+	}{
+		{name: "Responses done alias", body: strings.ReplaceAll(requestTraceProtocolPayload(types.RelayFormatOpenAIResponses, true), `"type":"response.completed"`, `"type":"response.done"`), contentType: "text/event-stream", marker: "response.done", tools: map[string]int64{"lookup": 1}},
+		{name: "Responses content filter", body: "data: " + `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}` + "\n\n", contentType: "text/event-stream", marker: "response.incomplete", refused: true},
+		{name: "Responses hosted tools JSON", body: hosted, contentType: "application/json", tools: map[string]int64{"web_search_call": 1, "file_search_call": 1, "image_generation_call": 1, "lookup": 1}},
+		{name: "Responses hosted tools SSE", body: hostedStream, contentType: "text/event-stream", marker: "response.completed", tools: map[string]int64{"web_search_call": 1, "file_search_call": 1, "image_generation_call": 1, "lookup": 1}},
+		{name: "string error", body: `{"error":"private-error-original"}`, contentType: "application/json", failed: true},
+		{name: "Claude refusal", body: `{"id":"source-id","type":"message","content":[{"type":"text","text":"private-refusal-body"}],"stop_reason":"refusal"}`, contentType: "application/json", refused: true},
+		{name: "Gemini blocked prompt", body: `{"promptFeedback":{"blockReason":"SAFETY"}}`, contentType: "application/json", refused: true},
+		{name: "Gemini usage-only SSE", body: "data: " + `{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"}]}` + "\n\ndata: " + `{"usageMetadata":{"thoughtsTokenCount":3}}` + "\n\n", contentType: "text/event-stream", tools: map[string]int64{"lookup": 1}},
+	} {
+		for _, level := range []common.TraceMetadataLevel{common.TraceMetadataFull, common.TraceMetadataSummary} {
+			t.Run(tc.name+"/"+string(level), func(t *testing.T) {
+				observer := common.NewTraceBodyObserverWithMode(time.Now(), level)
+				observer.ObserveString(tc.body, tc.contentType)
+				observer.Finish()
+				response, _, _ := observer.Snapshot()
+				assert.Equal(t, tc.failed, response.Error)
+				assert.Equal(t, tc.refused, response.Refused)
+				assert.False(t, response.MetadataIncomplete)
+				assert.Equal(t, tc.marker, response.EndMarker)
+				if level == common.TraceMetadataFull {
+					var tools int64
+					for _, count := range tc.tools {
+						tools += count
+					}
+					assert.Equal(t, tools, response.ToolCalls)
+					assert.Equal(t, tc.tools, response.ToolCallsByName)
+				} else {
+					assert.Zero(t, response.ToolCalls)
+				}
+				assert.NotContains(t, common.GetJsonString(response), "private-")
+			})
+		}
+	}
+}
+
+func TestRequestTraceReasoningTokenFields(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage string
+		want        *int64
+	}{
+		{name: "missing", usage: `{}`},
+		{name: "explicit zero", usage: `{"completion_tokens_details":{"reasoning_tokens":0}}`, want: common.GetPointer(int64(0))},
+		{name: "flat upstream field", usage: `{"reasoning_tokens":3}`, want: common.GetPointer(int64(3))},
+		{name: "standard field precedes flat field", usage: `{"completion_tokens_details":{"reasoning_tokens":0},"reasoning_tokens":3}`, want: common.GetPointer(int64(0))},
+		{name: "null", usage: `{"completion_tokens_details":{"reasoning_tokens":null}}`},
+		{name: "fraction", usage: `{"completion_tokens_details":{"reasoning_tokens":1.5}}`},
+		{name: "negative", usage: `{"completion_tokens_details":{"reasoning_tokens":-1}}`},
+		{name: "overflow", usage: `{"completion_tokens_details":{"reasoning_tokens":9223372036854775808}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observer := common.NewTraceBodyObserver(time.Now())
+			body := `{"choices":[],"usage":` + tc.usage + `}`
+			observer.ObserveString(body, "application/json")
+			observer.Finish()
+			response, _, _ := observer.Snapshot()
+			assert.Equal(t, tc.want, response.ReasoningTokens)
+			decoded := common.NewTraceBodyObserver(time.Now())
+			decoded.Prepare("application/json", int64(len(body)))
+			var value dto.OpenAITextResponse
+			if err := common.UnmarshalJsonStr(body, &value); err != nil {
+				decoded.ObserveDecoded([]byte(body), nil)
+			} else {
+				decoded.ObserveDecoded([]byte(body), &value)
+			}
+			decoded.Finish()
+			actual, _, _ := decoded.Snapshot()
+			assert.Equal(t, response, actual)
+		})
+	}
+}
+
+func TestRequestTraceAlternateRequestFields(t *testing.T) {
+	snake := strings.NewReplacer("systemInstruction", "system_instruction", "toolConfig", "tool_config", "functionCallingConfig", "function_calling_config", "functionDeclarations", "function_declarations", "generationConfig", "generation_config", "maxOutputTokens", "max_output_tokens").Replace(requestTraceProtocolRequest(types.RelayFormatGemini))
+	for _, tc := range []struct {
+		name, body, choice    string
+		messages, text, tools int64
+		system                bool
+	}{
+		{name: "Completions string prompt", body: `{"prompt":"Hi中😊","max_tokens":128,"temperature":0}`, messages: 1, text: 4},
+		{name: "Responses null instructions", body: `{"input":"Hi中😊","instructions":null,"max_output_tokens":128,"temperature":0}`, messages: 1, text: 4},
+		{name: "Completions batch prompts", body: `{"prompt":["Hi","中😊"],"max_tokens":128,"temperature":0}`, messages: 2, text: 4},
+		{name: "OpenAI legacy functions", body: `{"messages":[{"role":"user","content":"Hi中😊"}],"functions":[{"name":"lookup"}],"function_call":"auto","max_tokens":128,"temperature":0}`, messages: 1, text: 4, tools: 1, choice: "auto"},
+		{name: "Gemini snake case", body: snake, messages: 1, text: 5, tools: 2, choice: "auto", system: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage, err := common.CreateBodyStorage([]byte(tc.body))
+			require.NoError(t, err)
+			defer storage.Close()
+			collector := &common.RequestTraceCollector{}
+			collector.CaptureRequest(storage, true)
+			require.NotNil(t, collector.Shape)
+			shape := collector.Shape
+			assert.Equal(t, tc.messages, shape.Messages)
+			assert.Equal(t, tc.text, shape.TextCharacters)
+			assert.Equal(t, tc.tools, shape.Tools)
+			assert.Equal(t, tc.choice, shape.ToolChoice)
+			assert.Equal(t, tc.system, shape.System)
+			require.NotNil(t, shape.MaxTokens)
+			assert.EqualValues(t, 128, *shape.MaxTokens)
+			require.NotNil(t, shape.Temperature)
+			assert.Zero(t, *shape.Temperature)
+		})
+	}
+}
+
+func TestRequestTraceResponseMediaTypes(t *testing.T) {
+	for _, tc := range []struct {
+		contentType string
+		stream      bool
+	}{
+		{contentType: "text/event-stream; charset=utf-8", stream: true},
+		{contentType: "Text/Event-Stream ; charset=utf-8", stream: true},
+		{contentType: `application/json; example="text/event-stream"`},
+	} {
+		for _, prepared := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/prepared=%t", tc.contentType, prepared), func(t *testing.T) {
+				observer := common.NewTraceBodyObserver(time.Now())
+				if prepared {
+					observer.Prepare(tc.contentType, -1)
+				}
+				observer.ObserveString(requestTraceProtocolPayload(types.RelayFormatOpenAI, tc.stream), tc.contentType)
+				observer.Finish()
+				response, _, reason := observer.Snapshot()
+				assert.Equal(t, map[string]int64{"lookup": 1}, response.ToolCallsByName)
+				assert.True(t, response.Done)
+				assert.False(t, response.MetadataIncomplete)
+				require.NotNil(t, reason)
+				assert.Equal(t, "tool_calls", *reason)
+			})
+		}
+	}
+}
+
+func TestRequestTraceRequestMediaFields(t *testing.T) {
+	for _, tc := range []struct {
+		name, body                    string
+		images, audios, videos, files int64
+	}{
+		{name: "OpenAI", body: `{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"},{"type":"image_url","image_url":{"url":"private-media"}},{"type":"input_audio","input_audio":{"data":"private-media"}},{"type":"video_url","video_url":{"url":"private-media"}},{"type":"file","file":{"file_data":"private-media"}}]}]}`, images: 1, audios: 1, videos: 1, files: 1},
+		{name: "Responses", body: `{"input":[{"role":"user","content":[{"type":"input_text","text":"Hi"},{"type":"input_image","image_url":"private-media"},{"type":"input_file","file_data":"private-media"}]}]}`, images: 1, files: 1},
+		{name: "Claude", body: `{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"},{"type":"image","source":{"data":"private-media"}},{"type":"document","source":{"data":"private-media"}}]}]}`, images: 1, files: 1},
+		{name: "Gemini", body: `{"contents":[{"parts":[{"text":"Hi"},{"inlineData":{"mimeType":"image/png","data":"private-media"}},{"fileData":{"mimeType":"audio/wav","fileUri":"private-media"}},{"fileData":{"mimeType":"video/mp4","fileUri":"private-media"}},{"inlineData":{"mimeType":"application/pdf","data":"private-media"}}]}]}`, images: 1, audios: 1, videos: 1, files: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage, err := common.CreateBodyStorage([]byte(tc.body))
+			require.NoError(t, err)
+			defer storage.Close()
+			collector := &common.RequestTraceCollector{}
+			collector.CaptureRequest(storage, true)
+			require.NotNil(t, collector.Shape)
+			assert.EqualValues(t, 1, collector.Shape.Messages)
+			assert.EqualValues(t, 2, collector.Shape.TextCharacters)
+			assert.Equal(t, tc.images, collector.Shape.Images)
+			assert.Equal(t, tc.audios, collector.Shape.Audios)
+			assert.Equal(t, tc.videos, collector.Shape.Videos)
+			assert.Equal(t, tc.files, collector.Shape.Files)
+			assert.NotContains(t, common.GetJsonString(collector.Shape), "private-media")
+		})
+	}
+}
+
+func TestRequestTraceToolResultText(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{name: "OpenAI", body: `{"messages":[{"role":"tool","tool_call_id":"call-1","content":"Hi中😊"}]}`},
+		{name: "Claude", body: `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"Hi中😊"}]}]}`},
+		{name: "Responses", body: `{"input":[{"type":"function_call_output","call_id":"call-1","output":"Hi中😊"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage, err := common.CreateBodyStorage([]byte(tc.body))
+			require.NoError(t, err)
+			defer storage.Close()
+			collector := &common.RequestTraceCollector{}
+			collector.CaptureRequest(storage, true)
+			require.NotNil(t, collector.Shape)
+			assert.EqualValues(t, 1, collector.Shape.Messages)
+			assert.EqualValues(t, 4, collector.Shape.TextCharacters)
+			assert.NotContains(t, common.GetJsonString(collector.Shape), "Hi中😊")
+		})
+	}
+}
+
+func TestRequestTraceConversionFieldMatrix(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	type handler func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+	claudeJSON := func(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+		return claude.ClaudeHandler(c, resp, info)
+	}
+	claudeStream := func(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+		return claude.ClaudeStreamHandler(c, resp, info)
+	}
+	claudeResponses := func(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+		return claude.ClaudeResponsesStreamHandler(c, resp, info)
+	}
+	jsonHandlers := map[types.RelayFormat]map[types.RelayFormat]handler{
+		types.RelayFormatOpenAI: {
+			types.RelayFormatOpenAI: openai.OpenaiHandler, types.RelayFormatOpenAIResponses: openai.OaiChatToResponsesHandler,
+			types.RelayFormatClaude: openai.OpenaiHandler, types.RelayFormatGemini: openai.OpenaiHandler,
+		},
+		types.RelayFormatOpenAIResponses: {
+			types.RelayFormatOpenAI: openai.OaiResponsesToChatHandler, types.RelayFormatOpenAIResponses: openai.OaiResponsesHandler,
+			types.RelayFormatClaude: openai.OaiResponsesToChatHandler, types.RelayFormatGemini: openai.OaiResponsesToChatHandler,
+		},
+		types.RelayFormatClaude: {
+			types.RelayFormatOpenAI: claudeJSON, types.RelayFormatOpenAIResponses: claudeJSON,
+			types.RelayFormatClaude: claudeJSON, types.RelayFormatGemini: claudeJSON,
+		},
+		types.RelayFormatGemini: {
+			types.RelayFormatOpenAI: gemini.GeminiChatHandler, types.RelayFormatOpenAIResponses: gemini.GeminiResponsesHandler,
+			types.RelayFormatClaude: gemini.GeminiChatHandler, types.RelayFormatGemini: gemini.GeminiTextGenerationHandler,
+		},
+	}
+	streamHandlers := map[types.RelayFormat]map[types.RelayFormat]handler{
+		types.RelayFormatOpenAI: {
+			types.RelayFormatOpenAI: openai.OaiStreamHandler, types.RelayFormatOpenAIResponses: openai.OaiChatToResponsesStreamHandler,
+			types.RelayFormatClaude: openai.OaiStreamHandler, types.RelayFormatGemini: openai.OaiStreamHandler,
+		},
+		types.RelayFormatOpenAIResponses: {
+			types.RelayFormatOpenAI: openai.OaiResponsesToChatStreamHandler, types.RelayFormatOpenAIResponses: openai.OaiResponsesStreamHandler,
+			types.RelayFormatClaude: openai.OaiResponsesToChatStreamHandler, types.RelayFormatGemini: openai.OaiResponsesToChatStreamHandler,
+		},
+		types.RelayFormatClaude: {
+			types.RelayFormatOpenAI: claudeStream, types.RelayFormatOpenAIResponses: claudeResponses,
+			types.RelayFormatClaude: claudeStream, types.RelayFormatGemini: claudeStream,
+		},
+		types.RelayFormatGemini: {
+			types.RelayFormatOpenAI: gemini.GeminiChatStreamHandler, types.RelayFormatOpenAIResponses: gemini.GeminiResponsesStreamHandler,
+			types.RelayFormatClaude: gemini.GeminiChatStreamHandler, types.RelayFormatGemini: gemini.GeminiTextGenerationStreamHandler,
+		},
+	}
+	formats := []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini}
+	for _, upstreamFormat := range formats {
+		for _, clientFormat := range formats {
+			for _, mode := range []struct{ stream, refused bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+				stream, refused := mode.stream, mode.refused
+				t.Run(fmt.Sprintf("%s_to_%s/stream=%t/refused=%t", upstreamFormat, clientFormat, stream, refused), func(t *testing.T) {
+					setupRequestTraceDatabase(t)
+					require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all"}`))
+					body := requestTraceProtocolRequest(clientFormat)
+					if stream && clientFormat != types.RelayFormatGemini {
+						var fields map[string]any
+						require.NoError(t, common.Unmarshal([]byte(body), &fields))
+						fields["stream"] = true
+						encoded, err := common.Marshal(fields)
+						require.NoError(t, err)
+						body = string(encoded)
+					}
+					path := "/v1/chat/completions"
+					if clientFormat == types.RelayFormatClaude {
+						path = "/v1/messages"
+					} else if clientFormat == types.RelayFormatOpenAIResponses {
+						path = "/v1/responses"
+					} else if clientFormat == types.RelayFormatGemini {
+						path = "/v1beta/models/client-model:generateContent"
+						if stream {
+							path = "/v1beta/models/client-model:streamGenerateContent"
+						}
+					}
+					app := gin.New()
+					app.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+					app.POST(path, func(c *gin.Context) {
+						c.Set("id", 11)
+						_, err := common.GetBodyStorage(c)
+						require.NoError(t, err)
+						info := &relaycommon.RelayInfo{RelayFormat: clientFormat, FinalRequestRelayFormat: upstreamFormat, IsStream: stream, RequestURLPath: path, RelayMode: relayconstant.RelayModeChatCompletions, ShouldIncludeUsage: true, OriginModelName: "client-model", ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelId: 7, UpstreamModelName: "upstream-model"}}
+						info.InitRequestConversionChain()
+						info.ChannelSetting.PassThroughBodyEnabled = true
+						if upstreamFormat != clientFormat {
+							var request any
+							switch clientFormat {
+							case types.RelayFormatOpenAI:
+								request = &dto.GeneralOpenAIRequest{}
+							case types.RelayFormatOpenAIResponses:
+								request = &dto.OpenAIResponsesRequest{}
+							case types.RelayFormatClaude:
+								request = &dto.ClaudeRequest{}
+							case types.RelayFormatGemini:
+								request = &dto.GeminiChatRequest{}
+							}
+							require.NoError(t, common.Unmarshal([]byte(body), request))
+							converted, err := service.ConvertRequest(c, info, upstreamFormat, request)
+							require.NoError(t, err)
+							require.NotNil(t, converted.Value)
+						}
+						trace := common.GetRequestTrace(c)
+						attempt := trace.StartAttempt(0, 7, c.Request)
+						attempt.Upstream.Status, attempt.Upstream.Protocol, attempt.Upstream.RequestID = 200, "HTTP/2.0", "source-request-id"
+						attempt.Observer = trace.ClientObserver.NewRelatedObserver()
+						contentType := "application/json"
+						handle := jsonHandlers[upstreamFormat][clientFormat]
+						if stream {
+							contentType, handle = "text/event-stream", streamHandlers[upstreamFormat][clientFormat]
+						}
+						payload := requestTraceProtocolPayload(upstreamFormat, stream)
+						if refused {
+							payload = requestTraceProtocolRefusalPayload(upstreamFormat, stream)
+						}
+						response := &http.Response{StatusCode: 200, Proto: "HTTP/2.0", Header: http.Header{"Content-Type": []string{contentType}}, Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(payload)), ContentType: contentType, Observer: attempt.Observer}}
+						usage, relayError := handle(c, info, response)
+						require.Nil(t, relayError)
+						require.NotNil(t, usage)
+						other := model.NewLogOther()
+						service.AppendRelayLogAdminInfo(c, info, other)
+						model.RecordConsumeLog(c, 11, model.RecordConsumeLogParams{ChannelId: 7, ModelName: "client-model", PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, Other: other})
+						trace.FinishAttempt(0)
+					})
+					recorder := httptest.NewRecorder()
+					request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+					request.Header.Set("Content-Type", "application/json")
+					app.ServeHTTP(recorder, request)
+					require.Equal(t, 200, recorder.Code)
+					awaitRequestTraceWrites(t)
+					requestID := recorder.Header().Get(common.RequestIdKey)
+					rows, err := model.GetRequestTraces(t.Context(), requestID, 0, true)
+					require.NoError(t, err)
+					require.Len(t, rows, 1)
+					record := rows[0]
+					require.NotNil(t, record.AdminInfo)
+					admin := record.AdminInfo
+					assert.Equal(t, "source-id", admin.Upstream.ResponseID)
+					assert.Equal(t, "upstream-model", admin.Upstream.Model)
+					assert.Equal(t, "source-request-id", admin.Upstream.RequestID)
+					assert.Equal(t, "HTTP/2.0", admin.Upstream.Protocol)
+					assert.Equal(t, 200, admin.Upstream.Status)
+					require.NotNil(t, record.Trace.RequestBytes)
+					assert.EqualValues(t, len(body), *record.Trace.RequestBytes)
+					require.NotNil(t, admin.Shape)
+					assert.EqualValues(t, 5, admin.Shape.TextCharacters)
+					assert.True(t, admin.Shape.System)
+					assert.EqualValues(t, 2, admin.Shape.Tools)
+					assert.Equal(t, "auto", admin.Shape.ToolChoice)
+					if refused {
+						assert.Zero(t, admin.Response.ToolCalls)
+						assert.Empty(t, admin.Response.ToolCallsByName)
+					} else {
+						assert.EqualValues(t, 1, admin.Response.ToolCalls)
+						assert.Equal(t, map[string]int64{"lookup": 1}, admin.Response.ToolCallsByName)
+					}
+					assert.Equal(t, refused, admin.Response.Refused)
+					assert.False(t, admin.Response.MetadataIncomplete)
+					assert.False(t, admin.Response.Error)
+					assert.Equal(t, "success", record.Trace.Outcome)
+					if upstreamFormat == types.RelayFormatClaude {
+						assert.Nil(t, admin.Response.ReasoningTokens)
+					} else {
+						require.NotNil(t, admin.Response.ReasoningTokens)
+						assert.EqualValues(t, 3, *admin.Response.ReasoningTokens)
+					}
+					require.NotNil(t, record.Trace.FinishReason)
+					reasons := map[types.RelayFormat]string{types.RelayFormatOpenAI: "tool_calls", types.RelayFormatOpenAIResponses: "completed", types.RelayFormatClaude: "tool_use", types.RelayFormatGemini: "STOP"}
+					if !refused {
+						assert.Equal(t, reasons[clientFormat], *record.Trace.FinishReason)
+					}
+					if stream {
+						markers := map[types.RelayFormat]string{types.RelayFormatOpenAI: "[DONE]", types.RelayFormatOpenAIResponses: "response.completed", types.RelayFormatClaude: "message_stop"}
+						marker := markers[clientFormat]
+						if refused && clientFormat == types.RelayFormatOpenAIResponses && upstreamFormat != types.RelayFormatOpenAIResponses {
+							marker = "response.incomplete"
+						}
+						assert.Equal(t, marker, admin.Response.EndMarker)
+					}
+					assert.NotContains(t, common.GetJsonString(record), "unused_tool")
+					assert.NotContains(t, common.GetJsonString(record), "Hi中😊")
+					assert.NotContains(t, common.GetJsonString(record), "private-refusal-body")
+					owned, err := model.GetRequestTraces(t.Context(), requestID, 11, false)
+					require.NoError(t, err)
+					require.Len(t, owned, 1)
+					assert.Nil(t, owned[0].AdminInfo)
+					other, err := model.GetRequestTraces(t.Context(), requestID, 12, false)
+					require.NoError(t, err)
+					assert.Empty(t, other)
+				})
+			}
+		}
+	}
 }
 
 func TestRequestTraceNativeRelayMetadata(t *testing.T) {
@@ -1472,8 +2308,6 @@ func TestRequestTraceNativeRelayMetadata(t *testing.T) {
 			require.NotNil(t, rows[0].AdminInfo)
 			require.NotNil(t, rows[0].Trace.FinishReason)
 			assert.Equal(t, tc.reason, *rows[0].Trace.FinishReason)
-			assert.EqualValues(t, 2, rows[0].AdminInfo.Response.ContentCharacters)
-			assert.EqualValues(t, recorder.Body.Len(), rows[0].Trace.ResponseBytes)
 			assert.Equal(t, common.TraceMetadataFull, rows[0].AdminInfo.MetadataLevel)
 			assert.False(t, rows[0].AdminInfo.Response.MetadataIncomplete)
 		})
@@ -1484,16 +2318,15 @@ func TestRequestTraceSummaryAndPromotion(t *testing.T) {
 	t.Run("related full observer does not leak detailed counts into summary", func(t *testing.T) {
 		client := common.NewTraceBodyObserverWithMode(time.Now(), common.TraceMetadataSummary)
 		upstream := client.NewRelatedObserverWithMode(common.TraceMetadataFull)
-		body := `{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}`
+		body := `{"id":"source-id","choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}`
 		upstream.ObserveString(body, "application/json")
 		upstream.Finish()
 		client.ObserveString(body, "application/json")
 		client.Finish()
-		full, _, _ := upstream.Snapshot()
-		summary, _, reason := client.Snapshot()
-		assert.EqualValues(t, 2, full.ContentCharacters)
-		assert.Zero(t, summary.ContentCharacters)
-		assert.Nil(t, summary.Keys)
+		_, fullInfo, _ := upstream.Snapshot()
+		_, summaryInfo, reason := client.Snapshot()
+		assert.Equal(t, "source-id", fullInfo.ResponseID)
+		assert.Empty(t, summaryInfo.ResponseID)
 		require.NotNil(t, reason)
 		assert.Equal(t, "stop", *reason)
 	})
@@ -1525,19 +2358,17 @@ func TestRequestTraceSummaryAndPromotion(t *testing.T) {
 			assert.Equal(t, tc.full, observer.MetadataLevel() == common.TraceMetadataFull)
 			assert.Equal(t, tc.partial, response.MetadataIncomplete)
 			assert.Equal(t, tc.marker, response.EndMarker)
-			assert.EqualValues(t, len(tc.payload), observer.Size())
 			if tc.reason != "" {
 				require.NotNil(t, reason)
 				assert.Equal(t, tc.reason, *reason)
 			}
-			assert.Zero(t, response.ContentCharacters)
 			assert.Zero(t, response.ToolCalls)
 			if tc.partial {
 				assert.Contains(t, response.IncompleteReasons, "capture_upgraded")
 			}
 		})
 	}
-	t.Run("summary JSON size limit preserves byte count", func(t *testing.T) {
+	t.Run("summary JSON size limit still marks incomplete metadata", func(t *testing.T) {
 		payload := `{"choices":[{"message":{"content":"` + strings.Repeat("x", 64<<10) + `"},"finish_reason":"stop"}]}`
 		for _, level := range []common.TraceMetadataLevel{common.TraceMetadataSummary, common.TraceMetadataFull} {
 			observer := common.NewTraceBodyObserverWithMode(time.Now(), level)
@@ -1545,11 +2376,8 @@ func TestRequestTraceSummaryAndPromotion(t *testing.T) {
 			observer.ObserveString(payload, "application/json")
 			observer.Finish()
 			response, _, _ := observer.Snapshot()
-			assert.EqualValues(t, len(payload), observer.Size())
 			assert.Equal(t, level == common.TraceMetadataSummary, response.MetadataIncomplete)
-			if level == common.TraceMetadataFull {
-				assert.EqualValues(t, 64<<10, response.ContentCharacters)
-			} else {
+			if level == common.TraceMetadataSummary {
 				assert.Contains(t, response.IncompleteReasons, "size_limit")
 			}
 		}
@@ -1568,7 +2396,6 @@ func TestRequestTraceSummaryAndPromotion(t *testing.T) {
 		assert.Equal(t, common.TraceMetadataFull, observer.MetadataLevel())
 		assert.Contains(t, response.IncompleteReasons, "upstream_read_error")
 		assert.Contains(t, response.IncompleteReasons, "capture_upgraded")
-		assert.Zero(t, response.ContentCharacters)
 	})
 	t.Run("reuse preserves source and delivery failure stays local", func(t *testing.T) {
 		source := common.NewTraceBodyObserver(time.Now())
@@ -1580,14 +2407,12 @@ func TestRequestTraceSummaryAndPromotion(t *testing.T) {
 		client.DeliveryFailed()
 		client.Finish()
 		response, _, _ := client.Snapshot()
-		assert.EqualValues(t, 2, response.ContentCharacters)
 		assert.True(t, response.Error)
 		assert.False(t, response.Done)
 		assert.Contains(t, response.IncompleteReasons, "client_delivery_incomplete")
 		upstream, _, _ := source.Snapshot()
 		assert.False(t, upstream.Error)
 		assert.True(t, upstream.Done)
-		assert.EqualValues(t, 9, client.Size())
 	})
 }
 

@@ -135,6 +135,9 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 	}
 	if strings.HasPrefix(contentType, "application/json") {
 		err = Unmarshal(requestBody, v)
+		if err == nil {
+			captureDecodedRequestTrace(c, storage, requestBody, v)
+		}
 	} else if strings.Contains(contentType, gin.MIMEPOSTForm) {
 		err = parseFormData(requestBody, v)
 	} else if strings.Contains(contentType, gin.MIMEMultipartPOSTForm) {

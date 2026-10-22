@@ -31,7 +31,6 @@ export type RequestTrace = {
   trace: {
     ms: number
     req_bytes?: number
-    resp_bytes: number
     status: number
     finish_reason?: string
     stage?: string
@@ -62,7 +61,6 @@ export type RequestTrace = {
       max_tokens?: number
       temperature?: number
       include_usage?: boolean
-      keys?: string[]
     }
     upstream: {
       status?: number
@@ -82,23 +80,16 @@ export type RequestTrace = {
     }
     resp: {
       error?: boolean
-      content_type?: string
-      content_chars: number
-      reasoning_chars: number
       reasoning_tokens?: number
       reasoning_output_tokens?: number
       tool_calls?: number
       tool_calls_by_name?: Record<string, number>
       refused?: boolean
-      chunks?: number
-      last_chunk_ms?: number
       done: boolean
       end_marker?: string
       end_marker_policy?: 'required' | 'not_applicable'
-      usage_chunk: boolean
       metadata_incomplete?: boolean
       incomplete_reasons?: string[]
-      keys?: Record<string, string[]>
     }
   }
 }

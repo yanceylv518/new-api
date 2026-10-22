@@ -363,18 +363,12 @@ describe('request trace log details', () => {
         }),
       },
     })
-    await screen.findByText('Field-name fingerprint')
+    await screen.findByText('Finish reason')
     expect(screen.getAllByText('Response Time')).toHaveLength(1)
     expect(screen.getByText('15 ms')).toBeInTheDocument()
     expect(screen.queryByText('Request trace')).not.toBeInTheDocument()
     expect(screen.queryByText('Request metadata')).not.toBeInTheDocument()
-    const headings = [
-      'Request Conversion',
-      'Request',
-      'Upstream',
-      'Response',
-      'Field-name fingerprint',
-    ]
+    const headings = ['Request Conversion', 'Request', 'Upstream', 'Response']
     const nodes = headings.map((heading) =>
       screen.getByText(heading, { exact: true })
     )
@@ -409,21 +403,26 @@ describe('request trace log details', () => {
     expect(screen.queryByText('Streaming')).not.toBeInTheDocument()
   })
 
-  test('keeps field fingerprints collapsed and supports keyboard expansion', async () => {
+  test('hides removed diagnostics in legacy records and preserves billing tokens', async () => {
     vi.spyOn(api, 'get').mockResolvedValue(response([detailed]))
-    renderDetails({ isAdmin: true })
-    const trigger = await screen.findByRole('button', {
-      name: 'Field-name fingerprint',
-    })
-    expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    expect(screen.getByText('3 layers')).toBeInTheDocument()
-    expect(screen.queryByText('choices')).not.toBeInTheDocument()
-    trigger.focus()
-    await userEvent.keyboard('{Enter}')
-    expect(trigger).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('choices')).toBeVisible()
-    await userEvent.keyboard('{Enter}')
-    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    renderDetails({ isAdmin: true, isRoot: true })
+    await screen.findByText('Finish reason')
+    for (const label of [
+      'Top-level fields',
+      'Response body',
+      'Output',
+      'Streaming',
+      'Field-name fingerprint',
+    ]) {
+      expect(screen.queryByText(label, { exact: true })).not.toBeInTheDocument()
+    }
+    expect(screen.queryByText('Body: 61 characters')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('Reasoning: 318 characters')
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('provider-response')).toBeInTheDocument()
+    expect(screen.getByText('Input Tokens')).toBeInTheDocument()
+    expect(screen.getByText('Output Tokens')).toBeInTheDocument()
   })
 
   test('keeps ordinary users to request and response summaries even if extra metadata is returned', async () => {
@@ -444,7 +443,7 @@ describe('request trace log details', () => {
     }
   })
 
-  test('shows truncation and a reasoning-only warning without inventing body text', async () => {
+  test('shows truncation and the missing end marker without removed statistics', async () => {
     vi.spyOn(api, 'get').mockResolvedValue(
       response([
         {
@@ -471,22 +470,16 @@ describe('request trace log details', () => {
     })
     await screen.findByText('Truncated')
     expect(screen.getByText('length')).toBeInTheDocument()
-    expect(screen.getByText('Body: 0 characters')).toHaveClass(
-      'text-destructive'
-    )
+    expect(screen.queryByText('Body: 0 characters')).not.toBeInTheDocument()
     expect(
-      screen.getByText(
-        'The output limit was used entirely for reasoning; no body text was returned.'
-      )
+      screen.getByText('Output was truncated at the configured limit.')
     ).toBeInTheDocument()
-    expect(screen.getByText(/First: 2.81 s/)).toBeInTheDocument()
-    expect(screen.getByText(/Last: 15.12 s/)).toBeInTheDocument()
+    expect(screen.queryByText(/First: 2.81 s/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Last: 15.12 s/)).not.toBeInTheDocument()
     expect(screen.getByText('End marker missing')).toHaveClass(
       'text-destructive'
     )
-    expect(screen.getByText(/Usage event missing/)).toHaveClass(
-      'text-destructive'
-    )
+    expect(screen.queryByText(/Usage event missing/)).not.toBeInTheDocument()
   })
 
   test('keeps error information ahead of request data and preserves legacy error details', async () => {
@@ -553,7 +546,7 @@ describe('request trace log details', () => {
     expect(screen.queryByText('Upstream')).not.toBeInTheDocument()
   })
 
-  test('shows final attempt first and leaves earlier attempts collapsed for administrators', async () => {
+  test('shows only the final attempt for administrators', async () => {
     vi.spyOn(api, 'get').mockResolvedValue(
       response([
         {
@@ -572,19 +565,37 @@ describe('request trace log details', () => {
       ])
     )
     renderDetails({ isAdmin: true })
-    const trigger = await screen.findByRole('button', {
-      name: 'Previous upstream attempts (1)',
-    })
+    await screen.findByText('Finish reason')
+    expect(
+      screen.queryByRole('button', { name: 'Previous upstream attempts (1)' })
+    ).not.toBeInTheDocument()
     expect(screen.queryByText('first-attempt-id')).not.toBeInTheDocument()
-    await userEvent.click(trigger)
-    expect(screen.getByText('first-attempt-id')).toBeVisible()
-    expect(screen.getByText('overloaded')).toBeVisible()
+    expect(screen.queryByText('overloaded')).not.toBeInTheDocument()
   })
 
   test.each([
     ['failed', 'failed', true, 'required', false, 'Failed'],
     ['PROVIDER_UNKNOWN', 'unknown', false, 'required', false, 'Unknown'],
     ['SAFETY', 'success', false, 'not_applicable', false, 'Refused'],
+    ['IMAGE_SAFETY', 'success', false, 'not_applicable', false, 'Refused'],
+    ['refusal', 'success', false, 'required', true, 'Refused'],
+    [
+      'incomplete:content_filter',
+      'success',
+      false,
+      'required',
+      true,
+      'Refused',
+    ],
+    ['incomplete', 'success', false, 'required', true, 'Incomplete'],
+    [
+      'incomplete:max_output_tokens',
+      'success',
+      false,
+      'required',
+      true,
+      'Truncated',
+    ],
     ['STOP', 'success', false, 'not_applicable', false, 'Normal completion'],
   ] as const)(
     'classifies %s without inventing successful completion',
@@ -610,6 +621,15 @@ describe('request trace log details', () => {
       renderDetails({ isAdmin: true, log: { ...log, is_stream: true } })
       await screen.findByText(reason)
       expect(screen.getAllByText(label).length).toBeGreaterThan(0)
+      if (label === 'Truncated') {
+        expect(
+          screen.getByText('Output was truncated at the configured limit.')
+        ).toBeInTheDocument()
+      } else {
+        expect(
+          screen.queryByText('Output was truncated at the configured limit.')
+        ).not.toBeInTheDocument()
+      }
       if (label !== 'Normal completion') {
         expect(screen.queryByText('Normal completion')).not.toBeInTheDocument()
       }
@@ -647,7 +667,7 @@ describe('request trace log details', () => {
     ).not.toBeInTheDocument()
   })
 
-  test('uses per-attempt durations instead of duplicating request elapsed time', async () => {
+  test('shows request elapsed time without per-attempt timing rows', async () => {
     vi.spyOn(api, 'get').mockResolvedValue(
       response([
         {
@@ -670,14 +690,10 @@ describe('request trace log details', () => {
       ])
     )
     renderDetails({ isAdmin: true })
-    expect(await screen.findByText('22 ms')).toBeVisible()
-    expect(screen.getByText('5.00 s')).toBeVisible()
+    expect(await screen.findByText('5.00 s')).toBeVisible()
+    expect(screen.queryByText('22 ms')).not.toBeInTheDocument()
     expect(screen.queryByText('11 ms')).not.toBeInTheDocument()
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Previous upstream attempts (1)' })
-    )
-    expect(screen.getByText('11 ms')).toBeVisible()
-    expect(screen.getAllByText('Attempt duration')).toHaveLength(2)
+    expect(screen.queryByText('Attempt duration')).not.toBeInTheDocument()
   })
 
   test('explains partial capture using the recorded reason codes', async () => {
