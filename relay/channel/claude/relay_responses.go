@@ -17,6 +17,7 @@ import (
 )
 
 func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
 	responseID := helper.GetResponseID(c)
 	created := common.GetTimestamp()
 	state, err := relayconvert.NewResponseStreamState(types.RelayFormatClaude, types.RelayFormatOpenAIResponses, relayconvert.ResponseStreamOptions{
@@ -84,7 +85,7 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var claudeResponse dto.ClaudeResponse
-		if err := common.UnmarshalJsonStr(data, &claudeResponse); err != nil {
+		if err := common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &claudeResponse); err != nil {
 			logger.LogError(c, "failed to unmarshal Claude stream event: "+err.Error())
 			if failResponsesStream(err) {
 				// A nil streamErr here is intentional: the protocol-level failure
@@ -95,6 +96,9 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			sr.Stop(streamErr)
 			return
+		}
+		if claudeResponse.Error != nil || claudeResponse.Type == "error" {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
 		}
 		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 			if failResponsesStream(fmt.Errorf("%s", claudeError.Message)) {

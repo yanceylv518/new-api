@@ -56,6 +56,23 @@ type CustomEvent struct {
 	Data  interface{}
 }
 
+type DecodedEvent struct {
+	CustomEvent
+	Value any
+}
+
+func (r DecodedEvent) Render(w http.ResponseWriter) error {
+	if writer, ok := w.(interface{ WriteTraceEvent(CustomEvent, any) error }); ok {
+		return writer.WriteTraceEvent(r.CustomEvent, r.Value)
+	}
+	return r.CustomEvent.Render(w)
+}
+
+func TraceEventEnabled(w http.ResponseWriter) bool {
+	writer, ok := w.(interface{ NeedsDecodedTraceEvent() bool })
+	return ok && writer.NeedsDecodedTraceEvent()
+}
+
 func encode(writer io.Writer, event CustomEvent) error {
 	w := checkWriter(writer)
 	return writeData(w, event.Data)

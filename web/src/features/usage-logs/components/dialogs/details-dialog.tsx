@@ -50,9 +50,10 @@ import {
   Info,
   LogIn,
 } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
@@ -68,7 +69,12 @@ import { cn } from '@/lib/utils'
 import { AuditDetailFields } from '../../audit/components/audit-detail-fields'
 import type { UsageLog } from '../../data/schema'
 import {
+  formatTraceTime,
+  useRequestTraces,
+} from '../../hooks/use-request-traces'
+import {
   parseLogOther,
+  parseUpstreamBusinessError,
   getParamOverrideActionLabel,
   parseAuditLine,
   decodeBillingExprB64,
@@ -91,6 +97,7 @@ import {
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
+import { RequestTraceDetails } from './request-trace-details'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
 // to its i18n label key for display in the audit details.
@@ -401,7 +408,11 @@ function BillingBreakdown(props: {
   )
 }
 
-function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
+function TokenBreakdown(props: {
+  log: UsageLog
+  other: LogOtherData
+  reasoningTokens?: number
+}) {
   const { t } = useTranslation()
   const { log, other } = props
 
@@ -411,7 +422,10 @@ function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
   const cacheWrite = other.cache_creation_tokens || 0
   const cacheWrite5m = other.cache_creation_tokens_5m || 0
   const cacheWrite1h = other.cache_creation_tokens_1h || 0
-  const hasTokens = promptTokens > 0 || completionTokens > 0
+  const hasTokens =
+    promptTokens > 0 ||
+    completionTokens > 0 ||
+    props.reasoningTokens !== undefined
 
   if (!hasTokens) return null
 
@@ -422,6 +436,13 @@ function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
     label: t('Output Tokens'),
     value: completionTokens.toLocaleString(),
   })
+
+  if (props.reasoningTokens !== undefined) {
+    rows.push({
+      label: t('Reasoning Tokens'),
+      value: props.reasoningTokens.toLocaleString(),
+    })
+  }
 
   if (cacheRead > 0) {
     rows.push({
@@ -475,10 +496,17 @@ interface DetailsDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-export function DetailsDialog(props: DetailsDialogProps) {
+export const DetailsDialog = memo(function DetailsDialog(
+  props: DetailsDialogProps
+) {
+  if (!props.open) return null
+  return <OpenLogDetailsDialog {...props} />
+})
+
+function OpenLogDetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
-  const other = parseLogOther(props.log.other)
+  const other = useMemo(() => parseLogOther(props.log.other), [props.log.other])
   const discountAmounts = getRecordedDiscountAmounts(other)
   const typeConfig = getLogTypeConfig(props.log.type)
 
@@ -499,6 +527,20 @@ export function DetailsDialog(props: DetailsDialogProps) {
   )?.billing_usage_schema
   const hasAudioTokens = other?.ws || other?.audio
   const showTiming = isTimingLogType(props.log.type)
+  const traceQuery = useRequestTraces(
+    props.log.request_id,
+    props.open && (props.log.type === 2 || props.log.type === 5),
+    props.log.created_at
+  )
+  const finalTrace = traceQuery.data?.at(-1)
+  const reasoningTokens = props.isAdmin
+    ? finalTrace?.admin_info?.resp.reasoning_tokens
+    : undefined
+  const responseMilliseconds = finalTrace?.trace.ms
+  const responseSeconds =
+    responseMilliseconds !== undefined
+      ? responseMilliseconds / 1000
+      : props.log.use_time
   const showAdminIp =
     !!props.log.ip && (showTiming || (props.isAdmin && isTopup))
   const adminInfo = other?.admin_info
@@ -564,7 +606,13 @@ export function DetailsDialog(props: DetailsDialogProps) {
       )
     : null
   const operationText = renderAuditContent(other, t)
-  const details = (isTopup ? operationText : null) ?? props.log.content ?? ''
+  const businessError = useMemo(() => {
+    if (props.log.type !== 2 && props.log.type !== 5) return null
+    return parseUpstreamBusinessError(props.log.content)
+  }, [props.log.content, props.log.type])
+  const details = businessError
+    ? JSON.stringify(businessError, null, 2)
+    : ((isTopup ? operationText : null) ?? props.log.content ?? '')
   const auditRoute = isManage && props.isAdmin ? other?.audit_info : undefined
   // Channel update records which fields changed (stable field tokens); render
   // them with their localized labels for admins.
@@ -645,6 +693,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
       descriptionClassName='sr-only'
       contentHeight='min(72dvh, 720px)'
       bodyClassName='pr-2 sm:pr-4'
+      backdropBlur={false}
     >
       <div className='w-full max-w-full min-w-0 space-y-2.5 overflow-x-hidden py-1 sm:space-y-3'>
         {/* Overview section - key identifiers */}
@@ -711,69 +760,49 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
 
-          {showTiming && props.log.use_time > 0 && (
-            <DetailRow
-              label={t('Response Time')}
-              value={
-                <span
-                  className={cn(
-                    'font-medium',
-                    timingTextColorClass(
-                      getResponseTimeColor(
-                        props.log.use_time,
-                        props.log.completion_tokens
+          {showTiming &&
+            (responseMilliseconds !== undefined || props.log.use_time > 0) && (
+              <DetailRow
+                label={t('Response Time')}
+                value={
+                  <span
+                    className={cn(
+                      'font-medium',
+                      timingTextColorClass(
+                        getResponseTimeColor(
+                          responseSeconds,
+                          props.log.completion_tokens
+                        )
                       )
-                    )
-                  )}
-                >
-                  {formatUseTime(props.log.use_time)}
-                  {props.log.is_stream &&
-                    other?.frt != null &&
-                    other.frt > 0 && (
-                      <span
-                        className={cn(
-                          'font-normal',
-                          timingTextColorClass(
-                            getFirstResponseTimeColor(other.frt / 1000)
-                          )
-                        )}
-                      >
-                        {' '}
-                        (FRT: {formatUseTime(other.frt / 1000)})
-                      </span>
                     )}
-                </span>
-              }
-            />
-          )}
+                  >
+                    {responseMilliseconds !== undefined
+                      ? formatTraceTime(responseMilliseconds)
+                      : formatUseTime(props.log.use_time)}
+                    {props.log.is_stream &&
+                      other?.frt != null &&
+                      other.frt > 0 && (
+                        <span
+                          className={cn(
+                            'font-normal',
+                            timingTextColorClass(
+                              getFirstResponseTimeColor(other.frt / 1000)
+                            )
+                          )}
+                        >
+                          {' '}
+                          (FRT:{' '}
+                          {responseMilliseconds !== undefined
+                            ? formatTraceTime(other.frt)
+                            : formatUseTime(other.frt / 1000)}
+                          )
+                        </span>
+                      )}
+                  </span>
+                }
+              />
+            )}
         </div>
-
-        {/* 金额来自本次日志快照；任务差额流水明确展示任务总费用。 */}
-        {(isConsume || isRefund) && discountAmounts && (
-          <DetailSection
-            label={
-              other?.discount_cost_scope === 'task_total'
-                ? t('Task total')
-                : t('Cost breakdown')
-            }
-          >
-            <DetailRow
-              label={t('Before discount')}
-              value={formatLogQuota(discountAmounts.before)}
-              mono
-            />
-            <DetailRow
-              label={t('After discount')}
-              value={formatLogQuota(discountAmounts.after)}
-              mono
-            />
-            <DetailRow
-              label={t('Discount savings')}
-              value={formatLogQuota(discountAmounts.savings)}
-              mono
-            />
-          </DetailSection>
-        )}
 
         {/* Request conversion (admin only, not for refund) */}
         {showConversion && (
@@ -812,6 +841,41 @@ export function DetailsDialog(props: DetailsDialogProps) {
                 </div>
               </div>
             </div>
+          </DetailSection>
+        )}
+
+        {props.open && (props.log.type === 2 || props.log.type === 5) && (
+          <RequestTraceDetails
+            query={traceQuery}
+            log={props.log}
+            isAdmin={props.isAdmin}
+          />
+        )}
+
+        {/* 金额来自本次日志快照；任务差额流水明确展示任务总费用。 */}
+        {(isConsume || isRefund) && discountAmounts && (
+          <DetailSection
+            label={
+              other?.discount_cost_scope === 'task_total'
+                ? t('Task total')
+                : t('Cost breakdown')
+            }
+          >
+            <DetailRow
+              label={t('Before discount')}
+              value={formatLogQuota(discountAmounts.before)}
+              mono
+            />
+            <DetailRow
+              label={t('After discount')}
+              value={formatLogQuota(discountAmounts.after)}
+              mono
+            />
+            <DetailRow
+              label={t('Discount savings')}
+              value={formatLogQuota(discountAmounts.savings)}
+              mono
+            />
           </DetailSection>
         )}
 
@@ -1165,9 +1229,14 @@ export function DetailsDialog(props: DetailsDialogProps) {
           )}
 
         {/* Token breakdown (for consume/error types with token data) */}
-        {isDisplayableType(props.log.type) && other && (
-          <TokenBreakdown log={props.log} other={other} />
-        )}
+        {isDisplayableType(props.log.type) &&
+          (other || reasoningTokens !== undefined) && (
+            <TokenBreakdown
+              log={props.log}
+              other={other ?? {}}
+              reasoningTokens={reasoningTokens}
+            />
+          )}
 
         {/* Billing breakdown (consume type) */}
         {isConsume && other && !isViolation && (
@@ -1338,26 +1407,30 @@ export function DetailsDialog(props: DetailsDialogProps) {
         {/* Content */}
         {details && (
           <div className='space-y-1.5'>
-            <Label className='text-xs font-semibold'>{t('Content')}</Label>
+            <Label className='text-xs font-semibold'>
+              {businessError ? t('Upstream error JSON') : t('Content')}
+            </Label>
             <div className='bg-muted/30 relative min-w-0 overflow-hidden rounded-md border p-2.5'>
-              <Button
-                variant='ghost'
-                size='sm'
+              <CopyButton
+                value={details}
+                size='icon'
                 className='absolute top-1.5 right-1.5 h-5 w-5 p-0'
-                onClick={() => copyToClipboard(details)}
-                title={t('Copy to clipboard')}
-                aria-label={t('Copy to clipboard')}
-              >
-                {copiedText === details ? (
-                  <Check className='size-3 text-green-600' />
-                ) : (
-                  <Copy className='size-3' />
+                iconClassName='size-3'
+              />
+              <p
+                className={cn(
+                  'min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word',
+                  businessError && 'font-mono'
                 )}
-              </Button>
-              <p className='min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word'>
+              >
                 {details}
               </p>
             </div>
+            {businessError?.truncated && (
+              <p className='text-muted-foreground text-xs'>
+                {t('Error details were shortened.')}
+              </p>
+            )}
           </div>
         )}
       </div>

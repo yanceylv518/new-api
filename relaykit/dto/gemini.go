@@ -487,6 +487,8 @@ type GeminiChatPromptFeedback struct {
 }
 
 type GeminiChatResponse struct {
+	ResponseID       string                    `json:"responseId,omitempty"`
+	ModelVersion     string                    `json:"modelVersion,omitempty"`
 	Candidates       []GeminiChatCandidate     `json:"candidates"`
 	PromptFeedback   *GeminiChatPromptFeedback `json:"promptFeedback,omitempty"`
 	UsageMetadata    GeminiUsageMetadata       `json:"usageMetadata"`
@@ -501,6 +503,8 @@ type GeminiChatResponse struct {
 // is silently dropped during unmarshal.
 func (r *GeminiChatResponse) UnmarshalJSON(data []byte) error {
 	var aux struct {
+		ResponseID     any                       `json:"responseId,omitempty"`
+		ModelVersion   any                       `json:"modelVersion,omitempty"`
 		Candidates     []GeminiChatCandidate     `json:"candidates"`
 		PromptFeedback *GeminiChatPromptFeedback `json:"promptFeedback,omitempty"`
 		UsageMetadata  *GeminiUsageMetadata      `json:"usageMetadata"`
@@ -509,6 +513,9 @@ func (r *GeminiChatResponse) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	r.Candidates = aux.Candidates
+	// 这些可选标识此前被忽略，非字符串值不能使原本可转发的响应解码失败。
+	r.ResponseID, _ = aux.ResponseID.(string)
+	r.ModelVersion, _ = aux.ModelVersion.(string)
 	r.PromptFeedback = aux.PromptFeedback
 	r.HasUsageMetadata = aux.UsageMetadata != nil
 	if aux.UsageMetadata != nil {

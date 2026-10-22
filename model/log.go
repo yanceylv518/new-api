@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/types"
 
@@ -288,6 +289,9 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	isStream bool, group string, other *LogOther, knownKeys ...string) {
 	// 写入前移除凭证与媒体编码，避免数据库及旧节点获得原始敏感内容。
 	content = common.SanitizeErrorLogContent(content, knownKeys...)
+	if businessError := common.GetUpstreamBusinessError(c); businessError != nil {
+		content = businessError.LogContent("")
+	}
 	logger.LogInfo(c, fmt.Sprintf("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
@@ -329,6 +333,10 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	err := createLog(log)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
+	} else if trace := common.GetRequestTrace(c); trace != nil {
+		trace.Lock()
+		trace.ErrorLogged = true
+		trace.Unlock()
 	}
 }
 
@@ -350,6 +358,9 @@ type RecordConsumeLogParams struct {
 func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
 	if !common.LogConsumeEnabled {
 		return
+	}
+	if businessError := common.GetUpstreamBusinessError(c); businessError != nil {
+		params.Content = businessError.LogContent(params.Content, c.GetString("key"), common.GetContextKeyString(c, constant.ContextKeyChannelKey))
 	}
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
 	username := c.GetString("username")

@@ -12,6 +12,7 @@ import (
 
 func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.CORS())
+	router.Use(middleware.RequestTraceMetadata())
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())

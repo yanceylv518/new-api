@@ -93,14 +93,19 @@ type LogCleanupPayload struct {
 }
 
 type LogCleanupState struct {
-	Total     int64 `json:"total"`
-	Processed int64 `json:"processed"`
-	Progress  int   `json:"progress"`
-	Remaining int64 `json:"remaining"`
+	Phase          string `json:"phase,omitempty"`
+	TraceTotal     int64  `json:"trace_total,omitempty"`
+	TraceProcessed int64  `json:"trace_processed,omitempty"`
+	TraceRemaining int64  `json:"trace_remaining,omitempty"`
+	Total          int64  `json:"total"`
+	Processed      int64  `json:"processed"`
+	Progress       int    `json:"progress"`
+	Remaining      int64  `json:"remaining"`
 }
 
 type LogCleanupResult struct {
-	DeletedCount int64 `json:"deleted_count"`
+	DeletedCount      int64 `json:"deleted_count"`
+	TraceDeletedCount int64 `json:"trace_deleted_count,omitempty"`
 }
 
 var (
@@ -354,6 +359,42 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 		failSystemTask(task, runnerID, err)
 		return
 	}
+	remainingTraces, err := model.CountOldRequestTraces(ctx, payload.TargetTimestamp)
+	if err != nil {
+		failSystemTask(task, runnerID, err)
+		return
+	}
+	state.Phase = "traces"
+	state.TraceRemaining = remainingTraces
+	state.TraceTotal = state.TraceProcessed + remainingTraces
+	state.Progress = logCleanupProgress(state.TraceProcessed, state.TraceTotal)
+	if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state); err != nil {
+		logSystemTaskLockError(ctx, task, err)
+		return
+	}
+	for {
+		deleted, err := model.DeleteOldRequestTraces(ctx, payload.TargetTimestamp, payload.BatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		if deleted == 0 {
+			break
+		}
+		state.TraceProcessed += deleted
+		state.TraceRemaining = max(int64(0), state.TraceRemaining-deleted)
+		state.Progress = logCleanupProgress(state.TraceProcessed, state.TraceTotal)
+		if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state); err != nil {
+			logSystemTaskLockError(ctx, task, err)
+			return
+		}
+	}
+	state.TraceRemaining, state.Phase = 0, "logs"
+	state.Progress = 0
+	if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state); err != nil {
+		logSystemTaskLockError(ctx, task, err)
+		return
+	}
 
 	for {
 		remaining, err := model.CountOldLog(ctx, payload.TargetTimestamp)
@@ -411,6 +452,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 
 	state.Remaining = 0
 	state.Progress = 100
+	state.Phase = "done"
 	if state.Total < state.Processed {
 		state.Total = state.Processed
 	}
@@ -419,7 +461,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 		return
 	}
 
-	result := LogCleanupResult{DeletedCount: state.Processed}
+	result := LogCleanupResult{DeletedCount: state.Processed, TraceDeletedCount: state.TraceProcessed}
 	if err := model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, result, ""); err != nil {
 		logSystemTaskLockError(ctx, task, err)
 	}

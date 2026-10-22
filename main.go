@@ -78,6 +78,14 @@ func main() {
 			common.FatalLog("failed to close database: " + err.Error())
 		}
 	}()
+	model.StartRequestTraceWriter()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := model.StopRequestTraceWriter(ctx); err != nil {
+			common.SysError(err.Error())
+		}
+	}()
 
 	if common.RedisEnabled {
 		// for compatibility with old versions

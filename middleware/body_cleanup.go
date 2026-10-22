@@ -10,12 +10,47 @@ import (
 // 在请求处理完成后自动清理磁盘/内存缓存
 func BodyStorageCleanup() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		defer common.ClearUpstreamBusinessError(c)
 		defer func() {
+			panicValue := recover()
+			if trace := common.GetRequestTrace(c); trace != nil {
+				if panicValue != nil {
+					trace.Failed = true
+					if trace.ClientObserver != nil {
+						trace.ClientObserver.ObserveClientError()
+					}
+				}
+				if trace.ClientObserver != nil {
+					// panic 的恢复响应尚未写出，观察器由追踪收尾阶段结束。
+					if panicValue == nil {
+						trace.ClientObserver.Finish()
+					}
+					trace.Failed = trace.Failed || trace.ClientObserver.HasError()
+				}
+				detailed := (trace.Config.Level == "all" && trace.SampledSuccess) || trace.Failed || c.Writer.Status() >= 400
+				for _, attempt := range trace.Attempts {
+					if attempt.Diagnostic || attempt.Failed || attempt.Upstream.Status >= 400 || attempt.Upstream.ErrorType != "" {
+						detailed = true
+					}
+					if attempt.Observer != nil {
+						attempt.Observer.Finish()
+						detailed = detailed || attempt.Observer.HasError()
+					}
+				}
+				if value, exists := c.Get(common.KeyBodyStorage); exists {
+					if storage, ok := value.(common.BodyStorage); ok {
+						trace.CaptureRequest(storage, detailed)
+					}
+				}
+			}
 			// 请求结束后清理存储
 			common.CleanupBodyStorage(c)
 
 			// 清理文件缓存（URL 下载的文件等）
 			service.CleanupFileSources(c)
+			if panicValue != nil {
+				panic(panicValue)
+			}
 		}()
 		c.Next()
 	}

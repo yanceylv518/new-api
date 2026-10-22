@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -148,7 +149,7 @@ func handleStream(c *gin.Context, info *relaycommon.RelayInfo, resp *dto.ChatCom
 	if err != nil {
 		return fmt.Errorf("failed to marshal stream response: %w", err)
 	}
-	err = openai.HandleStreamFormat(c, info, string(streamData), info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+	err = openai.HandleStreamFormat(c, info, string(streamData), resp, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 	if err != nil {
 		return fmt.Errorf("failed to handle stream format: %w", err)
 	}
@@ -160,11 +161,12 @@ func handleFinalStream(c *gin.Context, info *relaycommon.RelayInfo, resp *dto.Ch
 	if err != nil {
 		return fmt.Errorf("failed to marshal stream response: %w", err)
 	}
-	openai.HandleFinalResponse(c, info, string(streamData), resp.Id, resp.Created, resp.Model, resp.GetSystemFingerprint(), resp.Usage, false)
+	openai.HandleFinalResponse(c, info, string(streamData), resp, resp.Id, resp.Created, resp.Model, resp.GetSystemFingerprint(), resp.Usage, false)
 	return nil
 }
 
 func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, callback func(data string, geminiResponse *dto.GeminiChatResponse) bool) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
 	var usage = &dto.Usage{}
 	var imageCount int
 	var hasBillableUsageMetadata bool
@@ -174,10 +176,13 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var geminiResponse dto.GeminiChatResponse
-		if err := common.UnmarshalJsonStr(data, &geminiResponse); err != nil {
+		if err := common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &geminiResponse); err != nil {
 			streamErr = fmt.Errorf("unmarshal Gemini stream response: %w", err)
 			sr.Stop(streamErr)
 			return
+		}
+		if strings.Contains(data, `"error"`) {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
 		}
 
 		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
@@ -359,6 +364,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 }
 
 func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -366,9 +372,12 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	service.CloseResponseBodyGracefully(resp)
 	logger.LogDebug(c, "Gemini response body: %s", responseBody)
 	var geminiResponse dto.GeminiChatResponse
-	err = common.Unmarshal(responseBody, &geminiResponse)
+	err = common.UnmarshalRequestTraceResponse(c, responseBody, &geminiResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if bytes.Contains(responseBody, []byte(`"error"`)) {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
 	}
 	markGeminiGoogleSearchCall(c, &geminiResponse)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
@@ -430,6 +439,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		responseBody = claudeRespStr
 	case types.RelayFormatGemini:
+		common.ReuseUpstreamRequestTrace(c, resp)
 		break
 	}
 

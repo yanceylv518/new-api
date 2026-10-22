@@ -330,6 +330,9 @@ func migrateDB() error {
 	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
 	}
+	if err := migrateRequestTraceTableName(DB); err != nil {
+		return err
+	}
 
 	err := DB.AutoMigrate(
 		&Channel{},
@@ -348,6 +351,7 @@ func migrateDB() error {
 		&Redemption{},
 		&Ability{},
 		&Log{},
+		&RequestTraceMetadata{},
 		&Midjourney{},
 		&TopUp{},
 		&QuotaData{},
@@ -398,6 +402,9 @@ func migrateDB() error {
 
 func migrateLOGDB() error {
 	if err := MigrateAuditLogs(); err != nil {
+		return err
+	}
+	if err := migrateRequestTraces(); err != nil {
 		return err
 	}
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
