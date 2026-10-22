@@ -38,8 +38,14 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
+	if responsesResp.Error != nil {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(body))
+	}
 	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+	if strings.TrimSpace(string(responsesResp.Status)) == `"failed"` {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "response.failed", string(body))
 	}
 
 	responseValue, usage, err := convertResponsesResponseForClient(c, info, &responsesResp)
@@ -88,6 +94,9 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 			logger.LogError(c, "failed to unmarshal buffered responses stream event: "+err.Error())
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			break
+		}
+		if streamResp.Type == "response.failed" || streamResp.Type == "response.error" || streamResp.Type == "error" {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, streamResp.Type, data)
 		}
 		accumulator.ProcessEvent(&streamResp)
 		switch streamResp.Type {
@@ -260,6 +269,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" || streamResp.Type == "error" {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, streamResp.Type, data)
+		}
 		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {

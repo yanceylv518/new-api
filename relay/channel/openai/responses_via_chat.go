@@ -32,6 +32,9 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if err := common.UnmarshalRequestTraceResponse(c, body, &chatResp); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	if chatResp.Error != nil {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(body))
+	}
 	if oaiError := chatResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
@@ -120,7 +123,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		var chunk openAIStreamChunk
 		decodeErr := common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &chunk)
 		errorValue := chunk.Error
-		_, validType := chunk.Type.(string)
+		errorKind, validType := chunk.Type.(string)
 		validType = validType || chunk.Type == nil
 		if decodeErr != nil {
 			var fallback struct {
@@ -128,9 +131,12 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				Type string `json:"type"`
 			}
 			validType = common.UnmarshalJsonStr(data, &fallback) == nil
-			errorValue = fallback.Error
+			errorValue, errorKind = fallback.Error, fallback.Type
 		}
 		if validType {
+			if errorValue != nil || errorKind == "error" {
+				common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+			}
 			if oaiError := dto.GetOpenAIError(errorValue); oaiError != nil && oaiError.Type != "" {
 				if failResponsesStream(fmt.Errorf("%s", oaiError.Message)) {
 					sr.Stop(streamErr)

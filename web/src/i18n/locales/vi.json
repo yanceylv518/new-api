@@ -6408,6 +6408,9 @@
     "Zero retention": "Không lưu dữ liệu",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
+    "Upstream failed": "Nhà cung cấp thất bại",
+    "Upstream error JSON": "JSON lỗi từ nhà cung cấp",
+    "Error details were shortened.": "Chi tiết lỗi đã được rút gọn.",
     "Zoom": "Zoom"
   }
 }

@@ -297,6 +297,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 	var err *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if strings.Contains(data, `"error"`) {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
 			sr.Stop(err)
@@ -315,6 +318,9 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	err := common.UnmarshalRequestTraceResponse(c, data, &claudeResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if claudeResponse.Error != nil {
+		common.CaptureUpstreamBusinessError(c, httpResp.StatusCode, "error", string(data))
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)

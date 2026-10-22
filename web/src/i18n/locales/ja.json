@@ -6408,6 +6408,9 @@
     "Zero retention": "データ保持なし",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V 4",
+    "Upstream failed": "上流で失敗",
+    "Upstream error JSON": "上流エラーの JSON",
+    "Error details were shortened.": "エラーの詳細は短縮されています。",
     "Zoom": "ズーム"
   }
 }

@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -179,6 +180,9 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			streamErr = fmt.Errorf("unmarshal Gemini stream response: %w", err)
 			sr.Stop(streamErr)
 			return
+		}
+		if strings.Contains(data, `"error"`) {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
 		}
 
 		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
@@ -371,6 +375,9 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	err = common.UnmarshalRequestTraceResponse(c, responseBody, &geminiResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if bytes.Contains(responseBody, []byte(`"error"`)) {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
 	}
 	markGeminiGoogleSearchCall(c, &geminiResponse)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)

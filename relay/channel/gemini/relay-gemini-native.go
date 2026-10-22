@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,9 @@ func GeminiTextGenerationHandler(c *gin.Context, info *relaycommon.RelayInfo, re
 	err = common.UnmarshalRequestTraceResponse(c, responseBody, &geminiResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if bytes.Contains(responseBody, []byte(`"error"`)) {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
 	}
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
 

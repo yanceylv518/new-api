@@ -173,6 +173,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					_, validType := chunk.Type.(string)
 					if chunk.Type == nil || validType {
 						collectStreamFunctionCallNames(lastDecoded.Choices, seenStreamToolCalls, &streamFunctionCallNames)
+						if chunk.Error != nil || chunk.Type == "error" {
+							common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+						}
 					}
 					_ = ProcessStreamResponse(*lastDecoded, &responseTextBuilder, &toolCount)
 				}
@@ -186,6 +189,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				}
 				if common.UnmarshalJsonStr(data, &metadata) == nil {
 					collectStreamFunctionCallNames(metadata.Choices, seenStreamToolCalls, &streamFunctionCallNames)
+					if metadata.Error != nil || metadata.Type == "error" {
+						common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+					}
 				}
 			}
 			if decodeErr != nil {
@@ -335,6 +341,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
+	if simpleResponse.Error != nil {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
+	}
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}

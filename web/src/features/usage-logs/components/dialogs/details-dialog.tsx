@@ -53,6 +53,7 @@ import {
 import { memo, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
@@ -73,6 +74,7 @@ import {
 } from '../../hooks/use-request-traces'
 import {
   parseLogOther,
+  parseUpstreamBusinessError,
   getParamOverrideActionLabel,
   parseAuditLine,
   decodeBillingExprB64,
@@ -604,7 +606,13 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
       )
     : null
   const operationText = renderAuditContent(other, t)
-  const details = (isTopup ? operationText : null) ?? props.log.content ?? ''
+  const businessError = useMemo(() => {
+    if (props.log.type !== 2 && props.log.type !== 5) return null
+    return parseUpstreamBusinessError(props.log.content)
+  }, [props.log.content, props.log.type])
+  const details = businessError
+    ? JSON.stringify(businessError, null, 2)
+    : ((isTopup ? operationText : null) ?? props.log.content ?? '')
   const auditRoute = isManage && props.isAdmin ? other?.audit_info : undefined
   // Channel update records which fields changed (stable field tokens); render
   // them with their localized labels for admins.
@@ -1399,26 +1407,30 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
         {/* Content */}
         {details && (
           <div className='space-y-1.5'>
-            <Label className='text-xs font-semibold'>{t('Content')}</Label>
+            <Label className='text-xs font-semibold'>
+              {businessError ? t('Upstream error JSON') : t('Content')}
+            </Label>
             <div className='bg-muted/30 relative min-w-0 overflow-hidden rounded-md border p-2.5'>
-              <Button
-                variant='ghost'
-                size='sm'
+              <CopyButton
+                value={details}
+                size='icon'
                 className='absolute top-1.5 right-1.5 h-5 w-5 p-0'
-                onClick={() => copyToClipboard(details)}
-                title={t('Copy to clipboard')}
-                aria-label={t('Copy to clipboard')}
-              >
-                {copiedText === details ? (
-                  <Check className='size-3 text-green-600' />
-                ) : (
-                  <Copy className='size-3' />
+                iconClassName='size-3'
+              />
+              <p
+                className={cn(
+                  'min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word',
+                  businessError && 'font-mono'
                 )}
-              </Button>
-              <p className='min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word'>
+              >
                 {details}
               </p>
             </div>
+            {businessError?.truncated && (
+              <p className='text-muted-foreground text-xs'>
+                {t('Error details were shortened.')}
+              </p>
+            )}
           </div>
         )}
       </div>

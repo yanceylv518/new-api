@@ -32,8 +32,14 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	if responsesResponse.Error != nil {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
+	}
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+	if strings.TrimSpace(string(responsesResponse.Status)) == `"failed"` {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "response.failed", string(responseBody))
 	}
 
 	// 写入新的 response body
@@ -89,6 +95,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
 			sr.Error(err)
 			return
+		}
+		if streamResponse.Type == "response.failed" || streamResponse.Type == "response.error" || streamResponse.Type == "error" {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, streamResponse.Type, data)
 		}
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {

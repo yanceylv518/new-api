@@ -10,6 +10,7 @@ import (
 // 在请求处理完成后自动清理磁盘/内存缓存
 func BodyStorageCleanup() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		defer common.ClearUpstreamBusinessError(c)
 		defer func() {
 			panicValue := recover()
 			if trace := common.GetRequestTrace(c); trace != nil {

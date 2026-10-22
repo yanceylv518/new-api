@@ -488,6 +488,7 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	common2.ClearUpstreamBusinessError(c)
 	common2.UseDecodedRequestTrace(c, nil)
 	trace := common2.GetRequestTrace(c)
 	var attempt *common2.RequestTraceAttempt

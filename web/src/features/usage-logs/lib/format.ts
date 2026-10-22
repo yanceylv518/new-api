@@ -24,11 +24,27 @@ import {
   type ParsedTier,
 } from '@/features/pricing/lib/billing-expr'
 
-import type { UsageLog } from '../data/schema'
+import {
+  upstreamBusinessErrorSchema,
+  type UpstreamBusinessError,
+  type UsageLog,
+} from '../data/schema'
 import type { LogOtherData } from '../types'
 import { buildQuotaAuditOperation } from './quota-audit-operation'
 
 export { normalizeTierLabel }
+
+export function parseUpstreamBusinessError(
+  content: string
+): UpstreamBusinessError | null {
+  if (!content.startsWith('{')) return null
+  try {
+    const result = upstreamBusinessErrorSchema.safeParse(JSON.parse(content))
+    return result.success ? result.data : null
+  } catch {
+    return null
+  }
+}
 
 const PARAM_OVERRIDE_ACTION_MAP: Record<string, string> = {
   set: 'Set',

@@ -97,6 +97,9 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			sr.Stop(streamErr)
 			return
 		}
+		if claudeResponse.Error != nil || claudeResponse.Type == "error" {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+		}
 		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 			if failResponsesStream(fmt.Errorf("%s", claudeError.Message)) {
 				sr.Stop(streamErr)

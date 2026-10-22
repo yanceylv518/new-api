@@ -17,6 +17,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  flexRender,
+  getCoreRowModel,
+  useReactTable,
+} from '@tanstack/react-table'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosHeaders, type GenericAbortSignal } from 'axios'
@@ -27,6 +32,8 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import type { UsageLog } from '../../data/schema'
+import { parseUpstreamBusinessError } from '../../lib/format'
+import { useCommonLogsColumns } from '../columns/common-logs-columns'
 import { DetailsDialog } from './details-dialog'
 
 const log: UsageLog = {
@@ -154,6 +161,133 @@ const detailed = {
     },
   },
 }
+
+function BusinessErrorLogCell(props: { log: UsageLog }) {
+  const columns = useCommonLogsColumns(true, true)
+  const table = useReactTable({
+    data: [props.log],
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+  })
+  const cell = table
+    .getRowModel()
+    .rows[0].getAllCells()
+    .find((item) => item.column.id === 'content')
+  return cell ? flexRender(cell.column.columnDef.cell, cell.getContext()) : null
+}
+
+describe('HTTP 200 upstream business error logs', () => {
+  const failure = {
+    http_status: 200,
+    event: 'response.failed',
+    reported_status_code: 429,
+    error: { code: 'upstream_timeout', message: '<script>failed</script>' },
+    note: 'existing billing note',
+    truncated: true,
+  }
+
+  test.each([2, 5])(
+    'shows formatted copyable JSON for log type %s',
+    async (type) => {
+      const user = userEvent.setup()
+      const copy = vi
+        .spyOn(navigator.clipboard, 'writeText')
+        .mockResolvedValue()
+      vi.spyOn(api, 'get').mockResolvedValue(response([]))
+      renderDetails({ log: { ...log, type, content: JSON.stringify(failure) } })
+      expect(await screen.findByText('Upstream error JSON')).toBeInTheDocument()
+      const content = screen.getByText(/"http_status": 200/)
+      expect(content.textContent).toBe(JSON.stringify(failure, null, 2))
+      expect(content.querySelector('script')).toBeNull()
+      expect(
+        screen.getByText('Error details were shortened.')
+      ).toBeInTheDocument()
+      const section = content.parentElement
+      expect(section).not.toBeNull()
+      const button = section?.querySelector('button')
+      expect(button).not.toBeNull()
+      if (button) await user.click(button)
+      expect(copy).toHaveBeenCalledWith(JSON.stringify(failure, null, 2))
+    }
+  )
+
+  test.each([1, 3, 6, 7])(
+    'keeps structured-looking text unchanged for other log type %s',
+    async (type) => {
+      vi.spyOn(api, 'get').mockResolvedValue(response([]))
+      const content = JSON.stringify(failure)
+      renderDetails({ log: { ...log, type, content } })
+      expect(await screen.findByText(content)).toBeInTheDocument()
+      expect(screen.queryByText('Upstream error JSON')).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('Error details were shortened.')
+      ).not.toBeInTheDocument()
+    }
+  )
+
+  test.each([
+    'legacy error text',
+    '{invalid JSON',
+    '{"error":{"message":"legacy"}}',
+  ])('preserves historical content %s', async (content) => {
+    vi.spyOn(api, 'get').mockResolvedValue(response([]))
+    renderDetails({ log: { ...log, content } })
+    expect(await screen.findByText(content)).toBeInTheDocument()
+    expect(screen.queryByText('Upstream error JSON')).not.toBeInTheDocument()
+  })
+
+  test.each([2, 5])(
+    'prioritizes business failure over billing and admin summaries for type %s',
+    async (type) => {
+      vi.spyOn(api, 'get').mockResolvedValue(response([]))
+      render(
+        <QueryClientProvider client={queryClient()}>
+          <BusinessErrorLogCell
+            log={{
+              ...log,
+              type,
+              content: JSON.stringify(failure),
+              other: JSON.stringify({
+                model_ratio: 1,
+                admin_info: { quota_saturation: { field: 'quota' } },
+              }),
+            }}
+          />
+        </QueryClientProvider>
+      )
+      const preview = screen.getByRole('button', {
+        name: /Upstream failed · HTTP 200 · upstream_timeout/,
+      })
+      expect(preview).not.toHaveTextContent('Quota clamped')
+      await userEvent.click(preview)
+      expect(await screen.findByText('Upstream error JSON')).toBeInTheDocument()
+    }
+  )
+
+  test.each([
+    { ...failure, http_status: 502 },
+    { ...failure, event: 'response.completed' },
+    { ...failure, reported_status_code: '429' },
+    { ...failure, reported_status_code: 600 },
+    { ...failure, error: { message: [] } },
+    { ...failure, error: null },
+  ])('rejects content outside the business-error contract %#', (content) => {
+    expect(parseUpstreamBusinessError(JSON.stringify(content))).toBeNull()
+  })
+
+  test('retains numeric zero codes and missing fields without inventing values', () => {
+    expect(
+      parseUpstreamBusinessError(
+        '{"http_status":200,"event":"error","error":{"code":0}}'
+      )
+    ).toEqual({ http_status: 200, event: 'error', error: { code: 0 } })
+    expect(
+      parseUpstreamBusinessError(
+        '{"http_status":200,"event":"response.failed","error":{}}'
+      )
+    ).toEqual({ http_status: 200, event: 'response.failed', error: {} })
+  })
+})
 
 describe('request trace log details', () => {
   test('hides uncollected counts for summary metadata while preserving billing tokens', async () => {
