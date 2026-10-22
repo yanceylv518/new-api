@@ -99,7 +99,7 @@ func (w *traceResponseWriter) WriteTraceEvent(event common.CustomEvent, value an
 }
 
 func (w *traceResponseWriter) WriteTraceResponse(data []byte) (int, error) {
-	if common.IsEventStreamContentType(w.Header().Get("Content-Type")) {
+	if common.IsEventStreamContentType(w.Header().Get("Content-Type")) && !w.observer.JSONMode() {
 		return w.Write(data)
 	}
 	n, err := w.ResponseWriter.Write(data)

@@ -19,7 +19,7 @@ import (
 )
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	common.UseDecodedRequestTrace(c, resp)
+	common.UseDecodedJSONRequestTrace(c, resp)
 	defer service.CloseResponseBodyGracefully(resp)
 
 	// read response body

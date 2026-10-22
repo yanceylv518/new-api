@@ -44,6 +44,27 @@ func UseDecodedRequestTrace(c *gin.Context, response *http.Response) {
 	c.Set(decodedRequestTraceKey, o)
 }
 
+// UseDecodedJSONRequestTrace 只用于非流式 JSON 处理器，防止上游误标 SSE 响应头。
+func UseDecodedJSONRequestTrace(c *gin.Context, response *http.Response) {
+	UseDecodedRequestTrace(c, response)
+	if c == nil {
+		return
+	}
+	trace := GetRequestTrace(c)
+	if trace == nil {
+		return
+	}
+	entry, exists := c.Get(decodedRequestTraceKey)
+	observer, ok := entry.(*TraceBodyObserver)
+	if !exists || !ok {
+		return
+	}
+	observer.UseJSON()
+	if trace.ClientObserver != nil {
+		trace.ClientObserver.UseJSON()
+	}
+}
+
 // UnmarshalRequestTraceResponse 复用业务解码结果，解码失败仍按原始字段记录诊断，不改变调用方错误处理。
 func UnmarshalRequestTraceResponse(c *gin.Context, data []byte, value any) error {
 	err := Unmarshal(data, value)

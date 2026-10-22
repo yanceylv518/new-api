@@ -1863,6 +1863,92 @@ func TestRequestTraceDecodedDelivery(t *testing.T) {
 	}
 }
 
+func TestRequestTraceResponsesJSONWithSSEHeader(t *testing.T) {
+	formats := []types.RelayFormat{types.RelayFormatOpenAIResponses, types.RelayFormatOpenAI, types.RelayFormatClaude, types.RelayFormatGemini}
+	for _, level := range []string{"all", "errors"} {
+		for _, format := range formats {
+			t.Run(level+"/"+string(format), func(t *testing.T) {
+				setupRequestTraceDatabase(t)
+				require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(common.RequestTraceConfig{Level: level, SuccessSampleRate: 100})))
+				payload := requestTraceProtocolPayload(types.RelayFormatOpenAIResponses, false)
+				path := "/v1/chat/completions"
+				switch format {
+				case types.RelayFormatOpenAIResponses:
+					path = "/v1/responses"
+				case types.RelayFormatClaude:
+					path = "/v1/messages"
+				case types.RelayFormatGemini:
+					path = "/v1beta/models/client-model:generateContent"
+				}
+				app := gin.New()
+				app.Use(middleware.RequestId(), middleware.RequestTrace(), middleware.BodyStorageCleanup())
+				app.POST(path, func(c *gin.Context) {
+					c.Set("id", 11)
+					_, err := common.GetBodyStorage(c)
+					require.NoError(t, err)
+					info := &relaycommon.RelayInfo{RelayFormat: format, FinalRequestRelayFormat: types.RelayFormatOpenAIResponses, RequestURLPath: path, RelayMode: relayconstant.RelayModeChatCompletions, OriginModelName: "client-model", ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelId: 7, UpstreamModelName: "upstream-model"}}
+					info.InitRequestConversionChain()
+					trace := common.GetRequestTrace(c)
+					attempt := trace.StartAttempt(0, 7, c.Request)
+					attempt.Upstream.Status = http.StatusOK
+					attempt.Observer = trace.ClientObserver.NewRelatedObserverWithMode(trace.ResponseMetadataLevel(7, http.StatusOK))
+					response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, ContentLength: int64(len(payload)), Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(payload)), ContentType: "text/event-stream", Observer: attempt.Observer}}
+					handler := openai.OaiResponsesToChatHandler
+					if format == types.RelayFormatOpenAIResponses {
+						handler = openai.OaiResponsesHandler
+					}
+					usage, relayError := handler(c, info, response)
+					require.Nil(t, relayError)
+					require.NotNil(t, usage)
+					assert.Equal(t, "text/event-stream", response.Header.Get("Content-Type"))
+					assert.EqualValues(t, 10, usage.PromptTokens)
+					assert.EqualValues(t, 9, usage.CompletionTokens)
+					model.RecordConsumeLog(c, 11, model.RecordConsumeLogParams{ChannelId: 7, ModelName: "client-model", PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, Other: model.NewLogOther()})
+					trace.FinishAttempt(0)
+				})
+				writer := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(requestTraceProtocolRequest(format)))
+				request.Header.Set("Content-Type", "application/json")
+				app.ServeHTTP(writer, request)
+				require.Equal(t, http.StatusOK, writer.Code)
+				assert.Equal(t, "text/event-stream", writer.Header().Get("Content-Type"))
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(writer.Body.Bytes(), &body))
+				awaitRequestTraceWrites(t)
+				rows, err := model.GetRequestTraces(t.Context(), writer.Header().Get(common.RequestIdKey), 0, true)
+				require.NoError(t, err)
+				require.Len(t, rows, 1)
+				admin := rows[0].AdminInfo
+				require.NotNil(t, admin)
+				assert.True(t, admin.Response.Done)
+				assert.Empty(t, admin.Response.EndMarker)
+				if level == "errors" && format == types.RelayFormatGemini {
+					assert.Equal(t, "not_applicable", admin.Response.EndMarkerPolicy)
+				} else {
+					assert.Empty(t, admin.Response.EndMarkerPolicy)
+				}
+				assert.False(t, admin.Response.Error)
+				assert.Equal(t, level == "errors", admin.Response.MetadataIncomplete)
+				if level == "all" {
+					assert.EqualValues(t, 1, admin.Response.ToolCalls)
+					assert.Equal(t, map[string]int64{"lookup": 1}, admin.Response.ToolCallsByName)
+					assert.Equal(t, common.GetPointer(int64(3)), admin.Response.ReasoningTokens)
+					assert.Equal(t, "source-id", admin.Upstream.ResponseID)
+					assert.Equal(t, "upstream-model", admin.Upstream.Model)
+				} else {
+					assert.Equal(t, common.TraceMetadataSummary, admin.MetadataLevel)
+					assert.Zero(t, admin.Response.ToolCalls)
+					assert.Empty(t, admin.Response.ToolCallsByName)
+				}
+				if format == types.RelayFormatOpenAIResponses {
+					assert.JSONEq(t, payload, writer.Body.String())
+					assert.Equal(t, common.GetPointer("completed"), rows[0].Trace.FinishReason)
+				}
+			})
+		}
+	}
+}
+
 func TestRequestTraceProtocolEdgeFields(t *testing.T) {
 	hosted := `{"id":"source-id","object":"response","status":"completed","output":[{"type":"web_search_call","id":"ws-1","status":"completed"},{"type":"file_search_call","id":"fs-1","status":"completed"},{"type":"image_generation_call","id":"img-1","status":"completed"},{"type":"function_call","id":"fc-1","name":"lookup","arguments":"{}"}]}`
 	hostedStream := "data: " + `{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws-1"}}` + "\n\ndata: " + `{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws-1","status":"completed"}}` + "\n\ndata: " + `{"type":"response.completed","response":` + hosted + `}` + "\n\n"

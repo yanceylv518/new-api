@@ -294,6 +294,7 @@ type TraceBodyObserver struct {
 	buffer        []byte
 	event         []byte
 	stream        bool
+	jsonMode      bool
 	finished      bool
 	finishedAt    time.Time
 	skippingLine  bool
@@ -352,10 +353,27 @@ func (o *TraceBodyObserver) Prepare(contentType string, contentLength int64) {
 	defer o.Unlock()
 	if contentType != "" {
 		o.response.ContentType = TraceMetadataString(contentType, 128)
-		o.stream = IsEventStreamContentType(contentType)
+		if !o.jsonMode {
+			o.stream = IsEventStreamContentType(contentType)
+		}
 	}
 	// 延迟到第一次实际观察字节时分配，协议处理器接管采集后无需第二份正文缓冲。
 	o.contentLength = contentLength
+}
+
+// UseJSON 保留原始响应头，以实际非流式处理路径确定采集模式。
+func (o *TraceBodyObserver) UseJSON() {
+	o.Lock()
+	defer o.Unlock()
+	if !o.observed && !o.finished {
+		o.jsonMode, o.stream = true, false
+	}
+}
+
+func (o *TraceBodyObserver) JSONMode() bool {
+	o.Lock()
+	defer o.Unlock()
+	return o.jsonMode
 }
 
 func (o *TraceBodyObserver) MetadataLevel() TraceMetadataLevel {
@@ -474,7 +492,9 @@ func (o *TraceBodyObserver) observe(data []byte, contentType string) {
 	}
 	if o.response.ContentType == "" && contentType != "" {
 		o.response.ContentType = TraceMetadataString(contentType, 128)
-		o.stream = IsEventStreamContentType(contentType)
+		if !o.jsonMode {
+			o.stream = IsEventStreamContentType(contentType)
+		}
 	}
 	if !o.stream {
 		if o.response.MetadataIncomplete {
