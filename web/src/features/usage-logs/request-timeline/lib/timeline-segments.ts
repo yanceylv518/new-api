@@ -177,7 +177,7 @@ export function buildRequestSegments(
         })
       }
       if (firstWrite === null) {
-        // 没有写出任何内容：首次响应之后只能记为接收；连首次响应也没有时整段记为调用模型
+        // 缺少首次写出记录时，四点口径合并接收和转发，旧口径保留接收阶段。
         if (firstByte === null) {
           push({
             key: 'call',
@@ -190,7 +190,7 @@ export function buildRequestSegments(
           push({
             key: 'receive',
             kind: 'flow',
-            label: t('Receive response'),
+            label: fourPoints ? t('Process response') : t('Receive response'),
             end: final.end_us,
             attempt: final,
           })

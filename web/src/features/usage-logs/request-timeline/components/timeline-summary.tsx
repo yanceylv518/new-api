@@ -174,7 +174,7 @@ export function TimelineMetrics(props: {
           </>
         )}
         <Metric
-          label={fourPoints ? t('Receive response') : t('First output')}
+          label={fourPoints ? t('Process response') : t('First output')}
           value={receiveDuration}
         />
         <Metric

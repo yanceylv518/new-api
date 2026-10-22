@@ -243,7 +243,7 @@ export function buildTimelineGroups(
       if (response !== null) {
         children.push({
           id: `attempt-${attempt.index}-response`,
-          label: t('Receive response'),
+          label: t('Process response'),
           description: '',
           start: response,
           end: attempt.end_us,
