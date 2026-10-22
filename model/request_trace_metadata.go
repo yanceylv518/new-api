@@ -158,7 +158,7 @@ func migrateRequestTraceTableName(db *gorm.DB) error {
 	case len(metadataColumns):
 		target, expected = "request_trace_metadata", metadataColumns
 	case len(requestTraceColumns):
-		target, expected = requestTraceTableName, requestTraceColumns
+		target, expected = requestTraceTableName, requestTraceColumns[:]
 	default:
 		return errors.New("unknown legacy request_traces layout; resolve the schema before migration")
 	}

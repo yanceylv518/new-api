@@ -380,6 +380,86 @@ func TestRequestTraceMainAndSeparateLogMigration(t *testing.T) {
 	assert.Equal(t, mainRow, unchanged)
 }
 
+func TestRequestTraceTimelineLegacyMigrationMySQL(t *testing.T) {
+	for _, separate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("separate-log=%t", separate), func(t *testing.T) {
+			mainDB, _ := requestTraceWriterMySQL(t)
+			db := mainDB
+			if separate {
+				t.Setenv("REQUEST_TRACE_TIMELINE_LOG_DSN", requesttracetest.MySQLDSN(t))
+				var dbType common.DatabaseType
+				var err error
+				db, dbType, err = chooseDB("REQUEST_TRACE_TIMELINE_LOG_DSN", true)
+				require.NoError(t, err)
+				db.Logger = logger.Default.LogMode(logger.Silent)
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				t.Cleanup(func() { LOG_DB = mainDB; assert.NoError(t, sqlDB.Close()) })
+				LOG_DB = db
+				common.SetLogDatabaseType(dbType)
+				require.NoError(t, db.AutoMigrate(&RequestTraceMetadata{}))
+			}
+			require.NoError(t, MigrateRequestTraces())
+			metadata := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 200}})
+			require.NoError(t, RecordRequestTraces(t.Context(), []RequestTraceMetadata{{RequestId: "preserved-metadata", UserId: 11, Data: metadata}}))
+			row := RequestTrace{RequestId: "legacy-timeline", RequestKind: "chat", Outcome: "success", StartedAtUS: 100, FinishedAtUS: 150, DurationUS: 50, CaptureStatus: "complete", NodeId: "migration-test", SchemaVersion: 1, TraceData: `{"measurement_version":3}`}
+			require.NoError(t, db.Create(&row).Error)
+			require.NoError(t, db.Migrator().RenameTable(&RequestTrace{}, "request_traces"))
+			for range 2 {
+				if !separate {
+					require.NoError(t, migrateDB())
+				}
+				require.NoError(t, migrateLOGDB())
+			}
+			assert.False(t, db.Migrator().HasTable("request_traces"))
+			columns, err := db.Migrator().ColumnTypes(&RequestTrace{})
+			require.NoError(t, err)
+			assert.Len(t, columns, 21)
+			columns, err = db.Migrator().ColumnTypes(&RequestTraceMetadata{})
+			require.NoError(t, err)
+			assert.Len(t, columns, 6)
+			stored, err := FindRequestTrace(t.Context(), row.RequestId, 0)
+			require.NoError(t, err)
+			assert.Equal(t, row, *stored)
+			views, err := GetRequestTraces(t.Context(), "preserved-metadata", 11, false)
+			require.NoError(t, err)
+			require.Len(t, views, 1)
+			assert.Equal(t, 200, views[0].Trace.Status)
+		})
+	}
+	t.Run("unknown legacy layout preserves the source table", func(t *testing.T) {
+		db, _ := requestTraceWriterMySQL(t)
+		legacy := struct {
+			Id      int64 `gorm:"primaryKey"`
+			Payload string
+		}{Id: 1, Payload: "preserve"}
+		require.NoError(t, db.Table("request_traces").Migrator().CreateTable(&legacy))
+		require.NoError(t, db.Table("request_traces").Create(&legacy).Error)
+		require.ErrorContains(t, migrateRequestTraceTableName(db), "unknown legacy request_traces layout")
+		var stored struct {
+			Id      int64
+			Payload string
+		}
+		require.NoError(t, db.Table("request_traces").First(&stored).Error)
+		assert.Equal(t, "preserve", stored.Payload)
+		assert.False(t, db.Migrator().HasTable(&RequestTrace{}))
+	})
+	t.Run("existing destination preserves both metadata tables", func(t *testing.T) {
+		db, _ := requestTraceWriterMySQL(t)
+		require.NoError(t, db.Table("request_traces").Migrator().CreateTable(&RequestTraceMetadata{}))
+		legacy := RequestTraceMetadata{RequestId: "legacy-preserved", Data: "legacy"}
+		current := RequestTraceMetadata{RequestId: "current-preserved", Data: "current"}
+		require.NoError(t, db.Table("request_traces").Create(&legacy).Error)
+		require.NoError(t, db.Create(&current).Error)
+		require.ErrorContains(t, migrateRequestTraceTableName(db), "both request_traces and request_trace_metadata exist")
+		var legacyStored, currentStored RequestTraceMetadata
+		require.NoError(t, db.Table("request_traces").First(&legacyStored).Error)
+		require.NoError(t, db.First(&currentStored).Error)
+		assert.Equal(t, legacy, legacyStored)
+		assert.Equal(t, current, currentStored)
+	})
+}
+
 func TestRequestTraceStorageContractMySQL(t *testing.T) {
 	t.Run("live compression changes and legacy frames remain readable", func(t *testing.T) {
 		_, _ = requestTraceWriterMySQL(t)
