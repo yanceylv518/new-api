@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -175,6 +176,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 						collectStreamFunctionCallNames(lastDecoded.Choices, seenStreamToolCalls, &streamFunctionCallNames)
 						if chunk.Error != nil || chunk.Type == "error" {
 							common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+							if common.GetUpstreamBusinessError(c) != nil {
+								sr.Error(errors.New("upstream business error"))
+							}
 						}
 					}
 					_ = ProcessStreamResponse(*lastDecoded, &responseTextBuilder, &toolCount)
@@ -191,6 +195,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					collectStreamFunctionCallNames(metadata.Choices, seenStreamToolCalls, &streamFunctionCallNames)
 					if metadata.Error != nil || metadata.Type == "error" {
 						common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+						if common.GetUpstreamBusinessError(c) != nil {
+							sr.Error(errors.New("upstream business error"))
+						}
 					}
 				}
 			}
