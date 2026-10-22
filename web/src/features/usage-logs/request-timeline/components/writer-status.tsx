@@ -131,7 +131,7 @@ function WriterStatusContent() {
     { label: t('Dropped since startup'), value: status.dropped },
     { label: t('Write retries since startup'), value: status.retries },
     { label: t('Expired timelines deleted'), value: status.cleanup_deleted },
-    { label: t('Failed cleanup batches'), value: status.cleanup_failed },
+    { label: t('Failed cleanup tasks'), value: status.cleanup_failed },
   ]
   const drops = [
     { label: t('Encoding or size limit'), value: status.dropped_encoding },
@@ -265,9 +265,7 @@ function WriterStatusContent() {
         )}
       </p>
       {status.cleanup_pending && (
-        <p className='text-muted-foreground text-xs'>
-          {t('Retention cleanup will check for more expired records.')}
-        </p>
+        <p className='text-muted-foreground text-xs'>{t('Cleaning...')}</p>
       )}
     </div>
   )

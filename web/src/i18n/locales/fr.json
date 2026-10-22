@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "Conservation des métadonnées des requêtes (jours)",
+    "Request timeline retention (days)": "Conservation des chronologies des requêtes (jours)",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Par défaut : 30 jours. Les enregistrements expirés sont supprimés automatiquement. 0 les conserve indéfiniment. Les journaux d’utilisation sont conservés.",
+    "Clean expired records": "Supprimer les enregistrements expirés",
+    "Save the retention period before cleaning.": "Enregistrez la durée de conservation avant le nettoyage.",
+    "Unable to load trace cleanup status": "Impossible de charger l’état du nettoyage des traces",
+    "Unable to start trace cleanup": "Impossible de démarrer le nettoyage des traces",
+    "Clean expired request metadata?": "Supprimer les métadonnées de requête expirées ?",
+    "Clean expired request timelines?": "Supprimer les chronologies de requête expirées ?",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "Les enregistrements plus anciens que la durée enregistrée de {{days}} jours seront définitivement supprimés. Les journaux d’utilisation sont conservés.",
+    "cleanup stopped because the retention period was extended or disabled": "Le nettoyage a été arrêté car la durée de conservation a été prolongée ou désactivée",
+    "save a positive retention period before cleaning expired traces": "Enregistrez une durée de conservation supérieure à 0 avant de supprimer les traces expirées",
+    "Failed cleanup tasks": "Tâches de nettoyage en échec",
     "The upstream response could not be read completely.": "La réponse du serveur en amont n’a pas pu être lue entièrement.",
     "Trace rows dropped for failed or diagnostic requests": "Lignes de trace abandonnées pour les requêtes en échec ou de diagnostic",
     "Trace rows dropped for regular requests": "Lignes de trace abandonnées pour les requêtes ordinaires",

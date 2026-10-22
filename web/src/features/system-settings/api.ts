@@ -25,6 +25,8 @@ import type {
   SystemOptionsResponse,
   SystemTaskListResponse,
   SystemTaskResponse,
+  TraceCleanupKind,
+  TraceCleanupStatus,
   UpdateOptionRequest,
   UpdateOptionResponse,
   UpstreamChannelsResponse,
@@ -75,6 +77,30 @@ export async function getSystemTask(taskId: string) {
     `/api/system-task/${taskId}`
   )
   return res.data
+}
+
+export async function getTraceCleanupStatus(
+  kind: TraceCleanupKind,
+  signal?: AbortSignal
+) {
+  const res = await api.get<SystemTaskResponse<TraceCleanupStatus>>(
+    `/api/system-task/trace-cleanup/${kind}`,
+    { signal }
+  )
+  if (!res.data.success || !res.data.data) {
+    throw new Error(res.data.message || 'Unable to load trace cleanup status')
+  }
+  return res.data.data
+}
+
+export async function startTraceCleanupTask(kind: TraceCleanupKind) {
+  const res = await api.post<SystemTaskResponse<TraceCleanupStatus>>(
+    `/api/system-task/trace-cleanup/${kind}`
+  )
+  if (!res.data.success || !res.data.data) {
+    throw new Error(res.data.message || 'Unable to start trace cleanup')
+  }
+  return res.data.data
 }
 
 export async function listSystemTasks(limit = 20) {

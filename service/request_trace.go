@@ -22,16 +22,12 @@ import (
 )
 
 const (
-	maxRequestTraceBytes             = 64 << 10
-	requestTraceQueueCapacity        = 512
-	requestTraceBatchSize            = 64
-	maxRequestTraceBatchBytes        = 1 << 20
-	maxRequestTracePendingBytes      = 16 << 20
-	requestTraceFlushInterval        = 250 * time.Millisecond
-	requestTraceCleanupIdleInterval  = 10 * time.Minute
-	requestTraceCleanupBatchInterval = 100 * time.Millisecond
-	requestTraceCleanupRetryInterval = 30 * time.Second
-	requestTraceCleanupTimeout       = 3 * time.Second
+	maxRequestTraceBytes        = 64 << 10
+	requestTraceQueueCapacity   = 512
+	requestTraceBatchSize       = 64
+	maxRequestTraceBatchBytes   = 1 << 20
+	maxRequestTracePendingBytes = 16 << 20
+	requestTraceFlushInterval   = 250 * time.Millisecond
 )
 
 type pendingRequestTrace struct {
@@ -40,19 +36,15 @@ type pendingRequestTrace struct {
 }
 
 type RequestTraceWriter struct {
-	mu             sync.RWMutex
-	stopped        bool
-	queue          chan *pendingRequestTrace
-	done           chan struct{}
-	cleanupDone    chan struct{}
-	cancel         context.CancelFunc
-	written        atomic.Int64
-	dropped        atomic.Int64
-	sampledOut     atomic.Int64
-	failed         atomic.Int64
-	cleanupDeleted atomic.Int64
-	cleanupFailed  atomic.Int64
-	cleanupPending atomic.Bool
+	mu         sync.RWMutex
+	stopped    bool
+	queue      chan *pendingRequestTrace
+	done       chan struct{}
+	cancel     context.CancelFunc
+	written    atomic.Int64
+	dropped    atomic.Int64
+	sampledOut atomic.Int64
+	failed     atomic.Int64
 	// mu 保护运行状态；单写入协程按入队顺序完成批次，时间环只保存仍待完成记录的时刻。
 	nodeID              string
 	startedAtUS         int64
@@ -76,18 +68,22 @@ type RequestTraceWriter struct {
 	lastBatchDurationUS int64
 }
 
-var activeRequestTraceWriter *RequestTraceWriter
+var (
+	activeRequestTraceWriter      *RequestTraceWriter
+	requestTimelineCleanupDeleted atomic.Int64
+	requestTimelineCleanupFailed  atomic.Int64
+	requestTimelineCleanupPending atomic.Bool
+)
 
 func StartRequestTraceWriter() *RequestTraceWriter {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &RequestTraceWriter{
 		queue: make(chan *pendingRequestTrace, requestTraceQueueCapacity), done: make(chan struct{}),
-		cleanupDone: make(chan struct{}), cancel: cancel,
+		cancel: cancel,
 		nodeID: common.GetNodeIdentity().Name, startedAtUS: time.Now().UnixMicro(),
 	}
 	activeRequestTraceWriter = w
 	go w.run(ctx)
-	go w.cleanup(ctx)
 	return w
 }
 
@@ -267,41 +263,6 @@ func (w *RequestTraceWriter) run(ctx context.Context) {
 	}
 }
 
-func (w *RequestTraceWriter) cleanup(ctx context.Context) {
-	defer close(w.cleanupDone)
-	if !common.IsMasterNode || common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		return
-	}
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			cleanupCtx, cancel := context.WithTimeout(ctx, requestTraceCleanupTimeout)
-			deleted, more, err := model.CleanupRequestTraceBatch(cleanupCtx)
-			cancel()
-			delay := requestTraceCleanupIdleInterval
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				w.cleanupFailed.Add(1)
-				common.SysError("request trace cleanup failed: " + err.Error())
-				delay = requestTraceCleanupRetryInterval
-			} else {
-				w.cleanupDeleted.Add(deleted)
-				w.cleanupPending.Store(more)
-				if more {
-					delay = requestTraceCleanupBatchInterval
-				}
-			}
-			timer.Reset(delay)
-		}
-	}
-}
-
 func (w *RequestTraceWriter) flush(ctx context.Context, batch []*model.RequestTrace) {
 	if len(batch) == 0 {
 		return
@@ -403,12 +364,7 @@ func (w *RequestTraceWriter) Shutdown(ctx context.Context) error {
 	select {
 	case <-w.done:
 		w.cancel()
-		select {
-		case <-w.cleanupDone:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return nil
 	case <-ctx.Done():
 		w.cancel()
 		return ctx.Err()
@@ -467,7 +423,7 @@ func GetRequestTraceWriterStatus() RequestTraceWriterStatus {
 		Buffered: w.buffered, Writing: w.writing, Outstanding: w.pendingCount, Pending: pending,
 		Written: w.written.Load(), Dropped: w.dropped.Load(), Failed: w.failed.Load(), RetentionDays: model.RequestTraceRetentionDays(),
 		SampledOut: w.sampledOut.Load(), PendingPayloadBytes: w.pendingBytes, PayloadBudgetBytes: maxRequestTracePendingBytes,
-		CleanupDeleted: w.cleanupDeleted.Load(), CleanupFailed: w.cleanupFailed.Load(), CleanupPending: w.cleanupPending.Load(),
+		CleanupDeleted: requestTimelineCleanupDeleted.Load(), CleanupFailed: requestTimelineCleanupFailed.Load(), CleanupPending: requestTimelineCleanupPending.Load(),
 		Retries: w.retries, DroppedEncoding: w.droppedEncoding, DroppedQueueFull: w.droppedQueueFull,
 		DroppedByteLimit: w.droppedByteLimit,
 		DroppedStopped:   w.droppedStopped, DroppedShutdown: w.droppedShutdown, LastBatchSize: w.lastBatchSize,

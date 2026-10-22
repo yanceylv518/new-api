@@ -190,6 +190,7 @@ func InitOptionMap() {
 	system_setting.SetRequestTraceEnabled(requestTraceEnabled)
 	common.OptionMap[system_setting.RequestTraceEnabledOptionKey] = strconv.FormatBool(requestTraceEnabled)
 	common.OptionMap[system_setting.RequestTraceCompressionOptionKey] = system_setting.DefaultRequestTraceCompressionLevel
+	common.OptionMap[system_setting.RequestTraceRetentionOptionKey] = strconv.Itoa(system_setting.DefaultRequestTraceRetentionDays())
 	for key, value := range map[string]string{
 		system_setting.RequestTraceSuccessSampleRateOptionKey: "100",
 		system_setting.RequestTraceSlowRequestOptionKey:       "0",
@@ -230,6 +231,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == system_setting.RequestTraceRetentionOptionKey {
+		return system_setting.ValidateRequestTraceRetentionDays(value)
+	}
 	if key == "RequestTraceConfig" {
 		_, err := common.ParseRequestTraceConfig(value)
 		return err
@@ -262,7 +266,7 @@ func UpdateOption(key string, value string) error {
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
 	}
-	if key == system_setting.RequestTraceCompressionOptionKey || key == system_setting.RequestTraceEnabledOptionKey || system_setting.IsRequestTraceSamplingOption(key) {
+	if key == system_setting.RequestTraceCompressionOptionKey || key == system_setting.RequestTraceEnabledOptionKey || key == system_setting.RequestTraceRetentionOptionKey || system_setting.IsRequestTraceSamplingOption(key) {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if err := validateOptionValue(key, value); err != nil {
@@ -322,6 +326,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == system_setting.RequestTraceRetentionOptionKey {
+		if err := system_setting.ValidateRequestTraceRetentionDays(value); err != nil {
+			return err
+		}
+	}
 	if err := system_setting.ValidateRequestTraceSamplingOption(key, value); err != nil {
 		return err
 	}
@@ -344,6 +353,9 @@ func updateOptionMap(key string, value string) (err error) {
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
+	if key == system_setting.RequestTraceRetentionOptionKey {
+		return nil
+	}
 	if key == "RequestTraceConfig" {
 		return common.SetRequestTraceOption(key, value)
 	}

@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -10,6 +12,42 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func RequestTraceCleanupTask(c *gin.Context) {
+	var taskType string
+	switch c.Param("kind") {
+	case "metadata":
+		taskType = model.SystemTaskTypeRequestTraceCleanup
+	case "timeline":
+		taskType = model.SystemTaskTypeRequestTimelineCleanup
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid request trace cleanup type"})
+		return
+	}
+	days, err := model.GetSavedRequestTraceRetentionDays(c.Request.Context(), taskType == model.SystemTaskTypeRequestTimelineCleanup)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	var task *model.SystemTask
+	if c.Request.Method == http.MethodPost {
+		task, err = service.StartRequestTraceCleanupTask(c.Request.Context(), taskType)
+	} else {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+		defer cancel()
+		task, err = model.GetLatestRequestTraceCleanup(ctx, taskType)
+	}
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	var response *model.SystemTaskResponse
+	if task != nil {
+		value := task.ToResponse()
+		response = &value
+	}
+	common.ApiSuccess(c, gin.H{"retention_days": days, "task": response})
+}
 
 func CreateLogCleanupSystemTask(c *gin.Context) {
 	targetTimestamp, _ := strconv.ParseInt(c.Query("target_timestamp"), 10, 64)

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -50,11 +53,48 @@ var requestTraceColumns = [...]string{
 }
 
 func RequestTraceRetentionDays() int {
-	days := common.GetEnvOrDefault("REQUEST_TRACE_RETENTION_DAYS", 7)
-	if days < 1 || days > 3650 {
-		return 7
+	return system_setting.GetRequestTraceRetentionDays()
+}
+
+// 删除前读取持久化策略，避免多节点选项缓存尚未同步时沿用较短的保留期。
+func GetSavedRequestTraceRetentionDays(ctx context.Context, timeline bool) (int, error) {
+	key := "RequestTraceConfig"
+	days := common.DefaultRequestTraceRetentionDays
+	if timeline {
+		key = system_setting.RequestTraceRetentionOptionKey
+		days = system_setting.DefaultRequestTraceRetentionDays()
 	}
-	return days
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var option Option
+	result := DB.WithContext(queryCtx).Where(&Option{Key: key}).Limit(1).Find(&option)
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return days, nil
+	}
+	if timeline {
+		if err := system_setting.ValidateRequestTraceRetentionDays(option.Value); err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(option.Value)
+	}
+	config, err := common.ParseRequestTraceConfig(option.Value)
+	return config.RetentionDays, err
+}
+
+func removeRequestTraceTTL(ctx context.Context, table string) error {
+	var definition string
+	db := LOG_DB.WithContext(ctx)
+	if err := db.Raw("SHOW CREATE TABLE ?", clause.Table{Name: table}).Scan(&definition).Error; err != nil {
+		return err
+	}
+	if strings.Contains(definition, "TTL ") {
+		// 清理由系统任务统一执行，旧 TTL 不得绕过管理员延长或关闭的保留策略。
+		return db.Exec("ALTER TABLE ? REMOVE TTL", clause.Table{Name: table}).Error
+	}
+	return nil
 }
 
 func MigrateRequestTraces() error {
@@ -90,7 +130,7 @@ func MigrateRequestTraces() error {
 		ORDER BY (request_id)`).Error; err != nil {
 			return err
 		}
-		if err := LOG_DB.Exec(fmt.Sprintf("ALTER TABLE request_trace_timeline MODIFY TTL toDateTime(intDiv(started_at_us, 1000000)) + INTERVAL %d DAY", RequestTraceRetentionDays())).Error; err != nil {
+		if err := removeRequestTraceTTL(context.Background(), requestTraceTableName); err != nil {
 			return err
 		}
 	} else if !LOG_DB.Migrator().HasTable(&RequestTrace{}) {
@@ -216,30 +256,27 @@ func findRequestTrace(ctx context.Context, requestID string, userID int, include
 	return &entry, nil
 }
 
-func CleanupRequestTraces(ctx context.Context) error {
-	for batch := 0; batch < 100; batch++ {
-		_, more, err := CleanupRequestTraceBatch(ctx)
-		if err != nil || !more {
-			return err
-		}
-	}
-	return nil
+func CountOldRequestTimelines(ctx context.Context, cutoff int64) (int64, error) {
+	var count int64
+	err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("started_at_us < ?", cutoff).Count(&count).Error
+	return count, err
 }
 
-// CleanupRequestTraceBatch 返回本批删除数，以及是否需要继续检查到期数据。
-func CleanupRequestTraceBatch(ctx context.Context) (int64, bool, error) {
+func DeleteOldRequestTimelines(ctx context.Context, cutoff int64, batchSize int) (int64, error) {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		return 0, false, nil
+		count, err := CountOldRequestTimelines(ctx, cutoff)
+		if err != nil || count == 0 {
+			return 0, err
+		}
+		return count, LOG_DB.WithContext(ctx).Exec("ALTER TABLE request_trace_timeline DELETE WHERE started_at_us < ? SETTINGS mutations_sync = 1", cutoff).Error
 	}
-	const batchSize = 1000
-	cutoff := time.Now().Add(-time.Duration(RequestTraceRetentionDays()) * 24 * time.Hour).UnixMicro()
 	var ids []int64
 	if err := LOG_DB.WithContext(ctx).Model(&RequestTrace{}).Where("started_at_us < ?", cutoff).Order("started_at_us").Order("id").Limit(batchSize).Pluck("id", &ids).Error; err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	if len(ids) == 0 {
-		return 0, false, nil
+		return 0, nil
 	}
 	result := LOG_DB.WithContext(ctx).Where("id IN ? AND started_at_us < ?", ids, cutoff).Delete(&RequestTrace{})
-	return result.RowsAffected, len(ids) == batchSize, result.Error
+	return result.RowsAffected, result.Error
 }

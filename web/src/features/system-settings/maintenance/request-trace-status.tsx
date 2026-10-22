@@ -22,12 +22,10 @@ import { useTranslation } from 'react-i18next'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { StatusBadge } from '@/components/status-badge'
-import { Progress } from '@/components/ui/progress'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { SettingsControlGroup } from '../components/settings-form-layout'
-import type { LogCleanupTask } from '../types'
 
 type TraceStatus = {
   node: string
@@ -48,8 +46,6 @@ type TraceStatus = {
   partial_requests: number
   average_write_ms: number
   last_write_ms: number
-  cleanup?: LogCleanupTask
-  cleanup_error?: string
 }
 
 export function RequestTraceStatus() {
@@ -79,15 +75,6 @@ export function RequestTraceStatus() {
     refetchOnWindowFocus: false,
   })
   const status = query.data
-  const cleanup = status?.cleanup
-  const cleanupActive =
-    cleanup?.status === 'pending' || cleanup?.status === 'running'
-  const cleanupStatus = {
-    pending: t('Pending'),
-    running: t('Running'),
-    succeeded: t('Succeeded'),
-    failed: t('Failed'),
-  }
   const metrics = status
     ? [
         [
@@ -175,32 +162,6 @@ export function RequestTraceStatus() {
             </div>
           ))}
         </dl>
-      )}
-      {cleanup && (
-        <div className='flex flex-col gap-2'>
-          <p className='text-muted-foreground text-xs'>
-            {t('Request trace cleanup')}: {cleanupStatus[cleanup.status]} ·{' '}
-            {t('{{count}} trace records removed.', {
-              count:
-                cleanup.state?.trace_processed ??
-                cleanup.result?.trace_deleted_count ??
-                0,
-            })}
-          </p>
-          {cleanupActive && (
-            <Progress
-              value={Math.min(100, Math.max(0, cleanup.state?.progress ?? 0))}
-            />
-          )}
-          {cleanup.error && (
-            <p className='text-destructive text-xs'>{cleanup.error}</p>
-          )}
-        </div>
-      )}
-      {status?.cleanup_error && (
-        <p className='text-destructive text-xs'>
-          {t('Request trace cleanup')}: {status.cleanup_error}
-        </p>
       )}
     </SettingsControlGroup>
   )

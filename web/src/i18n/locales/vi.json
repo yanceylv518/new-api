@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "Thời gian giữ siêu dữ liệu yêu cầu (ngày)",
+    "Request timeline retention (days)": "Thời gian giữ dòng thời gian yêu cầu (ngày)",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Mặc định: 30 ngày. Bản ghi hết hạn được tự động xóa. 0 giữ vô thời hạn. Nhật ký sử dụng được giữ lại.",
+    "Clean expired records": "Xóa bản ghi hết hạn",
+    "Save the retention period before cleaning.": "Lưu thời gian lưu giữ trước khi dọn dẹp.",
+    "Unable to load trace cleanup status": "Không thể tải trạng thái dọn dẹp truy vết",
+    "Unable to start trace cleanup": "Không thể bắt đầu dọn dẹp truy vết",
+    "Clean expired request metadata?": "Xóa siêu dữ liệu yêu cầu đã hết hạn?",
+    "Clean expired request timelines?": "Xóa dòng thời gian yêu cầu đã hết hạn?",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "Bản ghi cũ hơn thời gian lưu giữ đã lưu là {{days}} ngày sẽ bị xóa vĩnh viễn. Nhật ký sử dụng được giữ lại.",
+    "cleanup stopped because the retention period was extended or disabled": "Đã dừng dọn dẹp vì thời gian lưu giữ được kéo dài hoặc tắt",
+    "save a positive retention period before cleaning expired traces": "Hãy lưu thời gian lưu giữ lớn hơn 0 trước khi xóa truy vết hết hạn",
+    "Failed cleanup tasks": "Tác vụ dọn dẹp thất bại",
     "The upstream response could not be read completely.": "Không thể đọc đầy đủ phản hồi từ máy chủ thượng nguồn.",
     "Trace rows dropped for failed or diagnostic requests": "Số dòng truy vết bị bỏ của yêu cầu lỗi hoặc chẩn đoán",
     "Trace rows dropped for regular requests": "Số dòng truy vết bị bỏ của yêu cầu thông thường",

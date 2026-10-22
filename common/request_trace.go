@@ -20,6 +20,7 @@ const (
 	UpstreamRequestIDCapturedContextKey  = "upstream_request_id_captured"
 	maxUpstreamRequestIDHeaders          = 16
 	maxUpstreamRequestIDHeaderNameLength = 128
+	DefaultRequestTraceRetentionDays     = 30
 )
 
 type RequestTraceConfig struct {
@@ -37,7 +38,7 @@ type RequestTraceConfig struct {
 var requestTraceConfig = struct {
 	sync.RWMutex
 	value RequestTraceConfig
-}{value: RequestTraceConfig{Level: "errors", PreChannelErrors: true, CompressionLevel: "fast", SuccessSampleRate: 100}}
+}{value: RequestTraceConfig{Level: "errors", PreChannelErrors: true, CompressionLevel: "fast", SuccessSampleRate: 100, RetentionDays: DefaultRequestTraceRetentionDays}}
 
 func GetRequestTraceConfig() RequestTraceConfig {
 	requestTraceConfig.RLock()
@@ -60,7 +61,7 @@ func SetRequestTraceOption(key, value string) error {
 }
 
 func ParseRequestTraceConfig(value string) (RequestTraceConfig, error) {
-	config := RequestTraceConfig{CompressionLevel: "fast", SuccessSampleRate: 100}
+	config := RequestTraceConfig{CompressionLevel: "fast", SuccessSampleRate: 100, RetentionDays: DefaultRequestTraceRetentionDays}
 	var fields map[string]json.RawMessage
 	if err := UnmarshalJsonStr(value, &fields); err != nil {
 		return config, err

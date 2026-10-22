@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "Request metadata retention (days)",
+    "Request timeline retention (days)": "Request timeline retention (days)",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.",
+    "Clean expired records": "Clean expired records",
+    "Save the retention period before cleaning.": "Save the retention period before cleaning.",
+    "Unable to load trace cleanup status": "Unable to load trace cleanup status",
+    "Unable to start trace cleanup": "Unable to start trace cleanup",
+    "Clean expired request metadata?": "Clean expired request metadata?",
+    "Clean expired request timelines?": "Clean expired request timelines?",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.",
+    "cleanup stopped because the retention period was extended or disabled": "cleanup stopped because the retention period was extended or disabled",
+    "save a positive retention period before cleaning expired traces": "save a positive retention period before cleaning expired traces",
+    "Failed cleanup tasks": "Failed cleanup tasks",
     "The upstream response could not be read completely.": "The upstream response could not be read completely.",
     "Trace rows dropped for failed or diagnostic requests": "Trace rows dropped for failed or diagnostic requests",
     "Trace rows dropped for regular requests": "Trace rows dropped for regular requests",

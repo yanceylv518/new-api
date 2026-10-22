@@ -15,9 +15,40 @@ const DefaultRequestTraceCompressionLevel = "fastest"
 const RequestTraceSuccessSampleRateOptionKey = "request_trace.success_sample_rate"
 const RequestTraceSlowRequestOptionKey = "request_trace.slow_request_ms"
 const RequestTraceSlowFirstByteOptionKey = "request_trace.slow_first_byte_ms"
+const RequestTraceRetentionOptionKey = "request_trace.retention_days"
 
 var requestTraceEnabled atomic.Bool
 var requestTraceSampling atomic.Pointer[requesttrace.SamplingPolicy]
+
+func DefaultRequestTraceRetentionDays() int {
+	days := common.GetEnvOrDefault("REQUEST_TRACE_RETENTION_DAYS", common.DefaultRequestTraceRetentionDays)
+	if days < 1 || days > 3650 {
+		return common.DefaultRequestTraceRetentionDays
+	}
+	return days
+}
+
+func GetRequestTraceRetentionDays() int {
+	common.OptionMapRWMutex.RLock()
+	value, exists := common.OptionMap[RequestTraceRetentionOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+	if !exists {
+		return DefaultRequestTraceRetentionDays()
+	}
+	days, err := strconv.Atoi(value)
+	if err != nil || days < 0 || days > 3650 {
+		return DefaultRequestTraceRetentionDays()
+	}
+	return days
+}
+
+func ValidateRequestTraceRetentionDays(value string) error {
+	days, err := strconv.Atoi(value)
+	if err != nil || days < 0 || days > 3650 {
+		return errors.New("request timeline retention must be an integer between 0 and 3650 days")
+	}
+	return nil
+}
 
 func IsRequestTraceSamplingOption(key string) bool {
 	return key == RequestTraceSuccessSampleRateOptionKey || key == RequestTraceSlowRequestOptionKey || key == RequestTraceSlowFirstByteOptionKey
