@@ -35,37 +35,23 @@ import {
 } from './api'
 import { TimelineChart } from './components/timeline-chart'
 import { TimelineIssues } from './components/timeline-issues'
-import { TimelineLens } from './components/timeline-lens'
 import {
   TimelineHeader,
   TimelineMetrics,
   TimelineUserSplit,
 } from './components/timeline-summary'
-import {
-  buildTimelineGroups,
-  flattenTimeline,
-  getAttemptResponseOffset,
-  getChannelStart,
-} from './lib/timeline-model'
-import {
-  buildRequestSegments,
-  buildSegmentSteps,
-} from './lib/timeline-segments'
+import { getAttemptResponseOffset, getChannelStart } from './lib/timeline-model'
+import { buildRequestSegments } from './lib/timeline-segments'
 
 const EMPTY_TIMELINE_RECHECK_DELAYS = [500, 1000, 2000] as const
 
-/** 按关键时刻切段，点选一段时展开其已有记录。 */
+/** 按关键时刻切段，点选时高亮对应的时间块。 */
 function TimelineStages(props: {
   result: RequestTimelineResult
   data: RequestTimelineData
   total: number
 }) {
   const { t } = useTranslation()
-  const index = useMemo(() => {
-    const groups = buildTimelineGroups(t, props.data, props.total)
-    const rows = flattenTimeline(groups, new Set())
-    return new Map(rows.map(({ node }) => [node.id, node]))
-  }, [t, props.data, props.total])
   let firstByte =
     props.result.detail?.final_attempt_first_byte_offset_us ?? null
   if ((props.data.measurement_version ?? 1) >= 3) {
@@ -89,34 +75,18 @@ function TimelineStages(props: {
   )
   const [segmentKey, setSegmentKey] = useState<string | null>(null)
   const segment = timeline.segments.find((item) => item.key === segmentKey)
-  const steps = useMemo(
-    () =>
-      segment ? buildSegmentSteps(segment, props.data, index, props.total) : [],
-    [segment, props.data, index, props.total]
-  )
-  // 再次点选同一段收起放大镜
   const toggleSegment = useCallback(
     (key: string) => setSegmentKey((current) => (current === key ? null : key)),
     []
   )
   return (
-    <div className='space-y-4'>
-      <TimelineChart
-        segments={timeline.segments}
-        moments={timeline.moments}
-        total={props.total}
-        selectedKey={segment?.key ?? null}
-        onSelect={toggleSegment}
-      />
-      {segment && (
-        <TimelineLens
-          segment={segment}
-          steps={steps}
-          total={props.total}
-          stream={stream}
-        />
-      )}
-    </div>
+    <TimelineChart
+      segments={timeline.segments}
+      moments={timeline.moments}
+      total={props.total}
+      selectedKey={segment?.key ?? null}
+      onSelect={toggleSegment}
+    />
   )
 }
 

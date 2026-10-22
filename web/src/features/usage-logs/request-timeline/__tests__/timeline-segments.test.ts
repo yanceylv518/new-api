@@ -20,14 +20,9 @@ import type { TFunction } from 'i18next'
 import { describe, expect, test } from 'vitest'
 
 import type { RequestTimelineData, RequestTimelineResult } from '../api'
-import {
-  buildTimelineGroups,
-  flattenTimeline,
-  getAttemptResponseOffset,
-} from '../lib/timeline-model'
+import { getAttemptResponseOffset } from '../lib/timeline-model'
 import {
   buildRequestSegments,
-  buildSegmentSteps,
   type RequestSegment,
 } from '../lib/timeline-segments'
 import { retriedStreamResult, singleStreamResult } from './fixtures'
@@ -62,18 +57,6 @@ function cut(
 
 const spans = (segments: RequestSegment[]) =>
   segments.map((segment) => [segment.key, segment.start, segment.end])
-
-function stepsOf(result: RequestTimelineResult, key: string) {
-  const data = timelineOf(result)
-  const total = result.summary?.duration_us ?? 0
-  const groups = buildTimelineGroups(t, data, total)
-  const index = new Map(
-    flattenTimeline(groups, new Set()).map(({ node }) => [node.id, node])
-  )
-  const segment = cut(result).segments.find((item) => item.key === key)
-  if (!segment) throw new Error(`fixture has no ${key} segment`)
-  return buildSegmentSteps(segment, data, index, total)
-}
 
 describe('request timeline segments', () => {
   test('a streamed request is cut at the call start, first response, first output and last write', () => {
@@ -257,59 +240,5 @@ describe('four-point timeline', () => {
     expect(getAttemptResponseOffset(attempt, false, 1)).toBe(1_774_477)
     expect(getAttemptResponseOffset(attempt, false, 2)).toBeNull()
     expect(getAttemptResponseOffset(attempt, true, 1)).toBeNull()
-  })
-})
-
-describe('request timeline segment steps', () => {
-  test('preparation expands into the outermost gateway stages', () => {
-    const steps = stepsOf(singleStreamResult(), 'prepare')
-
-    expect(steps.map((step) => step.label)).toEqual([
-      'Verify identity',
-      'Check limits',
-      'Choose channel',
-      'Check request',
-      'Calculate cost',
-      'Reserve quota',
-    ])
-  })
-
-  test('waiting for the response expands into request conversion and the upstream connection, sending and processing', () => {
-    const steps = stepsOf(singleStreamResult(), 'wait')
-
-    expect(steps.map((step) => [step.label, step.start, step.end])).toEqual([
-      ['Convert request', 14_700, 15_820],
-      ['Existing connection', 15_950, 16_080],
-      ['Send request', 16_080, 22_700],
-      ['Upstream processing', 22_700, 1_774_477],
-    ])
-  })
-
-  test('a failed attempt expands into its upstream steps and the channel reselection after it', () => {
-    const steps = stepsOf(retriedStreamResult(), 'attempt-1')
-
-    expect(steps.map((step) => step.label)).toEqual([
-      'Existing connection',
-      'Send request',
-      'Upstream processing',
-      'Receive response',
-      'Choose channel',
-    ])
-    expect(
-      steps.find((step) => step.label === 'Upstream processing')?.kind
-    ).toBe('failed')
-  })
-
-  test('finishing work drills into the only stage that fills it', () => {
-    const steps = stepsOf(singleStreamResult(), 'finish')
-
-    expect(steps.map((step) => step.label)).toEqual([
-      'Finish billing',
-      'Save usage log',
-    ])
-  })
-
-  test('waiting for output has no recorded finer steps', () => {
-    expect(stepsOf(singleStreamResult(), 'think')).toEqual([])
   })
 })

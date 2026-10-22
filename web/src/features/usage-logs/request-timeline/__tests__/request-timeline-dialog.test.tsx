@@ -114,7 +114,7 @@ describe('request timeline dialog', () => {
     expect(requestedUrls).toEqual([])
   })
 
-  test('the timeline lists one stage per key-moment segment and opens no lens by default', async () => {
+  test('the timeline lists one stage per key-moment segment without a detail card', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
     const buttons = within(stages).getAllByRole('button')
@@ -134,7 +134,7 @@ describe('request timeline dialog', () => {
     expect(requestedUrls).toEqual(['/api/request-traces/req_retry_1'])
   })
 
-  test('selecting a failed attempt opens the lens with its upstream steps and selecting it again closes it', async () => {
+  test('selecting a failed attempt toggles its highlight without opening a detail card', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
     const failed = within(stages).getByRole('button', {
@@ -143,14 +143,11 @@ describe('request timeline dialog', () => {
 
     await userEvent.click(failed)
 
-    const lens = screen.getByRole('region', { name: 'Selected stage' })
     expect(
-      within(lens).getByRole('heading', { name: 'Attempt 1: Failed' })
-    ).toBeInTheDocument()
-    const steps = within(lens).getByRole('list', { name: 'Stage details' })
-    expect(within(steps).getByText('Upstream processing')).toBeInTheDocument()
-    expect(within(steps).getByText('Choose channel')).toBeInTheDocument()
+      screen.queryByRole('region', { name: 'Selected stage' })
+    ).not.toBeInTheDocument()
     expect(failed).toHaveAttribute('aria-pressed', 'true')
+    expect(failed).not.toHaveAttribute('aria-controls')
 
     await userEvent.click(failed)
 
@@ -160,22 +157,28 @@ describe('request timeline dialog', () => {
     expect(failed).toHaveAttribute('aria-pressed', 'false')
   })
 
-  test('the preparation lens lists the gateway steps and the time they do not cover', async () => {
+  test('selecting a different stage moves the highlight without showing stage details', async () => {
     renderDialog({ requestId: 'req_retry_1', admin: true })
     const stages = await screen.findByRole('list', { name: 'Request stages' })
 
-    await userEvent.click(
-      within(stages).getByRole('button', { name: /^Prepare request/ })
-    )
+    const prepare = within(stages).getByRole('button', {
+      name: /^Prepare request/,
+    })
+    const wait = within(stages).getByRole('button', {
+      name: /^Wait for response/,
+    })
 
-    const steps = within(
-      screen.getByRole('region', { name: 'Selected stage' })
-    ).getByRole('list', { name: 'Stage details' })
-    expect(within(steps).getByText('Verify identity')).toBeInTheDocument()
-    expect(within(steps).getByText('Reserve quota')).toBeInTheDocument()
+    await userEvent.click(prepare)
+    await userEvent.click(wait)
+
+    expect(prepare).toHaveAttribute('aria-pressed', 'false')
+    expect(wait).toHaveAttribute('aria-pressed', 'true')
     expect(
-      within(steps).getByText('Not covered').closest('li')
-    ).toHaveTextContent('4.740 ms')
+      screen.queryByRole('region', { name: 'Selected stage' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('list', { name: 'Stage details' })
+    ).not.toBeInTheDocument()
   })
 
   test('shows the timeline directly without view tabs or detail tables', async () => {

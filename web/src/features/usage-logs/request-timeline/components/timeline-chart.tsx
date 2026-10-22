@@ -330,7 +330,6 @@ export function TimelineChart(props: TimelineChartProps) {
                 variant='ghost'
                 size='sm'
                 aria-pressed={selected}
-                aria-controls={selected ? 'timeline-selection' : undefined}
                 className='aria-pressed:bg-foreground/10 h-auto max-w-full justify-start gap-2 px-2 py-1.5 text-left whitespace-normal'
                 onClick={() => props.onSelect(segment.key)}
               >

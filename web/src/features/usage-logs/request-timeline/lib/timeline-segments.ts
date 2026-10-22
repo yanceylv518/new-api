@@ -19,12 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 
 import type { RequestTimelineData } from '../api'
-import {
-  getAttemptResponseOffset,
-  type TimelineKind,
-  type TimelineNode,
-  type TraceAttempt,
-} from './timeline-model'
+import { getAttemptResponseOffset, type TraceAttempt } from './timeline-model'
 import { getOutcomeLabel } from './timeline-text'
 
 export type SegmentKind = 'gateway' | 'wait' | 'think' | 'flow' | 'failed'
@@ -50,46 +45,11 @@ export interface RequestMoment {
   failed: boolean
 }
 
-/** 放大镜里展开的一步，已裁到所属段的边界内。 */
-export interface SegmentStep {
-  id: string
-  label: string
-  start: number
-  end: number
-  kind: SegmentKind
-}
-
 interface SegmentInput {
   total: number
   firstByte: number | null
   firstWrite: number | null
   stream: boolean
-}
-
-const GATEWAY_STAGES = new Set([
-  'auth',
-  'rate_limit',
-  'distribute',
-  'request_body',
-  'validate',
-  'pricing_prepare',
-  'precharge',
-  'channel_select',
-])
-const FINISH_STAGES = new Set([
-  'settlement',
-  'usage_finalize',
-  'billing_settle',
-  'consume_log',
-  'error_log',
-  'log_insert',
-])
-const STEP_KIND: Record<TimelineKind, SegmentKind> = {
-  gateway: 'gateway',
-  log: 'gateway',
-  upstream: 'wait',
-  response: 'flow',
-  failed: 'failed',
 }
 
 function failedAttemptLabel(t: TFunction, attempt: TraceAttempt): string {
@@ -355,83 +315,4 @@ export function buildRequestSegments(
       .filter((moment) => moment.at >= 0 && moment.at <= input.total)
       .sort((a, b) => a.at - b.at),
   }
-}
-
-/** 按开始时间排列，只保留不被其他步骤包含的外层步骤。 */
-function outermost(steps: SegmentStep[]): SegmentStep[] {
-  const kept: SegmentStep[] = []
-  const ordered = [...steps].sort((a, b) => a.start - b.start || b.end - a.end)
-  for (const step of ordered) {
-    const parent = kept.at(-1)
-    if (parent && step.start >= parent.start && step.end <= parent.end) continue
-    kept.push(step)
-  }
-  return kept
-}
-
-/**
- * 放大镜展开的内部步骤，取自阶段树里的同一批节点：自身至少一半落在这段里才算，
- * 并裁到段的边界。等待输出在上游内部、输出与接收重叠，都不再细分。
- */
-export function buildSegmentSteps(
-  segment: RequestSegment,
-  data: RequestTimelineData,
-  index: ReadonlyMap<string, TimelineNode>,
-  total: number
-): SegmentStep[] {
-  const start = segment.start
-  const end = segment.end ?? total
-  const clip = (node: TimelineNode | undefined): SegmentStep[] => {
-    if (!node || node.end === null) return []
-    const overlap = Math.min(node.end, end) - Math.max(node.start, start)
-    if (overlap <= 0 || overlap * 2 < node.end - node.start) return []
-    return [
-      {
-        id: node.id,
-        label: node.label,
-        start: Math.max(node.start, start),
-        end: Math.min(node.end, end),
-        kind: STEP_KIND[node.kind],
-      },
-    ]
-  }
-  const stages = (names: ReadonlySet<string>) =>
-    data.phases.flatMap((phase, i) =>
-      names.has(phase.name) ? clip(index.get(`phase-${i}`)) : []
-    )
-  const exchanges = (attempt: TraceAttempt, withBody: boolean) =>
-    (attempt.exchanges ?? []).flatMap((exchange) =>
-      (index.get(`exchange-${attempt.index}-${exchange.index}`)?.children ?? [])
-        .filter((step) => withBody || !step.id.endsWith('-body'))
-        .flatMap(clip)
-    )
-
-  if (segment.key === 'prepare' || segment.key === 'process') {
-    return outermost(stages(GATEWAY_STAGES))
-  }
-  if (segment.key === 'finish') {
-    const steps = stages(FINISH_STAGES)
-    const top = outermost(steps)
-    // 唯一的外层步骤几乎占满整段时下钻一层，避免放大后仍只有一块
-    const single = top.length === 1 ? top[0] : null
-    if (single && (single.end - single.start) * 5 >= (end - start) * 4) {
-      const inner = steps.filter((step) => step.id !== single.id)
-      if (inner.length > 0) return outermost(inner)
-    }
-    return top
-  }
-  if (!segment.attempt) return []
-  if (segment.kind === 'failed') {
-    return outermost([
-      ...stages(new Set(['request_prepare', 'channel_select'])),
-      ...exchanges(segment.attempt, true),
-    ])
-  }
-  if (segment.key === 'wait' || segment.key === 'call') {
-    return outermost([
-      ...stages(new Set(['request_prepare'])),
-      ...exchanges(segment.attempt, false),
-    ])
-  }
-  return []
 }
