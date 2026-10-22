@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -17,6 +18,7 @@ import (
 )
 
 func EmbeddingHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	info.InitChannelMeta(c)
 
 	embeddingReq, ok := info.Request.(*dto.EmbeddingRequest)
@@ -82,7 +84,9 @@ func EmbeddingHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		}
 	}
 
+	trace.BeginForwarding()
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)

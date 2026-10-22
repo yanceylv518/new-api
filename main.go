@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/router"
@@ -189,7 +190,9 @@ func main() {
 		common.FatalLog("failed to configure trusted proxies: " + err.Error())
 		return
 	}
+	server.Use(middleware.RequestTraceContext())
 	server.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
+		requesttrace.FromContext(c.Request.Context()).Fail("panic")
 		common.SysLog(fmt.Sprintf("panic detected: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -197,6 +200,7 @@ func main() {
 				"type":    "new_api_panic",
 			},
 		})
+		requesttrace.FromContext(c.Request.Context()).ForwardingDone(c.Request.Context().Err())
 	}))
 	// This will cause SSE not to work!!!
 	//server.Use(gzip.Gzip(gzip.DefaultCompression))
@@ -217,9 +221,10 @@ func main() {
 		port = strconv.Itoa(*common.Port)
 	}
 
+	traceWriter := service.StartRequestTraceWriter()
 	srv := &http.Server{
 		Addr:    ":" + port,
-		Handler: server,
+		Handler: middleware.RequestTraceHandler(server, traceWriter.Enabled, traceWriter.Enqueue),
 	}
 
 	go func() {
@@ -244,6 +249,11 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(fmt.Sprintf("server forced to shutdown: %v", err))
 	}
+	traceShutdownCtx, traceShutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := traceWriter.Shutdown(traceShutdownCtx); err != nil {
+		common.SysError("request trace writer shutdown: " + err.Error())
+	}
+	traceShutdownCancel()
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
 		model.SaveQuotaDataCache()

@@ -147,17 +147,40 @@ func migrateRequestTraceTableName(db *gorm.DB) error {
 	if !migrator.HasTable("request_traces") {
 		return nil
 	}
-	if migrator.HasTable(&RequestTraceMetadata{}) {
-		return fmt.Errorf("both request_traces and request_trace_metadata exist; resolve the table conflict before migration")
+	columns, err := migrator.ColumnTypes("request_traces")
+	if err != nil {
+		return fmt.Errorf("inspect legacy request_traces: %w", err)
 	}
-	var err error
+	metadataColumns := []string{"id", "request_id", "attempt", "user_id", "created_at", "data"}
+	var target string
+	var expected []string
+	switch len(columns) {
+	case len(metadataColumns):
+		target, expected = "request_trace_metadata", metadataColumns
+	case len(requestTraceColumns):
+		target, expected = requestTraceTableName, requestTraceColumns
+	default:
+		return errors.New("unknown legacy request_traces layout; resolve the schema before migration")
+	}
+	actual := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		actual[column.Name()] = true
+	}
+	for _, name := range expected {
+		if !actual[name] {
+			return errors.New("unknown legacy request_traces layout; resolve the schema before migration")
+		}
+	}
+	if migrator.HasTable(target) {
+		return fmt.Errorf("both request_traces and %s exist; resolve the table conflict before migration", target)
+	}
 	if db.Dialector.Name() == "clickhouse" {
-		err = db.Exec("RENAME TABLE request_traces TO request_trace_metadata").Error
+		err = db.Exec("RENAME TABLE ? TO ?", clause.Table{Name: "request_traces"}, clause.Table{Name: target}).Error
 	} else {
-		err = migrator.RenameTable("request_traces", &RequestTraceMetadata{})
+		err = migrator.RenameTable("request_traces", target)
 	}
 	if err != nil {
-		return fmt.Errorf("rename request_traces to request_trace_metadata: %w", err)
+		return fmt.Errorf("rename request_traces to %s: %w", target, err)
 	}
 	return nil
 }

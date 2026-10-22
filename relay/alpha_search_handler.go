@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -19,6 +20,7 @@ import (
 )
 
 func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	info.InitChannelMeta(c)
 
 	switch info.ChannelType {
@@ -96,8 +98,11 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 		c.Writer.Header().Set("Content-Type", contentType)
 	}
 	c.Writer.WriteHeader(httpResp.StatusCode)
-	if _, err := io.Copy(c.Writer, httpResp.Body); err != nil {
-		return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
+	trace.BeginForwarding()
+	_, copyErr := io.Copy(c.Writer, httpResp.Body)
+	trace.ForwardingDone(c.Request.Context().Err())
+	if copyErr != nil {
+		return types.NewError(copyErr, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
 	// Upstream alpha search returns no usage; bill one web_search_preview call.

@@ -22,6 +22,7 @@ import { createContext, useContext, useState, type ReactNode } from 'react'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
+import type { UsageLog } from '../data/schema'
 import type { ChannelAffinityInfo } from '../types'
 
 export type LogsViewScope = 'all' | 'self'
@@ -36,6 +37,15 @@ export function resolveLogsViewAccess(
 }
 
 interface UsageLogsContextValue {
+  selectedLog: UsageLog | null
+  detailsDialogOpen: boolean
+  setDetailsDialogOpen: (open: boolean) => void
+  openLogDetails: (log: UsageLog) => void
+  /** null 表示打开后先输入请求 ID 查询。 */
+  timelineRequestId: string | null
+  timelineDialogOpen: boolean
+  setTimelineDialogOpen: (open: boolean) => void
+  openRequestTimeline: (requestId: string | null) => void
   selectedUserId: number | null
   setSelectedUserId: (userId: number | null) => void
   userInfoDialogOpen: boolean
@@ -55,17 +65,47 @@ const UsageLogsContext = createContext<UsageLogsContextValue | undefined>(
 )
 
 export function UsageLogsProvider({ children }: { children: ReactNode }) {
+  const [selectedLog, setSelectedLog] = useState<UsageLog | null>(null)
+  const [detailsDialogOpen, setDetailsDialogOpen] = useState(false)
+  const [timelineRequestId, setTimelineRequestId] = useState<string | null>(
+    null
+  )
+  const [timelineDialogOpen, setTimelineDialogOpen] = useState(false)
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
   const [userInfoDialogOpen, setUserInfoDialogOpen] = useState(false)
   const [affinityTarget, setAffinityTarget] =
     useState<ChannelAffinityInfo | null>(null)
   const [affinityDialogOpen, setAffinityDialogOpen] = useState(false)
   const [sensitiveVisible, setSensitiveVisible] = useState(true)
-  const [viewScope, setViewScope] = useState<LogsViewScope>('all')
+  const [viewScope, setViewScopeState] = useState<LogsViewScope>('all')
+  const setViewScope = (scope: LogsViewScope) => {
+    setDetailsDialogOpen(false)
+    setSelectedLog(null)
+    setTimelineDialogOpen(false)
+    setViewScopeState(scope)
+  }
+  const openLogDetails = (log: UsageLog) => {
+    setSelectedLog(log)
+    setDetailsDialogOpen(true)
+  }
+  // 时间线是独立弹窗；从日志详情跳转时先关闭详情，避免两层弹窗叠加。
+  const openRequestTimeline = (requestId: string | null) => {
+    setDetailsDialogOpen(false)
+    setTimelineRequestId(requestId)
+    setTimelineDialogOpen(true)
+  }
 
   return (
     <UsageLogsContext.Provider
       value={{
+        selectedLog,
+        detailsDialogOpen,
+        setDetailsDialogOpen,
+        openLogDetails,
+        timelineRequestId,
+        timelineDialogOpen,
+        setTimelineDialogOpen,
+        openRequestTimeline,
         selectedUserId,
         setSelectedUserId,
         userInfoDialogOpen,

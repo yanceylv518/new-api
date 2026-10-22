@@ -2,6 +2,7 @@ package relay
 
 import (
 	"fmt"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -35,7 +36,10 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 		defer info.TargetWs.Close()
 	}
 
+	trace := requesttrace.FromContext(c.Request.Context())
+	trace.BeginForwarding()
 	usage, newAPIError := adaptor.DoResponse(c, nil, info)
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)

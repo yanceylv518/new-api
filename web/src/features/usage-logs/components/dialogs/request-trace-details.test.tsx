@@ -34,6 +34,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import type { UsageLog } from '../../data/schema'
 import { parseUpstreamBusinessError } from '../../lib/format'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
+import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
 import { DetailsDialog } from './details-dialog'
 
 const log: UsageLog = {
@@ -163,7 +164,9 @@ const detailed = {
 }
 
 function BusinessErrorLogCell(props: { log: UsageLog }) {
-  const columns = useCommonLogsColumns(true, true)
+  const columns = useCommonLogsColumns(true)
+  const { selectedLog, detailsDialogOpen, setDetailsDialogOpen } =
+    useUsageLogsContext()
   const table = useReactTable({
     data: [props.log],
     columns,
@@ -173,7 +176,20 @@ function BusinessErrorLogCell(props: { log: UsageLog }) {
     .getRowModel()
     .rows[0].getAllCells()
     .find((item) => item.column.id === 'content')
-  return cell ? flexRender(cell.column.columnDef.cell, cell.getContext()) : null
+  return (
+    <>
+      {cell && flexRender(cell.column.columnDef.cell, cell.getContext())}
+      {selectedLog && (
+        <DetailsDialog
+          log={selectedLog}
+          open={detailsDialogOpen}
+          isAdmin
+          isRoot
+          onOpenChange={setDetailsDialogOpen}
+        />
+      )}
+    </>
+  )
 }
 
 describe('HTTP 200 upstream business error logs', () => {
@@ -242,17 +258,19 @@ describe('HTTP 200 upstream business error logs', () => {
       vi.spyOn(api, 'get').mockResolvedValue(response([]))
       render(
         <QueryClientProvider client={queryClient()}>
-          <BusinessErrorLogCell
-            log={{
-              ...log,
-              type,
-              content: JSON.stringify(failure),
-              other: JSON.stringify({
-                model_ratio: 1,
-                admin_info: { quota_saturation: { field: 'quota' } },
-              }),
-            }}
-          />
+          <UsageLogsProvider>
+            <BusinessErrorLogCell
+              log={{
+                ...log,
+                type,
+                content: JSON.stringify(failure),
+                other: JSON.stringify({
+                  model_ratio: 1,
+                  admin_info: { quota_saturation: { field: 'quota' } },
+                }),
+              }}
+            />
+          </UsageLogsProvider>
         </QueryClientProvider>
       )
       const preview = screen.getByRole('button', {
