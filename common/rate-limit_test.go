@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,140 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManagementRateLimitDefaultsAreValid(t *testing.T) {
+	encoded, err := Marshal(DefaultManagementRateLimits())
+	require.NoError(t, err)
+	_, err = ParseManagementRateLimits(string(encoded))
+	require.NoError(t, err)
+}
+
+func TestManagementRateLimitRequiresExplicitBoolean(t *testing.T) {
+	encoded, err := Marshal(DefaultManagementRateLimits())
+	require.NoError(t, err)
+	for _, test := range []struct {
+		name  string
+		omit  bool
+		value any
+	}{
+		{"missing", true, nil}, {"null", false, nil}, {"string", false, "true"}, {"number", false, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var value map[string]map[string]any
+			require.NoError(t, Unmarshal(encoded, &value))
+			if test.omit {
+				delete(value["global_api"], "enabled")
+			} else {
+				value["global_api"]["enabled"] = test.value
+			}
+			invalid, err := Marshal(value)
+			require.NoError(t, err)
+			_, err = ParseManagementRateLimits(string(invalid))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestManagementRateLimitPreservesLongEnvironmentDefaults(t *testing.T) {
+	oldAPIRequests, oldAPIWindow := GlobalApiRateLimitNum, GlobalApiRateLimitDuration
+	oldCriticalRequests, oldCriticalWindow, oldCriticalEnabled := CriticalRateLimitNum, CriticalRateLimitDuration, CriticalRateLimitEnable
+	t.Cleanup(func() {
+		GlobalApiRateLimitNum, GlobalApiRateLimitDuration = oldAPIRequests, oldAPIWindow
+		CriticalRateLimitNum, CriticalRateLimitDuration, CriticalRateLimitEnable = oldCriticalRequests, oldCriticalWindow, oldCriticalEnabled
+	})
+	GlobalApiRateLimitNum, GlobalApiRateLimitDuration = 2_000_000, 3600
+	CriticalRateLimitNum, CriticalRateLimitDuration, CriticalRateLimitEnable = 0, 86400, false
+	settings := DefaultManagementRateLimits()
+	assert.Equal(t, 2_000_000, settings.GlobalAPI.Requests)
+	assert.EqualValues(t, 3600, settings.GlobalAPI.WindowSeconds)
+	assert.EqualValues(t, 86400, settings.LoginIP.WindowSeconds)
+	assert.False(t, settings.LoginIP.Enabled)
+	assert.Positive(t, settings.LoginIP.Requests)
+	encoded, err := Marshal(settings)
+	require.NoError(t, err)
+	_, err = ParseManagementRateLimits(string(encoded))
+	require.NoError(t, err)
+}
+
+func TestInMemoryRateLimiterKeepsLongWindowsDuringIdleCleanup(t *testing.T) {
+	var limiter InMemoryRateLimiter
+	limiter.Init(0)
+	limiter.expirationDuration = 20 * time.Minute
+	now := time.Now()
+	require.True(t, limiter.Request("long-window", 1, 3600))
+	long := limiter.store["long-window"]
+	long.lastActive = now.Add(-30 * time.Minute)
+	long.requests.head.timestamp = long.lastActive.Unix()
+	require.True(t, limiter.Request("short-window", 1, 60))
+	short := limiter.store["short-window"]
+	short.lastActive = now.Add(-25 * time.Minute)
+	short.requests.head.timestamp = short.lastActive.Unix()
+	limiter.deleteExpiredEntries(now)
+	assert.NotContains(t, limiter.store, "short-window")
+	assert.False(t, limiter.Request("long-window", 1, 3600))
+	long.lastActive = now.Add(-2 * time.Hour)
+	long.requests.head.timestamp = long.lastActive.Unix()
+	limiter.deleteExpiredEntries(now)
+	assert.NotContains(t, limiter.store, "long-window")
+}
+
+func TestInMemoryRateLimiterReservationRetainsItsWindowAfterEviction(t *testing.T) {
+	var limiter InMemoryRateLimiter
+	limiter.Init(0)
+	limiter.expirationDuration = 20 * time.Minute
+	reservation := limiter.Reserve("reserved", 1, 3600)
+	require.NotNil(t, reservation)
+	limiter.store["reserved"].lastActive = time.Now().Add(-2 * time.Hour)
+	limiter.deleteExpiredEntries(time.Now())
+	assert.NotContains(t, limiter.store, "reserved")
+	reservation.Complete(true)
+	entry := limiter.store["reserved"]
+	entry.lastActive = time.Now().Add(-30 * time.Minute)
+	entry.requests.head.timestamp = entry.lastActive.Unix()
+	limiter.deleteExpiredEntries(time.Now())
+	assert.False(t, limiter.Request("reserved", 1, 3600))
+}
+
+func TestManagementRateLimitRejectsInvalidSettingsWithoutReplacingSnapshot(t *testing.T) {
+	previous := managementRateLimits.Load()
+	t.Cleanup(func() { managementRateLimits.Store(previous) })
+	settings := DefaultManagementRateLimits()
+	settings.TokenQuery = ManagementRateLimit{Enabled: true, Requests: 3, WindowSeconds: 60}
+	encoded, err := Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, LoadManagementRateLimits(string(encoded)))
+	for _, raw := range []string{"invalid", "null", "{}"} {
+		require.Error(t, LoadManagementRateLimits(raw))
+		assert.Equal(t, settings, GetManagementRateLimits())
+	}
+	for _, mutate := range []func(*ManagementRateLimits){
+		func(value *ManagementRateLimits) { value.LoginAccount.Requests = 0 },
+		func(value *ManagementRateLimits) { value.TokenQuery.Requests = MaxManagementRateLimitRequests + 1 },
+		func(value *ManagementRateLimits) { value.SessionRefresh.WindowSeconds = -1 },
+		func(value *ManagementRateLimits) {
+			value.GlobalAPI.WindowSeconds = MaxManagementRateLimitWindowSeconds + 1
+		},
+	} {
+		invalid := settings
+		mutate(&invalid)
+		encoded, err := Marshal(invalid)
+		require.NoError(t, err)
+		require.Error(t, LoadManagementRateLimits(string(encoded)))
+		assert.Equal(t, settings, GetManagementRateLimits())
+	}
+}
+
+func TestScopedMemoryRateLimitReturnsRetryAfterAndIsolatesKeys(t *testing.T) {
+	previous := RedisEnabled
+	RedisEnabled = false
+	t.Cleanup(func() { RedisEnabled = previous })
+	key := t.Name()
+	require.NoError(t, CheckRateLimit(context.Background(), key, 1, 60))
+	var limited *RateLimitError
+	require.ErrorAs(t, CheckRateLimit(context.Background(), key, 1, 60), &limited)
+	assert.EqualValues(t, 60, limited.RetryAfterSeconds)
+	require.NoError(t, CheckRateLimit(context.Background(), key+":another-account", 1, 60))
+}
 
 func TestInMemoryRateLimiterAllocatesTimestampsOnDemand(t *testing.T) {
 	var limiter InMemoryRateLimiter
@@ -71,9 +206,9 @@ func TestInMemoryRateLimiterEvictsOnlyExpiredLRUTail(t *testing.T) {
 	limiter.Init(0)
 	limiter.expirationDuration = 10 * time.Second
 
-	require.True(t, limiter.Request("active", 1, 100))
-	require.True(t, limiter.Request("idle", 1, 100))
-	assert.False(t, limiter.Request("active", 1, 100))
+	require.True(t, limiter.Request("active", 1, 10))
+	require.True(t, limiter.Request("idle", 1, 10))
+	assert.False(t, limiter.Request("active", 1, 10))
 
 	assert.Equal(t, "active", limiter.lru.Front().Value.(*rateLimitEntry).key)
 	assert.Equal(t, "idle", limiter.lru.Back().Value.(*rateLimitEntry).key)
@@ -97,7 +232,7 @@ func TestInMemoryRateLimiterCleanupTicksEvictExpiredKeys(t *testing.T) {
 	var limiter InMemoryRateLimiter
 	limiter.Init(0)
 	limiter.expirationDuration = 10 * time.Second
-	require.True(t, limiter.Request("idle", 1, 100))
+	require.True(t, limiter.Request("idle", 1, 10))
 
 	now := time.Now()
 	limiter.store["idle"].lastActive = now.Add(-10 * time.Second)

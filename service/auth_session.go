@@ -357,13 +357,9 @@ func ClearRefreshCookie(c *gin.Context) {
 	clearSessionHintCookie(c)
 }
 
-// writeSessionHintCookie mirrors the Refresh Cookie's lifetime with a
-// script-readable marker. The Refresh Cookie itself is HttpOnly and scoped to
-// /api/user/auth, so a page at / cannot tell whether a login session exists;
-// without this hint the frontend has to POST /api/user/auth/refresh on every
-// cold boot just to learn that an anonymous visitor is anonymous. That request
-// is guaranteed to 401 and still consumes a slot of the IP-keyed
-// CriticalRateLimit budget shared by everyone behind the same address.
+// writeSessionHintCookie 写入与 HttpOnly Refresh Cookie 同寿命的可读标识。
+// 页面无法读取限定在 /api/user/auth 的 Cookie；此标识避免匿名访客冷启动时
+// 发起必然返回 401 且仍消耗全局 IP 额度的续期请求。
 //
 // The value is the constant "1" and carries no credential: it states that a
 // Refresh Cookie was issued, never who for. Authorization still derives solely

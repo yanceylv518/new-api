@@ -17,15 +17,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient } from '@tanstack/react-query'
-import { afterEach, describe, expect, test } from 'vitest'
+import axios from 'axios'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { useAuthStore, type AuthBundle } from '../stores/auth-store'
 import {
   applyAuthRotation,
+  applyAuthBundle,
   bootstrapAuthentication,
   clearAuthenticatedClientState,
+  clearAuthentication,
   createRefreshRunner,
   isAuthBundle,
+  refreshAuthentication,
   type AuthRefreshRuntime,
 } from './auth-session'
 
@@ -51,10 +55,95 @@ const bundle: AuthBundle = {
 }
 
 afterEach(() => {
-  useAuthStore.getState().auth.reset('idle')
+  clearAuthentication(false, 'idle')
+  vi.restoreAllMocks()
 })
 
 describe('authentication session coordination', () => {
+  test.each([
+    ['10', 10_000],
+    ['Fri, 23 Oct 2026 00:00:15 GMT', 15_000],
+    [undefined, 60_000],
+    ['invalid', 60_000],
+    ['0', 1000],
+  ])(
+    'a 429 with Retry-After %s suppresses requests until cooldown expires',
+    async (header, delay) => {
+      let now = Date.parse('2026-10-23T00:00:00Z')
+      vi.spyOn(Date, 'now').mockImplementation(() => now)
+      applyAuthBundle(bundle, false)
+      const rateLimited = new axios.AxiosError(
+        'rate limited',
+        undefined,
+        undefined,
+        undefined,
+        {
+          status: 429,
+          statusText: 'Too Many Requests',
+          headers: header ? { 'retry-after': header } : {},
+          config: { headers: new axios.AxiosHeaders() },
+          data: { code: 'AUTH_RATE_LIMITED' },
+        }
+      )
+      const request = vi
+        .spyOn(axios.Axios.prototype, 'request')
+        .mockRejectedValueOnce(rateLimited)
+        .mockResolvedValueOnce({
+          status: 200,
+          data: { success: true, data: bundle },
+        })
+
+      expect((await refreshAuthentication()).kind).toBe('transient_error')
+      expect(useAuthStore.getState().auth.accessToken).toBe(bundle.access_token)
+      now += delay - 1
+      expect((await refreshAuthentication()).kind).toBe('transient_error')
+      expect(request).toHaveBeenCalledTimes(1)
+      now += 1
+      expect((await refreshAuthentication()).kind).toBe('authenticated')
+      expect(request).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  test('concurrent refreshes share one 429 and a new login clears its cooldown', async () => {
+    applyAuthBundle(bundle, false)
+    const error = new axios.AxiosError(
+      'rate limited',
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: { 'retry-after': '60' },
+        config: { headers: new axios.AxiosHeaders() },
+        data: {},
+      }
+    )
+    const request = vi
+      .spyOn(axios.Axios.prototype, 'request')
+      .mockRejectedValueOnce(error)
+    const outcomes = await Promise.all(
+      Array.from({ length: 64 }, () => refreshAuthentication())
+    )
+    expect(
+      outcomes.every((outcome) => outcome.kind === 'transient_error')
+    ).toBe(true)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    const next = {
+      ...bundle,
+      session: { ...bundle.session, sid: 'another-session' },
+    }
+    applyAuthBundle(next, false)
+    request.mockResolvedValueOnce({
+      status: 200,
+      data: { success: true, data: next },
+    })
+    expect((await refreshAuthentication()).kind).toBe('authenticated')
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(useAuthStore.getState().auth.session?.sid).toBe('another-session')
+  })
+
   test('bootstrap distinguishes a completed anonymous check from an active session', async () => {
     useAuthStore.getState().auth.reset('complete')
     expect(await bootstrapAuthentication()).toEqual({ kind: 'anonymous' })

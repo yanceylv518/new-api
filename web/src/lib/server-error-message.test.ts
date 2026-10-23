@@ -16,11 +16,39 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import i18next from 'i18next'
 import { describe, expect, test } from 'vitest'
 
-import { getServerErrorMessageKey } from './server-error-message'
+import zh from '@/i18n/locales/zh.json'
+
+import {
+  getServerErrorMessage,
+  getServerErrorMessageKey,
+} from './server-error-message'
 
 describe('server error message mapping', () => {
+  test('authentication rate limits use the current language instead of raw HTTP text', async () => {
+    const previous = i18next.language
+    i18next.addResourceBundle('zh', 'translation', zh.translation)
+    await i18next.changeLanguage('zh')
+    try {
+      expect(
+        getServerErrorMessage({
+          response: {
+            status: 429,
+            data: { code: 'AUTH_RATE_LIMITED', message: 'Too Many Requests' },
+          },
+        })
+      ).toBe('登录或会话续期请求过于频繁，请稍后重试。')
+      expect(
+        getServerErrorMessageKey({ code: 'MANAGEMENT_RATE_LIMITS_CONFLICT' })
+      ).toBe(
+        'Rate limits changed elsewhere. Reload saved limits before saving again.'
+      )
+    } finally {
+      await i18next.changeLanguage(previous)
+    }
+  })
   test('maps the active-session limit to recovery instructions', () => {
     const message = getServerErrorMessageKey({ code: 'AUTH_SESSION_LIMIT' })
 

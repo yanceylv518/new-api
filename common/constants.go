@@ -207,12 +207,11 @@ var (
 	ImageDownloadPermission = RoleGuestUser
 )
 
-// All duration's unit is seconds
-// Shouldn't larger then RateLimitKeyExpirationDuration
+// 限流窗口以秒为单位，长窗口计数会保留到各自窗口结束。
 var (
 	GlobalApiRateLimitEnable   bool
-	GlobalApiRateLimitNum      int
-	GlobalApiRateLimitDuration int64
+	GlobalApiRateLimitNum            = 360
+	GlobalApiRateLimitDuration int64 = 180
 
 	GlobalWebRateLimitEnable   bool
 	GlobalWebRateLimitNum      int
@@ -225,6 +224,12 @@ var (
 	CriticalRateLimitEnable   bool
 	CriticalRateLimitNum            = 20
 	CriticalRateLimitDuration int64 = 20 * 60
+
+	AuthRefreshRateLimitNum            = 60
+	AuthRefreshRateLimitDuration int64 = 60
+
+	TokenQueryRateLimitNum            = 60
+	TokenQueryRateLimitDuration int64 = 60
 
 	UploadRateLimitNum            = 10
 	UploadRateLimitDuration int64 = 60

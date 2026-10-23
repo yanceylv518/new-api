@@ -85,7 +85,10 @@ func Login(c *gin.Context) {
 	}
 	err = user.ValidateAndFill()
 	if err != nil {
+		var rateLimitErr *common.RateLimitError
 		switch {
+		case errors.As(err, &rateLimitErr):
+			writeAuthSessionError(c, err)
 		case errors.Is(err, model.ErrDatabase):
 			common.SysLog(fmt.Sprintf("Login database error for user %s: %v", username, err))
 			common.ApiErrorI18n(c, i18n.MsgDatabaseError)

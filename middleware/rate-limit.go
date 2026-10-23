@@ -19,27 +19,6 @@ const (
 	seedanceAssetRateLimitWindowSec = 60
 )
 
-// Redis rate limiting intentionally uses a fixed window. The single Lua script
-// makes increment, expiry, and the limit decision atomic, while retaining the
-// simple fixed-window behavior: traffic at a window boundary can burst up to
-// twice the configured limit. Do not replace this with a sliding-window ZSET
-// unless that externally visible behavior is intentionally changed.
-const redisFixedWindowScript = `
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-local ttl = redis.call('TTL', KEYS[1])
-if ttl < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-  ttl = redis.call('TTL', KEYS[1])
-end
-if count > tonumber(ARGV[1]) then
-  return {0, count, ttl}
-end
-return {1, count, ttl}
-`
-
 var inMemoryRateLimiter common.InMemoryRateLimiter
 
 var defNext = func(c *gin.Context) {
@@ -54,61 +33,8 @@ func redisUserRateLimitKey(mark string, userID int) string {
 	return fmt.Sprintf("%s:user:%s:%d", redisRateLimitNamespace, mark, userID)
 }
 
-func redisReplyInteger(value any) (int64, error) {
-	switch typed := value.(type) {
-	case int64:
-		return typed, nil
-	case string:
-		return strconv.ParseInt(typed, 10, 64)
-	case []byte:
-		return strconv.ParseInt(string(typed), 10, 64)
-	default:
-		return 0, fmt.Errorf("unexpected Redis integer reply type %T", value)
-	}
-}
-
 func redisFixedWindowTake(ctx context.Context, key string, maxRequestNum int, duration int64) (bool, int64, int64, error) {
-	if common.RDB == nil {
-		return false, 0, 0, errors.New("Redis client is not initialized")
-	}
-	if key == "" {
-		return false, 0, 0, errors.New("rate limit key is empty")
-	}
-	if maxRequestNum <= 0 {
-		return false, 0, 0, errors.New("rate limit maximum must be positive")
-	}
-	if duration <= 0 {
-		return false, 0, 0, errors.New("rate limit duration must be positive")
-	}
-
-	values, err := common.RDB.Eval(
-		ctx,
-		redisFixedWindowScript,
-		[]string{key},
-		maxRequestNum,
-		duration,
-	).Slice()
-	if err != nil {
-		return false, 0, 0, err
-	}
-	if len(values) != 3 {
-		return false, 0, 0, fmt.Errorf("unexpected Redis rate limit reply length %d", len(values))
-	}
-
-	allowedValue, err := redisReplyInteger(values[0])
-	if err != nil {
-		return false, 0, 0, err
-	}
-	count, err := redisReplyInteger(values[1])
-	if err != nil {
-		return false, 0, 0, err
-	}
-	ttlSeconds, err := redisReplyInteger(values[2])
-	if err != nil {
-		return false, 0, 0, err
-	}
-
-	return allowedValue == 1, count, ttlSeconds, nil
+	return common.RedisFixedWindowTake(ctx, key, maxRequestNum, duration)
 }
 
 func redisRateLimiter(c *gin.Context, maxRequestNum int, duration int64, mark string) {
@@ -185,28 +111,58 @@ func GlobalWebRateLimit(frontendFS static.ServeFileSystem) func(c *gin.Context) 
 }
 
 func GlobalAPIRateLimit() func(c *gin.Context) {
-	if common.GlobalApiRateLimitEnable {
-		return rateLimitFactory(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "GA")
-	}
-	return defNext
+	return managementRateLimitFactory("GA", false, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.GlobalAPI })
 }
 
-func CriticalRateLimit() func(c *gin.Context) {
-	if common.CriticalRateLimitEnable {
-		return rateLimitFactory(common.CriticalRateLimitNum, common.CriticalRateLimitDuration, "CT")
+func CriticalRateLimit(scope ...string) func(c *gin.Context) {
+	mark := "CT"
+	if len(scope) > 0 && scope[0] != "" {
+		mark += ":" + scope[0]
 	}
-	return defNext
+	return managementRateLimitFactory(mark, false, func(settings common.ManagementRateLimits) common.ManagementRateLimit {
+		if len(scope) > 0 && scope[0] == "login" {
+			return settings.LoginIP
+		}
+		return settings.Sensitive
+	})
 }
 
 func UserCriticalRateLimit(scope string) func(c *gin.Context) {
-	if !common.CriticalRateLimitEnable {
-		return defNext
+	return managementRateLimitFactory("UC:"+scope, true, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.Sensitive })
+}
+
+// TokenQueryRateLimit 按已认证的用户合并统计各 API Key 的用量和日志查询。
+func TokenQueryRateLimit() func(c *gin.Context) {
+	return managementRateLimitFactory("TQ", true, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.TokenQuery })
+}
+
+func managementRateLimitFactory(mark string, byUser bool, policy func(common.ManagementRateLimits) common.ManagementRateLimit) func(*gin.Context) {
+	return func(c *gin.Context) {
+		limit := policy(common.GetManagementRateLimits())
+		if !limit.Enabled {
+			return
+		}
+		// 修改窗口后立即使用新计数，不继承旧窗口的剩余 TTL。
+		scope := fmt.Sprintf("%s:w%d", mark, limit.WindowSeconds)
+		key := redisIPRateLimitKey(scope, c.ClientIP())
+		if byUser {
+			userID := c.GetInt("id")
+			if userID <= 0 {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+			key = redisUserRateLimitKey(scope, userID)
+		}
+		if err := common.CheckRateLimit(c.Request.Context(), key, limit.Requests, limit.WindowSeconds); err != nil {
+			var limited *common.RateLimitError
+			if errors.As(err, &limited) {
+				writeRateLimited(c, limited.RetryAfterSeconds)
+				return
+			}
+			logger.LogError(c.Request.Context(), fmt.Sprintf("rate limit check failed (mark=%s): %v", mark, err))
+			c.AbortWithStatus(http.StatusInternalServerError)
+		}
 	}
-	return userRateLimitFactory(
-		common.CriticalRateLimitNum,
-		common.CriticalRateLimitDuration,
-		"UC:"+scope,
-	)
 }
 
 func DownloadRateLimit() func(c *gin.Context) {

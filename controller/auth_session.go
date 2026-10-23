@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -162,6 +164,12 @@ func requireBrowserSession(c *gin.Context) (service.AuthIdentity, bool) {
 }
 
 func writeAuthSessionError(c *gin.Context, err error) {
+	var rateLimitErr *common.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		c.Header("Retry-After", strconv.FormatInt(max(rateLimitErr.RetryAfterSeconds, 1), 10))
+		c.JSON(http.StatusTooManyRequests, gin.H{"success": false, "code": "AUTH_RATE_LIMITED", "message": http.StatusText(http.StatusTooManyRequests)})
+		return
+	}
 	status, code := service.AuthSessionErrorCode(err)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		status, code = http.StatusUnauthorized, "AUTH_UNAUTHORIZED"

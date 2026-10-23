@@ -1,6 +1,8 @@
 package model
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1087,11 +1089,22 @@ func (user *User) ValidateAndFill() (err error) {
 	}
 	// find by username or email
 	err = DB.Where("username = ? OR email = ?", username, username).First(user).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrInvalidCredentials
-		}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("%w: %v", ErrDatabase, err)
+	}
+	if limit := common.GetManagementRateLimits().LoginAccount; limit.Enabled {
+		// 用户名和邮箱共用账号额度；未知账号也计数，且不把标识明文写入缓存。
+		key := fmt.Sprintf("rateLimit:v2:login:identifier:%x", sha256.Sum256([]byte(strings.ToLower(username))))
+		if err == nil {
+			key = fmt.Sprintf("rateLimit:v2:login:user:%d", user.Id)
+		}
+		key += fmt.Sprintf(":w%d", limit.WindowSeconds)
+		if limitErr := common.CheckRateLimit(context.Background(), key, limit.Requests, limit.WindowSeconds); limitErr != nil {
+			return fmt.Errorf("%w: login rate limit: %w", ErrDatabase, limitErr)
+		}
+	}
+	if err != nil {
+		return ErrInvalidCredentials
 	}
 	if user.Password == "" {
 		return ErrInvalidCredentials

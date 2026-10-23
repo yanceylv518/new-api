@@ -33,6 +33,10 @@ const serverErrorMessageKeys = {
   TELEGRAM_LEGACY_AUTH_REMOVED:
     'Telegram login has changed. Reload the page and start Telegram OAuth again.',
   AUTH_INTERNAL_ERROR: 'Please try again later.',
+  AUTH_RATE_LIMITED:
+    'Too many authentication requests. Please try again later.',
+  MANAGEMENT_RATE_LIMITS_CONFLICT:
+    'Rate limits changed elsewhere. Reload saved limits before saving again.',
   SECURITY_VERIFICATION_FAILED: 'Verification failed. Please try again.',
   PASSKEY_RP_ID_UNAVAILABLE:
     'This Passkey domain is not available on this website. Use its original website or another verification method.',

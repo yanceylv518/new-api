@@ -467,6 +467,8 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 	if graceSeconds < 0 {
 		return nil, ErrUserSessionInvalid
 	}
+	rateLimitChecked := false
+	refreshLimit := common.GetManagementRateLimits().SessionRefresh
 	for range 3 {
 		cacheDeadline := userSessionCacheDeadline()
 		var session UserSession
@@ -477,7 +479,17 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 			return nil, ErrUserSessionInactive
 		}
 
-		if hmac.Equal([]byte(session.RefreshHash), []byte(presentedHash)) {
+		validCurrent := hmac.Equal([]byte(session.RefreshHash), []byte(presentedHash))
+		validPrevious := session.PreviousRefreshHash != "" && hmac.Equal([]byte(session.PreviousRefreshHash), []byte(presentedHash))
+		// 只给已验证的账号计数，并在轮换前限流；旧凭据的重放撤销仍需执行。
+		if refreshLimit.Enabled && !rateLimitChecked && (validCurrent || (validPrevious && now <= session.PreviousValidUntil)) {
+			key := fmt.Sprintf("rateLimit:v2:user:auth-refresh:w%d:%d", refreshLimit.WindowSeconds, userID)
+			if err := common.CheckRateLimit(context.Background(), key, refreshLimit.Requests, refreshLimit.WindowSeconds); err != nil {
+				return nil, err
+			}
+			rateLimitChecked = true
+		}
+		if validCurrent {
 			result := DB.Model(&UserSession{}).
 				Where("sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ? AND refresh_hash = ?",
 					sid, userID, UserSessionStatusActive, 0, now, presentedHash).
@@ -511,7 +523,7 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 			return &session, nil
 		}
 
-		if session.PreviousRefreshHash == "" || !hmac.Equal([]byte(session.PreviousRefreshHash), []byte(presentedHash)) {
+		if !validPrevious {
 			return nil, ErrUserSessionRefreshInvalid
 		}
 		if now <= session.PreviousValidUntil {

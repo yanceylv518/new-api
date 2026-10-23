@@ -32,11 +32,13 @@ export type SystemOptionsResponse = {
 export type UpdateOptionRequest = {
   key: string
   value: string | boolean | number
+  expected_value?: string
 }
 
 export type UpdateOptionResponse = {
   success: boolean
   message: string
+  data?: unknown
 }
 
 export interface PasskeyDomainChange {
@@ -406,6 +408,7 @@ export type PrivateAssetOSSSettingsRequest = {
 }
 
 export type SecuritySettings = {
+  ManagementRateLimits: string
   ModelRequestRateLimitEnabled: boolean
   ModelRequestRateLimitCount: number
   ModelRequestRateLimitSuccessCount: number

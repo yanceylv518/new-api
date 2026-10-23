@@ -136,6 +136,11 @@ func InitEnv() {
 	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 20)
 	CriticalRateLimitDuration = int64(GetEnvOrDefault("CRITICAL_RATE_LIMIT_DURATION", 20*60))
 
+	AuthRefreshRateLimitNum = max(GetEnvOrDefault("AUTH_REFRESH_RATE_LIMIT", 60), 1)
+	AuthRefreshRateLimitDuration = int64(max(GetEnvOrDefault("AUTH_REFRESH_RATE_LIMIT_DURATION", 60), 1))
+	TokenQueryRateLimitNum = max(GetEnvOrDefault("TOKEN_QUERY_RATE_LIMIT", 60), 1)
+	TokenQueryRateLimitDuration = int64(max(GetEnvOrDefault("TOKEN_QUERY_RATE_LIMIT_DURATION", 60), 1))
+
 	SearchRateLimitEnable = GetEnvOrDefaultBool("SEARCH_RATE_LIMIT_ENABLE", true)
 	SearchRateLimitNum = GetEnvOrDefault("SEARCH_RATE_LIMIT", 10)
 	SearchRateLimitDuration = int64(GetEnvOrDefault("SEARCH_RATE_LIMIT_DURATION", 60))

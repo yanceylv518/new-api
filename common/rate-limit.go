@@ -2,9 +2,111 @@ package common
 
 import (
 	"container/list"
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// Redis 使用原子固定窗口；窗口边界仍允许两倍瞬时突发，保持现有限流语义。
+const redisFixedWindowScript = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+  ttl = redis.call('TTL', KEYS[1])
+end
+if count > tonumber(ARGV[1]) then
+  return {0, count, ttl}
+end
+return {1, count, ttl}
+`
+
+type RateLimitError struct {
+	RetryAfterSeconds int64
+}
+
+func (err *RateLimitError) Error() string {
+	return "rate limit exceeded"
+}
+
+var scopedRateLimiter InMemoryRateLimiter
+
+// CheckRateLimit 占用独立限流额度，不负责凭据校验或修改认证状态。
+func CheckRateLimit(ctx context.Context, key string, maximum int, duration int64) error {
+	if key == "" || maximum <= 0 || duration <= 0 {
+		return errors.New("invalid rate limit configuration")
+	}
+	if RedisEnabled {
+		allowed, _, ttl, err := RedisFixedWindowTake(ctx, key, maximum, duration)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return &RateLimitError{RetryAfterSeconds: max(ttl, 1)}
+		}
+		return nil
+	}
+	scopedRateLimiter.Init(RateLimitKeyExpirationDuration)
+	if !scopedRateLimiter.Request(key, maximum, duration) {
+		return &RateLimitError{RetryAfterSeconds: duration}
+	}
+	return nil
+}
+
+func RedisFixedWindowTake(ctx context.Context, key string, maxRequestNum int, duration int64) (bool, int64, int64, error) {
+	if RDB == nil {
+		return false, 0, 0, errors.New("Redis client is not initialized")
+	}
+	if key == "" {
+		return false, 0, 0, errors.New("rate limit key is empty")
+	}
+	if maxRequestNum <= 0 {
+		return false, 0, 0, errors.New("rate limit maximum must be positive")
+	}
+	if duration <= 0 {
+		return false, 0, 0, errors.New("rate limit duration must be positive")
+	}
+
+	values, err := RDB.Eval(ctx, redisFixedWindowScript, []string{key}, maxRequestNum, duration).Slice()
+	if err != nil {
+		return false, 0, 0, err
+	}
+	if len(values) != 3 {
+		return false, 0, 0, fmt.Errorf("unexpected Redis rate limit reply length %d", len(values))
+	}
+	allowedValue, err := redisReplyInteger(values[0])
+	if err != nil {
+		return false, 0, 0, err
+	}
+	count, err := redisReplyInteger(values[1])
+	if err != nil {
+		return false, 0, 0, err
+	}
+	ttlSeconds, err := redisReplyInteger(values[2])
+	if err != nil {
+		return false, 0, 0, err
+	}
+	return allowedValue == 1, count, ttlSeconds, nil
+}
+
+func redisReplyInteger(value any) (int64, error) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, nil
+	case string:
+		return strconv.ParseInt(typed, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(typed), 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected Redis integer reply type %T", value)
+	}
+}
 
 // rateLimitRequest stores one accepted request in a key's sliding window.
 type rateLimitRequest struct {
@@ -61,10 +163,11 @@ func (q *rateLimitQueue) clear() {
 
 // rateLimitEntry is both a rate-limit bucket and a node in the key-level LRU.
 type rateLimitEntry struct {
-	lastActive time.Time
-	element    *list.Element
-	requests   rateLimitQueue
-	key        string
+	lastActive    time.Time
+	windowSeconds int64
+	element       *list.Element
+	requests      rateLimitQueue
+	key           string
 }
 
 // InMemoryRateLimiter implements a sliding-window limiter with idle-key eviction.
@@ -112,21 +215,23 @@ func (l *InMemoryRateLimiter) deleteExpiredEntries(now time.Time) {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
-	for {
-		oldest := l.lru.Back()
-		if oldest == nil {
-			return
-		}
-
+	for oldest := l.lru.Back(); oldest != nil; {
+		next := oldest.Prev()
 		entry := oldest.Value.(*rateLimitEntry)
 		if now.Sub(entry.lastActive) < l.expirationDuration {
 			return
+		}
+		// 长窗口计数仍有效时保留该项，继续回收后面的短窗口空闲项。
+		if now.Unix()-entry.lastActive.Unix() < entry.windowSeconds {
+			oldest = next
+			continue
 		}
 
 		delete(l.store, entry.key)
 		l.lru.Remove(oldest)
 		entry.element = nil
 		entry.requests.clear()
+		oldest = next
 	}
 }
 
@@ -155,6 +260,7 @@ func (l *InMemoryRateLimiter) Request(key string, maxRequestNum int, duration in
 
 	now := time.Now()
 	entry := l.touchEntry(key, now)
+	entry.windowSeconds = duration
 	entry.requests.removeExpired(now.Unix(), duration)
 
 	allowed := entry.requests.length < maxRequestNum
@@ -168,9 +274,10 @@ func (l *InMemoryRateLimiter) Request(key string, maxRequestNum int, duration in
 // RateLimitReservation counts an active request towards admission until its
 // outcome is known. Failed requests release the slot without consuming quota.
 type RateLimitReservation struct {
-	limiter *InMemoryRateLimiter
-	key     string
-	once    sync.Once
+	limiter       *InMemoryRateLimiter
+	key           string
+	windowSeconds int64
+	once          sync.Once
 }
 
 // Reserve admits a request when the key's accepted requests plus its in-flight
@@ -181,12 +288,13 @@ func (l *InMemoryRateLimiter) Reserve(key string, maxRequests int, duration int6
 
 	now := time.Now()
 	entry := l.touchEntry(key, now)
+	entry.windowSeconds = duration
 	entry.requests.removeExpired(now.Unix(), duration)
 	if entry.requests.length+l.reservations[key] >= maxRequests {
 		return nil
 	}
 	l.reservations[key]++
-	return &RateLimitReservation{limiter: l, key: key}
+	return &RateLimitReservation{limiter: l, key: key, windowSeconds: duration}
 }
 
 // Complete releases the reservation. A successful outcome records the request
@@ -205,7 +313,9 @@ func (r *RateLimitReservation) Complete(success bool) {
 		}
 		if success {
 			now := time.Now()
-			l.touchEntry(r.key, now).requests.append(now.Unix())
+			entry := l.touchEntry(r.key, now)
+			entry.windowSeconds = r.windowSeconds
+			entry.requests.append(now.Unix())
 		}
 	})
 }

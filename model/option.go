@@ -191,12 +191,25 @@ func InitOptionMap() {
 	for key, value := range system_setting.PrivateAssetOSSOptionValues(system_setting.DefaultPrivateAssetOSSSettings()) {
 		common.OptionMap[key] = value
 	}
+	if encoded, err := common.Marshal(common.DefaultManagementRateLimits()); err != nil {
+		common.SysError("failed to encode management rate limits: " + err.Error())
+	} else {
+		common.OptionMap[common.ManagementRateLimitsOptionKey] = string(encoded)
+		if err := common.LoadManagementRateLimits(string(encoded)); err != nil {
+			common.SysError("invalid management rate limit defaults: " + err.Error())
+		}
+	}
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
 	maps.Copy(common.OptionMap, modelConfigs)
 
 	common.OptionMapRWMutex.Unlock()
+	SyncOptionsOnce()
+}
+
+// SyncOptionsOnce 完成一次配置同步，供启动和周期同步使用。
+func SyncOptionsOnce() {
 	loadOptionsFromDatabase()
 }
 
@@ -213,6 +226,9 @@ func loadOptionsFromDatabase() {
 	options, _ := AllOption()
 	passkeyOptions := make(map[string]string)
 	for _, option := range options {
+		if option.Key == common.ManagementRateLimitsOptionKey {
+			continue
+		}
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
 			continue
@@ -223,17 +239,24 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
+	if err := RefreshManagementRateLimits(); err != nil {
+		common.SysError("failed to refresh management rate limits: " + err.Error())
+	}
 }
 
 func SyncOptions(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
 		common.SysLog("syncing options from database")
-		loadOptionsFromDatabase()
+		SyncOptionsOnce()
 	}
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == common.ManagementRateLimitsOptionKey {
+		_, err := common.ParseManagementRateLimits(value)
+		return err
+	}
 	if key == "TaskRequestSnapshotEnabled" && value != "true" && value != "false" {
 		return errors.New("TaskRequestSnapshotEnabled must be true or false")
 	}
@@ -256,7 +279,7 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
-	if key == "TaskRequestSnapshotEnabled" {
+	if key == "TaskRequestSnapshotEnabled" || key == common.ManagementRateLimitsOptionKey {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if IsRequestPolicyOption(key) {
@@ -295,6 +318,13 @@ func UpdateOption(key string, value string) error {
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
+	}
+	if value, ok := values[common.ManagementRateLimitsOptionKey]; ok {
+		if len(values) != 1 {
+			return errors.New("management rate limits must be updated separately")
+		}
+		_, err := UpdateManagementRateLimits(value, nil)
+		return err
 	}
 	for key := range values {
 		if IsPasskeyDomainOption(key) {
@@ -371,6 +401,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == common.ManagementRateLimitsOptionKey {
+		return RefreshManagementRateLimits()
+	}
 	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)

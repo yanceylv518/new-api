@@ -2,10 +2,12 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +21,152 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func setManagementRateLimitTestSettings(t *testing.T, settings common.ManagementRateLimits) {
+	t.Helper()
+	previous, err := common.Marshal(common.GetManagementRateLimits())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, common.LoadManagementRateLimits(string(previous))) })
+	encoded, err := common.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, common.LoadManagementRateLimits(string(encoded)))
+}
+
+func managementRateLimitTestRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	router := gin.New()
+	require.NoError(t, router.SetTrustedProxies(nil))
+	router.Use(GlobalAPIRateLimit())
+	authenticated := func(c *gin.Context) {
+		id, _ := strconv.Atoi(c.GetHeader("X-Test-User"))
+		c.Set("id", id)
+	}
+	finish := func(c *gin.Context) { c.Status(http.StatusNoContent) }
+	router.GET("/ping", finish)
+	router.GET("/login", CriticalRateLimit("login"), finish)
+	router.GET("/logout", CriticalRateLimit("logout"), finish)
+	router.GET("/sensitive", CriticalRateLimit(), finish)
+	router.GET("/usage", authenticated, TokenQueryRateLimit(), finish)
+	router.GET("/logs", authenticated, TokenQueryRateLimit(), finish)
+	return router
+}
+
+func managementRateLimitTestRequest(router http.Handler, path, address string, userID int) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	request.RemoteAddr = address
+	request.Header.Set("X-Test-User", strconv.Itoa(userID))
+	router.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestManagementRateLimitScopesAndHotUpdates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, backend := range []string{"redis", "memory"} {
+		t.Run(backend, func(t *testing.T) {
+			if backend == "redis" {
+				useRateLimitMiniRedis(t)
+			} else {
+				previous := common.RedisEnabled
+				common.RedisEnabled = false
+				t.Cleanup(func() { common.RedisEnabled = previous })
+			}
+			settings := common.DefaultManagementRateLimits()
+			settings.GlobalAPI = common.ManagementRateLimit{Enabled: true, Requests: 100, WindowSeconds: 60}
+			settings.LoginIP = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			settings.Sensitive = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			settings.TokenQuery = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			setManagementRateLimitTestSettings(t, settings)
+			router := managementRateLimitTestRouter(t)
+			request := func(path, address string, id int) *httptest.ResponseRecorder {
+				return managementRateLimitTestRequest(router, path, address, id)
+			}
+			const address = "192.0.2.110:1000"
+			assert.Equal(t, 204, request("/usage", address, 41).Code)
+			assert.Equal(t, 204, request("/logs", address, 41).Code)
+			limited := request("/usage", "192.0.2.111:1000", 41)
+			assert.Equal(t, 429, limited.Code)
+			assert.Equal(t, "60", limited.Header().Get("Retry-After"))
+			assert.Equal(t, 204, request("/usage", address, 42).Code)
+			assert.Equal(t, 401, request("/usage", address, 0).Code)
+			assert.Equal(t, 204, request("/login", address, 0).Code)
+			assert.Equal(t, 204, request("/login", address, 0).Code)
+			assert.Equal(t, 429, request("/login", address, 0).Code)
+			assert.Equal(t, 204, request("/logout", address, 0).Code)
+			assert.Equal(t, 204, request("/sensitive", address, 0).Code)
+
+			settings.LoginIP.Requests = 10
+			setManagementRateLimitTestSettings(t, settings)
+			assert.Equal(t, 204, request("/login", address, 0).Code)
+			settings.LoginIP.Requests, settings.LoginIP.WindowSeconds = 1, 90
+			setManagementRateLimitTestSettings(t, settings)
+			assert.Equal(t, 204, request("/login", address, 0).Code)
+			limited = request("/login", address, 0)
+			assert.Equal(t, 429, limited.Code)
+			assert.Equal(t, "90", limited.Header().Get("Retry-After"))
+			settings.LoginIP.Enabled = false
+			setManagementRateLimitTestSettings(t, settings)
+			assert.Equal(t, 204, request("/login", address, 0).Code)
+			assert.Equal(t, 429, request("/logs", address, 41).Code)
+
+			settings.GlobalAPI.Requests, settings.GlobalAPI.WindowSeconds = 2, 30
+			setManagementRateLimitTestSettings(t, settings)
+			assert.Equal(t, 204, request("/ping", address, 0).Code)
+			assert.Equal(t, 204, request("/ping", address, 0).Code)
+			assert.Equal(t, 429, request("/ping", address, 0).Code)
+		})
+	}
+}
+
+func TestManagementRateLimitConcurrentAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	if address := os.Getenv("TEST_RATE_LIMIT_REDIS_ADDR"); address != "" {
+		previousEnabled, previousClient := common.RedisEnabled, common.RDB
+		client := redis.NewClient(&redis.Options{Addr: address})
+		require.NoError(t, client.Ping(t.Context()).Err())
+		common.RedisEnabled, common.RDB = true, client
+		t.Cleanup(func() {
+			common.RedisEnabled, common.RDB = previousEnabled, previousClient
+			keys := []string{redisIPRateLimitKey("GA:w61", "192.0.2.200")}
+			for userID := range 200 {
+				keys = append(keys, redisUserRateLimitKey("TQ:w61", 10_000+userID))
+			}
+			require.NoError(t, client.Del(context.Background(), keys...).Err())
+			require.NoError(t, client.Close())
+		})
+	} else {
+		useRateLimitMiniRedis(t)
+	}
+	settings := common.DefaultManagementRateLimits()
+	settings.GlobalAPI = common.ManagementRateLimit{Enabled: true, Requests: 1000, WindowSeconds: 61}
+	settings.TokenQuery = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 61}
+	setManagementRateLimitTestSettings(t, settings)
+	router := managementRateLimitTestRouter(t)
+	jobs := make(chan int)
+	failures := make(chan string, 600)
+	var workers sync.WaitGroup
+	for range 64 {
+		workers.Go(func() {
+			for userID := range jobs {
+				for _, expected := range []int{204, 204, 429} {
+					response := managementRateLimitTestRequest(router, "/usage", "192.0.2.200:1000", userID)
+					if response.Code != expected {
+						failures <- fmt.Sprintf("user %d: got %d, want %d", userID, response.Code, expected)
+					}
+				}
+			}
+		})
+	}
+	for userID := range 200 {
+		jobs <- 10_000 + userID
+	}
+	close(jobs)
+	workers.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+}
 
 func useRateLimitMiniRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 	t.Helper()

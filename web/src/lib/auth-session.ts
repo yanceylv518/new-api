@@ -79,6 +79,11 @@ const authClient = axios.create({
 const refreshRaceDelays = [80, 200, 500] as const
 let refreshPromise: Promise<RefreshOutcome> | null = null
 let authEpoch = 0
+let refreshCooldown: {
+  until: number
+  epoch: number
+  response: AuthRefreshHTTPResponse
+} | null = null
 
 class AuthRefreshSupersededError extends Error {
   constructor() {
@@ -153,6 +158,7 @@ export function applyAuthBundle(
 ): void {
   const previousSID = useAuthStore.getState().auth.session?.sid
   authEpoch += 1
+  refreshCooldown = null
   useAuthStore.getState().auth.setBundle(bundle)
   if (synchronizeTabs && previousSID !== bundle.session.sid) {
     publishAuthSessionEvent('authenticated', bundle.session.sid)
@@ -190,6 +196,7 @@ export function clearAuthentication(
 ): void {
   const sid = useAuthStore.getState().auth.session?.sid
   authEpoch += 1
+  refreshCooldown = null
   useAuthStore.getState().auth.reset(bootstrapState)
   if (synchronizeTabs && sid) {
     publishAuthSessionEvent('signed_out', sid)
@@ -276,6 +283,13 @@ export function createRefreshRunner(
 async function requestRefresh(
   expectedSID?: string
 ): Promise<AuthRefreshHTTPResponse> {
+  const requestEpoch = authEpoch
+  if (
+    refreshCooldown?.epoch === requestEpoch &&
+    refreshCooldown.until > Date.now()
+  ) {
+    return refreshCooldown.response
+  }
   try {
     const response = await authClient.post(
       '/api/user/auth/refresh',
@@ -287,11 +301,30 @@ async function requestRefresh(
     return { status: response.status, data: response.data }
   } catch (error: unknown) {
     if (!axios.isAxiosError(error)) return { status: 0, error }
-    return {
+    const response: AuthRefreshHTTPResponse = {
       status: error.response?.status ?? 0,
       data: error.response?.data,
       error,
     }
+    if (response.status === 429 && requestEpoch === authEpoch) {
+      const now = Date.now()
+      const header: unknown = error.response?.headers['retry-after']
+      const retryAfter =
+        typeof header === 'string' || typeof header === 'number'
+          ? String(header).trim()
+          : ''
+      const retryAt = /^\d+$/.test(retryAfter)
+        ? now + Number(retryAfter) * 1000
+        : Date.parse(retryAfter)
+      refreshCooldown = {
+        until: Number.isFinite(retryAt)
+          ? Math.max(retryAt, now + 1000)
+          : now + 60_000,
+        epoch: requestEpoch,
+        response,
+      }
+    }
+    return response
   }
 }
 

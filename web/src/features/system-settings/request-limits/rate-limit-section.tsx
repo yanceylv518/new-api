@@ -132,7 +132,7 @@ export function RateLimitSection({ defaultValues }: RateLimitSectionProps) {
                   <FormLabel>{t('Enable rate limiting')}</FormLabel>
                   <FormDescription>
                     {t(
-                      'This controls model request rate limiting. Web/API route throttling is configured by environment variables and may still return 429.'
+                      'Model requests have a separate limit from management APIs.'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>

@@ -82,6 +82,15 @@ func buildCompletionRatioMetaValue(optionValues map[string]string) string {
 }
 
 func GetOptions(c *gin.Context) {
+	common.OptionMapRWMutex.RLock()
+	_, hasManagementLimits := common.OptionMap[common.ManagementRateLimitsOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+	if hasManagementLimits {
+		if err := model.RefreshManagementRateLimits(); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 	var options []*model.Option
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
@@ -137,8 +146,9 @@ func GetOptions(c *gin.Context) {
 }
 
 type OptionUpdateRequest struct {
-	Key   string `json:"key"`
-	Value any    `json:"value"`
+	Key           string  `json:"key"`
+	Value         any     `json:"value"`
+	ExpectedValue *string `json:"expected_value"`
 }
 
 type privateAssetOSSSettingsRequest struct {
@@ -568,7 +578,21 @@ func UpdateOption(c *gin.Context) {
 		common.ApiSuccess(c, change)
 		return
 	}
-	err = model.UpdateOption(option.Key, option.Value.(string))
+	var managementValue string
+	if option.Key == common.ManagementRateLimitsOptionKey {
+		if option.ExpectedValue == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "MANAGEMENT_RATE_LIMITS_BASE_REQUIRED", "message": "saved rate limit configuration is required"})
+			return
+		}
+		managementValue, err = model.UpdateManagementRateLimits(option.Value.(string), option.ExpectedValue)
+		var conflict *model.ManagementRateLimitConflictError
+		if errors.As(err, &conflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "MANAGEMENT_RATE_LIMITS_CONFLICT", "message": conflict.Error(), "data": gin.H{"value": conflict.CurrentValue}})
+			return
+		}
+	} else {
+		err = model.UpdateOption(option.Key, option.Value.(string))
+	}
 	if err != nil {
 		if errors.Is(err, system_setting.ErrPasskeyRPIDInvalid) {
 			writeSecurityOperationError(c, err)
@@ -581,6 +605,10 @@ func UpdateOption(c *gin.Context) {
 	recordManageAudit(c, "option.update", map[string]any{
 		"key": option.Key,
 	})
+	if option.Key == common.ManagementRateLimitsOptionKey {
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"value": managementValue}})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
