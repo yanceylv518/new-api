@@ -1,5 +1,5 @@
 export type JSONValue = null | boolean | number | string | readonly JSONValue[] | {readonly [key: string]: JSONValue};
-export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "json-order@1";
+export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "json-order@1" | "owned-resources@1";
 /** Kinds of upstream a driver can address: the vendor API itself, or another New API gateway with the same plugin installed. */
 export type UpstreamKind = "vendor" | "new_api";
 /** Host-injected on every driver hook context. With "new_api" the driver uses its own native-route prefix and the host already set Bearer credentials. */
@@ -32,7 +32,8 @@ export interface ProtocolDecodeContext extends NativeDecodeContext {protocol: Pr
 export type SubmitIntent = {kind: "submit"; model: string; action?: string; requestBody?: unknown; originTaskIds?: readonly string[]};
 export type QueryIntent = {kind: "query"; taskIds: readonly string[]; externalTaskIds?: readonly string[]; model?: string; models?: readonly string[]; actions?: readonly string[]; statuses?: readonly ("queued" | "running" | "succeeded" | "failed")[]; dataFilters?: Readonly<{template?: readonly string[]; resolution?: readonly string[]}>; listOptions?: {pageNum: number; pageSize: number; serviceTier?: "default" | "flex"; lookbackSeconds?: number; createdAfter?: number; createdBefore?: number}};
 export type DeleteIntent = {kind: "delete"; taskId: string; model?: string};
-export type ProxyIntent = {kind: "proxy"; model: string; requestBody?: unknown};
+export type ResourceReference = {id: string; action: string; paths: readonly string[]; taskId?: string};
+export type ProxyIntent = {kind: "proxy"; model: string; requestBody?: unknown; originResource?: ResourceReference};
 export type TaskIntent = SubmitIntent | QueryIntent | DeleteIntent | ProxyIntent;
 export interface NativeRoute {method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; path: string; type: "submit" | "query" | "dynamic"; action?: string; taskIdParam?: string; decode?: string; render: string; models?: readonly string[]; retainResult?: boolean}
 export type ProtocolName = "openai_responses" | "openai_video" | "openai_image";
@@ -76,7 +77,7 @@ export declare const protocols: {
 };
 export declare function buildSubmitRequest(ctx: DriverContext): RequestDescriptor;
 /** 为动态 proxy 路由构造不创建任务的受控 JSON 请求。 */
-export declare function buildNativeRequest(ctx: NativeDecodeContext & {requestBody: unknown; model: string; upstreamModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext}): RequestDescriptor;
+export declare function buildNativeRequest(ctx: NativeDecodeContext & {requestBody: unknown; model: string; upstreamModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext; resourceTask?: {taskId: string; action: string; status: string; data: unknown; state: unknown}}): RequestDescriptor;
 /** 动态 proxy 路由的响应包络。 */
 export declare function proxyResponse(ctx: NativeDecodeContext, response: {statusCode: number; body: unknown}): unknown;
 export interface SubmitEvent {event: string; id: string; data: string}

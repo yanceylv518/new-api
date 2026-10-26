@@ -38,6 +38,49 @@ func TestKlingResponsesProtocol(t *testing.T) {
 	})
 }
 
+func TestKlingResourceManagementRequiresItsCreationAccount(t *testing.T) {
+	source, err := builtinplugins.Source("kling")
+	require.NoError(t, err)
+	plugin, err := jsplugin.CompilePlugin(source, jsplugin.Options{})
+	require.NoError(t, err)
+	assert.Contains(t, plugin.Meta.RequiredCapabilities, jsplugin.CapabilityOwnedResources)
+	for _, resource := range []struct{ action, creation, field string }{
+		{"delete-voices", "custom_voices", "voice_id"},
+		{"delete-elements", "advanced_custom_elements", "element_id"},
+	} {
+		t.Run(resource.action, func(t *testing.T) {
+			path := "/kling/v1/general/" + resource.action
+			decoded, err := plugin.Engine.CallMember(t.Context(), "native", "decodeResourceDelete", map[string]any{
+				"path": path, "body": map[string]any{"kind": "json", "value": map[string]any{resource.field: "resource-owned", "metadata": map[string]any{resource.field: "resource-foreign"}}},
+			})
+			require.NoError(t, err)
+			intent := decoded.(map[string]any)
+			assert.Equal(t, "proxy", intent["kind"])
+			assert.Equal(t, map[string]any{resource.field: "resource-owned"}, intent["requestBody"])
+			created, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"action": resource.creation, "baseUrl": "https://provider.example/kling", "apiKey": "sk-fixture-a", "publicTaskId": "task-created"}, map[string]any{"body": map[string]any{"code": 0, "data": map[string]any{resource.field: "resource-owned"}}})
+			require.NoError(t, err)
+			state := created.(map[string]any)["state"]
+			for _, account := range []struct {
+				key, base string
+				allowed   bool
+			}{
+				{"sk-fixture-a", "https://provider.example/kling", true},
+				{"sk-fixture-b", "https://provider.example/kling", false},
+				{"sk-fixture-a", "https://other.example/kling", false},
+			} {
+				_, err := plugin.Engine.Call(t.Context(), "buildNativeRequest", map[string]any{"path": path, "method": http.MethodPost, "requestBody": intent["requestBody"], "baseUrl": account.base, "apiKey": account.key, "resourceTask": map[string]any{"action": resource.creation, "status": "SUCCESS", "state": state}})
+				if account.allowed {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "account binding")
+				}
+			}
+			_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"action": "delete_" + map[string]string{"delete-voices": "voices", "delete-elements": "elements"}[resource.action]})
+			require.ErrorContains(t, err, "resource management route")
+		})
+	}
+}
+
 func TestKlingRequestURLsRespectConfiguredPrefix(t *testing.T) {
 	source, err := builtinplugins.Source("kling")
 	require.NoError(t, err)

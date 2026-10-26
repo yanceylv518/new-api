@@ -1,15 +1,108 @@
 package model
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
 
 // TaskCancelledReason 是任务插件管理接口取消上游任务时使用的稳定内部标记。
 const TaskCancelledReason = "task cancelled by user"
+
+var ErrTaskPluginResourceAmbiguous = errors.New("resource has multiple creation records; provide its origin task ID")
+
+type TaskPluginResourceReference struct {
+	ID     string   `json:"id"`
+	Action string   `json:"action"`
+	Paths  []string `json:"paths"`
+	TaskID string   `json:"taskId,omitempty"`
+}
+
+func (reference TaskPluginResourceReference) Validate() error {
+	if strings.TrimSpace(reference.ID) == "" || len(reference.ID) > 191 || strings.TrimSpace(reference.Action) == "" || len(reference.Action) > 40 || len(reference.Paths) == 0 || len(reference.Paths) > 8 || len(reference.TaskID) > 191 {
+		return fmt.Errorf("invalid task resource reference")
+	}
+	for _, path := range reference.Paths {
+		if strings.TrimSpace(path) == "" || len(path) > 128 {
+			return fmt.Errorf("invalid task resource path")
+		}
+	}
+	return nil
+}
+
+// FindTaskPluginUserResource 复用成功创建任务作为归属记录，按游标读取，避免新增任务表字段或全表迁移。
+func FindTaskPluginUserResource(ctx context.Context, userID int, platforms []constant.TaskPlatform, reference TaskPluginResourceReference) (*Task, error) {
+	if err := reference.Validate(); err != nil {
+		return nil, err
+	}
+	if userID <= 0 || len(platforms) == 0 {
+		return nil, fmt.Errorf("invalid resource owner")
+	}
+	query := DB.WithContext(ctx).Where("user_id = ? AND platform IN ? AND action = ? AND status = ?", userID, platforms, reference.Action, TaskStatusSuccess)
+	if reference.TaskID != "" {
+		query = query.Where("task_id = ?", reference.TaskID)
+	}
+	// 普通资源 ID 可先缩小候选；特殊字符仍按结构化快照核对，不能因 JSON 转义漏掉归属。
+	if strings.IndexFunc(reference.ID, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.')
+	}) < 0 {
+		column := query.Statement.Quote("data")
+		castType := "TEXT"
+		if query.Dialector.Name() == "mysql" {
+			castType = "CHAR"
+		}
+		pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(reference.ID) + "%"
+		query = query.Where("CAST("+column+" AS "+castType+") LIKE ? ESCAPE '!'", pattern)
+	}
+	const batchSize = 100
+	var found *Task
+	var beforeID int64
+	for {
+		page := query.Session(&gorm.Session{})
+		if beforeID > 0 {
+			page = page.Where("id < ?", beforeID)
+		}
+		var tasks []*Task
+		if err := page.Order("id desc").Limit(batchSize).Find(&tasks).Error; err != nil {
+			return nil, err
+		}
+		for _, task := range tasks {
+			beforeID = task.ID
+			if !task.ResultRetrievable() {
+				continue
+			}
+			matches := false
+			for _, path := range reference.Paths {
+				value := gjson.GetBytes(task.Data, path)
+				if value.Type == gjson.String && value.Str == reference.ID {
+					matches = true
+				}
+				if value.IsArray() {
+					for _, item := range value.Array() {
+						if item.Type == gjson.String && item.Str == reference.ID {
+							matches = true
+						}
+					}
+				}
+			}
+			if !matches {
+				continue
+			}
+			if found != nil {
+				return nil, ErrTaskPluginResourceAmbiguous
+			}
+			found = task
+		}
+		if len(tasks) < batchSize {
+			return found, nil
+		}
+	}
+}
 
 // TaskPluginTaskFilter 描述插件任务列表的服务端过滤条件。
 // 模型过滤基于持久化的 Properties JSON，保证 SQLite、MySQL、PostgreSQL 查询一致。

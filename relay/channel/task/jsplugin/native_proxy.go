@@ -11,13 +11,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 )
 
 // ExecuteNativeRequest 执行不创建任务的插件原生代理请求。
-// 这类请求只用于只读或会话类厂商接口，不进入预扣费、任务轮询和结算链。
+// 只读、会话及已校验归属的资源管理不进入预扣费、任务轮询和结算链。
 func (a *TaskAdaptor) ExecuteNativeRequest(
 	ctx context.Context,
 	requestContext pluginruntime.RouteRequestContext,
@@ -27,6 +28,7 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 	key string,
 	channelType int,
 	proxy string,
+	resourceTasks ...*model.Task,
 ) (*channel.TaskActionResponse, error) {
 	if a == nil || a.plugin == nil {
 		return nil, fmt.Errorf("task plugin adaptor is unavailable")
@@ -40,6 +42,13 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 	hookContext["model"] = modelName
 	hookContext["upstreamModel"] = upstreamModel
 	hookContext["baseUrl"] = baseURL
+	if len(resourceTasks) > 0 && resourceTasks[0] != nil {
+		task := resourceTasks[0]
+		hookContext["resourceTask"] = map[string]any{
+			"taskId": task.TaskID, "action": task.Action, "status": string(task.Status),
+			"data": jsonValue(task.Data), "state": jsonValue(task.PrivateData.PluginState),
+		}
+	}
 	if err := a.applyUpstreamCredentials(hookContext, channelType, key, proxy); err != nil {
 		return nil, err
 	}

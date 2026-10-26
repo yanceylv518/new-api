@@ -90,6 +90,31 @@ func RelayTaskPluginNativeProxy(c *gin.Context) {
 	if key == "" {
 		key = channelModel.Key
 	}
+	var resourceTask *model.Task
+	if value, exists := c.Get(pluginruntime.ContextKeyOriginResourceTask); exists {
+		var valid bool
+		resourceTask, valid = value.(*model.Task)
+		if !valid || resourceTask == nil || resourceTask.UserId != common.GetContextKeyInt(c, constant.ContextKeyUserId) || resourceTask.ChannelId != channelID || channelModel.Status != common.ChannelStatusEnabled || !taskPluginNativeChannelOwned(pinned.Plugin.Meta, channelModel) || resourceTask.PrivateData.Key == "" {
+			respondTaskPluginNativeActionError(c, http.StatusForbidden, "resource_account_unavailable", "Resource account binding is unavailable")
+			return
+		}
+		key = resourceTask.PrivateData.Key
+		keyEnabled := false
+		for index, candidate := range channelModel.GetKeys() {
+			if candidate != key {
+				continue
+			}
+			status, hasStatus := channelModel.ChannelInfo.MultiKeyStatusList[index]
+			if !channelModel.ChannelInfo.IsMultiKey || !hasStatus || status == common.ChannelStatusEnabled {
+				keyEnabled = true
+				break
+			}
+		}
+		if !keyEnabled {
+			respondTaskPluginNativeActionError(c, http.StatusForbidden, "resource_account_unavailable", "Resource account is disabled or no longer available")
+			return
+		}
+	}
 	adaptor := taskjsplugin.New(pinned.Plugin)
 	response, err := adaptor.ExecuteNativeRequest(
 		c.Request.Context(),
@@ -100,6 +125,7 @@ func RelayTaskPluginNativeProxy(c *gin.Context) {
 		key,
 		channelModel.Type,
 		channelModel.GetSetting().Proxy,
+		resourceTask,
 	)
 	if err != nil {
 		respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_proxy_failed", "Task plugin proxy request failed")
@@ -856,6 +882,9 @@ func taskPluginNativeChannelOwned(meta pluginruntime.Meta, channelModel *model.C
 	}
 	if channelModel.Type == constant.ChannelTypeTaskPlugin {
 		return channelModel.GetSetting().TaskPluginKey == meta.Key
+	}
+	if channelModel.Type == constant.ChannelTypeNewAPI {
+		return meta.SupportsUpstream(pluginruntime.UpstreamKindNewAPI) && channelModel.GetSetting().BindsTaskPlugin(meta.Key)
 	}
 	return slices.Contains(meta.ChannelTypes, channelModel.Type)
 }

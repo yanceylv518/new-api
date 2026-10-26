@@ -169,6 +169,17 @@ function klingRoutes() {
   const routes = [];
   for (const action of Object.keys(KLING_ENDPOINTS)) {
     const endpoint = KLING_ENDPOINTS[action];
+    if (action === "delete_voices" || action === "delete_elements") {
+      routes.push({
+        method: "POST",
+        path: "/kling" + endpoint.path,
+        type: "dynamic",
+        action: "proxy",
+        decode: "decodeResourceDelete",
+        render: "proxyResponse",
+      });
+      continue;
+    }
     if (endpoint.proxy) {
       routes.push({ method: "GET", path: "/kling" + endpoint.path, type: "dynamic", action: "proxy", decode: "decodeProxy", render: "proxyResponse" });
       continue;
@@ -188,6 +199,7 @@ function klingRoutes() {
 
 export const meta = {
   apiVersion: 1,
+  requiredCapabilities: ["owned-resources@1"],
   key: "kling",
   name: "Kling",
   icon: "Kling.Color",
@@ -195,7 +207,7 @@ export const meta = {
     en: "Kuaishou Kling video generation and media APIs",
     zh: "快手可灵视频生成及媒体接口",
   },
-  version: "1.3.1",
+  version: "1.3.2",
   author: { name: "QuantumNous" },
   channelTypes: [50],
   models: KLING_MODELS,
@@ -519,6 +531,11 @@ function decodeNativeSubmit(ctx) {
   };
 }
 
+function resourceAccount(ctx) {
+  const baseURL = trimmed(ctx.baseUrl).replace(/\/+$/, "");
+  return utils.hmacSHA256("kling-resource:v1:" + baseURL + ":" + ((ctx.upstream && ctx.upstream.kind) || "vendor"), ctx.apiKey);
+}
+
 function decodeNewSubmit(ctx) {
   if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
   const body = ctx.body.value;
@@ -637,6 +654,42 @@ function newTaskListItem(view) {
 }
 
 export const native = {
+  decodeResourceDelete: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
+    const body = ctx.body.value;
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
+    const action = endpointActionForPath(ctx.path);
+    const voice = action === "delete_voices";
+    if (!voice && action !== "delete_elements") throw new Error("unsupported resource deletion");
+    const field = voice ? "voice_id" : "element_id";
+    const plural = voice ? "voices" : "elements";
+    const id = typeof body[field] === "string" ? body[field].trim() : "";
+    if (!id || id.length > 191) throw new Error(field + " is required");
+    const resource = {
+      id: id,
+      action: voice ? "custom_voices" : "advanced_custom_elements",
+      paths: [
+        "data.task_result." + plural + ".#." + field,
+        "data.task_result." + field,
+        "data." + plural + ".#." + field,
+        "data." + field,
+        "task_result." + plural + ".#." + field,
+        "task_result." + field,
+        plural + ".#." + field,
+        field,
+      ],
+    };
+    if (body.origin_task_id !== undefined) {
+      if (typeof body.origin_task_id !== "string" || !body.origin_task_id.trim() || body.origin_task_id.length > 191)
+        throw new Error("origin_task_id must be a gateway task ID");
+      resource.taskId = body.origin_task_id.trim();
+    }
+    const request = {};
+    request[field] = id;
+    const model = trimmed(body.model_name || body.model) || "kling-v1";
+    if (!KLING_CLASSIC_MODELS.includes(model)) throw new Error("unsupported classic Kling model: " + model);
+    return { kind: "proxy", model: model, requestBody: request, originResource: resource };
+  },
   decodeSubmit: decodeNativeSubmit,
   decodeNewSubmit: decodeNewSubmit,
   decodeProxy: function (ctx) {
@@ -721,6 +774,13 @@ export const native = {
 export function buildNativeRequest(ctx) {
   const action = endpointActionForPath(ctx.path);
   if (!action) throw new Error("unsupported Kling proxy path");
+  if (action === "delete_voices" || action === "delete_elements") {
+    const task = ctx.resourceTask;
+    const expectedAction = action === "delete_voices" ? "custom_voices" : "advanced_custom_elements";
+    if (!task || task.action !== expectedAction || task.status !== "SUCCESS" || !task.state || task.state.resource_account !== resourceAccount(ctx)) {
+      throw new Error("resource account binding is unavailable or has changed");
+    }
+  }
   const method = String(ctx.method || "GET").toUpperCase();
   const descriptor = {
     url: urlFor(ctx, action),
@@ -735,6 +795,8 @@ export function buildNativeRequest(ctx) {
 }
 
 export function buildSubmitRequest(ctx) {
+  if (ctx.action === "delete_voices" || ctx.action === "delete_elements")
+    throw new Error("resource deletion requires its authenticated resource management route");
   const req = ctx.requestBody && typeof ctx.requestBody === "object" && !Array.isArray(ctx.requestBody) ? ctx.requestBody : {};
   if (isNewKlingAction(ctx.action)) {
     const model = submitModel(ctx, req);
@@ -785,6 +847,11 @@ export function parseSubmitResponse(ctx, resp) {
   }
   const taskId = trimmed(data.task_id || result.task_id || ctx.publicTaskId);
   if (!taskId) throw new Error("missing task_id");
+  if (ctx.action === "custom_voices" || ctx.action === "advanced_custom_elements") {
+    const state = { resource_account: resourceAccount(ctx) };
+    if (data.task_id) return { taskId: taskId, taskData: result, state: state };
+    return { taskId: taskId, taskData: result, state: state, immediate: { status: "SUCCESS", progress: "100%" } };
+  }
   if (data.task_id) return { taskId: taskId, taskData: result };
   return { taskId: taskId, taskData: result, immediate: { status: "SUCCESS", progress: "100%" } };
 }

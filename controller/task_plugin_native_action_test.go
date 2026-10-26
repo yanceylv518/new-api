@@ -2,47 +2,256 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestKlingResourceDeletionEnforcesOwnerAndOriginalAccount(t *testing.T) {
+	for _, resource := range []struct{ action, field, plural, path string }{
+		{"custom_voices", "voice_id", "voices", "/kling/v1/general/delete-voices"},
+		{"advanced_custom_elements", "element_id", "elements", "/kling/v1/general/delete-elements"},
+	} {
+		t.Run(resource.action, func(t *testing.T) {
+			setupNativeActionTestDB(t)
+			service.InitHttpClient()
+			source, err := builtinplugins.Source("kling")
+			require.NoError(t, err)
+			plugin := nativeActionTestPlugin(t, source)
+			var route pluginruntime.Route
+			for _, candidate := range plugin.Meta.Routes {
+				if candidate.Path == resource.path {
+					route = candidate
+				}
+			}
+			require.Equal(t, pluginruntime.RouteTypeDynamic, route.Type)
+			require.Equal(t, "proxy", route.Action)
+			type forwarded struct{ key, body string }
+			requests := make(chan forwarded, 8)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				assert.NoError(t, common.DecodeJson(r.Body, &body))
+				encoded, encodeErr := common.Marshal(body)
+				assert.NoError(t, encodeErr)
+				requests <- forwarded{r.Header.Get("Authorization"), string(encoded)}
+				_, _ = w.Write([]byte(`{"code":0,"message":"ok"}`))
+			}))
+			defer upstream.Close()
+			channel := &model.Channel{Type: constant.ChannelTypeKling, Key: "sk-fixture-original-key\nsk-fixture-other-key", Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2}}
+			require.NoError(t, model.DB.Create(channel).Error)
+			result := map[string]any{"code": 0, "data": map[string]any{"task_result": map[string]any{resource.plural: []any{map[string]any{resource.field: "owned-resource"}}}}}
+			parsed, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"action": resource.action, "baseUrl": upstream.URL, "apiKey": "sk-fixture-original-key", "publicTaskId": "creation-owner"}, map[string]any{"body": result})
+			require.NoError(t, err)
+			state, err := common.Marshal(parsed.(map[string]any)["state"])
+			require.NoError(t, err)
+			task := &model.Task{TaskID: "creation-owner", UserId: 7, Platform: "kling", ChannelId: channel.Id, Action: resource.action, Status: model.TaskStatusSuccess, Progress: "100%", Quota: 73, PrivateData: model.TaskPrivateData{Key: "sk-fixture-original-key", PluginState: state}}
+			task.SetData(result)
+			require.NoError(t, model.DB.Create(task).Error)
+			router := gin.New()
+			router.POST(resource.path, func(c *gin.Context) {
+				owner := 7
+				if c.GetHeader("X-Test-Owner") == "8" {
+					owner = 8
+				}
+				common.SetContextKey(c, constant.ContextKeyUserId, owner)
+				c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: &pluginruntime.RoutingGeneration{}, Plugin: plugin, Route: route})
+			}, middleware.PrepareTaskPluginRoute(), func(c *gin.Context) {
+				pin, ok, _ := service.GetChannelConstraints(c).ResolvedPin()
+				require.True(t, ok)
+				assert.Equal(t, channel.Id, pin.ChannelId)
+				common.SetContextKey(c, constant.ContextKeyChannelId, pin.ChannelId)
+				common.SetContextKey(c, constant.ContextKeyChannelKey, "sk-fixture-other-key")
+				RelayTaskPluginNativeProxy(c)
+			})
+			request := func(owner, id, origin string) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"%s":%s,"origin_task_id":"%s","metadata":{"%s":"foreign-resource"}}`, resource.field, id, origin, resource.field)
+				req := httptest.NewRequest(http.MethodPost, resource.path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Test-Owner", owner)
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, req)
+				return recorder
+			}
+			for _, tc := range []struct{ owner, id, origin string }{
+				{"8", `"owned-resource"`, task.TaskID},
+				{"8", `"\u006fwned-resource"`, task.TaskID},
+				{"7", `"foreign-resource"`, task.TaskID},
+			} {
+				response := request(tc.owner, tc.id, tc.origin)
+				assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+				assert.Empty(t, requests)
+			}
+			for _, keys := range []string{"sk-fixture-original-key\nsk-fixture-other-key", "sk-fixture-other-key\nsk-fixture-original-key"} {
+				require.NoError(t, model.DB.Model(channel).UpdateColumn("key", keys).Error)
+				response := request("7", `"\u006fwned-resource"`, task.TaskID)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				require.Len(t, requests, 1)
+				forward := <-requests
+				assert.Equal(t, "Bearer sk-fixture-original-key", forward.key)
+				assert.JSONEq(t, fmt.Sprintf(`{"%s":"owned-resource"}`, resource.field), forward.body)
+			}
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("key", "sk-fixture-other-key").Error)
+			assert.Equal(t, http.StatusForbidden, request("7", `"owned-resource"`, task.TaskID).Code)
+			assert.Empty(t, requests)
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("key", "sk-fixture-original-key\nsk-fixture-other-key").Error)
+			channel.ChannelInfo.MultiKeyStatusList = map[int]int{0: common.ChannelStatusAutoDisabled}
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("channel_info", channel.ChannelInfo).Error)
+			assert.Equal(t, http.StatusForbidden, request("7", `"owned-resource"`, task.TaskID).Code)
+			assert.Empty(t, requests)
+			channel.ChannelInfo.MultiKeyStatusList = nil
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("channel_info", channel.ChannelInfo).Error)
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("base_url", upstream.URL+"/changed").Error)
+			assert.Equal(t, http.StatusBadGateway, request("7", `"owned-resource"`, task.TaskID).Code)
+			assert.Empty(t, requests)
+			require.NoError(t, model.DB.Model(channel).UpdateColumn("base_url", upstream.URL).Error)
+			task.PrivateData.PluginState = nil
+			require.NoError(t, model.DB.Model(task).UpdateColumn("private_data", task.PrivateData).Error)
+			assert.Equal(t, http.StatusBadGateway, request("7", `"owned-resource"`, task.TaskID).Code)
+			assert.Empty(t, requests)
+			var persisted model.Task
+			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+			assert.Equal(t, 73, persisted.Quota)
+		})
+	}
+}
+
+func TestTaskPluginNativeChannelBinding(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin := nativeActionTestPlugin(t, source)
+	for _, tc := range []struct {
+		name, setting string
+		channelType   int
+		allowed       bool
+	}{
+		{"newapi bound", `{"task_extend_plugin_keys":["doubao"]}`, constant.ChannelTypeNewAPI, true},
+		{"newapi wrong", `{"task_extend_plugin_keys":["hailuo"]}`, constant.ChannelTypeNewAPI, false},
+		{"newapi unbound", `{}`, constant.ChannelTypeNewAPI, false},
+		{"plugin bound", `{"task_plugin_key":"doubao"}`, constant.ChannelTypeTaskPlugin, true},
+		{"plugin wrong", `{"task_plugin_key":"hailuo"}`, constant.ChannelTypeTaskPlugin, false},
+		{"legacy doubao", `{}`, constant.ChannelTypeDoubaoVideo, true},
+		{"legacy other", `{}`, constant.ChannelTypeMiniMax, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.allowed, taskPluginNativeChannelOwned(plugin.Meta, &model.Channel{Type: tc.channelType, Setting: &tc.setting}))
+		})
+	}
+}
+
+func TestNewAPIChannelNativeActionRequiresCurrentPluginBinding(t *testing.T) {
+	for _, status := range []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusQueued} {
+		t.Run(string(status), func(t *testing.T) {
+			setupNativeActionTestDB(t)
+			service.InitHttpClient()
+			source, err := builtinplugins.Source("doubao")
+			require.NoError(t, err)
+			plugin := nativeActionTestPlugin(t, source)
+			requests := make(chan string, 3)
+			var deleted atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer sk-fixture-native", r.Header.Get("Authorization"))
+				requests <- r.URL.Path
+				if r.Method == http.MethodGet {
+					state := "queued"
+					if deleted.Load() {
+						state = "cancelled"
+					}
+					_, _ = fmt.Fprintf(w, `{"id":"upstream-private","status":"%s"}`, state)
+					return
+				}
+				assert.Equal(t, http.MethodDelete, r.Method)
+				deleted.Store(true)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer upstream.Close()
+			user := &model.User{Id: 7, Username: "native-gateway-owner", Quota: 927, UsedQuota: 73}
+			require.NoError(t, model.DB.Create(user).Error)
+			setting := `{"task_extend_plugin_keys":["doubao"]}`
+			channel := &model.Channel{Type: constant.ChannelTypeNewAPI, Key: "sk-fixture-native", Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL, Setting: &setting, UsedQuota: 73}
+			require.NoError(t, model.DB.Create(channel).Error)
+			task := &model.Task{TaskID: "gateway-public", UserId: 7, Platform: "doubao", ChannelId: channel.Id, Status: status, Progress: "0%", Quota: 73, Properties: model.Properties{OriginModelName: "doubao-seedance-2-0-260128"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-private"}}
+			require.NoError(t, model.DB.Create(task).Error)
+			for _, bound := range []bool{false, true} {
+				setting = `{"task_extend_plugin_keys":["hailuo"]}`
+				if bound {
+					setting = `{"task_extend_plugin_keys":["doubao"]}`
+				}
+				require.NoError(t, model.DB.Model(channel).UpdateColumn("setting", setting).Error)
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodDelete, "/doubao/api/v3/contents/generations/tasks/gateway-public", nil)
+				common.SetContextKey(c, constant.ContextKeyUserId, 7)
+				c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: &pluginruntime.RoutingGeneration{}, Plugin: plugin, Route: pluginruntime.Route{Action: "delete", Render: "taskDeleted"}})
+				c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{Method: http.MethodDelete, Path: c.Request.URL.Path})
+				c.Set(pluginruntime.ContextKeyNativeRouteIntent, map[string]any{"kind": "delete", "taskId": task.TaskID})
+				RelayTaskPluginNativeAction(c)
+				if bound {
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					count := 1
+					if status == model.TaskStatusQueued {
+						count = 3
+					}
+					require.Len(t, requests, count)
+					for range count {
+						assert.Equal(t, "/doubao/api/v3/contents/generations/tasks/upstream-private", <-requests)
+					}
+				} else {
+					assert.Equal(t, http.StatusBadRequest, recorder.Code)
+					assert.Empty(t, requests)
+				}
+			}
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			if status == model.TaskStatusSuccess {
+				assert.Equal(t, 73, task.Quota)
+			} else {
+				assert.Zero(t, task.Quota)
+				require.NoError(t, model.DB.First(user, user.Id).Error)
+				assert.Equal(t, 1000, user.Quota)
+			}
+		})
+	}
+}
 
 func setupNativeActionTestDB(t *testing.T) {
 	t.Helper()
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMemoryCache := common.MemoryCacheEnabled
 	previousRedis, previousBatch := common.RedisEnabled, common.BatchUpdateEnabled
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Token{}, &model.Log{}))
-	sqlDB, err := database.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	database, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Token{}, &model.Log{})
 	model.DB = database
 	model.LOG_DB = database
+	common.SetDatabaseTypes(dialect, dialect)
 	common.MemoryCacheEnabled = false
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	t.Cleanup(func() {
+		// 异步指标仍会读取全局缓存配置，结束后才能还原测试环境。
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
 		model.DB = previousDB
 		model.LOG_DB = previousLogDB
 		common.MemoryCacheEnabled = previousMemoryCache
 		common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
-		assert.NoError(t, sqlDB.Close())
+		common.SetDatabaseTypes(previousMain, previousLog)
 	})
 }
 
@@ -92,7 +301,7 @@ func TestRelayTaskPluginNativeActionCancellationRefundFailure(t *testing.T) {
 	require.NoError(t, model.DB.Create(task).Error)
 	const callback = "test:reject-cancel-funding"
 	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
-		if tx.Statement.Table == "users" {
+		if tx.Statement.Table == model.DB.NamingStrategy.TableName("users") {
 			tx.AddError(errors.New("funding unavailable"))
 		}
 	}))

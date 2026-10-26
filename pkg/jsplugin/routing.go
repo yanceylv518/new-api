@@ -212,11 +212,12 @@ type ProtocolBinding struct {
 }
 
 const (
-	ContextKeyPinnedPlugin    = "task_plugin_pinned_plugin"
-	ContextKeyPinnedRoute     = "task_plugin_pinned_route"
-	ContextKeyPinnedEndpoint  = "task_plugin_pinned_endpoint"
-	ContextKeyRouteRequest    = "task_plugin_route_request"
-	ContextKeyProtocolRequest = "task_plugin_protocol_request"
+	ContextKeyPinnedPlugin       = "task_plugin_pinned_plugin"
+	ContextKeyPinnedRoute        = "task_plugin_pinned_route"
+	ContextKeyPinnedEndpoint     = "task_plugin_pinned_endpoint"
+	ContextKeyRouteRequest       = "task_plugin_route_request"
+	ContextKeyOriginResourceTask = "task_plugin_origin_resource_task"
+	ContextKeyProtocolRequest    = "task_plugin_protocol_request"
 	// ContextKeyRequestBodyText holds, for a plugin that preserves JSON
 	// order, the decoded requestBody as JSON text (json.RawMessage) beside
 	// the Go value in task_request.

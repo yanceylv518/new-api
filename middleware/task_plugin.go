@@ -311,6 +311,16 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				c.Set("task_action", action)
 			}
 			c.Set("relay_mode", relayconstant.RelayModeVideoSubmit)
+			if _, present := resolved["originResource"]; present {
+				if kind != "proxy" || !slices.Contains(pinned.Plugin.Meta.RequiredCapabilities, pluginruntime.CapabilityOwnedResources) {
+					abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
+					return
+				}
+				if intentErr := applyTaskPluginResourceIntent(c, resolved, pinned.Plugin.Meta); intentErr != nil {
+					abortTaskPluginRouteErrorDetail(c, intentErr.StatusCode, intentErr.Message)
+					return
+				}
+			}
 			if intentErr := applyOriginTaskIntent(c, resolved, pinned.Plugin.Meta); intentErr != nil {
 				logger.LogWarn(
 					c,
@@ -1111,6 +1121,34 @@ type originTaskIntentError struct {
 	Code       string
 	Message    string
 	StatusCode int
+}
+
+func applyTaskPluginResourceIntent(c *gin.Context, intent map[string]any, meta pluginruntime.Meta) *originTaskIntentError {
+	var reference model.TaskPluginResourceReference
+	encoded, err := common.Marshal(intent["originResource"])
+	if err != nil || common.Unmarshal(encoded, &reference) != nil || reference.Validate() != nil {
+		return &originTaskIntentError{Code: "invalid_resource_reference", Message: "invalid resource reference", StatusCode: http.StatusBadRequest}
+	}
+	if _, present := intent["originTaskIds"]; present {
+		return &originTaskIntentError{Code: "invalid_resource_reference", Message: "resource and task references cannot be combined", StatusCode: http.StatusBadRequest}
+	}
+	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	task, err := model.FindTaskPluginUserResource(c.Request.Context(), userID, taskPluginLegacyPlatforms(meta), reference)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("resource ownership lookup failed plugin=%s user=%d: %v", meta.Key, userID, err))
+		if errors.Is(err, model.ErrTaskPluginResourceAmbiguous) {
+			return &originTaskIntentError{Code: "resource_reference_ambiguous", Message: "resource has multiple creation records; provide origin_task_id", StatusCode: http.StatusConflict}
+		}
+		return &originTaskIntentError{Code: "resource_lookup_failed", Message: "resource ownership lookup failed", StatusCode: http.StatusInternalServerError}
+	}
+	if task == nil {
+		return &originTaskIntentError{Code: "resource_not_found", Message: "resource not found or not owned by you", StatusCode: http.StatusNotFound}
+	}
+	if intentErr := applyOriginTaskIntent(c, map[string]any{"originTaskIds": []any{task.TaskID}}, meta); intentErr != nil {
+		return intentErr
+	}
+	c.Set(pluginruntime.ContextKeyOriginResourceTask, task)
+	return nil
 }
 
 // taskPluginLegacyPlatforms lists the Task.Platform values a plugin owns: its

@@ -560,12 +560,13 @@ func RefreshTaskForManagement(ctx context.Context, adaptor TaskPollingAdaptor, c
 	if err := RecoverTaskInitialAccounting(ctx, task); err != nil {
 		return nil, err
 	}
+	// 终态同样需要渠道身份，后续删除仍会构建上游请求。
+	adaptor.Init(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: ch.GetBaseURL(), ApiKey: ch.Key},
+	})
 	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		return task, nil
 	}
-	adaptor.Init(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: ch.GetBaseURL(), ApiKey: ch.Key},
-	})
 	upstreamID := task.GetUpstreamTaskID()
 	if err := updateVideoSingleTask(ctx, adaptor, ch, upstreamID, map[string]*model.Task{upstreamID: task}); err != nil {
 		return nil, err
