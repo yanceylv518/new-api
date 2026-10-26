@@ -120,6 +120,38 @@ func createScopedAccessToken(t *testing.T, userID int, expiresAt int64, scopes .
 	return raw, token
 }
 
+func TestPricingHistoryPATNeedsReadScopeAndAdminRole(t *testing.T) {
+	setupNativeActionTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UserAccessToken{}, &model.AuditLog{}))
+	t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(&model.UserAccessToken{}, &model.AuditLog{})) })
+	require.NoError(t, i18n.Init())
+	admin := &model.User{Username: "pricing-history-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, model.DB.Create(admin).Error)
+	ordinary := &model.User{Username: "pricing-history-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "history-user"}
+	require.NoError(t, model.DB.Create(ordinary).Error)
+	router := gin.New()
+	router.GET("/api/user/model-pricing/history", middleware.AdminAuth(), func(c *gin.Context) { common.ApiSuccess(c, nil) })
+	for _, tc := range []struct {
+		name, scope    string
+		userID, status int
+	}{
+		{"admin read", "user:read", admin.Id, http.StatusOK},
+		{"admin wrong scope", "wallet:read", admin.Id, http.StatusForbidden},
+		{"ordinary read", "user:read", ordinary.Id, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			credential, _ := createScopedAccessToken(t, tc.userID, time.Now().Unix()+3600, tc.scope)
+			response := accessTokenRequest(router, http.MethodGet, "/api/user/model-pricing/history", credential, "", "")
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.status == http.StatusOK {
+				var result struct{ Success bool }
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				assert.True(t, result.Success, response.Body.String())
+			}
+		})
+	}
+}
+
 // createAccessTokenTestSession returns a browser session identity and the
 // dashboard JWT that carries it.
 func createAccessTokenTestSession(t *testing.T, userID int, sid string) (service.AuthIdentity, string) {
