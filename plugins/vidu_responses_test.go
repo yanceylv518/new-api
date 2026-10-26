@@ -39,6 +39,19 @@ func TestViduResponsesProtocol(t *testing.T) {
 	})
 }
 
+func TestViduLegacyBillingKeepsDurationInFactsOnly(t *testing.T) {
+	plugin := loadViduPlugin(t)
+	request := map[string]any{"model": "viduq1", "duration": 5, "resolution": "1080p"}
+	ratios, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"usagePurpose": "billing_ratios", "action": "text_to_video", "requestBody": request})
+	require.NoError(t, err)
+	assert.Nil(t, ratios)
+	facts, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"usagePurpose": "facts", "action": "text_to_video", "requestBody": request})
+	require.NoError(t, err)
+	encoded, err := common.Marshal(facts)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"duration":5,"resolution":"1080p"}`, string(encoded))
+}
+
 func loadViduPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	t.Helper()
 	source, err := builtinplugins.Source("vidu")

@@ -55,7 +55,7 @@ export const meta = {
     en: "Shengshu Vidu video generation and template workflows",
     zh: "生数 Vidu 视频生成及模板工作流",
   },
-  version: "1.1.1",
+  version: "1.1.2",
   author: { name: "QuantumNous" },
   channelTypes: [52],
   upstreams: ["vendor", "new_api"],
@@ -363,6 +363,7 @@ export function parseSubmitResponse(ctx, resp) {
 }
 
 export function extractUsage(ctx) {
+  if (ctx.usagePurpose === "billing_ratios") return null;
   const req = ctx.requestBody || {};
   const model = ctx.upstreamModel || req.model;
   const action = normalizedAction(req, ctx.action);
