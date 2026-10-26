@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -30,6 +31,47 @@ const cacheExpr = `tier("default", p * 2 + c * 10 + cr * 0.2 + cc * 2.5 + cc1h *
 const probeExpr = `param("service_tier") == "fast" ? tier("fast", p * 4 + c * 20) : tier("normal", p * 2 + c * 10)`
 
 const testQuotaPerUnit = 500_000.0
+
+func TestImageRetryDiscountReservesAndSettlesRealBalance(t *testing.T) {
+	for _, ratio := range []float64{0.5, 1} {
+		t.Run(fmt.Sprintf("discount-%g", ratio), func(t *testing.T) {
+			truncate(t)
+			initialBalance := int(30_000 * ratio)
+			seedUser(t, 981, initialBalance)
+			const expression = `tier("images", fixed(0.02)) * image_count`
+			count := 2
+			info := &relaycommon.RelayInfo{
+				UserId: 981, UserQuota: initialBalance, IsPlayground: true, ForcePreConsume: true, OriginModelName: "image-fixture",
+				UserSetting:           dto.UserSetting{BillingPreference: "wallet_only"},
+				TieredBillingSnapshot: makeSnapshot(expression, 1, 0, 0),
+				BillingRequestInput:   &billingexpr.RequestInput{Body: []byte(`{"n":2}`)},
+				PriceData:             types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
+			}
+			info.TieredBillingSnapshot.EstimatedImageCount = &count
+			info.PriceData.AddOtherRatio(types.UserModelDiscountRatioKey, ratio)
+			ctx, _ := gin.CreateTestContext(nil)
+			for _, attemptCount := range []int{2, 2, 3} {
+				require.Nil(t, PrepareImageBillingForRequest(ctx, info, attemptCount))
+				expected := int(float64(attemptCount*10_000) * ratio)
+				assert.Equal(t, expected, info.FinalPreConsumedQuota)
+				assert.Equal(t, types.NewDiscountAmounts(attemptCount*10_000, expected), info.PriceData.DiscountAmounts)
+				balance, err := model.GetUserQuota(981, false)
+				require.NoError(t, err)
+				assert.Equal(t, initialBalance-expected, balance)
+			}
+			info.UpdateImageCount(1)
+			ok, actual, _ := TryTieredSettle(info, billingexpr.TokenParams{})
+			require.True(t, ok)
+			assert.Equal(t, int(10_000*ratio), actual)
+			require.NoError(t, info.Billing.Settle(actual))
+			require.NoError(t, info.Billing.Settle(actual))
+			balance, err := model.GetUserQuota(981, false)
+			require.NoError(t, err)
+			assert.Equal(t, initialBalance-actual, balance)
+			assert.Equal(t, `{"n":2}`, string(info.BillingRequestInput.Body))
+		})
+	}
+}
 
 // 折前发生额度饱和、折后恢复正常范围时，管理员审计仍需保留原异常。
 func TestDiscountRetainsOriginalTieredSaturation(t *testing.T) {

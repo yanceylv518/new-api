@@ -204,6 +204,22 @@ func TestUserModelDiscountActualUsageKeepsFrozenTimeAndSource(t *testing.T) {
 	assert.Equal(t, 2900, evaluation.DiscountBPS)
 }
 
+func TestImageActualCountReevaluatesDiscountWithoutChangingRequest(t *testing.T) {
+	for _, tc := range []struct{ submitted, actual, wantBPS int }{{10, 1, 10_000}, {1, 10, 5_000}, {10, 0, 5_000}} {
+		t.Run(fmt.Sprintf("%d-to-%d", tc.submitted, tc.actual), func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: "count >= 10 ? 0.5 : 1"}, Source: "permanent", Context: discountexpr.Context{Count: float64(tc.submitted), At: 199, Params: map[string]any{"n": tc.submitted}}}
+			info := &relaycommon.RelayInfo{UserModelDiscountEvaluation: evaluation}
+			info.UpdateImageCount(int64(tc.actual))
+			settleUserModelDiscount(ctx, info, 0, 0, 0)
+			assert.Equal(t, tc.wantBPS, evaluation.DiscountBPS)
+			assert.Equal(t, tc.submitted, evaluation.Context.Params["n"])
+			assert.Equal(t, int64(199), evaluation.Context.At)
+			assert.Equal(t, "permanent", evaluation.Source)
+		})
+	}
+}
+
 func TestUserModelDiscountEvaluationFailureKeepsReservedRatio(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	evaluation := &types.UserModelDiscountEvaluation{Rule: types.UserModelDiscountWindow{Expression: "output_tokens > 0 ? 1.1 : 0.8"}, Context: discountexpr.Context{}, DiscountBPS: 8000}

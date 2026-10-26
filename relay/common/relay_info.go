@@ -236,11 +236,13 @@ type RelayInfo struct {
 	*TaskRelayInfo
 }
 
-// UpdateImageCount replaces the billable quantity without changing the frozen
-// request parameters or multiplying the legacy and expression prices together.
+// UpdateImageCount 更新可信实际数量，冻结的请求参数和折扣规则保持不变。
 func (info *RelayInfo) UpdateImageCount(count int64) {
 	if info == nil || count <= 0 || count > int64(dto.MaxImageN) {
 		return
+	}
+	if info.UserModelDiscountEvaluation != nil {
+		info.UserModelDiscountEvaluation.Context.Count = float64(count)
 	}
 	if info.PriceData.UsePrice {
 		info.PriceData.AddOtherRatio("n", float64(count))

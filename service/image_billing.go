@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
@@ -10,7 +11,9 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 // PrepareImageBillingForRequest reserves the effective outbound image quantity
@@ -43,8 +46,27 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if trace.BillingUnit != billingexpr.BillingUnitRequest && snap.PreConsumeMultiplier != 0 {
 			beforeGroup *= snap.PreConsumeMultiplier
 		}
-		quota, err = billingexpr.QuotaRoundStrict(beforeGroup * info.PriceData.GroupRatioInfo.GroupRatio)
+		groupRatio := info.PriceData.GroupRatioInfo.GroupRatio
+		if math.IsNaN(beforeGroup) || math.IsInf(beforeGroup, 0) || math.IsNaN(groupRatio) || math.IsInf(groupRatio, 0) {
+			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image reservation amount"), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		discountRatio := info.PriceData.UserModelDiscountMultiplier()
+		var original int
+		var originalClamp *common.QuotaClamp
+		if discountRatio != 1 {
+			beforeValue := decimal.NewFromFloat(beforeGroup).Mul(decimal.NewFromFloat(groupRatio))
+			quota, err = common.QuotaDiscountDecimalStrict(beforeValue, discountRatio)
+			original, originalClamp = common.QuotaFromDecimalChecked(beforeValue)
+		} else {
+			quota, err = billingexpr.QuotaRoundStrict(beforeGroup * groupRatio)
+			original, originalClamp = common.QuotaRoundChecked(beforeGroup * groupRatio)
+		}
 		if err == nil {
+			if original > 0 && quota == 0 && discountRatio < 1 {
+				quota = 1
+			}
+			noteQuotaClamp(info, originalClamp)
+			info.PriceData.DiscountAmounts = hosttypes.NewDiscountAmounts(original, quota)
 			snap.EstimatedImageCount = trace.ImageCount
 			snap.EstimatedQuotaBeforeGroup = beforeGroup
 			snap.EstimatedQuotaAfterGroup = quota
