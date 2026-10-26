@@ -258,6 +258,12 @@ export function SeedanceAssets() {
       deleteSeedanceAssetGroup(group.id),
     onSuccess: (_response, group) => {
       if (selectedId === group.group_id) setSelectedGroupId('')
+      if (
+        validationSession.data?.data.local_group_id === group.id ||
+        validationSession.data?.data.group_id === group.group_id
+      ) {
+        clearValidationSession()
+      }
       setPage(1)
       setDeleteGroup(null)
       void invalidate()
@@ -375,7 +381,8 @@ export function SeedanceAssets() {
     resumeAction = t('Continue portrait upload')
   } else if (
     resumableSession?.status === 'Failed' ||
-    resumableSession?.status === 'Expired'
+    resumableSession?.status === 'Expired' ||
+    resumableSession?.status === 'Cancelled'
   ) {
     resumeAction = t('Review verification status')
   }

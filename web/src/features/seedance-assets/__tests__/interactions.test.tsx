@@ -364,6 +364,127 @@ test('completes verified human group setup and uploads its portrait for review',
   expect(localStorage.getItem('seedance-assets-human-session:7')).toBeNull()
 })
 
+test.each(['Cancelled', 'Succeeded'] as const)(
+  'starts a fresh verification from a restored %s session',
+  async (status) => {
+    localStorage.setItem('seedance-assets-human-session:7', '11')
+    api.defaults.adapter = async (config) => ({
+      data: {
+        success: true,
+        data: config.url?.includes('/validation-sessions/')
+          ? {
+              id: 11,
+              status,
+              name: 'Restored person',
+              group_id: status === 'Succeeded' ? 'group-human' : '',
+              local_group_id: status === 'Succeeded' ? 22 : 0,
+              expires_at: Math.floor(Date.now() / 1000) + 1800,
+              created_at: 1,
+              updated_at: 1,
+            }
+          : [],
+        total: 0,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    })
+    renderLibrary()
+    const resume = await screen.findByRole('button', {
+      name:
+        status === 'Succeeded'
+          ? 'Continue portrait upload'
+          : 'Review verification status',
+    })
+    await userEvent.click(resume)
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Start over' })
+    )
+    expect(
+      within(dialog).getByRole('textbox', { name: 'Group name' })
+    ).toHaveValue('')
+    expect(
+      within(dialog).getByRole('button', { name: 'Start verification' })
+    ).toBeDisabled()
+    expect(localStorage.getItem('seedance-assets-human-session:7')).toBeNull()
+  }
+)
+
+test('deleting the restored verified group clears the session across reloads', async () => {
+  localStorage.setItem('seedance-assets-human-session:7', '11')
+  let deleted = false
+  api.defaults.adapter = async (config) => {
+    if (config.method === 'delete') deleted = true
+    let data: unknown = []
+    if (config.url?.includes('/validation-sessions/')) {
+      data = {
+        id: 11,
+        status: 'Succeeded',
+        name: 'Verified person',
+        group_id: 'group-human',
+        local_group_id: 22,
+        expires_at: Math.floor(Date.now() / 1000) + 1800,
+        created_at: 1,
+        updated_at: 1,
+      }
+    } else if (config.url?.endsWith('/asset-groups') && !deleted) {
+      data = [
+        {
+          id: 22,
+          group_id: 'group-human',
+          name: 'Verified person',
+          group_type: 'LivenessFace',
+        },
+      ]
+    }
+    return {
+      data: {
+        success: true,
+        data,
+        total: 0,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  const page = renderLibrary()
+  await screen.findByRole('button', { name: 'Continue portrait upload' })
+  await screen.findByRole('button', { name: 'Verified person' })
+  await userEvent.click(screen.getByRole('button', { name: 'Group actions' }))
+  await userEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+  const confirmation = await screen.findByRole('alertdialog')
+  await userEvent.click(
+    within(confirmation).getByRole('button', { name: 'Delete' })
+  )
+  await waitFor(() =>
+    expect(localStorage.getItem('seedance-assets-human-session:7')).toBeNull()
+  )
+  expect(
+    screen.queryByRole('button', { name: 'Continue portrait upload' })
+  ).not.toBeInTheDocument()
+  page.unmount()
+  renderLibrary()
+  await screen.findByText('No asset groups yet')
+  await userEvent.click(screen.getByRole('tab', { name: /Human verification/ }))
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Create verified human group' })
+  )
+  const dialog = await screen.findByRole('dialog')
+  expect(
+    within(dialog).getByRole('textbox', { name: 'Group name' })
+  ).toHaveValue('')
+})
+
 test('restores an unfinished verification session after the page reloads', async () => {
   localStorage.setItem('seedance-assets-human-session:7', '11')
   api.defaults.adapter = async (config) => ({

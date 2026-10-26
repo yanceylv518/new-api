@@ -186,6 +186,14 @@ func QueueSeedanceAssetGroupDeletion(ctx context.Context, job SeedanceAssetClean
 				return err
 			}
 		}
+		if err := tx.Model(&SeedanceAssetValidationSession{}).
+			Where("user_id = ? AND local_group_id = ? AND status = ?", group.UserID, group.ID, SeedanceAssetValidationStatusSucceeded).
+			Updates(map[string]any{
+				"status":         SeedanceAssetValidationStatusCancelled,
+				"local_group_id": uint(0), "upstream_group_id": "", "launch_url": "",
+			}).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&SeedanceAsset{}).
 			Where("user_id = ? AND group_id = ?", group.UserID, group.GroupID).
 			Updates(map[string]any{

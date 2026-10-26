@@ -52,6 +52,7 @@ const validationStatusCopy: Record<string, string> = {
   Succeeded: 'Verification completed',
   Failed: 'Verification failed',
   Expired: 'Verification expired',
+  Cancelled: 'This verification session can no longer be continued.',
 }
 
 export type HumanAssetGroupDetails = {
@@ -83,7 +84,9 @@ export function CreateHumanValidationDialog(props: {
   const session = props.session
   const trimmedName = name.trim()
   const isSessionFailed =
-    session?.status === 'Failed' || session?.status === 'Expired'
+    session?.status === 'Failed' ||
+    session?.status === 'Expired' ||
+    session?.status === 'Cancelled'
   const isVerified = session?.status === 'Succeeded'
   const status = session
     ? t(validationStatusCopy[session.status] ?? session.status)
@@ -232,6 +235,15 @@ export function CreateHumanValidationDialog(props: {
   } else if (isVerified) {
     footer = (
       <>
+        <Button
+          type='button'
+          variant='outline'
+          onClick={handleStartOver}
+          disabled={uploadMutation.isPending}
+        >
+          <RefreshCw />
+          {t('Start over')}
+        </Button>
         <Button
           type='button'
           variant='outline'

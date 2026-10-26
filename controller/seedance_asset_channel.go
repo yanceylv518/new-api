@@ -11,8 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// selectSeedanceAssetValidationChannels returns ordered candidates for the official validation Action.
-// The service layer only falls back after the selected upstream explicitly lacks the Action.
+// selectSeedanceAssetValidationChannels 按优先级降序筛选允许访问的素材渠道，供认证回退和官方建组共用。
 func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]*model.Channel, error) {
 	modelLimitsEnabled := c.GetBool("token_model_limit_enabled")
 	allowed := map[string]bool{}

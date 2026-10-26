@@ -1000,21 +1000,26 @@ func SupportsSeedanceAssets(channel *model.Channel) bool {
 	return isSeedanceAssetChannel(channel)
 }
 
-// FindSeedanceAssetChannels 按主键游标扫描启用渠道，避免前 100 条无效配置遮蔽可用账号。
+// FindSeedanceAssetChannels 按优先级降序返回可用渠道；同级按 ID 排序，并用组合游标跨页。
 func FindSeedanceAssetChannels() ([]*model.Channel, error) {
 	const batchSize = 100
 	lastID := 0
+	var lastPriority int64
 	result := make([]*model.Channel, 0)
 	for {
 		var channels []*model.Channel
-		err := model.DB.Where("id > ? AND status = ? AND type IN ?", lastID, common.ChannelStatusEnabled,
-			[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin}).
-			Order("id asc").Limit(batchSize).Find(&channels).Error
+		query := model.DB.Where("status = ? AND type IN ?", common.ChannelStatusEnabled,
+			[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin})
+		if lastID > 0 {
+			query = query.Where("(COALESCE(priority, 0) < ? OR (COALESCE(priority, 0) = ? AND id > ?))", lastPriority, lastPriority, lastID)
+		}
+		err := query.Order("COALESCE(priority, 0) DESC").Order("id ASC").Limit(batchSize).Find(&channels).Error
 		if err != nil {
 			return nil, err
 		}
 		for _, channel := range channels {
 			lastID = channel.Id
+			lastPriority = channel.GetPriority()
 			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
 				continue
 			}
@@ -1041,20 +1046,25 @@ func FindSeedanceAssetChannels() ([]*model.Channel, error) {
 	}
 }
 
-// FindSeedanceAssetChannel 按主键游标扫描并在找到首个可用渠道后立即返回，保持普通素材管理的旧成本。
+// FindSeedanceAssetChannel 优先选择最高优先级的可用渠道，找到后立即返回，不加载全部候选。
 func FindSeedanceAssetChannel() (*model.Channel, error) {
 	const batchSize = 100
 	lastID := 0
+	var lastPriority int64
 	for {
 		var channels []*model.Channel
-		err := model.DB.Where("id > ? AND status = ? AND type IN ?", lastID, common.ChannelStatusEnabled,
-			[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin}).
-			Order("id asc").Limit(batchSize).Find(&channels).Error
+		query := model.DB.Where("status = ? AND type IN ?", common.ChannelStatusEnabled,
+			[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin})
+		if lastID > 0 {
+			query = query.Where("(COALESCE(priority, 0) < ? OR (COALESCE(priority, 0) = ? AND id > ?))", lastPriority, lastPriority, lastID)
+		}
+		err := query.Order("COALESCE(priority, 0) DESC").Order("id ASC").Limit(batchSize).Find(&channels).Error
 		if err != nil {
 			return nil, err
 		}
 		for _, channel := range channels {
 			lastID = channel.Id
+			lastPriority = channel.GetPriority()
 			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
 				continue
 			}

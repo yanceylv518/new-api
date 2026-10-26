@@ -20,6 +20,7 @@ For commercial licensing, please contact support@quantumnous.com
 package service
 
 import (
+	"cmp"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -30,6 +31,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -37,6 +39,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"gorm.io/gorm"
 )
 
 const (
@@ -258,15 +261,30 @@ func StartSeedanceAssetValidationSession(ctx context.Context, userID int, channe
 	return StartSeedanceAssetValidationSessionWithFallback(ctx, userID, []*model.Channel{channel}, details, projectName, callbackURL)
 }
 
-// StartSeedanceAssetValidationSessionWithFallback retries only explicit unsupported-action responses.
-// Authentication, callback, network and upstream business errors remain terminal for the selected request.
+// StartSeedanceAssetValidationSessionWithFallback 按渠道优先级降序尝试，创建后固定实际使用的账号。
 func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID int, channels []*model.Channel, details SeedanceAssetValidationGroupDetails, projectName, callbackURL string) (*SeedanceAssetValidationStart, error) {
 	if model.DB == nil || userID <= 0 || len(channels) == 0 {
 		return nil, errors.New("no enabled Seedance validation channel available")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if _, err := seedanceAssetValidationCipherKey(); err != nil {
 		return nil, err
 	}
+	channels = slices.Clone(channels)
+	slices.SortStableFunc(channels, func(left, right *model.Channel) int {
+		if left == nil {
+			if right == nil {
+				return 0
+			}
+			return 1
+		}
+		if right == nil {
+			return -1
+		}
+		return cmp.Compare(right.GetPriority(), left.GetPriority())
+	})
 	details.Name = strings.TrimSpace(details.Name)
 	details.Description = strings.TrimSpace(details.Description)
 	details.Tags = strings.TrimSpace(details.Tags)
@@ -352,16 +370,23 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 	}
 	lastErr = nil
 	for index := startIndex; index < len(channels); index++ {
+		if err := ctx.Err(); err != nil {
+			_ = failSeedanceAssetValidationSession(session.ID, userID, err.Error())
+			return nil, err
+		}
 		candidate := channels[index]
 		if candidate == nil {
 			continue
 		}
-		client, err = NewSeedanceAssetClient(candidate)
-		if err != nil {
-			lastErr = err
-			continue
+		// 首个候选复用已选好的客户端，不能再次推进多密钥轮询。
+		if index != startIndex {
+			client, err = NewSeedanceAssetClient(candidate)
+			if err != nil {
+				lastErr = err
+				continue
+			}
 		}
-		if index > 0 {
+		if session.ChannelID != candidate.Id || session.KeyFingerprint != client.KeyFingerprint || session.AccountFingerprint != client.AccountFingerprint {
 			channel = candidate
 			result := model.DB.WithContext(ctx).Model(session).
 				Where("id = ? AND user_id = ? AND status = ?", session.ID, userID, model.SeedanceAssetValidationStatusCreating).
@@ -374,16 +399,18 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 				_ = failSeedanceAssetValidationSession(session.ID, userID, result.Error.Error())
 				return nil, result.Error
 			}
+			if result.RowsAffected != 1 {
+				return nil, errors.New("validation session changed while selecting upstream account")
+			}
+			session.ChannelID = channel.Id
+			session.KeyFingerprint = client.KeyFingerprint
+			session.AccountFingerprint = client.AccountFingerprint
 		}
 		upstream, err = client.CreateSeedanceAssetValidationSession(ctx, callbackURL, projectName)
 		if err == nil {
 			break
 		}
 		lastErr = err
-		if !errors.Is(err, ErrSeedanceAssetValidationUnsupported) {
-			_ = failSeedanceAssetValidationSession(session.ID, userID, err.Error())
-			return nil, err
-		}
 	}
 	if lastErr != nil && strings.TrimSpace(upstream.BytedToken) == "" {
 		_ = failSeedanceAssetValidationSession(session.ID, userID, lastErr.Error())
@@ -440,6 +467,25 @@ func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 	session, err := model.GetSeedanceAssetValidationSession(ctx, userID, id)
 	if err != nil {
 		return nil, err
+	}
+	if session.Status == model.SeedanceAssetValidationStatusSucceeded {
+		var group model.SeedanceAssetGroup
+		groupErr := model.DB.WithContext(ctx).Select("id", "status").
+			Where("id = ? AND user_id = ?", session.LocalGroupID, userID).First(&group).Error
+		if groupErr != nil && !errors.Is(groupErr, gorm.ErrRecordNotFound) {
+			return nil, groupErr
+		}
+		if errors.Is(groupErr, gorm.ErrRecordNotFound) || group.Status == "Deleting" {
+			if err := model.DB.WithContext(ctx).Model(session).
+				Where("id = ? AND user_id = ? AND status = ?", id, userID, model.SeedanceAssetValidationStatusSucceeded).
+				Updates(map[string]any{
+					"status":         model.SeedanceAssetValidationStatusCancelled,
+					"local_group_id": uint(0), "upstream_group_id": "", "launch_url": "",
+				}).Error; err != nil {
+				return nil, err
+			}
+			return model.GetSeedanceAssetValidationSession(ctx, userID, id)
+		}
 	}
 	if session.Status == model.SeedanceAssetValidationStatusSucceeded || session.Status == model.SeedanceAssetValidationStatusFailed || session.Status == model.SeedanceAssetValidationStatusExpired || session.Status == model.SeedanceAssetValidationStatusCancelled {
 		return session, nil
