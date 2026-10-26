@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
@@ -174,7 +175,16 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		if shouldSendLastResp {
-			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+			// Keep the original frame for usage post-processing and protocol conversion.
+			clientStreamData := lastStreamData
+			if !info.ShouldIncludeUsage {
+				if filtered, err := sjson.Delete(clientStreamData, "usage"); err == nil {
+					clientStreamData = filtered
+				} else {
+					logger.LogError(c, "error filtering final stream usage: "+err.Error())
+				}
+			}
+			_ = sendStreamData(c, info, clientStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
 	}
 
