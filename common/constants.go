@@ -32,8 +32,10 @@ var DefaultCollapseSidebar = false // default value of collapse sidebar
 
 // Any options with "Secret", "Token" in its key won't be return by GetOptions
 
-var SessionSecret = uuid.New().String()
-var CryptoSecret = uuid.New().String()
+var generatedSessionSecret = uuid.New().String()
+var generatedCryptoSecret = uuid.New().String()
+var SessionSecret = generatedSessionSecret
+var CryptoSecret = generatedCryptoSecret
 var SessionCookieSecure = false
 var SessionCookieTrustedURLs []string
 

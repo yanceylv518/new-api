@@ -4,11 +4,69 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestTaskPollingIsolatesUnreadableCredentials(t *testing.T) {
+	truncateTables(t)
+	previous := common.CryptoSecret
+	common.CryptoSecret = "fixture-persistent-polling-secret"
+	t.Cleanup(func() { common.CryptoSecret = previous })
+	before := &Task{TaskID: "readable-before", Status: TaskStatusQueued, Progress: "0%", Quota: 31, PrivateData: TaskPrivateData{Key: "fixture-before-key"}}
+	broken := &Task{TaskID: "unreadable", Status: TaskStatusQueued, Progress: "0%", Quota: 41}
+	after := &Task{TaskID: "readable-after", Status: TaskStatusInProgress, Progress: "10%", Quota: 51, PrivateData: TaskPrivateData{Key: "fixture-after-key"}}
+	for _, task := range []*Task{before, broken, after} {
+		require.NoError(t, DB.Create(task).Error)
+	}
+	badJSON := `{"key":"task-sealed:v1:invalid","token_id":7}`
+	require.NoError(t, DB.Model(broken).UpdateColumn("private_data", badJSON).Error)
+	tasks, err := GetUnfinishedSyncTasksAfter(3, 0)
+	require.NoError(t, err)
+	require.Len(t, tasks, 3)
+	assert.Equal(t, "fixture-before-key", tasks[0].PrivateData.Key)
+	assert.NoError(t, tasks[0].PrivateDataReadError)
+	assert.Equal(t, broken.ID, tasks[1].ID)
+	assert.Error(t, tasks[1].PrivateDataReadError)
+	assert.Empty(t, tasks[1].PrivateData.Key)
+	assert.Zero(t, tasks[1].PrivateData.TokenId)
+	assert.Equal(t, "fixture-after-key", tasks[2].PrivateData.Key)
+	assert.NoError(t, tasks[2].PrivateDataReadError)
+	wrapped, err := GetUnfinishedSyncTasksAfter(2, broken.ID)
+	require.NoError(t, err)
+	require.Len(t, wrapped, 2)
+	assert.Equal(t, []int64{after.ID, before.ID}, []int64{wrapped[0].ID, wrapped[1].ID})
+	var stored string
+	require.NoError(t, DB.Model(&Task{}).Select("private_data").Where("id = ?", broken.ID).Scan(&stored).Error)
+	assert.JSONEq(t, badJSON, stored)
+	var quota int
+	require.NoError(t, DB.Model(&Task{}).Select("quota").Where("id = ?", broken.ID).Scan(&quota).Error)
+	assert.Equal(t, 41, quota)
+	assert.False(t, DB.Migrator().HasColumn(&Task{}, "private_data_read_error"))
+}
+
+func TestTaskLegacyCredentialsEncryptOnWriteback(t *testing.T) {
+	truncateTables(t)
+	previous := common.CryptoSecret
+	common.CryptoSecret = "fixture-persistent-writeback-secret"
+	t.Cleanup(func() { common.CryptoSecret = previous })
+	task := &Task{TaskID: "legacy-plaintext", Status: TaskStatusQueued, Progress: "0%"}
+	require.NoError(t, DB.Create(task).Error)
+	require.NoError(t, DB.Model(task).UpdateColumn("private_data", `{"key":"fixture-legacy-key","token_id":8}`).Error)
+	require.NoError(t, DB.First(task, task.ID).Error)
+	assert.Equal(t, "fixture-legacy-key", task.PrivateData.Key)
+	require.NoError(t, DB.Model(task).Update("private_data", task.PrivateData).Error)
+	var stored string
+	require.NoError(t, DB.Model(task).Select("private_data").Scan(&stored).Error)
+	assert.Contains(t, stored, "task-sealed:v1:")
+	assert.NotContains(t, stored, "fixture-legacy-key")
+	require.NoError(t, DB.First(task, task.ID).Error)
+	assert.Equal(t, "fixture-legacy-key", task.PrivateData.Key)
+	assert.Equal(t, 8, task.PrivateData.TokenId)
+}
 
 // 状态索引优化不得遗漏可重试任务，也不能重新领取终态或进度已完成的任务。
 func TestVideoPollingQueryStatusBoundaries(t *testing.T) {

@@ -532,6 +532,12 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 // runs leave a record.
 func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.DatabaseType) {
 	t.Helper()
+	previous := common.CryptoSecret
+	common.CryptoSecret = "fixture-persistent-controller-task-secret"
+	if secret := os.Getenv("CRYPTO_SECRET"); secret != "" {
+		common.CryptoSecret = secret
+	}
+	t.Cleanup(func() { common.CryptoSecret = previous })
 	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))
 	var driver gorm.Dialector
 	switch dialect {

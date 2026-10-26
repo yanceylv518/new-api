@@ -190,6 +190,10 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
+		if t.PrivateDataReadError != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("skip unreadable task credentials task=%s id=%d: %v", t.TaskID, t.ID, t.PrivateDataReadError))
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
 	}
 

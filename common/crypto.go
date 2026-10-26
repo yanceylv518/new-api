@@ -16,13 +16,18 @@ import (
 
 const taskSealedPrefix = "task-sealed:v1:"
 
+// HasPersistentTaskSecret 排除进程启动时生成的临时密钥，防止任务凭据重启后无法解密。
+func HasPersistentTaskSecret() bool {
+	return CryptoSecret != "" && CryptoSecret != generatedSessionSecret && CryptoSecret != generatedCryptoSecret
+}
+
 // SealTaskSecret 使用独立用途密钥加密任务凭证；各节点必须配置相同且持久的 CRYPTO_SECRET。
 func SealTaskSecret(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	if CryptoSecret == "" {
-		return "", errors.New("task encryption secret is unavailable")
+	if !HasPersistentTaskSecret() {
+		return "", errors.New("configure a persistent CRYPTO_SECRET or SESSION_SECRET before storing task credentials")
 	}
 	key := sha256.Sum256([]byte("new-api/task-secret/v1:" + CryptoSecret))
 	block, err := aes.NewCipher(key[:])

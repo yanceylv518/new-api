@@ -62,6 +62,9 @@ func InitEnv() {
 	} else {
 		CryptoSecret = SessionSecret
 	}
+	if !HasPersistentTaskSecret() {
+		log.Println("WARNING: persistent CRYPTO_SECRET or SESSION_SECRET is required; task credentials will not be written with a temporary key.")
+	}
 	if err := InitSessionCookieSettings(); err != nil {
 		log.Fatal(err)
 	}

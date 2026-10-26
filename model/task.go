@@ -73,7 +73,8 @@ type Task struct {
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
 
 	// RequestSnapshot 只在初始提交阶段使用，不序列化到 tasks.private_data，也不返回给任务 DTO。
-	RequestSnapshot *TaskRequestSnapshot `json:"-" gorm:"-"`
+	RequestSnapshot      *TaskRequestSnapshot `json:"-" gorm:"-"`
+	PrivateDataReadError error                `json:"-" gorm:"-"`
 }
 
 func (t *Task) SetData(data any) {
@@ -445,19 +446,45 @@ func GetUnfinishedSyncTasksAfter(limit int, after int64) ([]*Task, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	var tasks []*Task
 	query := DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses())
-	if err := query.Where("id > ?", after).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
+	tasks, err := findTaskPollingPage(query.Where("id > ?", after).Order("id").Limit(limit))
+	if err != nil {
 		return nil, err
 	}
 	if len(tasks) < limit && after > 0 {
-		var wrapped []*Task
-		if err := DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses()).Where("id <= ?", after).Order("id").Limit(limit - len(tasks)).Find(&wrapped).Error; err != nil {
+		wrapped, err := findTaskPollingPage(DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses()).Where("id <= ?", after).Order("id").Limit(limit - len(tasks)))
+		if err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, wrapped...)
 	}
 	return tasks, nil
+}
+
+// findTaskPollingPage 仅在整批解码失败时逐行读取，坏行仍推进游标，但不进入轮询或账务流程。
+func findTaskPollingPage(query *gorm.DB) ([]*Task, error) {
+	var tasks []*Task
+	if err := query.Session(&gorm.Session{}).Find(&tasks).Error; err == nil {
+		return tasks, nil
+	}
+	rows, err := query.Model(&Task{}).Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tasks = nil
+	for rows.Next() {
+		task := &Task{}
+		if err := DB.ScanRows(rows, task); err != nil {
+			if task.ID <= 0 {
+				return nil, err
+			}
+			task.PrivateData = TaskPrivateData{}
+			task.PrivateDataReadError = err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
 }
 
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is

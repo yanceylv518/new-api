@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 
@@ -400,7 +399,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if info.ApiKey != "" && os.Getenv("CRYPTO_SECRET") == "" && os.Getenv("SESSION_SECRET") == "" {
+	if info.ApiKey != "" && !common.HasPersistentTaskSecret() {
 		failure := service.TaskErrorWrapperLocal(errors.New("configure a persistent CRYPTO_SECRET or SESSION_SECRET before submitting tasks"), "task_encryption_not_configured", http.StatusServiceUnavailable)
 		failure.NoRetry = true
 		return nil, failure

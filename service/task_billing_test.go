@@ -29,6 +29,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	common.CryptoSecret = "fixture-persistent-service-task-secret"
+	if secret := os.Getenv("CRYPTO_SECRET"); secret != "" {
+		common.CryptoSecret = secret
+	}
 	var dialect gorm.Dialector = sqlite.Open(":memory:")
 	databaseType := common.DatabaseTypeSQLite
 	if dsn := os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN"); dsn != "" {

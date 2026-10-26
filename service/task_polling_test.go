@@ -750,6 +750,40 @@ func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
+func TestRunTaskPollingOnceSkipsUnreadableAccountAndKeepsOtherTasks(t *testing.T) {
+	truncate(t)
+	seedUser(t, 982, 10_000)
+	seedTaskPollingChannel(t, 982, true)
+	first := seedPollingTask(t, 982, "readable-first", "upstream-first")
+	broken := seedPollingTask(t, 982, "unreadable-middle", "upstream-broken")
+	last := seedPollingTask(t, 982, "readable-last", "upstream-last")
+	for _, task := range []*model.Task{first, broken, last} {
+		require.NoError(t, model.DB.Model(task).UpdateColumn("quota", 41).Error)
+	}
+	require.NoError(t, model.DB.Model(broken).UpdateColumn("private_data", `{"key":"task-sealed:v1:invalid","upstream_task_id":"upstream-broken"}`).Error)
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory, previousTimeout, previousCursor, previousLimit := GetTaskAdaptorFunc, constant.TaskTimeoutMinutes, taskPollingCursor.Load(), constant.TaskQueryLimit
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	constant.TaskTimeoutMinutes = 0
+	constant.TaskQueryLimit = 100
+	taskPollingCursor.Store(0)
+	t.Cleanup(func() {
+		GetTaskAdaptorFunc, constant.TaskTimeoutMinutes = previousFactory, previousTimeout
+		constant.TaskQueryLimit = previousLimit
+		taskPollingCursor.Store(previousCursor)
+	})
+	summary := RunTaskPollingOnce(t.Context(), nil)
+	assert.Equal(t, 3, summary.UnfinishedTasks)
+	assert.Zero(t, summary.NullTasksFailed)
+	assert.ElementsMatch(t, []string{"upstream-first", "upstream-last"}, adaptor.fetchedTaskIDs())
+	assert.Equal(t, int64(0), countLogs(t))
+	assert.Equal(t, 10_000, getUserQuota(t, 982))
+	assert.Equal(t, 41, getTaskQuota(t, broken.ID))
+	var status string
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", broken.ID).Pluck("status", &status).Error)
+	assert.Equal(t, string(model.TaskStatusInProgress), status)
+}
+
 func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	truncate(t)
 

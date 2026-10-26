@@ -53,6 +53,9 @@ func TestJSONColumnValuersReturnString(t *testing.T) {
 }
 
 func TestTaskPrivateDataEncryptsCredentialsAndRecoveryEvidence(t *testing.T) {
+	previous := common.CryptoSecret
+	common.CryptoSecret = "fixture-persistent-task-secret"
+	t.Cleanup(func() { common.CryptoSecret = previous })
 	value := TaskPrivateData{Key: "fixture-upstream-key", SubmissionPending: true, SubmissionResponse: json.RawMessage(`{"body":{"id":"fixture-id"}}`), SubmissionContext: json.RawMessage(`{"image":"private-fixture-url"}`)}
 	stored, err := value.Value()
 	require.NoError(t, err)
