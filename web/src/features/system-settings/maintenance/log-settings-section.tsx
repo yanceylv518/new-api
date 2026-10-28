@@ -24,6 +24,7 @@ import { toast } from 'sonner'
 import * as z from 'zod'
 
 import { DateTimePicker } from '@/components/datetime-picker'
+import { Accordion } from '@/components/ui/accordion'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -42,6 +43,7 @@ import {
   FormControl,
   FormDescription,
   FormField,
+  FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
@@ -58,6 +60,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { RequestTimelineWriterStatusPanel } from '@/features/usage-logs/request-timeline/components/writer-status'
 import { api } from '@/lib/api'
 import dayjs from '@/lib/dayjs'
 import { formatTimestampToDate } from '@/lib/format'
@@ -67,6 +70,7 @@ import {
   getSystemTask,
   startLogCleanupTask,
 } from '../api'
+import { SettingsAccordion } from '../components/settings-accordion'
 import {
   SettingsControlGroup,
   SettingsForm,
@@ -76,16 +80,34 @@ import {
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
-import type { LogCleanupTask } from '../types'
+import type { LogCleanupTask, UpdateOptionRequest } from '../types'
+import { RequestTraceRetentionControls } from './request-trace-retention'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTraceEnabled: z.boolean(),
+  RequestTraceRetentionDays: z.number().int().min(0).max(3650),
+  RequestTraceSuccessSampleRate: z.number().int().min(0).max(100),
+  RequestTraceSlowRequestMS: z.number().int().min(0).max(86400000),
+  RequestTraceSlowFirstByteMS: z.number().int().min(0).max(86400000),
+  RequestTraceCompressionLevel: z.enum([
+    'fastest',
+    'default',
+    'better',
+    'best',
+  ]),
 })
 
-type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
+export type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultTraceEnabled: boolean
+  defaultRetentionDays?: number
+  defaultSuccessSampleRate?: number
+  defaultSlowRequestMS?: number
+  defaultSlowFirstByteMS?: number
+  defaultCompressionLevel: LogSettingsFormValues['RequestTraceCompressionLevel']
 }
 
 type ServerLogInfo = {
@@ -139,18 +161,23 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
   return task?.status === 'pending' || task?.status === 'running'
 }
 
-export function LogSettingsSection({
-  defaultEnabled,
-}: LogSettingsSectionProps) {
+export function LogSettingsSection(props: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
-      LogConsumeEnabled: defaultEnabled,
+      LogConsumeEnabled: props.defaultEnabled,
+      RequestTraceEnabled: props.defaultTraceEnabled,
+      RequestTraceRetentionDays: props.defaultRetentionDays ?? 30,
+      RequestTraceSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
+      RequestTraceSlowRequestMS: props.defaultSlowRequestMS ?? 0,
+      RequestTraceSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
+      RequestTraceCompressionLevel: props.defaultCompressionLevel,
     },
   })
 
+  const [timelineOpen, setTimelineOpen] = useState(false)
   const [purgeDate, setPurgeDate] = useState<Date | undefined>(() =>
     getDateDaysAgo(30)
   )
@@ -174,8 +201,28 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    form.reset(
+      {
+        LogConsumeEnabled: props.defaultEnabled,
+        RequestTraceEnabled: props.defaultTraceEnabled,
+        RequestTraceRetentionDays: props.defaultRetentionDays ?? 30,
+        RequestTraceSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
+        RequestTraceSlowRequestMS: props.defaultSlowRequestMS ?? 0,
+        RequestTraceSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
+        RequestTraceCompressionLevel: props.defaultCompressionLevel,
+      },
+      { keepDirtyValues: true }
+    )
+  }, [
+    props.defaultEnabled,
+    props.defaultTraceEnabled,
+    props.defaultRetentionDays,
+    props.defaultSuccessSampleRate,
+    props.defaultSlowRequestMS,
+    props.defaultSlowFirstByteMS,
+    props.defaultCompressionLevel,
+    form,
+  ])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -257,11 +304,67 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    const updates: UpdateOptionRequest[] = []
+    if (values.LogConsumeEnabled !== props.defaultEnabled) {
+      updates.push({
+        key: 'LogConsumeEnabled',
+        value: values.LogConsumeEnabled,
+      })
+    }
+    if (
+      values.RequestTraceRetentionDays !== (props.defaultRetentionDays ?? 30)
+    ) {
+      updates.push({
+        key: 'request_trace.retention_days',
+        value: values.RequestTraceRetentionDays,
+      })
+    }
+    if (values.RequestTraceEnabled !== props.defaultTraceEnabled) {
+      updates.push({
+        key: 'request_trace.enabled',
+        value: values.RequestTraceEnabled,
+      })
+    }
+    if (values.RequestTraceCompressionLevel !== props.defaultCompressionLevel) {
+      updates.push({
+        key: 'request_trace.compression_level',
+        value: values.RequestTraceCompressionLevel,
+      })
+    }
+    if (
+      values.RequestTraceSuccessSampleRate !==
+      (props.defaultSuccessSampleRate ?? 100)
+    ) {
+      updates.push({
+        key: 'request_trace.success_sample_rate',
+        value: values.RequestTraceSuccessSampleRate,
+      })
+    }
+    if (
+      values.RequestTraceSlowRequestMS !== (props.defaultSlowRequestMS ?? 0)
+    ) {
+      updates.push({
+        key: 'request_trace.slow_request_ms',
+        value: values.RequestTraceSlowRequestMS,
+      })
+    }
+    if (
+      values.RequestTraceSlowFirstByteMS !== (props.defaultSlowFirstByteMS ?? 0)
+    ) {
+      updates.push({
+        key: 'request_trace.slow_first_byte_ms',
+        value: values.RequestTraceSlowFirstByteMS,
+      })
+    }
+    try {
+      for (const update of updates) {
+        const result = await updateOption.mutateAsync(update)
+        if (!result.success) return
+      }
+      form.reset(values)
+    } catch {
+      // 变更失败已由 useUpdateOption 显示错误，保留表单供用户重试。
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -340,7 +443,10 @@ export function LogSettingsSection({
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
           <SettingsPageFormActions
             onSave={form.handleSubmit(onSubmit)}
-            isSaving={updateOption.isPending}
+            isSaving={form.formState.isSubmitting}
+            isSaveDisabled={
+              Object.keys(form.formState.dirtyFields).length === 0
+            }
             saveLabel='Save log settings'
           />
           <FormField
@@ -360,12 +466,208 @@ export function LogSettingsSection({
                   <Switch
                     checked={field.value}
                     onCheckedChange={field.onChange}
+                    disabled={form.formState.isSubmitting}
                   />
                 </FormControl>
                 <FormMessage />
               </SettingsSwitchItem>
             )}
           />
+
+          <Accordion
+            value={timelineOpen ? ['request-timeline'] : []}
+            onValueChange={(value) =>
+              setTimelineOpen(value.includes('request-timeline'))
+            }
+            data-settings-form-span='full'
+            className='min-w-0 rounded-lg border px-4 pt-4'
+          >
+            <FormField
+              control={form.control}
+              name='RequestTraceEnabled'
+              render={({ field }) => (
+                <SettingsSwitchItem>
+                  <SettingsSwitchContent>
+                    <FormLabel>{t('Collect request timelines')}</FormLabel>
+                    <FormDescription>
+                      {t(
+                        'Applies to new requests after saving. Disabling collection lets requests already being traced and queued writes finish; existing timelines remain available.'
+                      )}
+                    </FormDescription>
+                  </SettingsSwitchContent>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      disabled={form.formState.isSubmitting}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </SettingsSwitchItem>
+              )}
+            />
+            <SettingsAccordion
+              value='request-timeline'
+              title={t('Request timeline')}
+              className='mt-4'
+            >
+              <div className='flex flex-col gap-6'>
+                <FormField
+                  control={form.control}
+                  name='RequestTraceCompressionLevel'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Request timeline compression')}</FormLabel>
+                      <Select
+                        items={[
+                          {
+                            value: 'fastest',
+                            label: t('Fastest (recommended)'),
+                          },
+                          { value: 'default', label: t('Default compression') },
+                          { value: 'better', label: t('Higher compression') },
+                          { value: 'best', label: t('Maximum compression') },
+                        ]}
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={form.formState.isSubmitting}
+                      >
+                        <FormControl>
+                          <SelectTrigger className='w-full sm:w-64'>
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent alignItemWithTrigger={false}>
+                          <SelectGroup>
+                            <SelectItem value='fastest'>
+                              {t('Fastest (recommended)')}
+                            </SelectItem>
+                            <SelectItem value='default'>
+                              {t('Default compression')}
+                            </SelectItem>
+                            <SelectItem value='better'>
+                              {t('Higher compression')}
+                            </SelectItem>
+                            <SelectItem value='best'>
+                              {t('Maximum compression')}
+                            </SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        {t(
+                          'For relational log databases. ClickHouse stores JSON with native ZSTD(1) compression.'
+                        )}{' '}
+                        {t(
+                          'Compression is lossless. Short timelines stay uncompressed when that is smaller.'
+                        )}{' '}
+                        {t(
+                          'Changes apply to newly written timelines. Higher compression uses more CPU and memory.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSuccessSampleRate'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Successful timeline sampling (%)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={100}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          '100 keeps every success. Errors, partial captures, retries, and requests over a configured threshold bypass sampling. Applies to requests starting after saving.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSlowRequestMS'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Non-streaming duration threshold (ms)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={86400000}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Keep non-streaming requests at or above this server duration. 0 disables this rule; normal streaming duration does not trigger it.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name='RequestTraceSlowFirstByteMS'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Entry-to-upstream-first-byte threshold (ms)')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={Number.isNaN(field.value) ? '' : field.value}
+                          type='number'
+                          min={0}
+                          max={86400000}
+                          step={1}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                          disabled={form.formState.isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Keep requests whose final attempt first byte reaches this offset from gateway entry, including earlier preparation and retries. 0 disables this rule.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {timelineOpen && <RequestTimelineWriterStatusPanel embedded />}
+                {timelineOpen && <RequestTraceRetentionControls form={form} />}
+              </div>
+            </SettingsAccordion>
+          </Accordion>
 
           <SettingsControlGroup className='space-y-3'>
             <div>

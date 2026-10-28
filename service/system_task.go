@@ -93,14 +93,19 @@ type LogCleanupPayload struct {
 }
 
 type LogCleanupState struct {
-	Total     int64 `json:"total"`
-	Processed int64 `json:"processed"`
-	Progress  int   `json:"progress"`
-	Remaining int64 `json:"remaining"`
+	Phase          string `json:"phase,omitempty"`
+	TraceTotal     int64  `json:"trace_total,omitempty"`
+	TraceProcessed int64  `json:"trace_processed,omitempty"`
+	TraceRemaining int64  `json:"trace_remaining,omitempty"`
+	Total          int64  `json:"total"`
+	Processed      int64  `json:"processed"`
+	Progress       int    `json:"progress"`
+	Remaining      int64  `json:"remaining"`
 }
 
 type LogCleanupResult struct {
-	DeletedCount int64 `json:"deleted_count"`
+	DeletedCount      int64 `json:"deleted_count"`
+	TraceDeletedCount int64 `json:"trace_deleted_count,omitempty"`
 }
 
 var (

@@ -116,7 +116,11 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
+	write := c.Writer.Write
+	if heartbeatWriter, ok := c.Writer.(interface{ WriteHeartbeat([]byte) (int, error) }); ok {
+		write = heartbeatWriter.WriteHeartbeat
+	}
+	if _, err := write([]byte(": PING\n\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
 	return FlushWriter(c)

@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -82,6 +83,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
+	trace := requesttrace.FromContext(c.Request.Context())
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -302,6 +304,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	trace.SetStreamResult(string(info.StreamStatus.EndReason), !info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors())
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {

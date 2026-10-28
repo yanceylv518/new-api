@@ -13,6 +13,7 @@ import (
 
 	common2 "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -373,6 +374,8 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 }
 
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	trace := requesttrace.FromContext(c.Request.Context())
+	trace.EnsureAttempt(info.ChannelId)
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -392,7 +395,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	observation := trace.StartUpstream("websocket", info.ChannelSetting.Proxy != "")
+	targetConn, response, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	observation.Response(response, err)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), err)
 	}
@@ -529,7 +534,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	trace := requesttrace.FromContext(c.Request.Context())
+	trace.EnsureAttempt(info.ChannelId)
+	var observation *requesttrace.HTTPObservation
+	req, observation = trace.HTTPRequest(req, info.ChannelSetting.Proxy != "")
 	resp, err := relayClient.Do(req)
+	observation.Response(resp, err)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))

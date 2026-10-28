@@ -140,17 +140,29 @@ func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, res
 func processTokenData(relayMode int, data string, responseTextBuilder *strings.Builder, toolCount *int) error {
 	switch relayMode {
 	case relayconstant.RelayModeChatCompletions:
-		var streamResponse dto.ChatCompletionsStreamResponse
+		var streamResponse struct {
+			dto.ChatCompletionsStreamResponse
+			Error *types.OpenAIError `json:"error"`
+		}
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			return err
 		}
-		return ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount)
+		if streamResponse.Error != nil && (streamResponse.Error.Message != "" || streamResponse.Error.Type != "" || streamResponse.Error.Code != nil) {
+			return fmt.Errorf("upstream business error")
+		}
+		return ProcessStreamResponse(streamResponse.ChatCompletionsStreamResponse, responseTextBuilder, toolCount)
 	case relayconstant.RelayModeCompletions:
-		var streamResponse dto.CompletionsStreamResponse
+		var streamResponse struct {
+			dto.CompletionsStreamResponse
+			Error *types.OpenAIError `json:"error"`
+		}
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			return err
 		}
-		processCompletionsStreamResponse(streamResponse, responseTextBuilder)
+		if streamResponse.Error != nil && (streamResponse.Error.Message != "" || streamResponse.Error.Type != "" || streamResponse.Error.Code != nil) {
+			return fmt.Errorf("upstream business error")
+		}
+		processCompletionsStreamResponse(streamResponse.CompletionsStreamResponse, responseTextBuilder)
 	}
 	return nil
 }

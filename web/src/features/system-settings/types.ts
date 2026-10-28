@@ -78,6 +78,10 @@ export type LogCleanupTaskPayload = {
 }
 
 export type LogCleanupTaskState = {
+  phase?: 'traces' | 'logs' | 'done'
+  trace_total?: number
+  trace_processed?: number
+  trace_remaining?: number
   total: number
   processed: number
   progress: number
@@ -86,6 +90,7 @@ export type LogCleanupTaskState = {
 
 export type LogCleanupTaskResult = {
   deleted_count: number
+  trace_deleted_count?: number
 }
 
 export type LogCleanupTask = SystemTask<
@@ -93,6 +98,11 @@ export type LogCleanupTask = SystemTask<
   LogCleanupTaskState,
   LogCleanupTaskResult
 >
+
+export type TraceCleanupStatus = {
+  retention_days: number
+  task: LogCleanupTask | null
+}
 
 export type SystemTaskResponse<TTask = SystemTask | null> = {
   success: boolean
@@ -357,6 +367,12 @@ export type OperationsSettings = {
   WorkerValidKey: string
   WorkerAllowHttpImageRequestEnabled: boolean
   LogConsumeEnabled: boolean
+  'request_trace.enabled': boolean
+  'request_trace.retention_days': number
+  'request_trace.success_sample_rate': number
+  'request_trace.slow_request_ms': number
+  'request_trace.slow_first_byte_ms': number
+  'request_trace.compression_level': 'fastest' | 'default' | 'better' | 'best'
   'performance_setting.disk_cache_enabled': boolean
   'performance_setting.disk_cache_threshold_mb': number
   'performance_setting.disk_cache_max_size_mb': number

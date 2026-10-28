@@ -3,6 +3,7 @@ package dto
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -318,6 +319,43 @@ type OpenAIResponsesResponse struct {
 	Usage              *Usage             `json:"usage"`
 	User               json.RawMessage    `json:"user"`
 	Metadata           json.RawMessage    `json:"metadata"`
+}
+
+// 仅兼容本字段的整秒小数写法，不放宽其他整数和用量字段的解析。
+type responsesCreatedAt int
+
+func (t *responsesCreatedAt) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "null" {
+		return nil
+	}
+	integer, fraction, decimal := strings.Cut(raw, ".")
+	if decimal && (fraction == "" || strings.Trim(fraction, "0") != "") {
+		return fmt.Errorf("invalid Responses created_at: timestamp must be an integer")
+	}
+	value, err := strconv.Atoi(integer)
+	if err != nil {
+		return fmt.Errorf("invalid Responses created_at: %w", err)
+	}
+	*t = responsesCreatedAt(value)
+	return nil
+}
+
+// UnmarshalJSON 保留公开整数类型和序列化格式，只在读取时兼容零小数部分。
+func (r *OpenAIResponsesResponse) UnmarshalJSON(data []byte) error {
+	type responseAlias OpenAIResponsesResponse
+	value := struct {
+		*responseAlias
+		CreatedAt responsesCreatedAt `json:"created_at"`
+	}{
+		responseAlias: (*responseAlias)(r),
+		CreatedAt:     responsesCreatedAt(r.CreatedAt),
+	}
+	if err := kitutil.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	r.CreatedAt = int(value.CreatedAt)
+	return nil
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构

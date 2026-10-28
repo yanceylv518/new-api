@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay/channel"
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -112,6 +113,7 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 }
 
 func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (*dto.Usage, *types.NewAPIError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
 	defer func() {
@@ -174,7 +176,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 
 	if upstreamStream && clientStream {
+		trace.BeginForwarding()
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
+		trace.ForwardingDone(c.Request.Context().Err())
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return nil, newApiErr
@@ -183,7 +187,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 	if upstreamStream {
 		info.IsStream = false
+		trace.BeginForwarding()
 		usage, newApiErr := openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
+		trace.ForwardingDone(c.Request.Context().Err())
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return nil, newApiErr
@@ -191,7 +197,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		return usage, nil
 	}
 
+	trace.BeginForwarding()
 	usage, newApiErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)
+	trace.ForwardingDone(c.Request.Context().Err())
 	if newApiErr != nil {
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr

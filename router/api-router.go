@@ -316,11 +316,18 @@ func SetApiRouter(router *gin.Engine) {
 		logRoute.GET("/search", middleware.AdminAuth(), controller.SearchAllLogs)
 		logRoute.GET("/self", middleware.UserAuth(), controller.GetUserLogs)
 		logRoute.GET("/self/search", middleware.UserAuth(), middleware.SearchRateLimit(), controller.SearchUserLogs)
+		traceRoute := apiRouter.Group("/request-traces")
+		traceRoute.Use(middleware.DisableCache())
+		traceRoute.GET("/status", middleware.AdminAuth(), controller.GetRequestTraceStatus)
+		traceRoute.GET("/self/:request_id", middleware.UserAuth(), controller.GetSelfRequestTrace)
+		traceRoute.GET("/:request_id", middleware.AdminAuth(), controller.GetRequestTrace)
 
 		systemTaskRoute := apiRouter.Group("/system-task")
 		systemTaskRoute.Use(middleware.RootAuth())
 		{
 			systemTaskRoute.POST("/log-cleanup", controller.CreateLogCleanupSystemTask)
+			systemTaskRoute.GET("/trace-cleanup/timeline", controller.RequestTraceCleanupTask)
+			systemTaskRoute.POST("/trace-cleanup/timeline", controller.RequestTraceCleanupTask)
 			systemTaskRoute.GET("/list", controller.ListSystemTasks)
 			systemTaskRoute.GET("/current", controller.GetCurrentSystemTask)
 			systemTaskRoute.GET("/:task_id", controller.GetSystemTask)

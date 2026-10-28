@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/gin-gonic/gin"
 )
 
@@ -13,6 +14,8 @@ func RelayPanicRecover() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if err := recover(); err != nil {
+				trace := requesttrace.FromContext(c.Request.Context())
+				trace.Fail("panic")
 				common.SysLog(fmt.Sprintf("panic detected: %v", err))
 				common.SysLog(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
 				c.JSON(http.StatusInternalServerError, gin.H{
@@ -22,6 +25,7 @@ func RelayPanicRecover() gin.HandlerFunc {
 					},
 				})
 				c.Abort()
+				trace.ForwardingDone(c.Request.Context().Err())
 			}
 		}()
 		c.Next()

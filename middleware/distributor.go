@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -33,6 +34,7 @@ type ModelRequest struct {
 
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		trace := requesttrace.FromContext(c.Request.Context())
 		var channel *model.Channel
 		constraints := service.GetChannelConstraints(c)
 		constraints.AddFilter(taskdto.ChannelFilter{
@@ -45,7 +47,9 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		if pin, found, overridden := constraints.ResolvedPin(); found {
+		trace.Describe(modelRequest.Model, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), nil)
+		pin, found, overridden := constraints.ResolvedPin()
+		if found {
 			for _, lost := range overridden {
 				logger.LogWarn(c, fmt.Sprintf(
 					"channel pin overridden: winning_source=%s winning_channel_id=%d overridden_source=%s overridden_channel_id=%d",

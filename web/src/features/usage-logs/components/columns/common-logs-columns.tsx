@@ -17,13 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { ColumnDef } from '@tanstack/react-table'
-import { GitBranch, Sparkles, KeyRound } from 'lucide-react'
-import { useState } from 'react'
+import { GitBranch, Sparkles, KeyRound, Activity } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
 import {
   Popover,
   PopoverContent,
@@ -54,7 +54,6 @@ import {
   getLogTypeConfig,
 } from '../../lib/utils'
 import type { LogOtherData } from '../../types'
-import { DetailsDialog } from '../dialogs/details-dialog'
 import { LogCostDisplay } from '../log-cost-display'
 import { ModelBadge } from '../model-badge'
 import { TimingMetricsCell, StreamTpsCell } from '../timing-metrics-cell'
@@ -164,11 +163,9 @@ function buildTypeDetailSegments(
   return segments
 }
 
-export function useCommonLogsColumns(
-  isAdmin: boolean,
-  isRoot: boolean
-): ColumnDef<UsageLog>[] {
+export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
   const { t } = useTranslation()
+  const { openLogDetails, openRequestTimeline } = useUsageLogsContext()
   const columns: ColumnDef<UsageLog>[] = [
     {
       accessorKey: 'created_at',
@@ -598,12 +595,25 @@ export function useCommonLogsColumns(
         const other = parseLogOther(log.other)
 
         return (
-          <TimingMetricsCell
-            useTimeSec={useTime}
-            completionTokens={log.completion_tokens}
-            frtMs={other?.frt}
-            isStream={log.is_stream}
-          />
+          <div className='flex items-center gap-1'>
+            <TimingMetricsCell
+              useTimeSec={useTime}
+              completionTokens={log.completion_tokens}
+              frtMs={other?.frt}
+              isStream={log.is_stream}
+            />
+            {log.request_id && (
+              <Button
+                size='icon'
+                variant='ghost'
+                className='size-7'
+                onClick={() => openRequestTimeline(log.request_id ?? null)}
+                aria-label={t('Request timeline')}
+              >
+                <Activity className='size-3.5' />
+              </Button>
+            )}
+          </div>
         )
       },
     },
@@ -613,7 +623,6 @@ export function useCommonLogsColumns(
       header: t('Details'),
       cell: function DetailsCell({ row }) {
         const { t } = useTranslation()
-        const [dialogOpen, setDialogOpen] = useState(false)
         const log = row.original
         const other = parseLogOther(log.other)
 
@@ -652,23 +661,15 @@ export function useCommonLogsColumns(
         }
 
         return (
-          <>
-            <button
-              type='button'
-              className='group flex max-w-[200px] items-center gap-1 text-left text-xs'
-              onClick={() => setDialogOpen(true)}
-              title={t('Click to view full details')}
-            >
-              {detailPreview}
-            </button>
-            <DetailsDialog
-              log={log}
-              isAdmin={isAdmin}
-              isRoot={isRoot}
-              open={dialogOpen}
-              onOpenChange={setDialogOpen}
-            />
-          </>
+          <Button
+            type='button'
+            variant='ghost'
+            className='group h-auto max-w-[200px] justify-start gap-1 p-0 text-left text-xs'
+            onClick={() => openLogDetails(log)}
+            title={t('Click to view full details')}
+          >
+            {detailPreview}
+          </Button>
         )
       },
       size: 180,

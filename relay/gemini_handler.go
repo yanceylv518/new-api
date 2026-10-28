@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -20,6 +21,7 @@ import (
 )
 
 func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	info.InitChannelMeta(c)
 
 	geminiReq, ok := info.Request.(*dto.GeminiChatRequest)
@@ -146,7 +148,9 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		}
 	}
 
+	trace.BeginForwarding()
 	usage, openaiErr := adaptor.DoResponse(c, resp.(*http.Response), info)
+	trace.ForwardingDone(c.Request.Context().Err())
 	if openaiErr != nil {
 		service.ResetStatusCode(openaiErr, statusCodeMappingStr)
 		return openaiErr
@@ -157,6 +161,7 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 }
 
 func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	trace := requesttrace.FromContext(c.Request.Context())
 	info.InitChannelMeta(c)
 
 	isBatch := strings.HasSuffix(c.Request.URL.Path, "batchEmbedContents")
@@ -249,7 +254,9 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo) (newAPI
 		}
 	}
 
+	trace.BeginForwarding()
 	usage, openaiErr := adaptor.DoResponse(c, resp.(*http.Response), info)
+	trace.ForwardingDone(c.Request.Context().Err())
 	if openaiErr != nil {
 		service.ResetStatusCode(openaiErr, statusCodeMappingStr)
 		return openaiErr

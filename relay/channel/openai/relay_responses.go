@@ -86,6 +86,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		// HTTP 200 与正常 EOF 不代表业务成功，协议错误仍需记入流状态。
+		switch streamResponse.Type {
+		case "response.failed", "response.error", "error":
+			sr.Error(fmt.Errorf("responses stream error event: %s", streamResponse.Type))
+		}
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":

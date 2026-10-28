@@ -184,6 +184,21 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
+	requestTraceEnabled := common.GetEnvOrDefaultBool("REQUEST_TRACE_ENABLED", true)
+	system_setting.SetRequestTraceEnabled(requestTraceEnabled)
+	common.OptionMap[system_setting.RequestTraceEnabledOptionKey] = strconv.FormatBool(requestTraceEnabled)
+	common.OptionMap[system_setting.RequestTraceCompressionOptionKey] = system_setting.DefaultRequestTraceCompressionLevel
+	common.OptionMap[system_setting.RequestTraceRetentionOptionKey] = strconv.Itoa(system_setting.DefaultRequestTraceRetentionDays())
+	for key, value := range map[string]string{
+		system_setting.RequestTraceSuccessSampleRateOptionKey: "100",
+		system_setting.RequestTraceSlowRequestOptionKey:       "0",
+		system_setting.RequestTraceSlowFirstByteOptionKey:     "0",
+	} {
+		common.OptionMap[key] = value
+		if err := system_setting.SetRequestTraceSamplingOption(key, value); err != nil {
+			common.SysError("initialize request trace sampling: " + err.Error())
+		}
+	}
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
@@ -214,6 +229,18 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == system_setting.RequestTraceRetentionOptionKey {
+		return system_setting.ValidateRequestTraceRetentionDays(value)
+	}
+	if system_setting.IsRequestTraceSamplingOption(key) {
+		return system_setting.ValidateRequestTraceSamplingOption(key, value)
+	}
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		return system_setting.ValidateRequestTraceEnabled(value)
+	}
+	if key == system_setting.RequestTraceCompressionOptionKey {
+		return system_setting.ValidateRequestTraceCompressionLevel(value)
+	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
@@ -229,6 +256,9 @@ func validateOptionValue(key string, value string) error {
 func UpdateOption(key string, value string) error {
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
+	}
+	if key == system_setting.RequestTraceCompressionOptionKey || key == system_setting.RequestTraceEnabledOptionKey || key == system_setting.RequestTraceRetentionOptionKey || system_setting.IsRequestTraceSamplingOption(key) {
+		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if err := validateOptionValue(key, value); err != nil {
 		return err
@@ -287,6 +317,24 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == system_setting.RequestTraceRetentionOptionKey {
+		if err := system_setting.ValidateRequestTraceRetentionDays(value); err != nil {
+			return err
+		}
+	}
+	if err := system_setting.ValidateRequestTraceSamplingOption(key, value); err != nil {
+		return err
+	}
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		if err := system_setting.ValidateRequestTraceEnabled(value); err != nil {
+			return err
+		}
+	}
+	if key == system_setting.RequestTraceCompressionOptionKey {
+		if err := system_setting.ValidateRequestTraceCompressionLevel(value); err != nil {
+			return err
+		}
+	}
 	if key == retiredThemeOptionKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
@@ -296,6 +344,13 @@ func updateOptionMap(key string, value string) (err error) {
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
+	if system_setting.IsRequestTraceSamplingOption(key) {
+		return system_setting.SetRequestTraceSamplingOption(key, value)
+	}
+	if key == system_setting.RequestTraceEnabledOptionKey {
+		system_setting.SetRequestTraceEnabled(value == "true")
+		return nil
+	}
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
