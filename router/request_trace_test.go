@@ -34,10 +34,12 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -2286,6 +2288,25 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 					timelineHandler := middleware.RequestTraceHandler(app, func() bool { return true }, timelineWriter.Enqueue)
 					timelineHandler.ServeHTTP(recorder, request)
 					require.Equal(t, 200, recorder.Code)
+					if clientFormat == types.RelayFormatClaude {
+						if !stream {
+							assert.Equal(t, "client-model", gjson.Get(recorder.Body.String(), "model").String())
+						} else {
+							models := []string{}
+							for _, line := range strings.Split(recorder.Body.String(), "\n") {
+								if !strings.HasPrefix(line, "data:") {
+									continue
+								}
+								data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+								for _, path := range []string{"model", "message.model"} {
+									if value := gjson.Get(data, path); value.Exists() {
+										models = append(models, value.String())
+									}
+								}
+							}
+							assert.Equal(t, []string{"client-model"}, models)
+						}
+					}
 					awaitRequestTraceWrites(t)
 					requestID := recorder.Header().Get(common.RequestIdKey)
 					require.Eventually(t, func() bool {
@@ -2365,6 +2386,104 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 					other, err := model.GetRequestTraces(t.Context(), requestID, 12, false)
 					require.NoError(t, err)
 					assert.Empty(t, other)
+				})
+			}
+		}
+	}
+}
+
+func TestRequestTraceMessagesClientModel(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	settings := model_setting.GetGlobalSettings()
+	previousPassThrough := settings.PassThroughRequestEnabled
+	t.Cleanup(func() { settings.PassThroughRequestEnabled = previousPassThrough })
+	for _, level := range []string{"off", "all"} {
+		for _, passThrough := range []string{"normal", "channel", "global"} {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", level, passThrough, stream), func(t *testing.T) {
+					setupRequestTraceDatabase(t)
+					require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", fmt.Sprintf(`{"level":%q}`, level)))
+					settings.PassThroughRequestEnabled = passThrough == "global"
+					payload := requestTraceProtocolPayload(types.RelayFormatClaude, stream)
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						assert.Equal(t, "/v1/messages", r.URL.Path)
+						contentType := "application/json"
+						if stream {
+							contentType = "text/event-stream"
+						}
+						w.Header().Set("Content-Type", contentType)
+						w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+						_, err := io.WriteString(w, payload)
+						assert.NoError(t, err)
+					}))
+					t.Cleanup(upstream.Close)
+					app := gin.New()
+					app.Use(middleware.RequestId(), middleware.RequestTraceMetadata(), middleware.BodyStorageCleanup())
+					app.POST("/v1/messages", func(c *gin.Context) {
+						c.Set("id", 11)
+						_, err := common.GetBodyStorage(c)
+						require.NoError(t, err)
+						info := &relaycommon.RelayInfo{
+							RelayFormat: types.RelayFormatClaude, OriginModelName: "client-model", IsStream: stream,
+							RequestURLPath: "/v1/messages", DisablePing: true,
+							ChannelMeta: &relaycommon.ChannelMeta{
+								ChannelType: constant.ChannelTypeAnthropic, ChannelId: 7,
+								ChannelBaseUrl: upstream.URL, UpstreamModelName: "upstream-model",
+							},
+						}
+						info.ChannelSetting.PassThroughBodyEnabled = passThrough == "channel"
+						info.InitRequestConversionChain()
+						adaptor := &claude.Adaptor{}
+						result, err := adaptor.DoRequest(c, info, strings.NewReader(requestTraceProtocolRequest(types.RelayFormatClaude)))
+						require.NoError(t, err)
+						response, ok := result.(*http.Response)
+						require.True(t, ok)
+						usageValue, relayError := adaptor.DoResponse(c, response, info)
+						require.Nil(t, relayError)
+						usage, ok := usageValue.(*dto.Usage)
+						require.True(t, ok)
+						assert.Equal(t, 10, usage.PromptTokens)
+						assert.Equal(t, 9, usage.CompletionTokens)
+						assert.Equal(t, "upstream-model", info.UpstreamModelName)
+						model.RecordConsumeLog(c, 11, model.RecordConsumeLogParams{ChannelId: 7, ModelName: "client-model", PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, Other: model.NewLogOther()})
+						if trace := common.GetRequestTrace(c); trace != nil {
+							trace.FinishAttempt(0)
+						}
+					})
+					recorder := httptest.NewRecorder()
+					request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestTraceProtocolRequest(types.RelayFormatClaude)))
+					request.Header.Set("Content-Type", "application/json")
+					app.ServeHTTP(recorder, request)
+					require.Equal(t, http.StatusOK, recorder.Code)
+					if stream {
+						var modelName string
+						for _, line := range strings.Split(recorder.Body.String(), "\n") {
+							if strings.HasPrefix(line, "data:") {
+								data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+								if gjson.Get(data, "type").String() == "message_start" {
+									modelName = gjson.Get(data, "message.model").String()
+								}
+							}
+						}
+						assert.Equal(t, "client-model", modelName)
+						assert.Contains(t, recorder.Body.String(), "message_stop")
+					} else {
+						assert.Equal(t, "client-model", gjson.Get(recorder.Body.String(), "model").String())
+						assert.Equal(t, fmt.Sprint(recorder.Body.Len()), recorder.Header().Get("Content-Length"))
+					}
+					awaitRequestTraceWrites(t)
+					rows, err := model.GetRequestTraces(t.Context(), recorder.Header().Get(common.RequestIdKey), 0, true)
+					require.NoError(t, err)
+					if level == "off" {
+						assert.Empty(t, rows)
+					} else {
+						require.Len(t, rows, 1)
+						require.NotNil(t, rows[0].AdminInfo)
+						assert.Equal(t, "upstream-model", rows[0].AdminInfo.Upstream.Model)
+						assert.Equal(t, map[string]int64{"lookup": 1}, rows[0].AdminInfo.Response.ToolCallsByName)
+					}
 				})
 			}
 		}

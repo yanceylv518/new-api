@@ -116,7 +116,14 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			}
 		}
 		countClaudeStreamBillableTools(c, info, &claudeResponse)
-		helper.ClaudeChunkData(c, claudeResponse, data)
+		clientResponse, clientData, err := relaycommon.ClientClaudeResponseData(&claudeResponse, info.OriginModelName, common.StringToByteSlice(data))
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		if clientResponse != &claudeResponse {
+			data = string(clientData)
+		}
+		helper.ClaudeChunkData(c, *clientResponse, data)
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		state, err := claudeToChatStreamState(info)
 		if err != nil {
@@ -285,7 +292,8 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	common.UseDecodedRequestTrace(c, resp)
-	if info.RelayFormat == types.RelayFormatClaude && shouldSkipClaudeMessageDeltaUsagePatch(info) {
+	// 客户端模型名可能改写，存在原始模型时不能预先复用上游作为客户端观察结果。
+	if info.RelayFormat == types.RelayFormatClaude && info.OriginModelName == "" && shouldSkipClaudeMessageDeltaUsagePatch(info) {
 		common.ReuseUpstreamRequestTrace(c, resp)
 	}
 	claudeInfo := &ClaudeResponseInfo{
@@ -369,8 +377,14 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 	case types.RelayFormatClaude:
-		responseData = data
-		common.ReuseUpstreamRequestTrace(c, httpResp)
+		var client *dto.ClaudeResponse
+		client, responseData, err = relaycommon.ClientClaudeResponseData(&claudeResponse, info.OriginModelName, data)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		if client == &claudeResponse {
+			common.ReuseUpstreamRequestTrace(c, httpResp)
+		}
 	case types.RelayFormatGemini:
 		{
 			convertResult, convertErr := service.ConvertResponse(c, info, types.RelayFormatGemini, &claudeResponse)
