@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "Хранение метаданных запросов (дни)",
+    "Request timeline retention (days)": "Хранение временных шкал запросов (дни)",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "По умолчанию: 30 дней. Устаревшие записи удаляются автоматически. 0 — хранить бессрочно. Журналы использования сохраняются.",
+    "Clean expired records": "Удалить устаревшие записи",
+    "Save the retention period before cleaning.": "Сохраните срок хранения перед очисткой.",
+    "Unable to load trace cleanup status": "Не удалось загрузить состояние очистки трассировок",
+    "Unable to start trace cleanup": "Не удалось запустить очистку трассировок",
+    "Clean expired request metadata?": "Удалить устаревшие метаданные запросов?",
+    "Clean expired request timelines?": "Удалить устаревшие временные шкалы запросов?",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "Записи старше сохранённого срока хранения ({{days}} дней) будут безвозвратно удалены. Журналы использования сохраняются.",
+    "cleanup stopped because the retention period was extended or disabled": "Очистка остановлена: срок хранения увеличен или отключён",
+    "save a positive retention period before cleaning expired traces": "Сохраните срок хранения больше 0 перед очисткой устаревших трассировок",
+    "Failed cleanup tasks": "Задачи очистки с ошибками",
     "The upstream response could not be read completely.": "Ответ вышестоящего сервера не удалось прочитать полностью.",
     "Trace rows dropped for failed or diagnostic requests": "Отброшенные строки трассировки ошибочных и диагностических запросов",
     "Trace rows dropped for regular requests": "Отброшенные строки трассировки обычных запросов",

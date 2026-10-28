@@ -30,7 +30,7 @@ func GetRequestTraceMetadata(c *gin.Context) {
 func GetRequestTraceMetadataStatus(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
 	defer cancel()
-	task, err := model.GetLatestRequestTraceCleanup(ctx)
+	task, err := model.GetLatestRequestTraceCleanup(ctx, model.SystemTaskTypeRequestTraceCleanup)
 	var cleanup *model.SystemTaskResponse
 	cleanupError := ""
 	if err != nil {

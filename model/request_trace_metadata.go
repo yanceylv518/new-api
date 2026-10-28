@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -130,9 +129,9 @@ func CountOldRequestTraces(ctx context.Context, timestamp int64) (int64, error) 
 	return count, err
 }
 
-func GetLatestRequestTraceCleanup(ctx context.Context) (*SystemTask, error) {
+func GetLatestRequestTraceCleanup(ctx context.Context, taskType string) (*SystemTask, error) {
 	var task SystemTask
-	result := DB.WithContext(ctx).Where("type = ?", SystemTaskTypeRequestTraceCleanup).Order("id desc").Limit(1).Find(&task)
+	result := DB.WithContext(ctx).Where("type = ?", taskType).Order("id desc").Limit(1).Find(&task)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -192,23 +191,12 @@ func migrateRequestTraces() error {
 	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return LOG_DB.AutoMigrate(&RequestTraceMetadata{})
 	}
-	ttlDays := clickHouseLogTTLDays()
 	statement := `CREATE TABLE IF NOT EXISTS request_trace_metadata (
 		id Int64 DEFAULT 0, request_id String, attempt Int32, user_id Int32,
 		created_at UInt64, data String
-	) ENGINE = ReplacingMergeTree(created_at) ORDER BY (request_id, attempt)` + clickHouseLogTTLClause(ttlDays)
+	) ENGINE = ReplacingMergeTree(created_at) ORDER BY (request_id, attempt)`
 	if err := LOG_DB.Exec(statement).Error; err != nil {
 		return err
 	}
-	if ttlDays > 0 {
-		return LOG_DB.Exec("ALTER TABLE request_trace_metadata MODIFY TTL " + clickHouseLogTTLExpression(ttlDays)).Error
-	}
-	var definition string
-	if err := LOG_DB.Raw("SHOW CREATE TABLE request_trace_metadata").Scan(&definition).Error; err != nil {
-		return err
-	}
-	if strings.Contains(definition, "TTL ") {
-		return LOG_DB.Exec("ALTER TABLE request_trace_metadata REMOVE TTL").Error
-	}
-	return nil
+	return removeRequestTraceTTL(context.Background(), "request_trace_metadata")
 }

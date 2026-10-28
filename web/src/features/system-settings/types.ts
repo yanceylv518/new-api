@@ -99,6 +99,13 @@ export type LogCleanupTask = SystemTask<
   LogCleanupTaskResult
 >
 
+export type TraceCleanupKind = 'metadata' | 'timeline'
+
+export type TraceCleanupStatus = {
+  retention_days: number
+  task: LogCleanupTask | null
+}
+
 export type SystemTaskResponse<TTask = SystemTask | null> = {
   success: boolean
   message: string
@@ -364,6 +371,7 @@ export type OperationsSettings = {
   LogConsumeEnabled: boolean
   RequestTraceConfig: string
   'request_trace.enabled': boolean
+  'request_trace.retention_days': number
   'request_trace.success_sample_rate': number
   'request_trace.slow_request_ms': number
   'request_trace.slow_first_byte_ms': number

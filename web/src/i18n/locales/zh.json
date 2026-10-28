@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "请求元数据保留天数",
+    "Request timeline retention (days)": "请求时间线保留天数",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "默认保留 30 天，过期自动清理；0 表示永久保留。原用量日志不受影响。",
+    "Clean expired records": "清理过期记录",
+    "Save the retention period before cleaning.": "请先保存保留天数，再执行清理。",
+    "Unable to load trace cleanup status": "无法加载追踪清理状态",
+    "Unable to start trace cleanup": "无法启动追踪清理",
+    "Clean expired request metadata?": "清理过期请求元数据？",
+    "Clean expired request timelines?": "清理过期请求时间线？",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "将永久删除超过已保存保留期（{{days}} 天）的记录。原用量日志不受影响。",
+    "cleanup stopped because the retention period was extended or disabled": "保留期已延长或关闭，清理已停止",
+    "save a positive retention period before cleaning expired traces": "请先保存大于 0 的保留天数，再清理过期追踪",
+    "Failed cleanup tasks": "清理失败任务数",
     "The upstream response could not be read completely.": "未能完整读取上游响应。",
     "Trace rows dropped for failed or diagnostic requests": "失败或诊断请求丢弃的追踪条数",
     "Trace rows dropped for regular requests": "普通请求丢弃的追踪条数",

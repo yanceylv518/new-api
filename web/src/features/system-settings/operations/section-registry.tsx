@@ -100,6 +100,7 @@ const OPERATIONS_SECTIONS = [
         defaultEnabled={Boolean(settings.LogConsumeEnabled)}
         defaultTraceConfig={settings.RequestTraceConfig}
         defaultTraceEnabled={settings['request_trace.enabled']}
+        defaultTimelineRetentionDays={settings['request_trace.retention_days']}
         defaultSuccessSampleRate={settings['request_trace.success_sample_rate']}
         defaultSlowRequestMS={settings['request_trace.slow_request_ms']}
         defaultSlowFirstByteMS={settings['request_trace.slow_first_byte_ms']}

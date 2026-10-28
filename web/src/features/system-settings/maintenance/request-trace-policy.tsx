@@ -69,33 +69,6 @@ export function RequestTracePolicyControls(props: {
       />
       <FormField
         control={props.form.control}
-        name='RequestTraceRetentionDays'
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>{t('Request trace retention (days)')}</FormLabel>
-            <FormDescription>
-              {t(
-                '0 disables automatic trace cleanup. A positive value removes older trace metadata hourly and keeps the original usage logs.'
-              )}
-            </FormDescription>
-            <FormControl>
-              <Input
-                {...field}
-                type='number'
-                min={0}
-                max={3650}
-                step={1}
-                value={Number.isFinite(field.value) ? field.value : ''}
-                onChange={(event) => field.onChange(event.target.valueAsNumber)}
-                disabled={props.disabled}
-              />
-            </FormControl>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
-      <FormField
-        control={props.form.control}
         name='RequestTraceDiagnosticChannels'
         render={({ field }) => (
           <FormItem>

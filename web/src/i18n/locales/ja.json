@@ -1,5 +1,18 @@
 {
   "translation": {
+    "Request metadata retention (days)": "リクエストメタデータの保持日数",
+    "Request timeline retention (days)": "リクエストタイムラインの保持日数",
+    "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "既定値は 30 日です。期限切れのレコードは自動削除されます。0 は無期限保持です。使用量ログは保持されます。",
+    "Clean expired records": "期限切れのレコードを削除",
+    "Save the retention period before cleaning.": "削除する前に保持期間を保存してください。",
+    "Unable to load trace cleanup status": "トレース削除の状態を読み込めません",
+    "Unable to start trace cleanup": "トレースの削除を開始できません",
+    "Clean expired request metadata?": "期限切れのリクエストメタデータを削除しますか？",
+    "Clean expired request timelines?": "期限切れのリクエストタイムラインを削除しますか？",
+    "Records older than the saved retention period of {{days}} days will be permanently deleted. Usage logs are kept.": "保存済みの保持期間（{{days}} 日）を超えたレコードを完全に削除します。使用量ログは保持されます。",
+    "cleanup stopped because the retention period was extended or disabled": "保持期間が延長または無効化されたため、削除を停止しました",
+    "save a positive retention period before cleaning expired traces": "期限切れのトレースを削除する前に、0 より大きい保持日数を保存してください",
+    "Failed cleanup tasks": "失敗した削除タスク数",
     "The upstream response could not be read completely.": "上流の応答を最後まで読み取れませんでした。",
     "Trace rows dropped for failed or diagnostic requests": "失敗・診断リクエストで破棄されたトレース行",
     "Trace rows dropped for regular requests": "通常リクエストで破棄されたトレース行",

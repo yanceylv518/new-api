@@ -46,6 +46,7 @@ const defaultOperationsSettings: OperationsSettings = {
   LogConsumeEnabled: false,
   RequestTraceConfig: '',
   'request_trace.enabled': true,
+  'request_trace.retention_days': 30,
   'request_trace.success_sample_rate': 100,
   'request_trace.slow_request_ms': 0,
   'request_trace.slow_first_byte_ms': 0,

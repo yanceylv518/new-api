@@ -30,7 +30,7 @@ export const requestTraceConfigSchema = z.object({
     compressionLevelSchema.optional().default('fast')
   ),
   success_sample_rate: z.number().int().min(0).max(100).optional().default(100),
-  retention_days: z.number().int().min(0).max(3650).optional().default(0),
+  retention_days: z.number().int().min(0).max(3650).optional().default(30),
   diagnostic_channel_ids: z
     .array(z.number().int().positive())
     .max(16)
@@ -48,7 +48,7 @@ export const defaultRequestTraceConfig: z.infer<
   upstream_request_id_headers: [],
   compression_level: 'fast',
   success_sample_rate: 100,
-  retention_days: 0,
+  retention_days: 30,
   diagnostic_channel_ids: [],
   diagnostic_expires_at: 0,
 }
@@ -62,6 +62,7 @@ export const logSettingsSchema = z.object({
   RequestTraceUpstreamRequestIdHeaders: z.string(),
   RequestTraceCompressionLevel: compressionLevelSchema,
   RequestTimelineEnabled: z.boolean(),
+  RequestTimelineRetentionDays: z.number().int().min(0).max(3650),
   RequestTimelineSuccessSampleRate: z.number().int().min(0).max(100),
   RequestTimelineSlowRequestMS: z.number().int().min(0).max(86400000),
   RequestTimelineSlowFirstByteMS: z.number().int().min(0).max(86400000),

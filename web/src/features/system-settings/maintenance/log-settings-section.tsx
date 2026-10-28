@@ -89,6 +89,7 @@ import {
   requestTraceConfigSchema,
   type LogSettingsFormValues,
 } from './request-trace-policy-schema'
+import { RequestTraceRetentionControls } from './request-trace-retention'
 import { RequestTraceStatus } from './request-trace-status'
 
 const MAX_REQUEST_ID_HEADERS = 16
@@ -107,6 +108,7 @@ type LogSettingsSectionProps = {
   defaultEnabled: boolean
   defaultTraceConfig?: string
   defaultTraceEnabled?: boolean
+  defaultTimelineRetentionDays?: number
   defaultSuccessSampleRate?: number
   defaultSlowRequestMS?: number
   defaultSlowFirstByteMS?: number
@@ -182,6 +184,7 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
     defaultValues: {
       LogConsumeEnabled: props.defaultEnabled,
       RequestTimelineEnabled: props.defaultTraceEnabled ?? true,
+      RequestTimelineRetentionDays: props.defaultTimelineRetentionDays ?? 30,
       RequestTimelineSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
       RequestTimelineSlowRequestMS: props.defaultSlowRequestMS ?? 0,
       RequestTimelineSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
@@ -238,6 +241,7 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
       {
         LogConsumeEnabled: props.defaultEnabled,
         RequestTimelineEnabled: props.defaultTraceEnabled ?? true,
+        RequestTimelineRetentionDays: props.defaultTimelineRetentionDays ?? 30,
         RequestTimelineSuccessSampleRate: props.defaultSuccessSampleRate ?? 100,
         RequestTimelineSlowRequestMS: props.defaultSlowRequestMS ?? 0,
         RequestTimelineSlowFirstByteMS: props.defaultSlowFirstByteMS ?? 0,
@@ -267,6 +271,7 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
   }, [
     props.defaultEnabled,
     props.defaultTraceEnabled,
+    props.defaultTimelineRetentionDays,
     props.defaultSuccessSampleRate,
     props.defaultSlowRequestMS,
     props.defaultSlowFirstByteMS,
@@ -421,6 +426,15 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
       return
     }
     const updates: UpdateOptionRequest[] = []
+    if (
+      values.RequestTimelineRetentionDays !==
+      (props.defaultTimelineRetentionDays ?? 30)
+    ) {
+      updates.push({
+        key: 'request_trace.retention_days',
+        value: values.RequestTimelineRetentionDays,
+      })
+    }
     if (values.LogConsumeEnabled !== props.defaultEnabled) {
       updates.push({
         key: 'LogConsumeEnabled',
@@ -822,6 +836,9 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
                   )}
                 />
                 {timelineOpen && <RequestTimelineWriterStatusPanel embedded />}
+                {timelineOpen && (
+                  <RequestTraceRetentionControls form={form} kind='timeline' />
+                )}
               </div>
             </SettingsAccordion>
           </Accordion>
@@ -1013,6 +1030,12 @@ export function LogSettingsSection(props: LogSettingsSectionProps) {
                     form={form}
                     disabled={form.formState.isSubmitting}
                   />
+                  {traceSettingsOpen && (
+                    <RequestTraceRetentionControls
+                      form={form}
+                      kind='metadata'
+                    />
+                  )}
                   <SettingsControlGroup>
                     <FormField
                       control={form.control}
