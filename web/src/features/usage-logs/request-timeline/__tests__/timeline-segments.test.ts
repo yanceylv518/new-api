@@ -1,0 +1,244 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { TFunction } from 'i18next'
+import { describe, expect, test } from 'vitest'
+
+import type { RequestTimelineData, RequestTimelineResult } from '../api'
+import { getAttemptResponseOffset } from '../lib/timeline-model'
+import {
+  buildRequestSegments,
+  type RequestSegment,
+} from '../lib/timeline-segments'
+import { retriedStreamResult, singleStreamResult } from './fixtures'
+
+// 返回翻译键本身，断言与界面语言无关。
+const t = ((key: string) => key) as unknown as TFunction
+
+type SegmentInput = Parameters<typeof buildRequestSegments>[2]
+
+function timelineOf(result: RequestTimelineResult): RequestTimelineData {
+  const data = result.detail?.timeline
+  if (!data) throw new Error('fixture must include a timeline')
+  return data
+}
+
+function cut(
+  result: RequestTimelineResult,
+  overrides: Partial<SegmentInput> = {}
+) {
+  const summary = result.summary
+  if (!summary || !result.detail) {
+    throw new Error('fixture must include details')
+  }
+  return buildRequestSegments(t, timelineOf(result), {
+    total: summary.duration_us,
+    firstByte: result.detail.final_attempt_first_byte_offset_us,
+    firstWrite: summary.first_payload_write_offset_us,
+    stream: summary.is_stream === true,
+    ...overrides,
+  })
+}
+
+const spans = (segments: RequestSegment[]) =>
+  segments.map((segment) => [segment.key, segment.start, segment.end])
+
+describe('request timeline segments', () => {
+  test('a streamed request is cut at the call start, first response, first output and last write', () => {
+    const { segments } = cut(singleStreamResult())
+
+    expect(spans(segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['wait', 14_592, 1_774_477],
+      ['think', 1_774_477, 2_927_720],
+      ['output', 2_927_720, 4_688_913],
+      ['finish', 4_688_913, 4_701_926],
+    ])
+  })
+
+  test('a failed attempt runs until the next attempt starts so channel reselection stays inside it', () => {
+    const { segments, moments } = cut(retriedStreamResult())
+
+    expect(spans(segments)).toEqual([
+      ['prepare', 0, 16_950],
+      ['attempt-1', 16_950, 320_700],
+      ['wait', 320_700, 1_305_800],
+      ['think', 1_305_800, 1_322_700],
+      ['output', 1_322_700, 7_402_100],
+      ['finish', 7_402_100, 7_419_300],
+    ])
+    expect(segments[1].kind).toBe('failed')
+    expect(
+      moments.find((moment) => moment.key === 'attempt-1-end')
+    ).toMatchObject({ at: 316_600, failed: true })
+    expect(moments.find((moment) => moment.key === 'first-byte')?.label).toBe(
+      'Final response received'
+    )
+  })
+
+  test('a non-stream response is received until its last write and only the work after it is finishing', () => {
+    const { segments } = cut(singleStreamResult(), { stream: false })
+
+    expect(spans(segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['wait', 14_592, 1_774_477],
+      ['receive', 1_774_477, 4_688_913],
+      ['finish', 4_688_913, 4_701_926],
+    ])
+  })
+
+  test('when the last attempt also fails it ends at its observed end and the rest is finishing work', () => {
+    const result = retriedStreamResult()
+    const data = timelineOf(result)
+    data.attempts[1] = {
+      ...data.attempts[1],
+      outcome: 'failed',
+      end_us: 2_000_000,
+    }
+
+    expect(spans(cut(result).segments)).toEqual([
+      ['prepare', 0, 16_950],
+      ['attempt-1', 16_950, 320_700],
+      ['attempt-2', 320_700, 2_000_000],
+      ['finish', 2_000_000, 7_419_300],
+    ])
+  })
+
+  test('an attempt without an observed end runs to the end of the request and nothing is guessed after it', () => {
+    const result = retriedStreamResult()
+    const data = timelineOf(result)
+    data.attempts[1] = {
+      ...data.attempts[1],
+      outcome: 'canceled',
+      end_us: null,
+    }
+
+    const { segments } = cut(result)
+
+    expect(segments.at(-1)).toMatchObject({
+      key: 'attempt-2',
+      start: 320_700,
+      end: null,
+    })
+    expect(segments.map((segment) => segment.key)).not.toContain('finish')
+  })
+
+  test('without an upstream first response the wait for response and for output form one segment', () => {
+    const { segments, moments } = cut(singleStreamResult(), { firstByte: null })
+
+    expect(spans(segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['wait', 14_592, 2_927_720],
+      ['output', 2_927_720, 4_688_913],
+      ['finish', 4_688_913, 4_701_926],
+    ])
+    expect(segments[1].label).toBe('Wait for output')
+    expect(moments.map((moment) => moment.key)).not.toContain('first-byte')
+  })
+
+  test('a request rejected before any attempt is a single processing segment', () => {
+    const result = singleStreamResult()
+    timelineOf(result).attempts = []
+
+    const { segments } = cut(result, { firstByte: null, firstWrite: 900 })
+
+    expect(spans(segments)).toEqual([['process', 0, 4_701_926]])
+  })
+})
+
+describe('four-point timeline', () => {
+  function fourPointResult() {
+    const result = singleStreamResult()
+    const data = timelineOf(result)
+    if (!result.summary || !result.detail) throw new Error('missing fixture')
+    const end = 4_688_913
+    result.summary.duration_us = end
+    result.summary.finished_at_us = result.summary.started_at_us + end
+    result.summary.first_payload_write_offset_us = null
+    data.measurement_version = 3
+    data.phases = []
+    data.response.last_write_us = null
+    data.response.cancel_observed_us = null
+    for (const attempt of data.attempts) {
+      attempt.end_us = end
+      attempt.stream = undefined
+      for (const exchange of attempt.exchanges ?? []) {
+        exchange.headers_us = null
+        exchange.end_us = null
+        exchange.bytes_read = null
+        exchange.events = []
+      }
+    }
+    return result
+  }
+
+  test('uses exactly preparation, waiting and forwarding without billing stages', () => {
+    const result = fourPointResult()
+
+    expect(spans(cut(result).segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['wait', 14_592, 1_774_477],
+      ['receive', 1_774_477, 4_688_913],
+    ])
+    expect(cut(result).moments.map((moment) => moment.at)).toEqual([
+      0, 14_592, 1_774_477, 4_688_913,
+    ])
+  })
+
+  test('does not replace an absent first byte with response headers or zero', () => {
+    const result = fourPointResult()
+    const data = timelineOf(result)
+    const attempt = data.attempts[0]
+    const exchange = attempt.exchanges?.[0]
+    if (!result.detail || !exchange) throw new Error('missing fixture')
+    exchange.first_byte_us = null
+    exchange.headers_us = 100_000
+    result.detail.final_attempt_first_byte_offset_us = null
+
+    expect(getAttemptResponseOffset(attempt)).toBeNull()
+    expect(spans(cut(result).segments)).toEqual([
+      ['prepare', 0, 14_592],
+      ['call', 14_592, 4_688_913],
+    ])
+  })
+
+  test('an unknown forwarding end has no finish marker or fabricated duration', () => {
+    const result = fourPointResult()
+    const data = timelineOf(result)
+    if (!result.summary) throw new Error('missing fixture')
+    result.summary.duration_us = 1_774_477
+    data.capture.missing = ['forwarding_end_not_observed']
+    data.attempts[0].end_us = null
+
+    const timeline = cut(result)
+    expect(timeline.segments.at(-1)).toMatchObject({
+      key: 'receive',
+      start: 1_774_477,
+      end: null,
+    })
+    expect(timeline.moments.map((moment) => moment.key)).not.toContain('end')
+  })
+
+  test('a retry that never reached upstream cannot borrow the previous response', () => {
+    const attempt = timelineOf(fourPointResult()).attempts[0]
+
+    expect(getAttemptResponseOffset(attempt, false, 1)).toBe(1_774_477)
+    expect(getAttemptResponseOffset(attempt, false, 2)).toBeNull()
+    expect(getAttemptResponseOffset(attempt, true, 1)).toBeNull()
+  })
+})

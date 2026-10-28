@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/internal/requesttracetest"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
@@ -33,6 +34,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2195,6 +2197,13 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 				stream, refused := mode.stream, mode.refused
 				t.Run(fmt.Sprintf("%s_to_%s/stream=%t/refused=%t", upstreamFormat, clientFormat, stream, refused), func(t *testing.T) {
 					setupRequestTraceDatabase(t)
+					require.NoError(t, model.MigrateRequestTraces())
+					timelineWriter := service.StartRequestTraceWriter()
+					t.Cleanup(func() {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						require.NoError(t, timelineWriter.Shutdown(ctx))
+					})
 					require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all"}`))
 					body := requestTraceProtocolRequest(clientFormat)
 					if stream && clientFormat != types.RelayFormatGemini {
@@ -2217,9 +2226,11 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 						}
 					}
 					app := gin.New()
-					app.Use(middleware.RequestId(), middleware.RequestTraceMetadata(), middleware.BodyStorageCleanup())
+					app.Use(middleware.RequestTraceContext(), middleware.RequestId(), middleware.RequestTraceMetadata(), middleware.BodyStorageCleanup())
 					app.POST(path, func(c *gin.Context) {
 						c.Set("id", 11)
+						timeline := requesttrace.FromContext(c.Request.Context())
+						timeline.BeginAttempt(7)
 						_, err := common.GetBodyStorage(c)
 						require.NoError(t, err)
 						info := &relaycommon.RelayInfo{RelayFormat: clientFormat, FinalRequestRelayFormat: upstreamFormat, IsStream: stream, RequestURLPath: path, RelayMode: relayconstant.RelayModeChatCompletions, ShouldIncludeUsage: true, OriginModelName: "client-model", ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelId: 7, UpstreamModelName: "upstream-model"}}
@@ -2256,21 +2267,46 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 							payload = requestTraceProtocolRefusalPayload(upstreamFormat, stream)
 						}
 						response := &http.Response{StatusCode: 200, Proto: "HTTP/2.0", Header: http.Header{"Content-Type": []string{contentType}}, Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(payload)), ContentType: contentType, Observer: attempt.Observer}}
+						observation := timeline.StartUpstream("http", false)
+						observation.Response(response, nil)
+						timeline.BeginForwarding()
 						usage, relayError := handle(c, info, response)
+						timeline.ForwardingDone(c.Request.Context().Err())
 						require.Nil(t, relayError)
 						require.NotNil(t, usage)
 						other := model.NewLogOther()
 						service.AppendRelayLogAdminInfo(c, info, other)
 						model.RecordConsumeLog(c, 11, model.RecordConsumeLogParams{ChannelId: 7, ModelName: "client-model", PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, Other: other})
 						trace.FinishAttempt(0)
+						timeline.EndAttempt("success")
 					})
 					recorder := httptest.NewRecorder()
 					request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 					request.Header.Set("Content-Type", "application/json")
-					app.ServeHTTP(recorder, request)
+					timelineHandler := middleware.RequestTraceHandler(app, func() bool { return true }, timelineWriter.Enqueue)
+					timelineHandler.ServeHTTP(recorder, request)
 					require.Equal(t, 200, recorder.Code)
 					awaitRequestTraceWrites(t)
 					requestID := recorder.Header().Get(common.RequestIdKey)
+					require.Eventually(t, func() bool {
+						return service.GetRequestTraceWriterStatus().Written == 1
+					}, 5*time.Second, 5*time.Millisecond)
+					timelineRow, err := model.FindRequestTrace(t.Context(), requestID, 0)
+					require.NoError(t, err)
+					assert.Equal(t, "success", timelineRow.Outcome)
+					assert.Equal(t, 1, timelineRow.AttemptCount)
+					assert.Greater(t, timelineRow.DurationUS, int64(0))
+					assert.Equal(t, timelineRow.StartedAtUS+timelineRow.DurationUS, timelineRow.FinishedAtUS)
+					timelineData, err := service.DecodeRequestTrace(timelineRow.TraceData)
+					require.NoError(t, err)
+					assert.Equal(t, 3, timelineData.MeasurementVersion)
+					require.Len(t, timelineData.Attempts, 1)
+					require.NotNil(t, timelineData.Attempts[0].EndUS)
+					assert.LessOrEqual(t, *timelineData.Attempts[0].EndUS, timelineRow.DurationUS)
+					assert.Positive(t, timelineData.Response.BytesWritten)
+					// 直接调用协议处理器没有 HTTP 传输观测，不能补造上游首字节时点。
+					assert.Nil(t, timelineRow.FinalAttemptFirstByteOffsetUS)
+					assert.NotContains(t, common.GetJsonString(timelineData), "private-refusal-body")
 					rows, err := model.GetRequestTraces(t.Context(), requestID, 0, true)
 					require.NoError(t, err)
 					require.Len(t, rows, 1)
@@ -2540,4 +2576,56 @@ func TestRequestTraceRootStatusAuthorization(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/log/trace/status", nil))
 	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+}
+
+func TestRequestTraceCombinedOptionsMySQL(t *testing.T) {
+	db := setupRequestTraceDatabase(t)
+	common.OptionMapRWMutex.RLock()
+	previousOptions := common.OptionMap
+	common.OptionMapRWMutex.RUnlock()
+	previousEnabled := system_setting.IsRequestTraceEnabled()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		system_setting.SetRequestTraceEnabled(previousEnabled)
+	})
+	model.InitOptionMap()
+	pat := rand.Text()
+	root := model.User{Username: "trace-options-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "trace-options-root", AccessToken: &pat, AuthVersion: 1}
+	require.NoError(t, db.Create(&root).Error)
+	engine := gin.New()
+	engine.PUT("/api/option/", middleware.RootAuth(), controller.UpdateOption)
+	put := func(key string, value any) {
+		t.Helper()
+		encoded, err := common.Marshal(gin.H{"key": key, "value": value})
+		require.NoError(t, err)
+		request := httptest.NewRequest(http.MethodPut, "/api/option/", strings.NewReader(string(encoded)))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+pat)
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var response struct {
+			Success bool
+			Message string
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.True(t, response.Success, response.Message)
+		var option model.Option
+		require.NoError(t, db.Where(&model.Option{Key: key}).First(&option).Error)
+		assert.NotEmpty(t, option.Value)
+	}
+	put("RequestTraceConfig", `{"level":"all","success_sample_rate":100}`)
+	put(system_setting.RequestTraceEnabledOptionKey, false)
+	assert.False(t, system_setting.IsRequestTraceEnabled())
+	assert.Equal(t, "all", common.GetRequestTraceConfig().Level)
+	assert.Equal(t, 100, common.GetRequestTraceConfig().SuccessSampleRate)
+	put("RequestTraceConfig", `{"level":"all","success_sample_rate":100,"upstream_request_id_headers":["X-Combined-Id"]}`)
+	assert.False(t, system_setting.IsRequestTraceEnabled())
+	assert.Equal(t, []string{"X-Combined-Id"}, common.GetRequestTraceConfig().UpstreamRequestIDHeaders)
+	put(system_setting.RequestTraceEnabledOptionKey, true)
+	assert.True(t, system_setting.IsRequestTraceEnabled())
+	assert.Equal(t, "all", common.GetRequestTraceConfig().Level)
+	assert.Equal(t, []string{"X-Combined-Id"}, common.GetRequestTraceConfig().UpstreamRequestIDHeaders)
 }

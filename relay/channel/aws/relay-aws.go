@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -67,6 +68,12 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 	}
 
 	awsSecret := strings.Split(info.ApiKey, "|")
+	var collector *requesttrace.Collector
+	if c != nil && c.Request != nil {
+		collector = requesttrace.FromContext(c.Request.Context())
+		collector.EnsureAttempt(info.ChannelId)
+	}
+	observedHTTPClient := requesttrace.WrapHTTPClient(httpClient, collector, info.ChannelSetting.Proxy != "")
 	var client *bedrockruntime.Client
 	switch len(awsSecret) {
 	case 2:
@@ -75,7 +82,7 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 		client = bedrockruntime.New(bedrockruntime.Options{
 			Region:                  region,
 			BearerAuthTokenProvider: bearer.StaticTokenProvider{Token: bearer.Token{Value: apiKey}},
-			HTTPClient:              httpClient,
+			HTTPClient:              observedHTTPClient,
 		})
 	case 3:
 		ak := awsSecret[0]
@@ -84,7 +91,7 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 		client = bedrockruntime.New(bedrockruntime.Options{
 			Region:      region,
 			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, "")),
-			HTTPClient:  httpClient,
+			HTTPClient:  observedHTTPClient,
 		})
 	default:
 		return nil, errors.New("invalid aws secret key")

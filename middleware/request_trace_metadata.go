@@ -26,6 +26,33 @@ func (w *traceResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+// 保活帧透传到时间线写入器，不作为首个有效响应载荷。
+func (w *traceResponseWriter) WriteHeartbeat(data []byte) (int, error) {
+	writer, ok := w.ResponseWriter.(interface{ WriteHeartbeat([]byte) (int, error) })
+	if !ok {
+		return w.Write(data)
+	}
+	n, err := writer.WriteHeartbeat(data)
+	if n > 0 {
+		w.prepare()
+		w.observer.Observe(data[:n], w.contentType)
+	}
+	if err != nil || n != len(data) {
+		w.observer.DeliveryFailed()
+	}
+	return n, err
+}
+
+func (w *traceResponseWriter) Flush() { _ = w.FlushError() }
+
+func (w *traceResponseWriter) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if err != nil {
+		w.observer.DeliveryFailed()
+	}
+	return err
+}
+
 func (w *traceResponseWriter) prepare() {
 	if !w.contentTypeSet {
 		w.contentType = w.Header().Get("Content-Type")

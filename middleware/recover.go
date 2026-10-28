@@ -5,11 +5,15 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/requesttrace"
 	"github.com/gin-gonic/gin"
 )
 
 func RelayPanicRecover() gin.HandlerFunc {
 	return gin.CustomRecovery(func(c *gin.Context, err any) {
+		trace := requesttrace.FromContext(c.Request.Context())
+		trace.Fail("panic")
+		defer trace.ForwardingDone(c.Request.Context().Err())
 		common.SysLog(fmt.Sprintf("panic detected: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{

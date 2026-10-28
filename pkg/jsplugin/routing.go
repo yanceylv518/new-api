@@ -645,6 +645,16 @@ func endpointIndexKey(method, path, model string) string {
 	return method + "\x00" + path + "\x00" + model
 }
 
+// IsReservedRoutePath 只检查实际 URL 的段边界，不把用户路径中的冒号当作路由参数。
+func IsReservedRoutePath(path string) bool {
+	for _, namespace := range reservedRouteNamespaces {
+		if path == namespace || strings.HasPrefix(path, namespace+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func intersectingReservedNamespace(routePath string) (string, bool) {
 	for _, namespace := range reservedRouteNamespaces {
 		if routePatternIntersectsNamespace(routePath, namespace) {

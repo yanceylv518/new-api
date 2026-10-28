@@ -96,8 +96,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		// 同时记录上游业务错误和时间线流状态，不能仅凭 HTTP 200 判为成功。
 		if streamResponse.Type == "response.failed" || streamResponse.Type == "response.error" || streamResponse.Type == "error" {
 			common.CaptureUpstreamBusinessError(c, resp.StatusCode, streamResponse.Type, data)
+			sr.Error(fmt.Errorf("responses stream error event: %s", streamResponse.Type))
 		}
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {

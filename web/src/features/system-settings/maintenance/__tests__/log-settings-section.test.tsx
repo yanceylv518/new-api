@@ -375,7 +375,7 @@ describe('request trace log settings', () => {
     await waitFor(() => expect(api.put).toHaveBeenCalledTimes(2))
   })
 
-  test('disables save and trace controls while a request is pending', async () => {
+  test('locks controls while saving and requires a new change after success', async () => {
     let complete: ((value: ReturnType<typeof response>) => void) | undefined
     vi.mocked(api.put).mockImplementationOnce(
       () =>
@@ -403,8 +403,50 @@ describe('request trace log settings', () => {
     await act(async () => complete?.(response({ success: true })))
     await waitFor(() =>
       expect(
-        screen.getByRole('button', { name: 'Save log settings' })
+        screen.getByRole('combobox', { name: 'Request trace level' })
       ).toBeEnabled()
+    )
+    expect(
+      screen.getByRole('button', { name: 'Save log settings' })
+    ).toBeDisabled()
+    await userEvent.type(input, '\nX-New-Id')
+    expect(
+      screen.getByRole('button', { name: 'Save log settings' })
+    ).toBeEnabled()
+  })
+
+  test('saves all metadata and timeline switches to their own options', async () => {
+    await renderTraceSettings(
+      <SettingsFixture config={JSON.stringify({ ...config, level: 'all' })} />
+    )
+    const input = screen.getByRole('textbox', {
+      name: 'Upstream request ID response headers',
+    })
+    await userEvent.clear(input)
+    await userEvent.type(input, 'X-Combined-Id')
+    await userEvent.click(
+      screen.getByRole('switch', { name: 'Collect request timelines' })
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save log settings' })
+    )
+    await waitFor(() => expect(api.put).toHaveBeenCalledTimes(2))
+    expect(api.put).toHaveBeenNthCalledWith(1, '/api/option/', {
+      key: 'RequestTraceConfig',
+      value: JSON.stringify({
+        ...config,
+        level: 'all',
+        upstream_request_id_headers: ['X-Combined-Id'],
+      }),
+    })
+    expect(api.put).toHaveBeenNthCalledWith(2, '/api/option/', {
+      key: 'request_trace.enabled',
+      value: false,
+    })
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save log settings' })
+      ).toBeDisabled()
     )
   })
 

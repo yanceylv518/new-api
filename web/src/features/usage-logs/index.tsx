@@ -26,6 +26,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CacheStatsDialog } from '@/features/system-settings/general/channel-affinity/cache-stats-dialog'
 import { useSidebarConfig } from '@/hooks/use-sidebar-config'
 
+import { DetailsDialog } from './components/dialogs/details-dialog'
 import { UserInfoDialog } from './components/dialogs/user-info-dialog'
 import {
   type LogsViewScope,
@@ -34,6 +35,7 @@ import {
   useUsageLogsContext,
 } from './components/usage-logs-provider'
 import { UsageLogsTable } from './components/usage-logs-table'
+import { RequestTimelineDialog } from './request-timeline/request-timeline-dialog'
 import {
   isUsageLogsSectionId,
   USAGE_LOGS_DEFAULT_SECTION,
@@ -70,8 +72,15 @@ function UsageLogsContent() {
     affinityTarget,
     affinityDialogOpen,
     setAffinityDialogOpen,
+    selectedLog,
+    detailsDialogOpen,
+    setDetailsDialogOpen,
+    timelineRequestId,
+    timelineDialogOpen,
+    setTimelineDialogOpen,
   } = useUsageLogsContext()
-  const { canManageScope, viewScope, setViewScope } = useLogsViewScope()
+  const { canManageScope, viewScope, setViewScope, isAdminView, isRootView } =
+    useLogsViewScope()
   const tabNavGroups = useMemo<NavGroup[]>(
     () => [
       {
@@ -157,6 +166,21 @@ function UsageLogsContent() {
           </div>
         </SectionPageLayout.Content>
       </SectionPageLayout>
+      {selectedLog && (
+        <DetailsDialog
+          log={selectedLog}
+          isAdmin={isAdminView}
+          isRoot={isRootView}
+          open={detailsDialogOpen}
+          onOpenChange={setDetailsDialogOpen}
+        />
+      )}
+      <RequestTimelineDialog
+        open={timelineDialogOpen}
+        onOpenChange={setTimelineDialogOpen}
+        requestId={timelineRequestId}
+        admin={isAdminView}
+      />
 
       <UserInfoDialog
         userId={selectedUserId}

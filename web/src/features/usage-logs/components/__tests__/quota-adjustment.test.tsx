@@ -47,6 +47,7 @@ import { renderAuditContent } from '../../lib/format'
 import type { LogOtherData } from '../../types'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
 import { DetailsDialog } from '../dialogs/details-dialog'
+import { UsageLogsProvider } from '../usage-logs-provider'
 
 // Provider icons are unused by quota logs; their browser-only dependencies
 // cannot be loaded by Vitest's Node ESM resolver.
@@ -65,7 +66,7 @@ afterAll(() => vi.unstubAllGlobals())
 function QuotaLogPreview(props: { log: UsageLog }) {
   const table = useReactTable({
     data: [props.log],
-    columns: useCommonLogsColumns(false, false),
+    columns: useCommonLogsColumns(false),
     getCoreRowModel: getCoreRowModel(),
   })
   const cell = table
@@ -184,7 +185,9 @@ describe('quota adjustment log localization', () => {
       render(
         <I18nextProvider i18n={i18n}>
           <QueryClientProvider client={queryClient}>
-            <QuotaLogPreview log={log} />
+            <UsageLogsProvider>
+              <QuotaLogPreview log={log} />
+            </UsageLogsProvider>
           </QueryClientProvider>
         </I18nextProvider>
       )
