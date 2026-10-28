@@ -24,6 +24,7 @@ import {
   textColorMap,
   type StatusVariant,
 } from '@/components/status-badge'
+import { Button } from '@/components/ui/button'
 import {
   Tooltip,
   TooltipContent,
@@ -33,6 +34,10 @@ import {
 import { formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
+import {
+  UPSTREAM_BUSINESS_ERROR_KIND,
+  type UpstreamBusinessError,
+} from '../data/schema'
 import { getFirstResponseTimeColor, getResponseTimeColor } from '../lib/format'
 import type { LogOtherData } from '../types'
 
@@ -155,6 +160,7 @@ interface StreamTpsCellProps {
   isTask?: boolean
   tokensPerSecond?: number | null
   streamStatus?: LogOtherData['stream_status']
+  businessError?: UpstreamBusinessError | null
   className?: string
 }
 
@@ -162,6 +168,9 @@ export function StreamTpsCell(props: StreamTpsCellProps) {
   const { t } = useTranslation()
   const showStreamError =
     props.isStream && props.streamStatus && props.streamStatus.status !== 'ok'
+  const errorLabel = props.businessError
+    ? t('Upstream business error (HTTP 200)')
+    : t('Stream Status')
   const tpsLabel =
     props.tokensPerSecond != null
       ? `${Math.round(props.tokensPerSecond)} t/s`
@@ -185,23 +194,53 @@ export function StreamTpsCell(props: StreamTpsCellProps) {
         )}
       >
         {streamLabel}
-        {showStreamError && (
+        {(props.businessError || showStreamError) && (
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger
-                render={<CircleAlert className='text-destructive size-3' />}
-              />
-              <TooltipContent>
+                render={
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='icon-xs'
+                    className='text-destructive size-3 p-0'
+                    aria-label={errorLabel}
+                  />
+                }
+              >
+                <CircleAlert
+                  className='text-destructive size-3'
+                  aria-hidden='true'
+                />
+              </TooltipTrigger>
+              <TooltipContent role='tooltip'>
                 <div className='space-y-0.5 text-xs'>
                   <p>
-                    {t('Stream Status')}: {t('Error')}
+                    {errorLabel}
+                    {!props.businessError && `: ${t('Error')}`}
                   </p>
-                  <p>{props.streamStatus?.end_reason || 'unknown'}</p>
-                  {(props.streamStatus?.error_count ?? 0) > 0 && (
+                  {props.businessError && (
+                    <>
+                      <p>{UPSTREAM_BUSINESS_ERROR_KIND}</p>
+                      {props.businessError.error.code !== undefined && (
+                        <p>
+                          {t('Error Code')}:{' '}
+                          {String(props.businessError.error.code)}
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {props.isStream && props.streamStatus?.end_reason && (
                     <p>
-                      {t('Soft Errors')}: {props.streamStatus?.error_count}
+                      {t('End Reason')}: {props.streamStatus.end_reason}
                     </p>
                   )}
+                  {props.isStream &&
+                    (props.streamStatus?.error_count ?? 0) > 0 && (
+                      <p>
+                        {t('Soft Errors')}: {props.streamStatus?.error_count}
+                      </p>
+                    )}
                 </div>
               </TooltipContent>
             </Tooltip>

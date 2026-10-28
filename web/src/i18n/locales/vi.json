@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "Lỗi xử lý từ thượng nguồn (HTTP 200)",
+    "Request Status": "Trạng thái yêu cầu",
     "Request metadata retention (days)": "Thời gian giữ siêu dữ liệu yêu cầu (ngày)",
     "Request timeline retention (days)": "Thời gian giữ dòng thời gian yêu cầu (ngày)",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Mặc định: 30 ngày. Bản ghi hết hạn được tự động xóa. 0 giữ vô thời hạn. Nhật ký sử dụng được giữ lại.",

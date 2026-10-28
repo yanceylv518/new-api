@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "Ошибка обработки на стороне провайдера (HTTP 200)",
+    "Request Status": "Состояние запроса",
     "Request metadata retention (days)": "Хранение метаданных запросов (дни)",
     "Request timeline retention (days)": "Хранение временных шкал запросов (дни)",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "По умолчанию: 30 дней. Устаревшие записи удаляются автоматически. 0 — хранить бессрочно. Журналы использования сохраняются.",

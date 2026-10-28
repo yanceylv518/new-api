@@ -34,6 +34,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import type { UsageLog } from '../../data/schema'
 import { parseUpstreamBusinessError } from '../../lib/format'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
+import { UsageLogsMobileList } from '../usage-logs-mobile-card'
 import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
 import { DetailsDialog } from './details-dialog'
 
@@ -192,6 +193,33 @@ function BusinessErrorLogCell(props: { log: UsageLog }) {
   )
 }
 
+function BusinessErrorStatusCell(props: { log: UsageLog; mobile: boolean }) {
+  const columns = useCommonLogsColumns(true)
+  const table = useReactTable({
+    data: [props.log],
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+  })
+  if (props.mobile) {
+    return <UsageLogsMobileList table={table} logCategory='common' />
+  }
+  const cell = table
+    .getRowModel()
+    .rows[0].getAllCells()
+    .find((item) => item.column.id === 'is_stream')
+  return cell ? flexRender(cell.column.columnDef.cell, cell.getContext()) : null
+}
+
+function renderBusinessErrorStatus(logValue: UsageLog, mobile = false) {
+  return render(
+    <QueryClientProvider client={queryClient()}>
+      <UsageLogsProvider>
+        <BusinessErrorStatusCell log={logValue} mobile={mobile} />
+      </UsageLogsProvider>
+    </QueryClientProvider>
+  )
+}
+
 describe('HTTP 200 upstream business error logs', () => {
   const failure = {
     http_status: 200,
@@ -201,6 +229,107 @@ describe('HTTP 200 upstream business error logs', () => {
     note: 'existing billing note',
     truncated: true,
   }
+
+  test.each([
+    [false, false, false],
+    [false, false, true],
+    [false, true, false],
+    [false, true, true],
+    [true, false, false],
+    [true, false, true],
+    [true, true, false],
+    [true, true, true],
+  ])(
+    'shows business error status for mobile=%s stream=%s legacy=%s',
+    async (mobile, isStream, legacy) => {
+      const user = userEvent.setup()
+      renderBusinessErrorStatus(
+        {
+          ...log,
+          type: isStream ? 5 : 2,
+          is_stream: isStream,
+          content: JSON.stringify(
+            legacy ? failure : { ...failure, kind: 'upstream_business_error' }
+          ),
+          other: JSON.stringify({
+            stream_status: { status: 'ok', end_reason: 'done' },
+          }),
+        },
+        mobile
+      )
+      const indicator = screen.getByRole('button', {
+        name: 'Upstream business error (HTTP 200)',
+      })
+      await user.hover(indicator)
+      const tooltip = await screen.findByRole('tooltip')
+      expect(tooltip).toHaveTextContent('upstream_business_error')
+      expect(tooltip).toHaveTextContent('upstream_timeout')
+      if (isStream) expect(tooltip).toHaveTextContent('done')
+    }
+  )
+
+  test.each([false, true])(
+    'shows business failure in details without requiring trace metadata, stream=%s',
+    async (isStream) => {
+      vi.spyOn(api, 'get').mockResolvedValue(response([]))
+      renderDetails({
+        log: {
+          ...log,
+          is_stream: isStream,
+          content: JSON.stringify({
+            ...failure,
+            kind: 'upstream_business_error',
+          }),
+        },
+      })
+      expect(
+        await screen.findByText('Upstream business error (HTTP 200)')
+      ).toBeInTheDocument()
+      expect(screen.getByText('upstream_business_error')).toBeInTheDocument()
+    }
+  )
+
+  test('retains client_gone and supports keyboard access to the error hint', async () => {
+    const user = userEvent.setup()
+    renderBusinessErrorStatus({
+      ...log,
+      is_stream: true,
+      other: JSON.stringify({
+        stream_status: { status: 'error', end_reason: 'client_gone' },
+      }),
+    })
+    const indicator = screen.getByRole('button', { name: 'Stream Status' })
+    await user.tab()
+    expect(indicator).toHaveFocus()
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('client_gone')
+  })
+
+  test.each([
+    ['', 2],
+    ['ordinary failure text', 5],
+    ['{"kind":"upstream_business_error"}', 2],
+    [JSON.stringify({ ...failure, kind: 'other_error' }), 2],
+    [
+      JSON.stringify({
+        ...failure,
+        kind: 'upstream_business_error',
+        http_status: 500,
+      }),
+      2,
+    ],
+    [JSON.stringify({ ...failure, kind: 'upstream_business_error' }), 6],
+  ])('does not mark unrelated or invalid content %#', (content, type) => {
+    renderBusinessErrorStatus({
+      ...log,
+      content: String(content),
+      type: Number(type),
+    })
+    expect(
+      screen.queryByRole('button', {
+        name: 'Upstream business error (HTTP 200)',
+      })
+    ).not.toBeInTheDocument()
+  })
 
   test.each([2, 5])(
     'shows formatted copyable JSON for log type %s',
@@ -283,6 +412,8 @@ describe('HTTP 200 upstream business error logs', () => {
   )
 
   test.each([
+    { ...failure, kind: 'other_error' },
+    { ...failure, kind: null },
     { ...failure, http_status: 502 },
     { ...failure, event: 'response.completed' },
     { ...failure, reported_status_code: '429' },

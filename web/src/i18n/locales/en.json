@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "Upstream business error (HTTP 200)",
+    "Request Status": "Request Status",
     "Request metadata retention (days)": "Request metadata retention (days)",
     "Request timeline retention (days)": "Request timeline retention (days)",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.",

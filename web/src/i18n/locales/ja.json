@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "上流の処理エラー（HTTP 200）",
+    "Request Status": "リクエストの状態",
     "Request metadata retention (days)": "リクエストメタデータの保持日数",
     "Request timeline retention (days)": "リクエストタイムラインの保持日数",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "既定値は 30 日です。期限切れのレコードは自動削除されます。0 は無期限保持です。使用量ログは保持されます。",

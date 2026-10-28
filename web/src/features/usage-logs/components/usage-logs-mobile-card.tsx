@@ -40,7 +40,7 @@ import { cn } from '@/lib/utils'
 
 import { LOG_TYPE_ENUM } from '../constants'
 import type { UsageLog } from '../data/schema'
-import { parseLogOther } from '../lib/format'
+import { parseLogOther, parseUpstreamBusinessError } from '../lib/format'
 import { TASK_MOBILE_SUMMARY_FIELDS } from '../lib/task-mobile-layout'
 import {
   getLogTypeConfig,
@@ -304,6 +304,11 @@ function MobileStreamTimingField({ log }: { log: UsageLog }) {
         isTask={other?.is_task === true}
         tokensPerSecond={tokensPerSecond}
         streamStatus={other?.stream_status}
+        businessError={
+          log.type === 2 || log.type === 5
+            ? parseUpstreamBusinessError(log.content)
+            : null
+        }
         className='shrink-0'
       />
     </div>

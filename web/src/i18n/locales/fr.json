@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "Erreur applicative en amont (HTTP 200)",
+    "Request Status": "État de la requête",
     "Request metadata retention (days)": "Conservation des métadonnées des requêtes (jours)",
     "Request timeline retention (days)": "Conservation des chronologies des requêtes (jours)",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "Par défaut : 30 jours. Les enregistrements expirés sont supprimés automatiquement. 0 les conserve indéfiniment. Les journaux d’utilisation sont conservés.",

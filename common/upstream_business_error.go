@@ -13,6 +13,7 @@ import (
 const upstreamBusinessErrorKey = "upstream_business_error"
 
 type UpstreamBusinessError struct {
+	Kind               string               `json:"kind,omitempty"`
 	HTTPStatus         int                  `json:"http_status"`
 	Event              string               `json:"event"`
 	ReportedStatusCode *int                 `json:"reported_status_code,omitempty"`
@@ -58,7 +59,7 @@ func CaptureUpstreamBusinessError(c *gin.Context, httpStatus int, event string, 
 			problem = document
 		}
 	}
-	record := &UpstreamBusinessError{HTTPStatus: httpStatus, Event: strings.Clone(TraceMetadataString(event, 64))}
+	record := &UpstreamBusinessError{Kind: upstreamBusinessErrorKey, HTTPStatus: httpStatus, Event: strings.Clone(TraceMetadataString(event, 64))}
 	knownKeys := []string{c.GetString("key"), GetContextKeyString(c, constant.ContextKeyChannelKey)}
 	clean := func(value gjson.Result, limit int) string {
 		if value.Type != gjson.String {
@@ -123,6 +124,7 @@ func ClearUpstreamBusinessError(c *gin.Context) {
 
 func (record *UpstreamBusinessError) LogContent(note string, knownKeys ...string) string {
 	snapshot := *record
+	snapshot.Kind = upstreamBusinessErrorKey
 	snapshot.Note = SanitizeErrorLogContent(note, knownKeys...)
 	data, err := Marshal(snapshot)
 	if err != nil {

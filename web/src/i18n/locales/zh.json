@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Upstream business error (HTTP 200)": "上游业务错误（HTTP 200）",
+    "Request Status": "请求状态",
     "Request metadata retention (days)": "请求元数据保留天数",
     "Request timeline retention (days)": "请求时间线保留天数",
     "Default: 30 days. Expired records are cleaned automatically. 0 keeps records indefinitely. Usage logs are kept.": "默认保留 30 天，过期自动清理；0 表示永久保留。原用量日志不受影响。",

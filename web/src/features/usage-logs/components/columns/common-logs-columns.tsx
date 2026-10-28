@@ -531,6 +531,11 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
             isTask={other?.is_task === true}
             tokensPerSecond={tokensPerSecond}
             streamStatus={other?.stream_status}
+            businessError={
+              log.type === 2 || log.type === 5
+                ? parseUpstreamBusinessError(log.content)
+                : null
+            }
           />
         )
       },

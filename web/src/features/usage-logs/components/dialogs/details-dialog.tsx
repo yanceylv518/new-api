@@ -67,7 +67,7 @@ import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import { AuditDetailFields } from '../../audit/components/audit-detail-fields'
-import type { UsageLog } from '../../data/schema'
+import { UPSTREAM_BUSINESS_ERROR_KIND, type UsageLog } from '../../data/schema'
 import {
   formatTraceTime,
   useRequestTraces,
@@ -610,6 +610,7 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
     if (props.log.type !== 2 && props.log.type !== 5) return null
     return parseUpstreamBusinessError(props.log.content)
   }, [props.log.content, props.log.type])
+  const streamStatus = other?.stream_status
   const details = businessError
     ? JSON.stringify(businessError, null, 2)
     : ((isTopup ? operationText : null) ?? props.log.content ?? '')
@@ -1285,42 +1286,51 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
             />
           )}
 
-        {/* Stream status details */}
-        {other?.stream_status && other.stream_status.status !== 'ok' && (
-          <DetailSection label={t('Stream Status')}>
+        {(businessError || (streamStatus && streamStatus.status !== 'ok')) && (
+          <DetailSection
+            label={
+              props.log.is_stream ? t('Stream Status') : t('Request Status')
+            }
+          >
             <DetailRow
               label={t('Status')}
               value={
-                <StatusBadge
-                  label={other.stream_status.status || t('Error')}
-                  variant='red'
-                  size='sm'
-                  copyable={false}
-                />
+                <span className='text-destructive'>
+                  {businessError
+                    ? t('Upstream business error (HTTP 200)')
+                    : streamStatus?.status || t('Error')}
+                </span>
               }
             />
-            {other.stream_status.end_reason && (
+            {businessError && (
+              <DetailRow
+                label={t('Error Type')}
+                value={UPSTREAM_BUSINESS_ERROR_KIND}
+                mono
+              />
+            )}
+            {streamStatus?.end_reason && (
               <DetailRow
                 label={t('End Reason')}
-                value={other.stream_status.end_reason}
+                value={streamStatus.end_reason}
               />
             )}
-            {(other.stream_status.error_count ?? 0) > 0 && (
+            {(streamStatus?.error_count ?? 0) > 0 && (
               <DetailRow
                 label={t('Soft Errors')}
-                value={String(other.stream_status.error_count)}
+                value={String(streamStatus?.error_count)}
               />
             )}
-            {other.stream_status.end_error && (
+            {streamStatus?.end_error && (
               <DetailRow
                 label={t('End Error')}
-                value={other.stream_status.end_error}
+                value={streamStatus.end_error}
               />
             )}
-            {Array.isArray(other.stream_status.errors) &&
-              other.stream_status.errors.length > 0 && (
+            {Array.isArray(streamStatus?.errors) &&
+              streamStatus.errors.length > 0 && (
                 <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
-                  {other.stream_status.errors.join('\n')}
+                  {streamStatus.errors.join('\n')}
                 </pre>
               )}
           </DetailSection>

@@ -88,6 +88,9 @@ func TestUpstreamBusinessErrorFields(t *testing.T) {
 			}
 			var saved common.UpstreamBusinessError
 			require.NoError(t, common.UnmarshalJsonStr(record.LogContent("billing note"), &saved))
+			var savedFields map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(record.LogContent("billing note"), &savedFields))
+			assert.Equal(t, "upstream_business_error", savedFields["kind"])
 			assert.Equal(t, "billing note", saved.Note)
 			assert.Empty(t, record.Note)
 		})
@@ -253,6 +256,9 @@ func TestRequestTraceBusinessErrorProtocolMatrix(t *testing.T) {
 						require.NoError(t, db.Where("request_id = ?", recorder.Header().Get(common.RequestIdKey)).First(&row).Error)
 						var saved common.UpstreamBusinessError
 						require.NoError(t, common.UnmarshalJsonStr(row.Content, &saved))
+						var savedFields map[string]any
+						require.NoError(t, common.UnmarshalJsonStr(row.Content, &savedFields))
+						assert.Equal(t, "upstream_business_error", savedFields["kind"])
 						assert.Equal(t, 200, saved.HTTPStatus)
 						assert.Equal(t, common.GetPointer(429), saved.ReportedStatusCode)
 						assert.Equal(t, `"upstream_timeout"`, string(saved.Error.Code))
