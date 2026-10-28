@@ -239,6 +239,7 @@ func RequestTraceMetadata() gin.HandlerFunc {
 				attemptResponse, metadata, reason = attempt.Observer.Snapshot()
 				upstream.ResponseID, upstream.Model, upstream.Object, upstream.Created = metadata.ResponseID, metadata.Model, metadata.Object, metadata.Created
 				upstream.Fingerprint, upstream.ServiceTier, upstream.ErrorType, upstream.ErrorCode = metadata.Fingerprint, metadata.ServiceTier, metadata.ErrorType, metadata.ErrorCode
+				upstream.Usage = metadata.Usage
 			}
 			last := index == len(attempts)-1
 			attemptFailed := attempt.Failed || attemptResponse.Error || upstream.Status >= 400 || upstream.ErrorType != "" || (last && failed)
@@ -311,6 +312,15 @@ func RequestTraceMetadata() gin.HandlerFunc {
 				data.AdminInfo.Response.MetadataIncomplete = true
 			}
 			encoded, err := common.MarshalRequestTraceStorageData(data)
+			if err != nil && data.AdminInfo.Upstream.Usage != nil {
+				logger.LogError(c, "failed to encode upstream usage: "+err.Error())
+				data.AdminInfo.Upstream.Usage = &common.RequestTraceUsage{Format: data.AdminInfo.Upstream.Usage.Format, Parts: []common.RequestTraceUsagePart{}, Incomplete: true}
+				data.AdminInfo.Response.MetadataIncomplete = true
+				if len(data.AdminInfo.Response.IncompleteReasons) < 8 {
+					data.AdminInfo.Response.IncompleteReasons = append(data.AdminInfo.Response.IncompleteReasons, "usage_invalid_json")
+				}
+				encoded, err = common.MarshalRequestTraceStorageData(data)
+			}
 			if err != nil {
 				logger.LogError(c, "failed to encode request trace: "+err.Error())
 				continue

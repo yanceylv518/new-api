@@ -1,6 +1,64 @@
 # 请求追踪日志设计
 
-文档日期：2026-10-22。整合分支：`custom/rc35-discount-request-trace`，基线为最新折扣提交 `b20277c71`。
+文档日期：2026-10-26。整合分支：`custom/rc35-discount-request-trace`，基线为最新折扣提交 `b20277c71`。
+
+## 完整上游用量与表结构契约（2026-10-26）
+
+两张表继续固定为元数据 6 列、时间线 21 列。新增详情扩展版本化 JSON，不新增普通业务列。
+MySQL 的 `request_trace_metadata.data`、`request_trace_timeline.trace_data` 明确为 `LONGTEXT NOT NULL`、
+`utf8mb4`；PostgreSQL/SQLite 使用 `text`，ClickHouse 使用 `String`。主键由 ORM 按数据库生成，
+SQLite 保持 `INTEGER PRIMARY KEY` 的 64 位自增语义。MySQL 请求 ID 使用 `VARCHAR(64)`、
+`utf8mb4_bin`，长度与其他关联表及详情 API 的 64 位限制一致。
+
+元数据的用户 ID、创建时间为非空有符号 BIGINT，尝试编号为非空有符号 INT；匿名用户沿用 0，
+上游分配前失败沿用 attempt=-1。创建时间固定为 Unix 秒。索引为主键 id、
+唯一 `(request_id, attempt)`、清理 `(created_at, id)`。ClickHouse 用户 ID 扩为 Int64，
+创建时间保留 ReplacingMergeTree 版本列要求的 UInt64，单位同样是秒。
+
+时间线的用户/令牌/最终渠道 ID 为可空 BIGINT，模型/分组为可空 TEXT，节点名为非空 TEXT；
+is_stream、http_status 保持可空，后者为 INT。所有 `_us` 时间及偏移为有符号 BIGINT 微秒，
+两个首字节/首写偏移保持可空，`first_payload_write_offset_us` 目前为未采集的兼容列，不补造 0。
+started_at_us、finished_at_us、duration_us 非空，结束时点沿用转发终点，不含后续结算/日志时间。
+request_kind、outcome、capture_status 使用非空 VARCHAR(32)，不用数据库 ENUM；尝试次数和结构
+版本使用非空 INT。索引保持主键 id、唯一 request_id、清理 `(started_at_us, id)`。
+
+主库和独立日志库均走显式结构迁移，不再对元数据调用 AutoMigrate。迁移前读取实际类型、
+可空性、请求 ID 排序规则及索引，只有不符合契约的部分才修改；历史 NULL、超范围数值、
+过长字符串、未知结构会阻止升级，不自动填值或删除历史行。SQLite 列迁移在事务内保留原有
+索引、触发器与自增序号。生产升级应备份后由一个迁移节点先完成，DDL 可能持锁或重建大表，
+不能把容量放宽当作无锁操作；其他节点随后启动，避免并行修改同一结构。
+
+完整上游用量存于元数据 JSON 的 `admin_info.upstream.usage`，使用 `{format, parts, incomplete}`。
+每个 part 保存 `{event?, path, value}`；value 为原始 JSON 子值，保留未知字段、嵌套数组、null、
+显式 0 及大整数。采集在协议转换、客户端模型改名、Token 补算之前进行，只复制用量，不保存
+完整返回正文。Chat、Responses、Claude、Gemini 的已接入解码路径与公共 HTTP 字节观察路径共用
+采集器；Bedrock Claude SDK 也建立每次尝试的原始响应观察器，不伪造 HTTP 响应头/首字节时点。
+
+JSON 通常只有一个 part。SSE 按原始事件及字段位置保存；Claude 的 message_start.message.usage
+与 message_delta.usage 分开保留。相同片段去重，只有新累计快照完整覆盖旧字段时才替代，
+无法确认覆盖关系或包含变化数组时保留片段，不逐帧相加，也不额外保存合并副本。
+每次尝试最多保存 64 KiB 用量值、32 个片段，超过边界标记 usage_size_limit 和 incomplete，
+保留其余元数据；元数据总上限仍为 1 MiB，时间线仍为 64 KiB，LONGTEXT 不取消应用层限制。
+完整用量也保留在已采样的成功摘要记录中，其余详细统计仍沿用 errors/all 档位；off 不采集。
+记录继续按既有异步队列尽力写入，拥塞、整组超预算或进程退出可能丢弃，不提供审计式必达保证。
+
+用量随整条元数据统一压缩，沿用采样与保留期，过期及手动清理直接删除所在记录。详情 API
+只向管理员返回用量，原始 value 在响应中映射为两空格缩进的 raw_value JSON 字符串，使用
+common.IndentJson 保留大整数、科学计数法、null 和显式 0，避免浏览器 number 精度损失；
+数据库不回写格式化结果、不重复保存字符串副本。管理员详情按尝试直接展示，复用上游错误 JSON
+的单层文本区块及复制按钮，移除折叠、内部标题、编辑器工具栏和额外嵌套卡片；详情忽略值为
+null 的用量片段，全部为空时显示未提供用量，采集不完整时保留提示。用量文本区最高 20rem，
+并受视口高度 50% 限制，超出后在区块内部滚动；复制按钮位于滚动区外，复制完整内容。
+原始 null 仍按上游报告保存在数据库，历史记录无 usage 时不伪造、不回填。
+
+初版实现仅做静态检查。2026-10-26 后续格式化与协议验证：隔离 MySQL 8.4.11 上 304 个唯一
+后端用例通过且无竞态、无跳过，前端 77 个唯一用例通过。原生覆盖 Chat/Completions、Responses、
+Responses compact（仅 JSON）、Claude Messages、Gemini JSON/SSE，另有 64 个四协议转换组合；
+覆盖完整字段、权限、大整数、累计/分片、重试、超限、旧记录与 MySQL 主库/独立日志库迁移。
+修复 compact 用量协议标识遗漏及 Claude SDK 业务错误的空 HTTP 响应引用；错误帧协议可由
+实际业务解码类型补充，不根据模型名推断。使用本地可控上游和项目真实处理器，未调用真实付费
+模型或 AWS 网络接口；未测 PostgreSQL/ClickHouse、负载或浏览器。上述结果对应格式化与协议
+验证版本，后续取消折叠、过滤 null 和内部滚动布局仅通过类型、lint、格式检查，未重跑行为测试。
 
 ## 本分支的整合约定
 

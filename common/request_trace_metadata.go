@@ -310,6 +310,9 @@ type TraceBodyObserver struct {
 	level         TraceMetadataLevel
 	summaryEvents int64
 	source        *TraceBodyObserver
+	upstreamUsage bool
+	usageBytes    int
+	usageFormat   string
 }
 
 func NewTraceBodyObserver(started time.Time) *TraceBodyObserver {
@@ -339,6 +342,7 @@ func (o *TraceBodyObserver) relatedObserver(level TraceMetadataLevel) *TraceBody
 	}
 	observer := NewTraceBodyObserverWithMode(time.Time{}, level)
 	observer.workspace = o.workspace
+	observer.upstreamUsage = true
 	return observer
 }
 
@@ -667,7 +671,9 @@ func (o *TraceBodyObserver) Snapshot() (RequestTraceResponse, RequestTraceUpstre
 		}
 		response.ToolCallsByName[name]++
 	}
-	return response, o.upstream, o.finishReason
+	upstream := o.upstream
+	upstream.Usage = o.usageSnapshot()
+	return response, upstream, o.finishReason
 }
 
 // HasError 读取已解析的错误状态；收尾时先 Finish，避免遗漏最后一个事件。
@@ -764,6 +770,7 @@ func traceSummaryNeedsParsing(data []byte) bool {
 }
 
 func (o *TraceBodyObserver) consumePayload(data []byte) {
+	o.captureUsage(data)
 	summary := o.level == TraceMetadataSummary
 	if summary && o.stream && !traceSummaryNeedsParsing(data) {
 		o.summaryEvents++

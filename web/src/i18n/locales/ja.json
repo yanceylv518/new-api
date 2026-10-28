@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "上流の使用量",
+    "View usage": "使用量を表示",
+    "Upstream usage was not reported.": "上流から使用量が報告されていません。",
+    "Upstream usage was not captured completely.": "上流の使用量を完全に取得できませんでした。",
     "Upstream business error (HTTP 200)": "上流の処理エラー（HTTP 200）",
     "Request Status": "リクエストの状態",
     "Request metadata retention (days)": "リクエストメタデータの保持日数",

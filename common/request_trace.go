@@ -205,20 +205,34 @@ type RequestTraceResponse struct {
 }
 
 type RequestTraceUpstream struct {
-	Status             int    `json:"status,omitempty"`
-	Protocol           string `json:"proto,omitempty"`
-	RequestBytes       *int64 `json:"req_bytes,omitempty"`
-	HeaderMilliseconds int64  `json:"header_ms"`
-	Milliseconds       *int64 `json:"ms,omitempty"`
-	RequestID          string `json:"request_id,omitempty"`
-	ResponseID         string `json:"resp_id,omitempty"`
-	Model              string `json:"resp_model,omitempty"`
-	Object             string `json:"object,omitempty"`
-	Created            *int64 `json:"created,omitempty"`
-	Fingerprint        string `json:"fingerprint,omitempty"`
-	ServiceTier        string `json:"service_tier,omitempty"`
-	ErrorType          string `json:"error_type,omitempty"`
-	ErrorCode          string `json:"error_code,omitempty"`
+	Status             int                `json:"status,omitempty"`
+	Protocol           string             `json:"proto,omitempty"`
+	RequestBytes       *int64             `json:"req_bytes,omitempty"`
+	HeaderMilliseconds int64              `json:"header_ms"`
+	Milliseconds       *int64             `json:"ms,omitempty"`
+	RequestID          string             `json:"request_id,omitempty"`
+	ResponseID         string             `json:"resp_id,omitempty"`
+	Model              string             `json:"resp_model,omitempty"`
+	Object             string             `json:"object,omitempty"`
+	Created            *int64             `json:"created,omitempty"`
+	Fingerprint        string             `json:"fingerprint,omitempty"`
+	ServiceTier        string             `json:"service_tier,omitempty"`
+	ErrorType          string             `json:"error_type,omitempty"`
+	ErrorCode          string             `json:"error_code,omitempty"`
+	Usage              *RequestTraceUsage `json:"usage,omitempty"`
+}
+
+type RequestTraceUsage struct {
+	Format     string                  `json:"format,omitempty"`
+	Parts      []RequestTraceUsagePart `json:"parts"`
+	Incomplete bool                    `json:"incomplete,omitempty"`
+}
+
+type RequestTraceUsagePart struct {
+	Event    string          `json:"event,omitempty"`
+	Path     string          `json:"path"`
+	Value    json.RawMessage `json:"value,omitempty"`
+	RawValue string          `json:"raw_value,omitempty"`
 }
 
 type RequestTraceClient struct {
@@ -252,12 +266,13 @@ func MarshalRequestTraceStorageData(data RequestTraceData) ([]byte, error) {
 		return Marshal(data)
 	}
 	type summaryUpstream struct {
-		Status             int    `json:"status,omitempty"`
-		HeaderMilliseconds int64  `json:"header_ms,omitempty"`
-		Milliseconds       *int64 `json:"ms,omitempty"`
-		RequestID          string `json:"request_id,omitempty"`
-		ErrorType          string `json:"error_type,omitempty"`
-		ErrorCode          string `json:"error_code,omitempty"`
+		Status             int                `json:"status,omitempty"`
+		HeaderMilliseconds int64              `json:"header_ms,omitempty"`
+		Milliseconds       *int64             `json:"ms,omitempty"`
+		RequestID          string             `json:"request_id,omitempty"`
+		ErrorType          string             `json:"error_type,omitempty"`
+		ErrorCode          string             `json:"error_code,omitempty"`
+		Usage              *RequestTraceUsage `json:"usage,omitempty"`
 	}
 	type summaryResponse struct {
 		Error              bool     `json:"error,omitempty"`
@@ -285,7 +300,7 @@ func MarshalRequestTraceStorageData(data RequestTraceData) ([]byte, error) {
 		AdminInfo: summaryAdmin{
 			MetadataLevel: admin.MetadataLevel, ChannelID: admin.ChannelID, Shape: admin.Shape,
 			ShapeIncomplete: admin.ShapeIncomplete, ShapeIncompleteReason: admin.ShapeIncompleteReason,
-			Upstream: summaryUpstream{Status: admin.Upstream.Status, HeaderMilliseconds: admin.Upstream.HeaderMilliseconds, Milliseconds: admin.Upstream.Milliseconds, RequestID: admin.Upstream.RequestID, ErrorType: admin.Upstream.ErrorType, ErrorCode: admin.Upstream.ErrorCode},
+			Upstream: summaryUpstream{Status: admin.Upstream.Status, HeaderMilliseconds: admin.Upstream.HeaderMilliseconds, Milliseconds: admin.Upstream.Milliseconds, RequestID: admin.Upstream.RequestID, ErrorType: admin.Upstream.ErrorType, ErrorCode: admin.Upstream.ErrorCode, Usage: admin.Upstream.Usage},
 			Response: summaryResponse{Error: admin.Response.Error, Done: admin.Response.Done, EndMarker: admin.Response.EndMarker, MetadataIncomplete: admin.Response.MetadataIncomplete, IncompleteReasons: admin.Response.IncompleteReasons, EndMarkerPolicy: admin.Response.EndMarkerPolicy},
 		},
 	})

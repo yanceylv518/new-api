@@ -73,6 +73,12 @@ func setupRequestTraceDatabase(t testing.TB) *gorm.DB {
 		sqlDB.SetMaxOpenConns(1)
 	}
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.RequestTraceMetadata{}, &model.Option{}, &model.AuditLog{}, &model.UserSession{}))
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		common.IsMasterNode = true
+		migrationError := model.InitLogDB()
+		common.IsMasterNode = false
+		require.NoError(t, migrationError)
+	}
 	require.NoError(t, db.Create(&model.User{Id: 11, Username: "trace-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "trace-owner"}).Error)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -145,6 +151,8 @@ func TestRequestTraceProtocolMetadata(t *testing.T) {
 				client.Finish()
 				forwarded, forwardedUpstream, forwardedReason := client.Snapshot()
 				assert.Equal(t, response, forwarded)
+				assert.Nil(t, forwardedUpstream.Usage)
+				upstream.Usage = nil
 				assert.Equal(t, upstream, forwardedUpstream)
 				assert.Equal(t, reason, forwardedReason)
 			}
@@ -683,7 +691,9 @@ func TestRequestTraceMiddlewareModes(t *testing.T) {
 
 func TestRequestTraceDetailAuthorizationAndLegacyLogs(t *testing.T) {
 	db := setupRequestTraceDatabase(t)
-	data := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 200}, AdminInfo: &common.RequestTraceAdmin{ChannelID: 7}})
+	rawUsage := `{"input_tokens":0,"nested":{"wide":9007199254740993,"nullable":null},"array":[0,1e3]}`
+	formattedUsage := "{\n  \"input_tokens\": 0,\n  \"nested\": {\n    \"wide\": 9007199254740993,\n    \"nullable\": null\n  },\n  \"array\": [\n    0,\n    1e3\n  ]\n}"
+	data := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 200}, AdminInfo: &common.RequestTraceAdmin{ChannelID: 7, Upstream: common.RequestTraceUpstream{Usage: &common.RequestTraceUsage{Format: "openai", Parts: []common.RequestTraceUsagePart{{Path: "usage", Value: []byte(rawUsage)}}}}}})
 	rows := []model.RequestTraceMetadata{{RequestId: "trace-owned", Attempt: 0, UserId: 11, CreatedAt: 1, Data: data}, {RequestId: "trace-owned", Attempt: 1, UserId: 11, CreatedAt: 2, Data: data}, {RequestId: "trace-anonymous", Attempt: -1, UserId: 0, CreatedAt: 3, Data: data}}
 	require.NoError(t, model.RecordRequestTraces(t.Context(), rows))
 	require.NoError(t, model.RecordRequestTraces(t.Context(), rows))
@@ -723,7 +733,11 @@ func TestRequestTraceDetailAuthorizationAndLegacyLogs(t *testing.T) {
 				assert.Nil(t, result.Data[0].AdminInfo)
 			} else {
 				require.NotEmpty(t, result.Data)
-				assert.NotNil(t, result.Data[0].AdminInfo)
+				require.NotNil(t, result.Data[0].AdminInfo)
+				require.NotNil(t, result.Data[0].AdminInfo.Upstream.Usage)
+				require.Len(t, result.Data[0].AdminInfo.Upstream.Usage.Parts, 1)
+				assert.Equal(t, formattedUsage, result.Data[0].AdminInfo.Upstream.Usage.Parts[0].RawValue)
+				assert.Nil(t, result.Data[0].AdminInfo.Upstream.Usage.Parts[0].Value)
 			}
 		}
 	}
@@ -1749,7 +1763,7 @@ func TestRequestTraceDecodedMetadataParity(t *testing.T) {
 						}
 						payload = "data: " + textFrames[format] + "\n\n" + payload
 					}
-					original := common.NewTraceBodyObserverWithMode(time.Now(), level)
+					original := common.NewTraceBodyObserverWithMode(time.Now(), level).NewRelatedObserverWithMode(level)
 					original.ObserveString(payload, contentType)
 					original.Finish()
 					wantResponse, wantUpstream, wantReason := original.Snapshot()
@@ -2268,6 +2282,7 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 						if refused {
 							payload = requestTraceProtocolRefusalPayload(upstreamFormat, stream)
 						}
+						payload = requestTraceUsageFixture(payload)
 						response := &http.Response{StatusCode: 200, Proto: "HTTP/2.0", Header: http.Header{"Content-Type": []string{contentType}}, Body: &common.TraceResponseBody{ReadCloser: io.NopCloser(strings.NewReader(payload)), ContentType: contentType, Observer: attempt.Observer}}
 						observation := timeline.StartUpstream("http", false)
 						observation.Response(response, nil)
@@ -2336,6 +2351,7 @@ func TestRequestTraceConversionFieldMatrix(t *testing.T) {
 					admin := record.AdminInfo
 					assert.Equal(t, "source-id", admin.Upstream.ResponseID)
 					assert.Equal(t, "upstream-model", admin.Upstream.Model)
+					assertRequestTraceUsage(t, admin.Upstream.Usage, upstreamFormat, stream)
 					assert.Equal(t, "source-request-id", admin.Upstream.RequestID)
 					assert.Equal(t, "HTTP/2.0", admin.Upstream.Protocol)
 					assert.Equal(t, 200, admin.Upstream.Status)

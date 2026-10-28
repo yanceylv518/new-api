@@ -234,6 +234,8 @@ func getAwsModelID(requestModel string) string {
 }
 
 func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+	common.StartSDKRequestTrace(c, info.RetryIndex, info.ChannelId, int64(len(a.AwsReq.(*bedrockruntime.InvokeModelInput).Body)), false)
+	defer common.FinishSDKRequestTrace(c, info.RetryIndex)
 
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
@@ -265,6 +267,8 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 }
 
 func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+	common.StartSDKRequestTrace(c, info.RetryIndex, info.ChannelId, int64(len(a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput).Body)), true)
+	defer common.FinishSDKRequestTrace(c, info.RetryIndex)
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()

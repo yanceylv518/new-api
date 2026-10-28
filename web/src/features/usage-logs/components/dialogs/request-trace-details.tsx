@@ -25,6 +25,7 @@ import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 
@@ -34,7 +35,49 @@ import type {
   useRequestTraces,
 } from '../../hooks/use-request-traces'
 import { parseLogOther } from '../../lib/format'
-import { DetailRow, DetailSection } from './log-detail-layout'
+import { DetailContent, DetailRow, DetailSection } from './log-detail-layout'
+
+function UpstreamUsageDetails(props: {
+  record: RequestTrace
+  showAttempt: boolean
+}) {
+  const { t } = useTranslation()
+  const usage = props.record.admin_info?.upstream.usage
+  if (!usage) return null
+  const visibleParts = usage.parts.filter(
+    (part) => part.raw_value.trim() !== 'null'
+  )
+  return (
+    <div className='min-w-0 space-y-1.5'>
+      <Label className='text-xs font-semibold'>{t('Upstream usage')}</Label>
+      {props.showAttempt && (
+        <p className='text-muted-foreground text-xs'>
+          {t('Attempt {{number}}', { number: props.record.attempt + 1 })}
+        </p>
+      )}
+      {usage.incomplete && (
+        <StatusBadge
+          label={t('Upstream usage was not captured completely.')}
+          variant='orange'
+          copyable={false}
+        />
+      )}
+      {visibleParts.length === 0 && !usage.incomplete && (
+        <p className='text-muted-foreground text-xs'>
+          {t('Upstream usage was not reported.')}
+        </p>
+      )}
+      {visibleParts.map((part) => (
+        <DetailContent
+          key={`${part.event ?? ''}:${part.path}:${part.raw_value}`}
+          value={part.raw_value}
+          mono
+          scrollLabel={t('Upstream usage')}
+        />
+      ))}
+    </div>
+  )
+}
 
 function formatTraceBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -153,6 +196,8 @@ const TraceAttemptDetails = memo(function TraceAttemptDetails(
     tool_limit: t('Tool-call capture limit reached'),
     invalid_tool_name: t('Tool name is invalid or too long'),
     invalid_tool_index: t('Tool-call index is invalid'),
+    usage_size_limit: t('Upstream usage was not captured completely.'),
+    usage_invalid_json: t('Upstream usage was not captured completely.'),
     capture_upgraded: t(
       'Detailed capture started after earlier events; earlier text and tool statistics are unavailable.'
     ),
@@ -529,6 +574,14 @@ export function RequestTraceDetails(props: {
         log={props.log}
         isAdmin={props.isAdmin}
       />
+      {props.isAdmin &&
+        records.map((record) => (
+          <UpstreamUsageDetails
+            key={`${record.request_id}:${record.attempt}`}
+            record={record}
+            showAttempt={records.length > 1}
+          />
+        ))}
       {(props.query.isPending || props.query.isTracePending) &&
         props.log.request_id && (
           <div role='status' aria-live='polite'>

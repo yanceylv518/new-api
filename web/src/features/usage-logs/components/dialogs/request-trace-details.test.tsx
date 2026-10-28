@@ -439,6 +439,175 @@ describe('HTTP 200 upstream business error logs', () => {
 })
 
 describe('request trace log details', () => {
+  const formattedUsage =
+    '{\n  "zero": 0,\n  "wide": 9007199254740993,\n  "nullable": null\n}'
+  const usageRecord = {
+    ...detailed,
+    admin_info: {
+      ...detailed.admin_info,
+      upstream: {
+        ...detailed.admin_info.upstream,
+        usage: {
+          format: 'openai',
+          parts: [{ path: 'usage', raw_value: formattedUsage }],
+        },
+      },
+    },
+  }
+
+  test('shows formatted usage directly with a copy control and preserves numeric precision', async () => {
+    const user = userEvent.setup()
+    const writeText = vi
+      .spyOn(navigator.clipboard, 'writeText')
+      .mockResolvedValue()
+    vi.spyOn(api, 'get').mockResolvedValue(response([usageRecord]))
+    renderDetails({ isAdmin: true })
+    const content = await screen.findByText(
+      (_text, element) =>
+        element?.tagName === 'P' && element.textContent === formattedUsage
+    )
+    expect(content).toBeVisible()
+    expect(content).toHaveClass('font-mono', 'whitespace-pre-wrap')
+    expect(
+      screen.queryByRole('button', { name: 'View usage' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('textbox', { name: 'json' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Copy to clipboard' }))
+    expect(writeText).toHaveBeenCalledWith(formattedUsage)
+  })
+
+  test('updates directly displayed usage when switching between cached request details', async () => {
+    const client = queryClient()
+    const nextUsage = formattedUsage.replace('"zero": 0', '"zero": 1')
+    client.setQueryDefaults(['request-traces'], { gcTime: Infinity })
+    vi.spyOn(api, 'get').mockResolvedValue(response([]))
+    for (const id of ['trace-first', 'trace-second']) {
+      client.setQueryData(['request-traces', 11, 1, id], {
+        records: [
+          {
+            ...usageRecord,
+            request_id: id,
+            admin_info: {
+              ...usageRecord.admin_info,
+              upstream: {
+                ...usageRecord.admin_info.upstream,
+                usage: {
+                  parts: [
+                    {
+                      path: 'usage',
+                      raw_value:
+                        id === 'trace-first' ? formattedUsage : nextUsage,
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        pending: false,
+      })
+    }
+    const view = render(
+      <QueryClientProvider client={client}>
+        <DetailsDialog
+          log={{ ...log, request_id: 'trace-first' }}
+          open
+          isAdmin
+          isRoot={false}
+          onOpenChange={() => undefined}
+        />
+      </QueryClientProvider>
+    )
+    expect(
+      await screen.findByText(
+        (_text, element) =>
+          element?.tagName === 'P' && element.textContent === formattedUsage
+      )
+    ).toBeVisible()
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <DetailsDialog
+          log={{ ...log, request_id: 'trace-second' }}
+          open
+          isAdmin
+          isRoot={false}
+          onOpenChange={() => undefined}
+        />
+      </QueryClientProvider>
+    )
+    expect(
+      await screen.findByText(
+        (_text, element) =>
+          element?.tagName === 'P' && element.textContent === nextUsage
+      )
+    ).toBeVisible()
+    expect(
+      screen.queryByText(
+        (_text, element) =>
+          element?.tagName === 'P' && element.textContent === formattedUsage
+      )
+    ).not.toBeInTheDocument()
+  })
+
+  test('does not expose upstream usage to ordinary users', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(response([usageRecord]))
+    renderDetails()
+    await screen.findByText('Input Tokens')
+    expect(screen.queryByText('Upstream usage')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'View usage' })
+    ).not.toBeInTheDocument()
+  })
+
+  test.each([false, true])(
+    'distinguishes missing from incomplete usage, incomplete=%s',
+    async (incomplete) => {
+      vi.spyOn(api, 'get').mockResolvedValue(
+        response([
+          {
+            ...usageRecord,
+            admin_info: {
+              ...usageRecord.admin_info,
+              upstream: {
+                ...usageRecord.admin_info.upstream,
+                usage: { parts: [], incomplete },
+              },
+            },
+          },
+        ])
+      )
+      renderDetails({ isAdmin: true })
+      const message = incomplete
+        ? 'Upstream usage was not captured completely.'
+        : 'Upstream usage was not reported.'
+      expect(await screen.findByText(message)).toBeVisible()
+      expect(
+        screen.queryByRole('button', { name: 'View usage' })
+      ).not.toBeInTheDocument()
+    }
+  )
+
+  test('shows usage from retry attempts directly in separate sections', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([usageRecord, { ...usageRecord, attempt: 1 }])
+    )
+    renderDetails({ isAdmin: true })
+    const values = await screen.findAllByText(
+      (_text, element) =>
+        element?.tagName === 'P' && element.textContent === formattedUsage
+    )
+    expect(values).toHaveLength(2)
+    expect(screen.getByText('Attempt 1')).toBeVisible()
+    expect(screen.getByText('Attempt 2')).toBeVisible()
+    expect(values[0]).toBeVisible()
+    expect(values[1]).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'View usage' })
+    ).not.toBeInTheDocument()
+  })
+
   test('hides uncollected counts for summary metadata while preserving billing tokens', async () => {
     vi.spyOn(api, 'get').mockResolvedValue(
       response([

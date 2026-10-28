@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "Использование у провайдера",
+    "View usage": "Показать использование",
+    "Upstream usage was not reported.": "Провайдер не сообщил данные об использовании.",
+    "Upstream usage was not captured completely.": "Данные об использовании у провайдера записаны не полностью.",
     "Upstream business error (HTTP 200)": "Ошибка обработки на стороне провайдера (HTTP 200)",
     "Request Status": "Состояние запроса",
     "Request metadata retention (days)": "Хранение метаданных запросов (дни)",

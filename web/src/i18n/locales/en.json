@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "Upstream usage",
+    "View usage": "View usage",
+    "Upstream usage was not reported.": "Upstream usage was not reported.",
+    "Upstream usage was not captured completely.": "Upstream usage was not captured completely.",
     "Upstream business error (HTTP 200)": "Upstream business error (HTTP 200)",
     "Request Status": "Request Status",
     "Request metadata retention (days)": "Request metadata retention (days)",

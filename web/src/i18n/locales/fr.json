@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "Utilisation en amont",
+    "View usage": "Afficher l’utilisation",
+    "Upstream usage was not reported.": "Le fournisseur n’a pas indiqué l’utilisation.",
+    "Upstream usage was not captured completely.": "L’utilisation en amont n’a pas été entièrement enregistrée.",
     "Upstream business error (HTTP 200)": "Erreur applicative en amont (HTTP 200)",
     "Request Status": "État de la requête",
     "Request metadata retention (days)": "Conservation des métadonnées des requêtes (jours)",

@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "Mức sử dụng từ nhà cung cấp",
+    "View usage": "Xem mức sử dụng",
+    "Upstream usage was not reported.": "Nhà cung cấp không báo cáo mức sử dụng.",
+    "Upstream usage was not captured completely.": "Chưa thu thập đầy đủ mức sử dụng từ nhà cung cấp.",
     "Upstream business error (HTTP 200)": "Lỗi xử lý từ thượng nguồn (HTTP 200)",
     "Request Status": "Trạng thái yêu cầu",
     "Request metadata retention (days)": "Thời gian giữ siêu dữ liệu yêu cầu (ngày)",

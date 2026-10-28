@@ -18,9 +18,49 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { ReactNode } from 'react'
 
+import { CopyButton } from '@/components/copy-button'
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
 import { Label } from '@/components/ui/label'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
+
+export function DetailContent(props: {
+  value: string
+  mono?: boolean
+  scrollLabel?: string
+}) {
+  const content = (
+    <p
+      className={cn(
+        'min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word',
+        props.mono && 'font-mono'
+      )}
+    >
+      {props.value}
+    </p>
+  )
+  return (
+    <div className='bg-muted/30 relative min-w-0 overflow-hidden rounded-md border p-2.5'>
+      <CopyButton
+        value={props.value}
+        size='icon'
+        className='absolute top-1.5 right-1.5 h-5 w-5 p-0'
+        iconClassName='size-3'
+      />
+      {props.scrollLabel ? (
+        <ScrollArea
+          role='region'
+          aria-label={props.scrollLabel}
+          className='w-full [&_[data-slot=scroll-area-viewport]]:max-h-[min(20rem,50dvh)] [&_[data-slot=scroll-area-viewport]]:overscroll-contain'
+        >
+          {content}
+        </ScrollArea>
+      ) : (
+        content
+      )}
+    </div>
+  )
+}
 
 export function DetailRow(props: {
   label: ReactNode

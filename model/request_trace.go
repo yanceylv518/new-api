@@ -19,26 +19,26 @@ const requestTraceTableName = "request_trace_timeline"
 // RequestTrace 调整列时须显式迁移并保留历史数据；TraceData 按版本兼容旧格式。
 type RequestTrace struct {
 	Id                            int64   `json:"id" gorm:"primaryKey;autoIncrement;index:idx_request_traces_started,priority:2"`
-	RequestId                     string  `json:"request_id" gorm:"type:varchar(64);not null;uniqueIndex:idx_request_traces_request_id"`
+	RequestId                     string  `json:"request_id" gorm:"type:varchar(64);size:64;not null;uniqueIndex:idx_request_traces_request_id"`
 	UserId                        *int64  `json:"user_id" gorm:"type:bigint"`
 	TokenId                       *int64  `json:"token_id" gorm:"type:bigint"`
 	ModelName                     *string `json:"model_name" gorm:"type:text"`
 	GroupName                     *string `json:"group_name" gorm:"type:text"`
 	FinalChannelId                *int64  `json:"final_channel_id" gorm:"type:bigint"`
-	RequestKind                   string  `json:"request_kind" gorm:"type:varchar(32);not null"`
+	RequestKind                   string  `json:"request_kind" gorm:"type:varchar(32);size:32;not null"`
 	IsStream                      *bool   `json:"is_stream"`
 	HTTPStatus                    *int    `json:"http_status" gorm:"column:http_status;type:integer"`
-	Outcome                       string  `json:"outcome" gorm:"type:varchar(32);not null"`
+	Outcome                       string  `json:"outcome" gorm:"type:varchar(32);size:32;not null"`
 	StartedAtUS                   int64   `json:"started_at_us" gorm:"column:started_at_us;type:bigint;not null;index:idx_request_traces_started,priority:1"`
 	FinishedAtUS                  int64   `json:"finished_at_us" gorm:"column:finished_at_us;type:bigint;not null"`
 	DurationUS                    int64   `json:"duration_us" gorm:"column:duration_us;type:bigint;not null"`
 	FinalAttemptFirstByteOffsetUS *int64  `json:"final_attempt_first_byte_offset_us" gorm:"column:final_attempt_first_byte_offset_us;type:bigint"`
 	FirstPayloadWriteOffsetUS     *int64  `json:"first_payload_write_offset_us" gorm:"column:first_payload_write_offset_us;type:bigint"`
 	AttemptCount                  int     `json:"attempt_count" gorm:"type:integer;not null"`
-	CaptureStatus                 string  `json:"capture_status" gorm:"type:varchar(32);not null"`
+	CaptureStatus                 string  `json:"capture_status" gorm:"type:varchar(32);size:32;not null"`
 	NodeId                        string  `json:"node_id" gorm:"type:text;not null"`
 	SchemaVersion                 int     `json:"schema_version" gorm:"type:integer;not null"`
-	TraceData                     string  `json:"-" gorm:"not null"`
+	TraceData                     string  `json:"-" gorm:"type:text;not null"`
 }
 
 func (RequestTrace) TableName() string {
@@ -130,15 +130,14 @@ func MigrateRequestTraces() error {
 		ORDER BY (request_id)`).Error; err != nil {
 			return err
 		}
+		if err := migrateTraceClickHouseColumns(LOG_DB, &RequestTrace{}); err != nil {
+			return err
+		}
 		if err := removeRequestTraceTTL(context.Background(), requestTraceTableName); err != nil {
 			return err
 		}
-	} else if !LOG_DB.Migrator().HasTable(&RequestTrace{}) {
-		db := LOG_DB
-		if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
-			db = db.Set("gorm:table_options", "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
-		}
-		if err := db.Migrator().CreateTable(&RequestTrace{}); err != nil && !LOG_DB.Migrator().HasTable(&RequestTrace{}) {
+	} else {
+		if err := migrateTraceRelationalSchema(LOG_DB, &RequestTrace{}, "trace_data"); err != nil {
 			return err
 		}
 	}

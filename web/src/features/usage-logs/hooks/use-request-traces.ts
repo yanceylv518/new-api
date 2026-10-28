@@ -77,6 +77,11 @@ export type RequestTrace = {
       service_tier?: string
       error_type?: string
       error_code?: string
+      usage?: {
+        format?: string
+        parts: { event?: string; path: string; raw_value: string }[]
+        incomplete?: boolean
+      }
     }
     resp: {
       error?: boolean

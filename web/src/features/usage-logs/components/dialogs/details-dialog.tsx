@@ -53,7 +53,6 @@ import {
 import { memo, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
@@ -96,7 +95,7 @@ import {
 } from '../../lib/utils'
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { PluginAuthorLink } from '../plugin-author-link'
-import { DetailRow, DetailSection } from './log-detail-layout'
+import { DetailContent, DetailRow, DetailSection } from './log-detail-layout'
 import { RequestTraceDetails } from './request-trace-details'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
@@ -1420,22 +1419,7 @@ function OpenLogDetailsDialog(props: DetailsDialogProps) {
             <Label className='text-xs font-semibold'>
               {businessError ? t('Upstream error JSON') : t('Content')}
             </Label>
-            <div className='bg-muted/30 relative min-w-0 overflow-hidden rounded-md border p-2.5'>
-              <CopyButton
-                value={details}
-                size='icon'
-                className='absolute top-1.5 right-1.5 h-5 w-5 p-0'
-                iconClassName='size-3'
-              />
-              <p
-                className={cn(
-                  'min-w-0 pr-6 text-xs leading-relaxed break-all whitespace-pre-wrap sm:wrap-break-word',
-                  businessError && 'font-mono'
-                )}
-              >
-                {details}
-              </p>
-            </div>
+            <DetailContent value={details} mono={Boolean(businessError)} />
             {businessError?.truncated && (
               <p className='text-muted-foreground text-xs'>
                 {t('Error details were shortened.')}

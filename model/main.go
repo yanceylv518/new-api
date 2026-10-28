@@ -236,6 +236,9 @@ func InitLogDB() (err error) {
 			if err := MigrateAuditLogs(); err != nil {
 				return err
 			}
+			if err := migrateRequestTraces(); err != nil {
+				return err
+			}
 			return MigrateRequestTraces()
 		}
 		return
@@ -336,6 +339,9 @@ func migrateDB() error {
 	if err := migrateRequestTraceTableName(DB); err != nil {
 		return err
 	}
+	if err := migrateRequestTraceMetadata(DB); err != nil {
+		return err
+	}
 
 	err := DB.AutoMigrate(
 		&Channel{},
@@ -354,7 +360,6 @@ func migrateDB() error {
 		&Redemption{},
 		&Ability{},
 		&Log{},
-		&RequestTraceMetadata{},
 		&Midjourney{},
 		&TopUp{},
 		&QuotaData{},

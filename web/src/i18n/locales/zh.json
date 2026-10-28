@@ -1,5 +1,9 @@
 {
   "translation": {
+    "Upstream usage": "上游用量",
+    "View usage": "查看用量",
+    "Upstream usage was not reported.": "上游未提供用量。",
+    "Upstream usage was not captured completely.": "上游用量采集不完整。",
     "Upstream business error (HTTP 200)": "上游业务错误（HTTP 200）",
     "Request Status": "请求状态",
     "Request metadata retention (days)": "请求元数据保留天数",

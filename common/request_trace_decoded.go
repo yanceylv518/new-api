@@ -40,6 +40,7 @@ func UseDecodedRequestTrace(c *gin.Context, response *http.Response) {
 		return
 	}
 	o.decoded = true
+	o.upstreamUsage = true
 	o.buffer, o.event = nil, nil
 	c.Set(decodedRequestTraceKey, o)
 }
@@ -562,8 +563,22 @@ func (o *TraceBodyObserver) ObserveDecoded(data []byte, value any) {
 	if o.finished || o.source != nil || len(data) == 0 {
 		return
 	}
+	if o.upstreamUsage && o.usageFormat == "" {
+		// 错误事件可能没有协议标识，使用实际业务解码类型补充来源，不依据模型名猜测。
+		switch value.(type) {
+		case dto.ClaudeResponse, *dto.ClaudeResponse:
+			o.usageFormat = "claude"
+		case dto.ChatCompletionsStreamResponse, *dto.ChatCompletionsStreamResponse, *dto.OpenAITextResponse:
+			o.usageFormat = "openai"
+		case *dto.OpenAIResponsesResponse, *dto.ResponsesStreamResponse:
+			o.usageFormat = "openai_responses"
+		case *dto.GeminiChatResponse:
+			o.usageFormat = "gemini"
+		}
+	}
 	o.observed = o.observed || len(data) > 0
 	if len(data) > o.bufferLimit() {
+		o.captureUsage(data)
 		o.markIncomplete("size_limit")
 		return
 	}
@@ -582,6 +597,7 @@ func (o *TraceBodyObserver) ObserveDecoded(data []byte, value any) {
 	*parser = tracePayloadParser{}
 	o.workspace.Unlock()
 	if reused {
+		o.captureUsage(data)
 		o.mergeMetadata(metadata)
 		return
 	}

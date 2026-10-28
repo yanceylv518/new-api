@@ -38,7 +38,8 @@ func requestTraceWriterMySQL(t *testing.T) (*gorm.DB, *requestTraceWriter) {
 	DB, LOG_DB = db, db
 	common.SetDatabaseTypes(dbType, dbType)
 	initCol()
-	require.NoError(t, db.AutoMigrate(&RequestTraceMetadata{}, &SystemTask{}))
+	require.NoError(t, db.AutoMigrate(&SystemTask{}))
+	require.NoError(t, migrateRequestTraces())
 	require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", `{"level":"all","compression_level":"fast"}`))
 	t.Cleanup(func() {
 		assert.NoError(t, sqlDB.Close())

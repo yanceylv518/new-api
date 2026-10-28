@@ -11,12 +11,12 @@ import (
 )
 
 type RequestTraceMetadata struct {
-	Id        int64  `gorm:"primaryKey"`
-	RequestId string `gorm:"type:varchar(64);uniqueIndex:idx_request_trace_attempt,priority:1"`
-	Attempt   int    `gorm:"uniqueIndex:idx_request_trace_attempt,priority:2"`
-	UserId    int
-	CreatedAt int64  `gorm:"index:idx_request_traces_created_at"`
-	Data      string `gorm:"type:text"`
+	Id        int64  `gorm:"primaryKey;autoIncrement;index:idx_request_traces_created_at,priority:2"`
+	RequestId string `gorm:"type:varchar(64);size:64;not null;uniqueIndex:idx_request_trace_attempt,priority:1"`
+	Attempt   int    `gorm:"type:integer;not null;uniqueIndex:idx_request_trace_attempt,priority:2"`
+	UserId    int    `gorm:"type:bigint;not null"`
+	CreatedAt int64  `gorm:"type:bigint;not null;index:idx_request_traces_created_at,priority:1"`
+	Data      string `gorm:"type:text;not null"`
 }
 
 func (RequestTraceMetadata) TableName() string {
@@ -95,6 +95,16 @@ func GetRequestTraces(ctx context.Context, requestId string, userId int, admin b
 		}
 		if !admin {
 			data.AdminInfo = nil
+		} else if data.AdminInfo != nil && data.AdminInfo.Upstream.Usage != nil {
+			// 仅缩进原始 JSON，不重解码数值，避免浏览器丢失大整数精度。
+			for index := range data.AdminInfo.Upstream.Usage.Parts {
+				part := &data.AdminInfo.Upstream.Usage.Parts[index]
+				formatted, err := common.IndentJson(part.Value)
+				if err != nil {
+					return nil, fmt.Errorf("format request trace usage: %w", err)
+				}
+				part.RawValue, part.Value = string(formatted), nil
+			}
 		}
 		views = append(views, RequestTraceView{RequestId: row.RequestId, Attempt: row.Attempt, CreatedAt: row.CreatedAt, RequestTraceData: data})
 	}
@@ -185,17 +195,24 @@ func migrateRequestTraceTableName(db *gorm.DB) error {
 }
 
 func migrateRequestTraces() error {
-	if err := migrateRequestTraceTableName(LOG_DB); err != nil {
+	return migrateRequestTraceMetadata(LOG_DB)
+}
+
+func migrateRequestTraceMetadata(db *gorm.DB) error {
+	if err := migrateRequestTraceTableName(db); err != nil {
 		return err
 	}
-	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		return LOG_DB.AutoMigrate(&RequestTraceMetadata{})
+	if db.Dialector.Name() != "clickhouse" {
+		return migrateTraceRelationalSchema(db, &RequestTraceMetadata{}, "data")
 	}
 	statement := `CREATE TABLE IF NOT EXISTS request_trace_metadata (
-		id Int64 DEFAULT 0, request_id String, attempt Int32, user_id Int32,
+		id Int64 DEFAULT 0, request_id String, attempt Int32, user_id Int64,
 		created_at UInt64, data String
 	) ENGINE = ReplacingMergeTree(created_at) ORDER BY (request_id, attempt)`
-	if err := LOG_DB.Exec(statement).Error; err != nil {
+	if err := db.Exec(statement).Error; err != nil {
+		return err
+	}
+	if err := migrateTraceClickHouseColumns(db, &RequestTraceMetadata{}); err != nil {
 		return err
 	}
 	return removeRequestTraceTTL(context.Background(), "request_trace_metadata")

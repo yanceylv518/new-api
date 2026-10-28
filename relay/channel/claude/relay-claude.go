@@ -328,7 +328,12 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeResponse.Error != nil {
-		common.CaptureUpstreamBusinessError(c, httpResp.StatusCode, "error", string(data))
+		// SDK 成功返回正文时没有 http.Response，业务错误仍需按成功传输后的失败记录。
+		status := http.StatusOK
+		if httpResp != nil {
+			status = httpResp.StatusCode
+		}
+		common.CaptureUpstreamBusinessError(c, status, "error", string(data))
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
