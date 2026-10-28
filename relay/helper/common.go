@@ -68,7 +68,13 @@ func ClaudeData(c *gin.Context, resp dto.ClaudeResponse) error {
 		common.SysError("error marshalling stream response: " + err.Error())
 	} else {
 		c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-		c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonData)})
+		event := common.CustomEvent{Data: "data: " + string(jsonData)}
+		if common.TraceEventEnabled(c.Writer) {
+			decoded := resp
+			c.Render(-1, common.DecodedEvent{CustomEvent: event, Value: &decoded})
+		} else {
+			c.Render(-1, event)
+		}
 	}
 	_ = FlushWriter(c)
 	return nil
@@ -80,7 +86,13 @@ func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) {
 	}
 
 	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s\n", data)})
+	event := common.CustomEvent{Data: fmt.Sprintf("data: %s\n", data)}
+	if common.TraceEventEnabled(c.Writer) {
+		decoded := resp
+		c.Render(-1, common.DecodedEvent{CustomEvent: event, Value: &decoded})
+	} else {
+		c.Render(-1, event)
+	}
 	_ = FlushWriter(c)
 }
 
@@ -90,11 +102,21 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	}
 
 	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s", data)})
+	event := common.CustomEvent{Data: fmt.Sprintf("data: %s", data)}
+	if common.TraceEventEnabled(c.Writer) {
+		decoded := resp
+		c.Render(-1, common.DecodedEvent{CustomEvent: event, Value: &decoded})
+	} else {
+		c.Render(-1, event)
+	}
 	return FlushWriter(c)
 }
 
 func StringData(c *gin.Context, str string) error {
+	return DecodedStringData(c, str, nil)
+}
+
+func DecodedStringData(c *gin.Context, str string, value any) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
 	}
@@ -103,7 +125,12 @@ func StringData(c *gin.Context, str string) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: "data: " + str})
+	event := common.CustomEvent{Data: "data: " + str}
+	if value != nil && common.TraceEventEnabled(c.Writer) {
+		c.Render(-1, common.DecodedEvent{CustomEvent: event, Value: value})
+	} else {
+		c.Render(-1, event)
+	}
 	return FlushWriter(c)
 }
 
@@ -130,7 +157,7 @@ func ObjectData(c *gin.Context, object interface{}) error {
 	if err != nil {
 		return fmt.Errorf("error marshalling object: %w", err)
 	}
-	return StringData(c, string(jsonData))
+	return DecodedStringData(c, string(jsonData), object)
 }
 
 func Done(c *gin.Context) {

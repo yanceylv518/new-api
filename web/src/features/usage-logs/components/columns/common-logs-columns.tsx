@@ -44,6 +44,7 @@ import type { UsageLog } from '../../data/schema'
 import {
   formatModelName,
   parseLogOther,
+  parseUpstreamBusinessError,
   isViolationFeeLog,
   renderAuditContent,
 } from '../../lib/format'
@@ -98,11 +99,12 @@ function buildDetailSegments(
   isAdmin: boolean
 ): DetailSegment[] {
   const segments = buildTypeDetailSegments(log, other, t)
+  const businessError =
+    log.type === 2 || log.type === 5
+      ? parseUpstreamBusinessError(log.content)
+      : null
   const adminSegments: DetailSegment[] = []
-  // Quota saturation is a rare, admin-only anomaly marker; surface it first
-  // and in danger styling so it stands out on the related billing log. The
-  // backend already strips admin_info for non-admins; gate on isAdmin too as
-  // defense in depth so the marker never leaks if that changes.
+  // 额度异常仅向管理员展示，优先于普通计费摘要。
   if (isAdmin && other?.admin_info?.quota_saturation) {
     adminSegments.push({ text: t('Quota clamped'), danger: true })
   }
@@ -113,7 +115,17 @@ function buildDetailSegments(
       text: `${t('Plugin')}: ${plugin.name || plugin.key}${version}`,
     })
   }
-  return [...adminSegments, ...segments]
+  const result = [...adminSegments, ...segments]
+  if (businessError) {
+    const code = businessError.error.code
+    result.unshift({
+      text: [t('Upstream failed'), `HTTP ${businessError.http_status}`, code]
+        .filter((value) => value !== undefined && value !== '')
+        .join(' · '),
+      danger: true,
+    })
+  }
+  return result
 }
 
 function buildTypeDetailSegments(

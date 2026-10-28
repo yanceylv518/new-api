@@ -86,7 +86,7 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 
 func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
-	err := common.UnmarshalJsonStr(data, &claudeResponse)
+	err := common.UnmarshalRequestTraceResponse(c, common.StringToByteSlice(data), &claudeResponse)
 	if err != nil {
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
@@ -208,8 +208,7 @@ func sendGeminiStreamResults(c *gin.Context, results []relayconvert.ResponseResu
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
-		c.Render(-1, common.CustomEvent{Data: "data: " + string(data)})
-		_ = helper.FlushWriter(c)
+		_ = helper.DecodedStringData(c, string(data), geminiResponse)
 	}
 	return nil
 }
@@ -285,6 +284,10 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 }
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
+	if info.RelayFormat == types.RelayFormatClaude && shouldSkipClaudeMessageDeltaUsagePatch(info) {
+		common.ReuseUpstreamRequestTrace(c, resp)
+	}
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
 		Created:      common.GetTimestamp(),
@@ -294,6 +297,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 	var err *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if strings.Contains(data, `"error"`) {
+			common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", data)
+		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
 			sr.Stop(err)
@@ -309,9 +315,12 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 
 func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
-	err := common.Unmarshal(data, &claudeResponse)
+	err := common.UnmarshalRequestTraceResponse(c, data, &claudeResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if claudeResponse.Error != nil {
+		common.CaptureUpstreamBusinessError(c, httpResp.StatusCode, "error", string(data))
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
@@ -361,6 +370,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		}
 	case types.RelayFormatClaude:
 		responseData = data
+		common.ReuseUpstreamRequestTrace(c, httpResp)
 	case types.RelayFormatGemini:
 		{
 			convertResult, convertErr := service.ConvertResponse(c, info, types.RelayFormatGemini, &claudeResponse)
@@ -393,6 +403,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 }
 
 func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
 	defer service.CloseResponseBodyGracefully(resp)
 
 	claudeInfo := &ClaudeResponseInfo{

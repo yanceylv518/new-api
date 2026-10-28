@@ -48,3 +48,20 @@ export const usageLogSchema = z.object({
 })
 
 export type UsageLog = z.infer<typeof usageLogSchema>
+
+export const upstreamBusinessErrorSchema = z.object({
+  http_status: z.literal(200),
+  event: z.enum(['error', 'response.failed', 'response.error']),
+  reported_status_code: z.number().int().min(100).max(599).optional(),
+  error: z.object({
+    type: z.string().optional(),
+    code: z.union([z.string(), z.number()]).optional(),
+    message: z.string().optional(),
+    param: z.string().optional(),
+    status: z.string().optional(),
+  }),
+  note: z.string().optional(),
+  truncated: z.boolean().optional(),
+})
+
+export type UpstreamBusinessError = z.infer<typeof upstreamBusinessErrorSchema>

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/internal/requesttracetest"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -30,17 +31,28 @@ import (
 func TestMain(m *testing.M) {
 	var dialect gorm.Dialector = sqlite.Open(":memory:")
 	databaseType := common.DatabaseTypeSQLite
-	// 外部验证只允许专用 Compose 的回环地址，且拒绝使用已有表的数据库。
-	switch os.Getenv("TASK_BILLING_TEST_DATABASE") {
-	case "", "sqlite":
-	case "mysql":
-		dialect = mysql.Open("root@tcp(127.0.0.1:13326)/pricing_review?charset=utf8mb4&parseTime=true&timeout=5s")
-		databaseType = common.DatabaseTypeMySQL
-	case "postgres":
-		dialect = postgres.Open("postgres://postgres@127.0.0.1:15427/pricing_review?sslmode=disable&connect_timeout=5")
-		databaseType = common.DatabaseTypePostgreSQL
-	default:
-		panic("unsupported TASK_BILLING_TEST_DATABASE")
+	suiteCleanup := func() error { return nil }
+	if traceDSN := os.Getenv("REQUEST_TRACE_TEST_DSN"); traceDSN != "" {
+		dsn, cleanup, err := requesttracetest.SuiteMySQLDSN(traceDSN, "service-suite")
+		if err != nil {
+			panic(err)
+		}
+		suiteCleanup = cleanup
+		defer func() { _ = suiteCleanup() }()
+		dialect, databaseType = mysql.Open(dsn), common.DatabaseTypeMySQL
+	} else {
+		// 外部验证只允许专用 Compose 的回环地址，且拒绝使用已有表的数据库。
+		switch os.Getenv("TASK_BILLING_TEST_DATABASE") {
+		case "", "sqlite":
+		case "mysql":
+			dialect = mysql.Open("root@tcp(127.0.0.1:13326)/pricing_review?charset=utf8mb4&parseTime=true&timeout=5s")
+			databaseType = common.DatabaseTypeMySQL
+		case "postgres":
+			dialect = postgres.Open("postgres://postgres@127.0.0.1:15427/pricing_review?sslmode=disable&connect_timeout=5")
+			databaseType = common.DatabaseTypePostgreSQL
+		default:
+			panic("unsupported TASK_BILLING_TEST_DATABASE")
+		}
 	}
 	db, err := gorm.Open(dialect, &gorm.Config{})
 	if err != nil {
@@ -72,6 +84,7 @@ func TestMain(m *testing.M) {
 		&model.User{},
 		&model.Token{},
 		&model.Log{},
+		&model.RequestTraceMetadata{},
 		&model.Channel{},
 		&model.Midjourney{},
 		&model.TopUp{},
@@ -89,6 +102,9 @@ func TestMain(m *testing.M) {
 	if err := sqlDB.Close(); err != nil && exitCode == 0 {
 		exitCode = 1
 	}
+	if err := suiteCleanup(); err != nil && exitCode == 0 {
+		exitCode = 1
+	}
 	os.Exit(exitCode)
 }
 
@@ -103,6 +119,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
 		model.DB.Exec("DELETE FROM logs")
+		model.DB.Exec("DELETE FROM request_trace_metadata")
 		model.DB.Exec("DELETE FROM channels")
 		model.DB.Exec("DELETE FROM midjourneys")
 		model.DB.Exec("DELETE FROM top_ups")

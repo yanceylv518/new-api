@@ -488,8 +488,20 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	common2.ClearUpstreamBusinessError(c)
+	common2.UseDecodedRequestTrace(c, nil)
+	trace := common2.GetRequestTrace(c)
+	var attempt *common2.RequestTraceAttempt
+	c.Set(common2.UpstreamRequestIdKey, "")
+	c.Set(common2.UpstreamRequestIDCapturedContextKey, false)
+	if trace != nil {
+		attempt = trace.StartAttempt(info.RetryIndex, info.ChannelId, req)
+	}
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
+		if attempt != nil {
+			attempt.Upstream.ErrorType = "proxy_config_error"
+		}
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
 	// Clients are cached and shared across channels, so override redirect
@@ -531,11 +543,37 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 
 	resp, err := relayClient.Do(req)
 	if err != nil {
+		if attempt != nil {
+			attempt.Upstream.ErrorType = "transport_error"
+		}
 		logger.LogError(c, "do request failed: "+err.Error())
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
+		if attempt != nil {
+			attempt.Upstream.ErrorType = "empty_response"
+		}
 		return nil, errors.New("resp is nil")
+	}
+	if attempt != nil {
+		attempt.Upstream.Status = resp.StatusCode
+		attempt.Upstream.Protocol = resp.Proto
+		attempt.Upstream.HeaderMilliseconds = time.Since(attempt.Started).Milliseconds()
+		level := trace.ResponseMetadataLevel(attempt.ChannelID, resp.StatusCode)
+		if attempt.Diagnostic {
+			level = common2.TraceMetadataFull
+		}
+		attempt.Observer = common2.NewTraceBodyObserverWithMode(trace.Started, level)
+		if trace.ClientObserver != nil {
+			attempt.Observer = trace.ClientObserver.NewRelatedObserverWithMode(level)
+		}
+		attempt.Observer.Prepare(resp.Header.Get("Content-Type"), resp.ContentLength)
+		if attempt.Diagnostic {
+			trace.ClientObserver.PromoteToFull()
+		}
+		if resp.Body != nil {
+			resp.Body = &common2.TraceResponseBody{ReadCloser: resp.Body, Observer: attempt.Observer, ContentType: resp.Header.Get("Content-Type")}
+		}
 	}
 	if common2.DebugEnabled {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
@@ -549,9 +587,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		))
 	}
 
-	upID := resp.Header.Get(common2.RequestIdKey)
-	if upID == "" {
-		upID = resp.Header.Get("X-Request-Id")
+	upID := common2.GetUpstreamRequestID(resp.Header)
+	c.Set(common2.UpstreamRequestIDCapturedContextKey, true)
+	if attempt != nil {
+		attempt.Upstream.RequestID = upID
 	}
 	if upID != "" {
 		c.Set(common2.UpstreamRequestIdKey, upID)

@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 )
 
 func GeminiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	common.UseDecodedRequestTrace(c, resp)
 	defer service.CloseResponseBodyGracefully(resp)
 
 	responseBody, err := io.ReadAll(resp.Body)
@@ -28,8 +30,11 @@ func GeminiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	logger.LogDebug(c, "Gemini responses response body: %s", responseBody)
 
 	var geminiResponse dto.GeminiChatResponse
-	if err := common.Unmarshal(responseBody, &geminiResponse); err != nil {
+	if err := common.UnmarshalRequestTraceResponse(c, responseBody, &geminiResponse); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if bytes.Contains(responseBody, []byte(`"error"`)) {
+		common.CaptureUpstreamBusinessError(c, resp.StatusCode, "error", string(responseBody))
 	}
 	markGeminiGoogleSearchCall(c, &geminiResponse)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)

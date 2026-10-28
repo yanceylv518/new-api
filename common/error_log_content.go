@@ -10,14 +10,14 @@ import (
 const errorLogBase64Placeholder = "[BASE64_REDACTED]"
 const errorLogUnmarkedBase64MinLength = 256
 const errorLogBase64FieldNames = `(?:b64_json|bytes[_-]?base64[_-]?encoded|(?:image|audio|video|file)[_-]?base64|base64(?:[_-]?(?:image|audio|video|file|data))?)`
-const errorLogBase64Chunk = `(?:[a-z0-9+/_-]|\\[/rn])+`
+const errorLogBase64Chunk = `(?:[a-z0-9+/_-]|\\[/rnt])+`
 
 var (
-	errorLogDataURLPattern         = regexp.MustCompile(`(?i)(data:[^,\s"'<>]*;base64,)(?:[a-z0-9+/_=-]|\\[/rn])+`)
-	errorLogBase64FieldPattern     = regexp.MustCompile(`(?i)(\b` + errorLogBase64FieldNames + `\\?["']?\s*[:=]\s*)(\\?["']?)((?:[a-z0-9+/_=-]|\\[/rn])+)(\\?["']?)`)
-	errorLogMultilineBase64Pattern = regexp.MustCompile(`(?i)(data:[^,\s"'<>]*;base64,|\b` + errorLogBase64FieldNames + `\\?["']?\s*[:=]\s*\\?["']?)(` + errorLogBase64Chunk + `(?:(?:\r\n|\r|\n)` + errorLogBase64Chunk + `)+={0,2})(\\?["']|[ \t\r\n<>,;}\]]|$)`)
-	errorLogBase64RunPattern       = regexp.MustCompile(`(?:[A-Za-z0-9+/_-]|\\[/rn])+={0,2}`)
-	errorLogBase64Escapes          = strings.NewReplacer(`\/`, "/", `\r`, "", `\n`, "", "\r", "", "\n", "")
+	errorLogDataURLPattern         = regexp.MustCompile(`(?i)(data:[^,\s"'<>]*;base64,)(?:[a-z0-9+/_=-]|\\[/rnt])+`)
+	errorLogBase64FieldPattern     = regexp.MustCompile(`(?i)(\b` + errorLogBase64FieldNames + `\\?["']?\s*[:=]\s*)(\\?["']?)((?:[a-z0-9+/_=-]|\\[/rnt])+)(\\?["']?)`)
+	errorLogMultilineBase64Pattern = regexp.MustCompile(`(?i)(data:[^,\s"'<>]*;base64,|\b` + errorLogBase64FieldNames + `\\?["']?\s*[:=]\s*\\?["']?)(` + errorLogBase64Chunk + `(?:(?:\r\n|\r|\n)[ \t]*` + errorLogBase64Chunk + `)+={0,2})(\\?["']|[ \t\r\n<>,;}\]]|$)`)
+	errorLogBase64RunPattern       = regexp.MustCompile(`(?:[A-Za-z0-9+/_-]|\\[/rnt])+={0,2}`)
+	errorLogBase64Escapes          = strings.NewReplacer(`\/`, "/", `\r`, "", `\n`, "", `\t`, "", "\r", "", "\n", "", "\t", "", " ", "")
 )
 
 // SanitizeErrorLogContent 移除错误日志中的凭证和媒体编码，保留周围诊断文字。
@@ -40,7 +40,15 @@ func SanitizeErrorLogContent(content string, knownKeys ...string) string {
 		return parts[1] + errorLogBase64Placeholder + suffix + parts[3]
 	})
 	content = errorLogDataURLPattern.ReplaceAllString(content, "${1}"+errorLogBase64Placeholder)
-	content = errorLogBase64FieldPattern.ReplaceAllString(content, "${1}${2}"+errorLogBase64Placeholder+"${4}")
+	content = errorLogBase64FieldPattern.ReplaceAllStringFunc(content, func(match string) string {
+		parts := errorLogBase64FieldPattern.FindStringSubmatch(match)
+		field := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(parts[1]), ":="))
+		// 裸 base64 标签也会出现在解码错误文字中，先校验以免吞掉原始诊断。
+		if strings.EqualFold(field, "base64") && parts[2] == "" && !isErrorLogBase64(parts[3]) {
+			return match
+		}
+		return parts[1] + parts[2] + errorLogBase64Placeholder + parts[4]
+	})
 	return errorLogBase64RunPattern.ReplaceAllStringFunc(content, func(encoded string) string {
 		// 无字段或 data URL 标记时只识别长编码，避免把普通错误码和请求 ID 当成媒体。
 		if len(encoded) < errorLogUnmarkedBase64MinLength {

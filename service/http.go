@@ -24,18 +24,18 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 }
 
 // ShouldCopyUpstreamHeader 不复制 Content-Length 和上游的 X-Oneapi-Request-Id。
-// 记录上游请求 ID 时，X-Oneapi-Request-Id 优先于 X-Request-Id。
+// 公共发送入口已按配置选取请求 ID；其他响应路径沿用默认响应头的优先级。
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 	if strings.EqualFold(k, "Content-Length") {
 		return false
 	}
 	if strings.EqualFold(k, common.RequestIdKey) {
-		if c != nil && len(v) > 0 && v[0] != "" {
+		if c != nil && !c.GetBool(common.UpstreamRequestIDCapturedContextKey) && len(v) > 0 && v[0] != "" {
 			c.Set(common.UpstreamRequestIdKey, v[0])
 		}
 		return false
 	}
-	if strings.EqualFold(k, "X-Request-Id") && c != nil && c.GetString(common.UpstreamRequestIdKey) == "" && len(v) > 0 && v[0] != "" {
+	if strings.EqualFold(k, "X-Request-Id") && c != nil && !c.GetBool(common.UpstreamRequestIDCapturedContextKey) && c.GetString(common.UpstreamRequestIdKey) == "" && len(v) > 0 && v[0] != "" {
 		c.Set(common.UpstreamRequestIdKey, v[0])
 	}
 	return true
@@ -45,8 +45,6 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 	if c.Writer == nil {
 		return
 	}
-
-	body := io.NopCloser(bytes.NewBuffer(data))
 
 	// We shouldn't set the header before we parse the response body, because the parse part may fail.
 	// And then we will have to send an error response, but in this case, the header has already been set.
@@ -71,7 +69,13 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 		c.Writer.WriteHeader(http.StatusOK)
 	}
 
-	_, err := io.Copy(c.Writer, body)
+	var err error
+	if writer, ok := c.Writer.(interface{ WriteTraceResponse([]byte) (int, error) }); ok {
+		_, err = writer.WriteTraceResponse(data)
+	} else {
+		body := io.NopCloser(bytes.NewBuffer(data))
+		_, err = io.Copy(c.Writer, body)
+	}
 	if err != nil {
 		logger.LogError(c, fmt.Sprintf("failed to copy response body: %s", err.Error()))
 	}

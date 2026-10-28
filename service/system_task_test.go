@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // withSystemTaskRegistry swaps the package registry for the given handlers for
@@ -60,6 +62,156 @@ func countSystemTasks(t *testing.T, taskType string) int64 {
 	var count int64
 	require.NoError(t, model.DB.Model(&model.SystemTask{}).Where("type = ?", taskType).Count(&count).Error)
 	return count
+}
+
+func TestRequestTraceRetentionMySQL(t *testing.T) {
+	if !common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+		t.Skip("request trace retention integration requires MySQL")
+	}
+	for _, scenario := range []string{"retention", "disabled", "extended-before-run", "disabled-after-batch", "cancelled", "manual-cleanup", "manual-log-read-failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			truncate(t)
+			previous := common.GetRequestTraceConfig()
+			t.Cleanup(func() {
+				assert.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(previous)))
+			})
+			days := 7
+			if scenario == "disabled" || scenario == "manual-cleanup" || scenario == "manual-log-read-failure" {
+				days = 0
+			}
+			config := common.RequestTraceConfig{Level: "errors", CompressionLevel: "fast", SuccessSampleRate: 100, RetentionDays: days}
+			require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+			now := time.Now()
+			old, recent := now.Add(-10*24*time.Hour).Unix(), now.Add(-2*24*time.Hour).Unix()
+			data := common.GetJsonString(common.RequestTraceData{Trace: common.RequestTraceSummary{Status: 200}})
+			rows := []model.RequestTraceMetadata{
+				{RequestId: "retention-old-a", UserId: 11, CreatedAt: old, Data: data},
+				{RequestId: "retention-old-b", UserId: 11, CreatedAt: old, Data: data},
+				{RequestId: "retention-recent", UserId: 11, CreatedAt: recent, Data: data},
+			}
+			require.NoError(t, model.RecordRequestTraces(t.Context(), rows))
+			require.NoError(t, model.DB.Create(&model.Log{UserId: 11, CreatedAt: old, Other: `{"unchanged":true}`}).Error)
+			payload := LogCleanupPayload{TargetTimestamp: now.Add(-7 * 24 * time.Hour).Unix(), BatchSize: 1}
+			if scenario == "extended-before-run" {
+				payload.TargetTimestamp = now.Add(-24 * time.Hour).Unix()
+			}
+			taskType := model.SystemTaskTypeRequestTraceCleanup
+			if scenario == "manual-cleanup" || scenario == "manual-log-read-failure" {
+				taskType = model.SystemTaskTypeLogCleanup
+			}
+			task, err := model.CreateSystemTask(taskType, payload, nil)
+			require.NoError(t, err)
+			claimed, locked, err := model.ClaimSystemTask(task.ID, taskType, "trace-retention-runner", common.GetTimestamp()+60)
+			require.NoError(t, err)
+			require.True(t, locked)
+			if scenario == "disabled-after-batch" {
+				require.NoError(t, model.LOG_DB.Callback().Delete().After("gorm:delete").Register("disable-trace-retention", func(tx *gorm.DB) {
+					if tx.Statement.Table == (model.RequestTraceMetadata{}).TableName() {
+						config.RetentionDays = 0
+						tx.AddError(common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, model.LOG_DB.Callback().Delete().Remove("disable-trace-retention")) })
+			}
+			ctx := t.Context()
+			if scenario == "manual-log-read-failure" {
+				require.NoError(t, model.LOG_DB.Callback().Query().Before("gorm:query").Register("fail-log-cleanup-count", func(tx *gorm.DB) {
+					if tx.Statement.Table == "logs" {
+						tx.AddError(errors.New("test log count unavailable"))
+					}
+				}))
+			}
+			if scenario == "cancelled" {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			if scenario == "manual-cleanup" || scenario == "manual-log-read-failure" {
+				runLogCleanupTask(ctx, claimed, "trace-retention-runner")
+			} else {
+				requestTraceCleanupHandler{}.Run(ctx, claimed, "trace-retention-runner")
+			}
+			if scenario == "manual-log-read-failure" {
+				require.NoError(t, model.LOG_DB.Callback().Query().Remove("fail-log-cleanup-count"))
+			}
+			stored, err := model.GetSystemTaskByTaskID(task.TaskID)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			var remaining, logs int64
+			require.NoError(t, model.LOG_DB.Model(&model.RequestTraceMetadata{}).Count(&remaining).Error)
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&logs).Error)
+			if scenario == "cancelled" {
+				assert.Equal(t, model.SystemTaskStatusFailed, stored.Status)
+				assert.EqualValues(t, 3, remaining)
+				return
+			}
+			if scenario == "manual-log-read-failure" {
+				assert.Equal(t, model.SystemTaskStatusFailed, stored.Status)
+				var state LogCleanupState
+				require.NoError(t, stored.DecodeState(&state))
+				assert.Equal(t, "logs", state.Phase)
+				assert.EqualValues(t, 2, state.TraceProcessed)
+				assert.EqualValues(t, 1, remaining)
+				assert.EqualValues(t, 1, logs)
+				return
+			}
+			assert.Equal(t, model.SystemTaskStatusSucceeded, stored.Status)
+			var state LogCleanupState
+			require.NoError(t, stored.DecodeState(&state))
+			assert.Equal(t, "done", state.Phase)
+			assert.Equal(t, 100, state.Progress)
+			switch scenario {
+			case "disabled":
+				assert.EqualValues(t, 3, remaining)
+			case "disabled-after-batch":
+				assert.EqualValues(t, 2, remaining)
+				assert.EqualValues(t, 1, state.TraceProcessed)
+			default:
+				assert.EqualValues(t, 1, remaining)
+				assert.EqualValues(t, 2, state.TraceProcessed)
+			}
+			if scenario == "manual-cleanup" {
+				assert.Zero(t, logs)
+				assert.EqualValues(t, 1, state.Processed)
+			} else {
+				assert.EqualValues(t, 1, logs)
+			}
+		})
+	}
+	t.Run("scheduled cleanup respects enablement and due interval", func(t *testing.T) {
+		truncate(t)
+		previous := common.GetRequestTraceConfig()
+		t.Cleanup(func() {
+			assert.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(previous)))
+		})
+		config := common.RequestTraceConfig{Level: "off", CompressionLevel: "fast", SuccessSampleRate: 100}
+		require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+		handler := requestTraceCleanupHandler{}
+		withSystemTaskRegistry(t, handler)
+		runSystemTaskScheduler()
+		assert.Zero(t, countSystemTasks(t, handler.Type()))
+		config.RetentionDays = 7
+		require.NoError(t, common.SetRequestTraceOption("RequestTraceConfig", common.GetJsonString(config)))
+		before := time.Now().Add(-7 * 24 * time.Hour).Unix()
+		runSystemTaskScheduler()
+		require.EqualValues(t, 1, countSystemTasks(t, handler.Type()))
+		task, err := model.GetLatestSystemTask(handler.Type())
+		require.NoError(t, err)
+		require.NotNil(t, task)
+		var payload LogCleanupPayload
+		require.NoError(t, task.DecodePayload(&payload))
+		assert.GreaterOrEqual(t, payload.TargetTimestamp, before)
+		assert.LessOrEqual(t, payload.TargetTimestamp, time.Now().Add(-7*24*time.Hour).Unix())
+		claimed, locked, err := model.ClaimSystemTask(task.ID, handler.Type(), "trace-scheduler", common.GetTimestamp()+60)
+		require.NoError(t, err)
+		require.True(t, locked)
+		handler.Run(t.Context(), claimed, "trace-scheduler")
+		runSystemTaskScheduler()
+		assert.EqualValues(t, 1, countSystemTasks(t, handler.Type()))
+		require.NoError(t, model.DB.Model(&model.SystemTask{}).Where("task_id = ?", task.TaskID).Update("updated_at", common.GetTimestamp()-7200).Error)
+		runSystemTaskScheduler()
+		assert.EqualValues(t, 2, countSystemTasks(t, handler.Type()))
+	})
 }
 
 func TestSystemTaskSchedulerCreatesWhenDueAndDedups(t *testing.T) {
