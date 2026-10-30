@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -147,6 +147,10 @@ export function LogSettingsSection({
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
+  const previousDefaults = useRef<LogSettingsFormValues>({
+    LogConsumeEnabled: defaultEnabled,
+    RequestTimelineEnabled: defaultTimelineEnabled,
+  })
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
@@ -178,10 +182,26 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({
+    const draft = form.getValues()
+    const nextDefaults = {
       LogConsumeEnabled: defaultEnabled,
       RequestTimelineEnabled: defaultTimelineEnabled,
-    })
+    }
+    form.reset(nextDefaults)
+    // A successful first save can refresh both defaults while the second is
+    // still pending. Preserve unsaved choices; acknowledge server-matched ones.
+    for (const key of [
+      'LogConsumeEnabled',
+      'RequestTimelineEnabled',
+    ] as const) {
+      if (
+        draft[key] !== previousDefaults.current[key] &&
+        draft[key] !== nextDefaults[key]
+      ) {
+        form.setValue(key, draft[key], { shouldDirty: true })
+      }
+    }
+    previousDefaults.current = nextDefaults
   }, [defaultEnabled, defaultTimelineEnabled, form])
 
   useEffect(() => {

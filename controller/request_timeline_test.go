@@ -853,3 +853,118 @@ func TestRequestTimelineErrorCaptureKeepsBoundedSanitizedFields(t *testing.T) {
 		assert.Equal(t, tc.code, event.Error.Code)
 	}
 }
+
+// This gate only coordinates when a real net/http socket is flushed. It never
+// synthesizes a write failure or cancellation; the HTTP client closes the request.
+type timelineCancelFlushGate struct {
+	http.ResponseWriter
+	ctx     context.Context
+	entered chan struct{}
+}
+
+func (w *timelineCancelFlushGate) Flush() {
+	close(w.entered)
+	<-w.ctx.Done()
+	w.ResponseWriter.(http.Flusher).Flush()
+}
+func (w *timelineCancelFlushGate) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func TestRequestTimelineRealHTTPClientCancellationDuringFlush(t *testing.T) {
+	for _, businessFailure := range []bool{false, true} {
+		t.Run(fmt.Sprint("prior_business_failure=", businessFailure), func(t *testing.T) {
+			enteringFlush := make(chan struct{})
+			records := make(chan *requesttimeline.Record, 1)
+			requestContexts := make(chan error, 1)
+			router := gin.New()
+			router.POST("/stream", func(c *gin.Context) {
+				trace := requesttimeline.New(time.Now(), "real-client-cancel", 7, "model")
+				restore := helper.ObserveRequestTimelineWriter(c, trace)
+				defer restore()
+				if businessFailure {
+					trace.BusinessError("overloaded", "upstream business failure")
+				}
+				_ = helper.StringData(c, `{"choices":[{"delta":{"content":"hello"}}]}`)
+				requestContexts <- c.Request.Context().Err()
+				trace.StreamEnd("client_gone", c.Request.Context().Err(), false)
+				records <- trace.Freeze(nil)
+			})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				router.ServeHTTP(&timelineCancelFlushGate{ResponseWriter: w, ctx: r.Context(), entered: enteringFlush}, r)
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/stream", nil)
+			require.NoError(t, err)
+			clientErrors := make(chan error, 1)
+			go func() {
+				resp, err := server.Client().Do(req)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				clientErrors <- err
+			}()
+			select {
+			case <-enteringFlush:
+			case <-time.After(5 * time.Second):
+				t.Fatal("real HTTP handler did not start flushing")
+			}
+			cancel()
+			select {
+			case err := <-clientErrors:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("HTTP client did not cancel")
+			}
+			var record *requesttimeline.Record
+			select {
+			case record = <-records:
+			case <-time.After(5 * time.Second):
+				t.Fatal("HTTP handler did not observe cancellation")
+			}
+			require.ErrorIs(t, <-requestContexts, context.Canceled)
+			require.NotNil(t, record)
+			require.NotNil(t, record.ErrorKind)
+			if businessFailure {
+				assert.Equal(t, "failed", record.Result)
+				assert.Equal(t, "upstream_business_error", *record.ErrorKind)
+				assert.Equal(t, "overloaded", record.Data.FirstError.Code)
+			} else {
+				assert.Equal(t, "interrupted", record.Result)
+				assert.Equal(t, "client_disconnected", *record.ErrorKind)
+				assert.Nil(t, record.Data.FirstWriteMS)
+			}
+		})
+	}
+}
+
+func TestRequestTimelineDistinguishesCancellationDeadlineAndWriteErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		kind, code string
+	}{
+		{"canceled", context.Canceled, "client_disconnected", "client_disconnected"},
+		{"wrapped_cancel", fmt.Errorf("request ended: %w", context.Canceled), "client_disconnected", "client_disconnected"},
+		{"request_deadline", fmt.Errorf("deadline: %w", context.DeadlineExceeded), "timeout", "deadline_exceeded"},
+		{"write_timeout", os.ErrDeadlineExceeded, "timeout", "write_timeout"},
+		{"broken_write", io.ErrClosedPipe, "downstream_write_error", "write_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := requesttimeline.New(time.Now(), tc.name, 7, "model")
+			trace.PayloadWritten(tc.err)
+			trace.StreamEnd("client_gone", context.Canceled, false)
+			record := trace.Freeze(nil)
+			require.NotNil(t, record.ErrorKind)
+			assert.Equal(t, "interrupted", record.Result)
+			assert.Equal(t, tc.kind, *record.ErrorKind)
+			assert.Equal(t, tc.code, record.Data.FirstError.Code)
+		})
+	}
+	trace := requesttimeline.New(time.Now(), "deadline-before-write", 7, "model")
+	trace.StreamEnd("client_gone", context.DeadlineExceeded, false)
+	record := trace.Freeze(nil)
+	require.NotNil(t, record.ErrorKind)
+	assert.Equal(t, "timeout", *record.ErrorKind)
+	assert.Equal(t, "deadline_exceeded", record.Data.FirstError.Code)
+}

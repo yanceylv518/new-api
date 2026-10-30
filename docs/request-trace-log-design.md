@@ -76,8 +76,16 @@
 - 后端命令：`go test ./controller -run '^TestRequestTimeline' -count=1 -timeout=90s`；数据库矩阵通过 `TIMELINE_TEST_MYSQL_DSN` 或 `TIMELINE_TEST_POSTGRES_DSN` 指向专用空库执行 `TestRequestTimelineDatabaseRoundtrip`，`TIMELINE_TEST_SHARED_DB=true` 验证共库。
 - 正常流性能命令：`go test ./controller -run '^$' -bench '^BenchmarkRequestTimelineStream$' -benchmem -benchtime=2s -count=3`，使用专用 MySQL DSN；真实本地 HTTP 流式转发，每请求 100 段内容并异步入库。本次开关对照：关闭 1.981–2.069 ms/请求，开启 2.410–2.463 ms/请求，开启约多 0.4 ms、11–12 KiB 分配，无丢记录。另用修复前源码覆盖映射作同环境对照：修复前开启 2.012–2.739 ms，修复后开启 2.167–2.484 ms，范围重叠；没有证据表明这四项修复引入额外时间退化，采集本身仍有开销。这是本机样本，不代表生产尾延迟。
 - 前端命令：`bun run typecheck`、受影响文件 `oxlint`、`bun run test src/features/system-settings src/features/usage-logs`、`bun run build`。共 19 个测试文件、138 项测试通过，新增设置开关的默认关闭、键盘启用、关闭及保存失败重试验证。时间线页面既有按需加载、权限、空值、错误和有限重试仍通过；日志维护开关另做真实组件页面检查。
-- 后端受影响模块全量回归发现基线已有失败：Windows 的 SQLite 测试文件未释放导致清理失败，以及渠道亲和性缓存断言；用 `af903ed7b` 源码覆盖映射复现了代表性失败。时间线专项及相关转发、模型、middleware、router 测试通过；另通过临时源码覆盖映射运行实际日志清理任务，验证原日志为空时仍删除旧时间线且保留较新记录；全量 controller 套件因已有文件清理失败累计超时，不声称全量测试通过。当前 Windows Go 环境 `CGO_ENABLED=0` 且无 gcc，未执行 race detector。
+- 后端受影响模块全量回归发现基线已有失败：Windows 的 SQLite 测试文件未释放导致清理失败，以及渠道亲和性缓存断言；用 `af903ed7b` 源码覆盖映射复现了代表性失败。时间线专项及相关转发、模型、middleware、router 测试通过；另通过临时源码覆盖映射运行实际日志清理任务，验证原日志为空时仍删除旧时间线且保留较新记录；全量 controller 套件因已有文件清理失败累计超时，不声称全量测试通过。首版在 Windows 上未执行 race detector；后续取消分类补丁已在隔离 Linux/amd64、Go 1.26.1、CGO 开启环境运行全部时间线专项的 `-race` 验证并通过。
 - 详情授权复用既有认证体系并执行服务端管理员限制；参考 OWASP [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)、[Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)。未改动认证机制，不声称完成全站 ASVS 审计。
+
+### 2026-10-30 取消分类与部分保存修复
+
+- 写出观察区分 `context.Canceled`、`context.DeadlineExceeded`、实际 I/O 超时和普通写入错误；取消记为 `client_disconnected`，请求截止及写超时分别保留 `deadline_exceeded` / `write_timeout`。保留已经观察到的真实 I/O 错误以及更早的业务错误，不改变转发返回值或计费分支。
+- 日志设置刷新服务器默认值时，保留未保存的本地选择和 dirty 状态；与服务器一致的字段更新为已保存状态。第一项保存成功、第二项失败后可直接重试第二项，不重复提交已经成功的字段。
+- 新增真实 HTTP 客户端在 flush 期间取消的回归。测试门闩只协调真实 socket 的 flush 时序，取消来自真实 HTTP 客户端，不伪造 I/O 错误；另覆盖包装后的取消、请求截止、实际写超时、普通写失败和既有业务错误优先级。
+- 前端回归接入真实 `useSystemOptions` 查询和 `useUpdateOption` 刷新，覆盖两开关同时保存的部分失败、重试和全部成功，而非固定 props 的单开关测试。
+- 两项缺陷的新增用例均先复现失败再修复通过。后端 17 项时间线测试（含 SQLite 往返/迁移）、Linux race、相关转发及计费回归通过；前端相关 19 个文件共 140 项测试、typecheck、受影响文件 lint 和生产构建通过。本补丁未修改数据库模型、迁移或 SQL，三数据库记录沿用前述验证，不把旧验证声称为本轮重新执行。
 
 ## 历史方案（2026-10-09，以下不是本版交付范围）
 

@@ -300,7 +300,17 @@ func (t *Trace) PayloadWritten(err error) {
 	}
 	t.markEnd()
 	if err != nil {
-		t.fail("interrupted", "downstream_write_error", "downstream_write", "write_error", err.Error())
+		var timeout interface{ Timeout() bool }
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			t.fail("interrupted", "timeout", "downstream", "deadline_exceeded", err.Error())
+		case errors.Is(err, context.Canceled):
+			t.fail("interrupted", "client_disconnected", "downstream", "client_disconnected", err.Error())
+		case errors.As(err, &timeout) && timeout.Timeout():
+			t.fail("interrupted", "timeout", "downstream_write", "write_timeout", err.Error())
+		default:
+			t.fail("interrupted", "downstream_write_error", "downstream_write", "write_error", err.Error())
+		}
 		return
 	}
 	if t.record.Data.FirstWriteMS == nil {
@@ -394,6 +404,8 @@ func (t *Trace) StreamEnd(reason string, clientErr error, processingError bool) 
 		t.record.Data.EndMarkerReceived = true
 	}
 	switch {
+	case errors.Is(clientErr, context.DeadlineExceeded):
+		t.fail("interrupted", "timeout", "downstream", "deadline_exceeded", clientErr.Error())
 	case clientErr != nil || reason == "client_gone":
 		t.fail("interrupted", "client_disconnected", "downstream", "client_disconnected", "Downstream request was canceled")
 	case reason == "timeout":
