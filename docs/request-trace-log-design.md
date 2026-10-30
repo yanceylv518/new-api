@@ -1,5 +1,87 @@
 # 请求追踪日志设计
 
+## 当前实现：rc35 流式请求时间线（2026-10-30 修订）
+
+基线为 `custom/rc35` 的 `af903ed7b`，开发分支为 `feat/rc35-stream-timeline`。本节是本次实现契约；后文 2026-10-09 的全量追踪设想仅保留作历史参考，其中“不新增表”和完整请求追踪等条目不适用于本版。
+
+### 启用、范围与入口
+
+- 默认关闭；在系统设置的“日志维护”中开启“记录流式请求时间线”，配置键为 `RequestTimelineEnabled`，保存到既有 `options` 表。保存成功后本节点对新请求生效，其他节点沿用现有配置同步周期；无需为切换开关重启。主节点启动时准备独立 `request_timelines` 表，各节点复用一个后台写入器；应先启动主节点。关闭只停止新请求采集，已开始的请求正常收尾，历史记录仍可查询。迁移失败只禁用时间线，不中止已有转发服务。
+- 仅对原始客户端请求要求流式的业务 Chat Completions、Responses，以及 Responses 转 Chat 链路采集；不改变现有首字口径、业务响应、计费或重试策略。
+- 首版覆盖实际复用 OpenAI 流式处理器的 OpenAI、OpenRouter、Xinference、Codex、NewAPI、Sub2API API 类型。其他原生 SDK、Claude/Gemini 入口、WebSocket、异步任务不纳入本版；支持的渠道以 `BeginRequestTimeline` 的协议/适配器条件为准。
+- 普通非流式、手动/自动模型测试不采集。业务重试或 transport 再次发送时放弃本次时间线，避免把多次请求合并为一条；原有重试照常执行。
+- 管理员在用量/错误日志详情展开“请求时间线”时才查询。列表不关联、查询新表。`other.admin_info.timeline_candidate=true` 仅表示当时具备采集条件，不保证已入库；不向 `other` 写入时间线内容。
+- 详情接口为 `GET /api/request-timelines/:request_id`，同时执行路由 `AdminAuth` 和控制器角色检查。无普通用户查询接口，不增加全局时间线搜索或无日志请求列表。
+
+### 五个时间点
+
+| 节点 | 界面名称 | 实际观察位置 | 含义及限制 |
+| --- | --- | --- | --- |
+| A | 开始处理 | 现有 `RelayInfo.StartTime` | 沿用 rc35 首字起点；通常已完成第一轮渠道选择，不代表请求刚到最外层入口 |
+| B | 请求发送至上游 | `httptrace.WroteRequest` 成功回调 | 完整请求已交给本地网络写出，不证明上游已开始生成；包含连接、发送等前置时间 |
+| C | 收到上游首段响应 | 原有 `SetFirstResponseTime` | 首个非空且非 `[DONE]` 的数据段；可能只是角色或元信息，不是响应头时间，也不保证已有正文 |
+| D | 首段响应写出完成 | 现有写出/刷新返回后 | 首次业务响应写出成功；保活消息不计入，不证明客户端已实际收到 |
+| E | 输出结束 | 最后写出/刷新或流终止观察 | 包含完整输出结束；不使用控制器退出时间替代，避免混入后续计费、日志入库耗时 |
+
+界面显示 B−A（发送前准备）、C−B（等待上游）、D−C（本地首段转发）、C−A（现有首字耗时）、E−A（完整输出耗时），各节点另显示相邻间隔。C−A 与原日志 `frt` 的毫秒计算保持一致。其他间隔使用进程单调时钟，并对齐相同毫秒舍入；时间倒序或时钟异常时隐藏耗时而保留字段。
+
+缺失的节点为 `null`，不补零。A 的绝对毫秒时间用于与其他系统核对，其余存储相对 A 的毫秒偏移。时钟同步和上游统计口径仍需单独核对；C−B 较长只能把范围缩小到上游等待及往返链路，不能单凭本服务日志断言是哪一方责任。
+
+### 表结构与记录内容
+
+表位于 `LOG_DB`，未配置独立日志库时自然使用业务库。SQLite、MySQL、PostgreSQL 使用相同八列结构；不依赖 JSON 数据库类型、外键、JOIN 或消费日志自增 ID。
+
+| 字段 | 类型 | 约束/含义 |
+| --- | --- | --- |
+| `request_id` | VARCHAR(64) | 唯一主键、非空；MySQL 使用 `utf8mb4_bin`，大小写区分 |
+| `user_id` | BIGINT | 非空，请求所属用户 |
+| `created_at` | BIGINT | 非空，生成快照时的 Unix 秒；单列清理索引 |
+| `upstream_status` | SMALLINT | 可空，真实上游 HTTP 状态，区别于平台最终状态 |
+| `result` | VARCHAR(16) | 非空：`success` / `failed` / `interrupted` / `unknown` |
+| `error_kind` | VARCHAR(32) | 可空，失败、中断或未确认结束的原因类别 |
+| `upstream_request_body_bytes` | BIGINT | 可空，最终上游完整请求体的字节数；0 表示确实为空 |
+| `data` | TEXT | 非空，版本化 JSON；单条序列化内容上限 16 KiB |
+
+`data.version=1` 包括 A 的绝对时间、B/C/D/E 偏移、时间有效标记、请求/返回模型、渠道 ID、上游请求 ID、响应 ID、首段类型、返回结束原因、流终止原因、上游结束标记、实际返回的 token 用量、首次异常的偏移/阶段/类别/代码/脱敏消息。
+
+请求体大小取最终 `http.Request.ContentLength`/现有可重放请求体元数据，不读取、复制或重新序列化请求体。未知长度为 `null`，即便发送失败也不把“已发送部分字节数”冒充完整大小。页面将其放在 B 节点，按字节显示。没有实际返回 usage 对象时显示“上游未返回”，不写本地估算用量。
+
+仅提取允许的标识与统计字段，不保存请求、响应正文、prompt、工具参数或整组头部。错误采集的输入预算为 8 KiB：Chat 错误对象在额外复制/解析之前检查大小，已解析的消息在脱敏之前检查大小；超限省略原文并记录长度和省略说明，不格式化任意嵌套错误对象。预算内消息复用现有凭证/媒体脱敏器，最终限 2048 字节；代码限 128 字节，标识/模型通常限 256 字节；截断或省略会标注。原始业务响应不受诊断采集上限影响。错误消息仍可能包含上游以自然语言回显的业务内容，因此仅管理员可查。
+
+### 结束状态和降级行为
+
+- HTTP 200 只表示 HTTP 层返回成功，不表示生成完成。流内业务错误一经观察即记录 `failed/upstream_business_error`，后续正常结束标记不覆盖首次错误。
+- 有上游结束标记、成功业务写出且未观察到错误时才标为成功。缺少结束标记的 EOF 为 `unknown/unconfirmed_end`，不猜测正常完成。
+- 客户端取消、下游写入失败、超时、上游读取失败分别保留类别。客户端取消优先于其引起的上游关闭错误，避免把断开误算成上游故障。
+- 解析/处理异常复用 `StreamStatus` 首条错误的实际时间与消息，使用 `stream_processing_error` 错误代码，与 `done` 等结束原因分开保存。在处理下一段之前记录首次错误，避免相同时间戳下被后来的业务错误抢占；退出时补录更早的错误。异常时间在脱敏之前固定。缺少节点不伪造时间；`response.incomplete` / cancelled 不会被后续 `[DONE]` 标成成功。
+- 快照只提交一次，重复请求 ID 的批次写入幂等。时间线和原日志不是同一事务：列表可能先出现，详情最多自动补查三次，然后显示缺失说明并保留手动刷新。
+- ClickHouse 日志库不启用时间线；数据库表缺失、版本不支持、记录格式损坏等均显式降级，不影响列表和转发。
+
+### 系统影响、清理与回退
+
+- 热路径仅保存有界字段和时刻，复用原有 DTO 解析，不增加逐段数据库写入；最终快照入内存队列后由一个后台写入器处理。
+- 队列 256 条、批次 32 条、最长等候 250 ms；每次数据库写入超时 3 秒，最多尝试两次。入队失败只增加原子计数并返回，不在请求线程打印日志；现有后台写入器约每 10 秒汇总新增丢弃，正常退出时补一次汇总。日志输出阻塞也不会让队列满时的请求等待告警。
+- 正常退出在 HTTP 请求收尾后最多等待 15 秒排空；强制退出、写入超时或队列满可能丢失时间线，因此它不是保证不丢的审计账本。
+- 新表初始化先于日志清理任务启动。沿用现有日志清理截止时间分批清理新表，即使原日志已清空也执行；保留原日志删除数量，额外返回 `timeline_deleted_count`。队列中迟到记录在下次清理处理，不引入墓碑或新定时任务。
+- 关闭系统配置开关或回退旧二进制即可停采，新表保留，旧版本忽略它。迁移允许新增可空、有默认值或自增的额外字段，仍要求必要字段及请求 ID 单列主键，拒绝额外必填且无默认值的字段。详情显式查询既有八列，避免 PostgreSQL 在运行期间加列后发生缓存计划结果类型变化。发现不兼容的实验表结构时报告并禁用功能，不自动删表或改写数据。
+
+### 本次验证
+
+- 四项修复的用例已先验证失败、再验证通过：队列满且日志输出阻塞、早期解析错误后又发生业务错误、大错误帧省略且转发字节/用量不变、兼容新增字段并保持旧写入有效。三数据库额外验证默认值、拒绝新增必填无默认值字段、系统配置持久化；保存失败不会先改变运行时开关。
+- 异常流性能命令：`go test ./controller -run '^$' -bench '^BenchmarkRequestTimelineErrorFrame$' -benchmem -benchtime=500ms -count=3`。同类约 1 MiB 错误帧，修复前开启约 677 ms、分配约 33.9 MB；修复后开启 5.227–5.356 ms、约 12.67 MB，关闭 5.265–5.722 ms、约 12.61 MB。修复消除了整段诊断脱敏带来的主要耗时和分配。
+- 后端专项与相关模块命令：`go test ./controller -run '^TestRequestTimeline' -count=1 -timeout=90s`，`go test ./relay/channel/openai ./relay/helper ./relay/common ./model ./middleware ./router -count=1 -timeout=90s`，`go test ./service -run 'Test.*(Billing|Quota|Settle|SystemTask|LogCleanup|OtherInfo)' -count=1 -timeout=90s`。本轮均通过；正常与错误流的转发对照、缓存/推理/工具用量和 usage 开关对照均保持一致。
+
+- 功能测试集中在 `controller/request_timeline_test.go`：真实 HTTP 发送回调和完整请求体大小，既有首字值一致性，Chat/Responses/Responses 转 Chat 启用前后输出字节一致，200 后业务错误，未知 EOF、超时、断开、写失败、保活排除、重试排除、队列满、后台写失败、排空、管理员权限和缺失记录。
+- 三数据库实测：SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 18.6。覆盖首次建表、原有日志数据保留、重复迁移、大小写主键与重复入库、中文、NULL 与 0、过期清理；另测 MySQL/PostgreSQL 共库与独立日志库路由。生产 MySQL 的具体版本尚未提供，本次未连接生产。
+- 后端命令：`go test ./controller -run '^TestRequestTimeline' -count=1 -timeout=90s`；数据库矩阵通过 `TIMELINE_TEST_MYSQL_DSN` 或 `TIMELINE_TEST_POSTGRES_DSN` 指向专用空库执行 `TestRequestTimelineDatabaseRoundtrip`，`TIMELINE_TEST_SHARED_DB=true` 验证共库。
+- 正常流性能命令：`go test ./controller -run '^$' -bench '^BenchmarkRequestTimelineStream$' -benchmem -benchtime=2s -count=3`，使用专用 MySQL DSN；真实本地 HTTP 流式转发，每请求 100 段内容并异步入库。本次开关对照：关闭 1.981–2.069 ms/请求，开启 2.410–2.463 ms/请求，开启约多 0.4 ms、11–12 KiB 分配，无丢记录。另用修复前源码覆盖映射作同环境对照：修复前开启 2.012–2.739 ms，修复后开启 2.167–2.484 ms，范围重叠；没有证据表明这四项修复引入额外时间退化，采集本身仍有开销。这是本机样本，不代表生产尾延迟。
+- 前端命令：`bun run typecheck`、受影响文件 `oxlint`、`bun run test src/features/system-settings src/features/usage-logs`、`bun run build`。共 19 个测试文件、138 项测试通过，新增设置开关的默认关闭、键盘启用、关闭及保存失败重试验证。时间线页面既有按需加载、权限、空值、错误和有限重试仍通过；日志维护开关另做真实组件页面检查。
+- 后端受影响模块全量回归发现基线已有失败：Windows 的 SQLite 测试文件未释放导致清理失败，以及渠道亲和性缓存断言；用 `af903ed7b` 源码覆盖映射复现了代表性失败。时间线专项及相关转发、模型、middleware、router 测试通过；另通过临时源码覆盖映射运行实际日志清理任务，验证原日志为空时仍删除旧时间线且保留较新记录；全量 controller 套件因已有文件清理失败累计超时，不声称全量测试通过。当前 Windows Go 环境 `CGO_ENABLED=0` 且无 gcc，未执行 race detector。
+- 详情授权复用既有认证体系并执行服务端管理员限制；参考 OWASP [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)、[Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)。未改动认证机制，不声称完成全站 ASVS 审计。
+
+## 历史方案（2026-10-09，以下不是本版交付范围）
+
+
 文档日期：2026-10-09。状态：设计稿，尚未实现。基线为 `custom/rc35-user-model-discount` 的 `3cf493fbe`。
 
 配套的可交互原型是同目录下的 `request-trace-log-prototype.html`，直接用浏览器打开即可，不依赖外网。原型里的报文和数值都是虚构示例。

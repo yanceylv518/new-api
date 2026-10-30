@@ -100,7 +100,8 @@ type LogCleanupState struct {
 }
 
 type LogCleanupResult struct {
-	DeletedCount int64 `json:"deleted_count"`
+	DeletedCount         int64 `json:"deleted_count"`
+	TimelineDeletedCount int64 `json:"timeline_deleted_count,omitempty"`
 }
 
 var (
@@ -420,6 +421,25 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 	}
 
 	result := LogCleanupResult{DeletedCount: state.Processed}
+	if RequestTimelineStorageReady() {
+		for {
+			deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			deleted, err := model.DeleteOldRequestTimelineBatch(deleteCtx, payload.TargetTimestamp, payload.BatchSize)
+			cancel()
+			if err != nil {
+				failSystemTask(task, runnerID, fmt.Errorf("usage logs cleared; timeline cleanup failed: %w", err))
+				return
+			}
+			result.TimelineDeletedCount += deleted
+			if deleted == 0 {
+				break
+			}
+			if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state); err != nil {
+				logSystemTaskLockError(ctx, task, err)
+				return
+			}
+		}
+	}
 	if err := model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, result, ""); err != nil {
 		logSystemTaskLockError(ctx, task, err)
 	}

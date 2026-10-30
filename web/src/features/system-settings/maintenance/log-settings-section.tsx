@@ -80,12 +80,14 @@ import type { LogCleanupTask } from '../types'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTimelineEnabled: z.boolean(),
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultTimelineEnabled?: boolean
 }
 
 type ServerLogInfo = {
@@ -141,6 +143,7 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
 
 export function LogSettingsSection({
   defaultEnabled,
+  defaultTimelineEnabled = false,
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
@@ -148,6 +151,7 @@ export function LogSettingsSection({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
+      RequestTimelineEnabled: defaultTimelineEnabled,
     },
   })
 
@@ -174,8 +178,11 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    form.reset({
+      LogConsumeEnabled: defaultEnabled,
+      RequestTimelineEnabled: defaultTimelineEnabled,
+    })
+  }, [defaultEnabled, defaultTimelineEnabled, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -257,11 +264,23 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    try {
+      if (values.LogConsumeEnabled !== defaultEnabled) {
+        const result = await updateOption.mutateAsync({
+          key: 'LogConsumeEnabled',
+          value: values.LogConsumeEnabled,
+        })
+        if (!result.success) return
+      }
+      if (values.RequestTimelineEnabled !== defaultTimelineEnabled) {
+        await updateOption.mutateAsync({
+          key: 'RequestTimelineEnabled',
+          value: values.RequestTimelineEnabled,
+        })
+      }
+    } catch {
+      // The mutation hook reports the error; retain input for retry.
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -353,6 +372,32 @@ export function LogSettingsSection({
                   <FormDescription>
                     {t(
                       'Track per-request consumption to power usage analytics. Keeping this on increases database writes.'
+                    )}
+                  </FormDescription>
+                </SettingsSwitchContent>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+                <FormMessage />
+              </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='RequestTimelineEnabled'
+            render={({ field }) => (
+              <SettingsSwitchItem>
+                <SettingsSwitchContent>
+                  <FormLabel>
+                    {t('Record streaming request timeline')}
+                  </FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>

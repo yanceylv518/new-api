@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -82,6 +83,7 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
+	Timeline *requesttimeline.Trace // Set only by the real streaming relay entry.
 	// 预留时的金额用于表达式失败回退，不能由已取整额度反推。
 	ReservedDiscountAmounts *hosttypes.DiscountAmounts
 	// 只读规则在请求开始时冻结，重试不重新读取管理员配置。
@@ -911,6 +913,7 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 func (info *RelayInfo) SetFirstResponseTime() {
 	if info.isFirstResponse {
 		info.FirstResponseTime = time.Now()
+		info.Timeline.FirstResponse(info.FirstResponseTime)
 		info.isFirstResponse = false
 	}
 }

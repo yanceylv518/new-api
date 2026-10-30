@@ -89,6 +89,7 @@ import {
   isTimingLogType,
 } from '../../lib/utils'
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
+import { RequestTimeline } from '../../request-timeline/request-timeline'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
 
@@ -1215,6 +1216,10 @@ export function DetailsDialog(props: DetailsDialogProps) {
               }
             />
           )}
+
+        {props.open && props.isAdmin && props.log.is_stream && adminInfo?.timeline_candidate && props.log.request_id && (
+          <RequestTimeline key={props.log.request_id} requestId={props.log.request_id} />
+        )}
 
         {/* Stream status details */}
         {other?.stream_status && other.stream_status.status !== 'ok' && (

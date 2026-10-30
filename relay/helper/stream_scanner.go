@@ -209,6 +209,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			wg.Done()
 		}()
 		sr := newStreamResult(info.StreamStatus)
+		firstProcessingErrorRecorded := false
 		for data := range dataChan {
 			sr.reset()
 			func() {
@@ -216,6 +217,13 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				defer writeMutex.Unlock()
 				ExtendWriteDeadline(c)
 				dataHandler(data, sr)
+				// Observe the first processing failure before handling a later chunk;
+				// clocks may give consecutive errors the same timestamp.
+				if info.Timeline != nil && !firstProcessingErrorRecorded && info.StreamStatus.HasErrors() {
+					first := info.StreamStatus.Errors[0]
+					info.Timeline.ProcessingError(first.Timestamp, first.Message)
+					firstProcessingErrorRecorded = true
+				}
 			}()
 			if sr.IsStopped() {
 				return
@@ -302,6 +310,12 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	// cleanup has joined every producer, so the first StreamStatus error is stable.
+	if info.Timeline != nil && len(info.StreamStatus.Errors) > 0 {
+		first := info.StreamStatus.Errors[0]
+		info.Timeline.ProcessingError(first.Timestamp, first.Message)
+	}
+	info.Timeline.StreamEnd(string(info.StreamStatus.EndReason), c.Request.Context().Err(), info.StreamStatus.HasErrors())
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {
