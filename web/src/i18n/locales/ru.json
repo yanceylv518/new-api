@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "Данные об использовании провайдера не записаны",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "Первый фрагмент может содержать только роль; идентификаторы и модель могут прийти позже.",
+    "Upstream usage summary": "Сводка использования провайдера",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "Полный объект usage из последнего обработанного фрагмента использования, полученного от непосредственно подключённого сервиса.",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "Объект usage обрезан (исходный размер: {{bytes}} B). Сохранённый префикс является текстом, а не полным JSON.",
+    "Truncated upstream usage": "Обрезанный usage вышестоящего сервиса",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "В старых записях есть только сводка без сведений о наличии полей.",
+    "Upstream response recorded fields": "Записанные поля ответа провайдера",
+    "Completion recorded fields": "Записанные поля завершения",
     "Record streaming request timeline": "Записывать временную шкалу потоковых запросов",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "Собирает время и выбранные поля поддерживаемых потоковых ответов, кроме тестов моделей. Изменение влияет на новые запросы; прежние записи остаются доступны.",
     "End marker received": "Получен",

@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "Không ghi nhận lượng dùng từ bên cung cấp",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "Phản hồi đầu tiên có thể chỉ có thông tin vai trò; mã định danh và mô hình có thể đến sau.",
+    "Upstream usage summary": "Tóm tắt lượng dùng từ bên cung cấp",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "Đối tượng usage đầy đủ từ đoạn dữ liệu sử dụng cuối cùng đã phân tích của dịch vụ thượng nguồn kết nối trực tiếp.",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "Usage thượng nguồn đã bị cắt (kích thước gốc: {{bytes}} B). Phần đầu được lưu là văn bản, không phải JSON đầy đủ.",
+    "Truncated upstream usage": "Usage thượng nguồn đã cắt",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "Bản ghi cũ chỉ có tóm tắt, không lưu thông tin trường gốc có tồn tại hay không.",
+    "Upstream response recorded fields": "Các trường đã ghi của phản hồi từ bên cung cấp",
+    "Completion recorded fields": "Các trường đã ghi khi kết thúc",
     "Record streaming request timeline": "Ghi dòng thời gian yêu cầu truyền trực tiếp",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "Ghi thời gian và các trường phản hồi được chọn cho yêu cầu truyền trực tiếp được hỗ trợ, không gồm kiểm tra mô hình. Thay đổi áp dụng cho yêu cầu mới; bản ghi cũ vẫn xem được.",
     "End marker received": "Đã nhận",

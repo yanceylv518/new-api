@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "未记录到上游用量",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "首段可能只有角色信息；响应标识和模型也可能在后续片段出现。",
+    "Upstream usage summary": "上游用量摘要",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "直接上游最后一个已解析用量片段中的完整 usage 对象。",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "上游 usage 已截断（原始大小：{{bytes}} B）。保存的是文本前缀，并非完整 JSON。",
+    "Truncated upstream usage": "已截断的上游 usage",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "历史记录只保存了摘要，未保留上游字段是否存在。",
+    "Upstream response recorded fields": "上游响应记录字段",
+    "Completion recorded fields": "结束时记录字段",
     "Record streaming request timeline": "记录流式请求时间线",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "记录支持链路的流式请求时间和关键返回字段，不包含模型测试。保存后影响新请求，已有时间线仍可查看。",
     "End marker received": "已收到",

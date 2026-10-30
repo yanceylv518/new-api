@@ -58,6 +58,7 @@ function recordedResponse(): TimelineResponse & {
       ended_ms: 200,
       timing_valid: true,
       request_model: 'example',
+      response_id: 'response-1',
       channel_id: 1,
       first_chunk_type: 'role',
       end_marker_received: true,
@@ -117,20 +118,34 @@ describe('request timeline', () => {
     expect(screen.queryByText('Completed')).not.toBeInTheDocument()
     expect(screen.getByText('0 B')).toBeVisible()
     expect(screen.getByText('Role information (not text)')).toBeVisible()
-    expect(screen.getByText('Not returned by upstream')).toBeVisible()
+    expect(screen.getByText('No upstream usage was recorded')).toBeVisible()
     expect(screen.getByText('+150 ms')).toBeVisible()
     expect(screen.getByText('<script>unsafe()</script>')).toBeVisible()
     expect(document.querySelector('script')).toBeNull()
     await user.click(
-      screen.getByRole('button', { name: 'View recorded fields' })
+      screen.getByRole('button', { name: 'Upstream response recorded fields' })
     )
     expect(
       screen.getByRole('button', { name: 'Copy recorded fields' })
     ).toBeVisible()
-    expect(screen.getByText(/"request_id": "request-1"/)).toHaveClass(
-      'whitespace-pre-wrap',
-      'break-all',
-      'max-h-64'
+    expect(screen.getByText(/"response_id": "response-1"/)).toHaveAttribute(
+      'tabindex',
+      '0'
+    )
+    await user.tab()
+    await user.tab()
+    expect(screen.getByText(/"response_id": "response-1"/)).toHaveFocus()
+    await user.click(
+      screen.getByRole('button', { name: 'Copy recorded fields' })
+    )
+    expect(await navigator.clipboard.readText()).toContain(
+      '"response_id": "response-1"'
+    )
+    expect(await navigator.clipboard.readText()).not.toContain('usage_summary')
+    expect(screen.getByText(/"response_id": "response-1"/)).toHaveClass(
+      'whitespace-pre',
+      'overflow-auto',
+      'max-h-40'
     )
   })
 
@@ -241,5 +256,128 @@ describe('request timeline', () => {
     )
     await userEvent.click(await screen.findByRole('button', { name: 'Retry' }))
     expect(await screen.findByRole('list')).toBeVisible()
+  })
+})
+
+describe('upstream usage and per-point fields', () => {
+  it('shows only actually returned token values and exposes the complete object at the completion point', async () => {
+    const response = recordedResponse()
+    response.timeline.upstream_usage = {
+      prompt_tokens: 0,
+      total_tokens: 9,
+      prompt_tokens_details: { cached_tokens: 4 },
+      vendor: { enabled: true, note: 'provider text', values: [1, null] },
+    }
+    response.timeline.returned_usage = {
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 9,
+    }
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    mountTimeline()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Request timeline' })
+    )
+    await screen.findByRole('list')
+    expect(
+      screen.getByText('Input 0 · Output Not recorded · Total 9')
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        'Complete usage object from the last parsed usage frame received from the directly connected upstream.'
+      )
+    ).toBeVisible()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Completion recorded fields' })
+    )
+    expect(screen.getByText(/"cached_tokens": 4/)).toBeVisible()
+    expect(screen.getByText(/"note": "provider text"/)).toBeVisible()
+    expect(screen.getByText(/"enabled": true/)).toBeVisible()
+    expect(screen.queryByText(/"completion_tokens": 0/)).not.toBeInTheDocument()
+  })
+
+  it('labels older records as summaries when original field presence was not saved', async () => {
+    const response = recordedResponse()
+    response.timeline.returned_usage = {
+      input_tokens: 3,
+      output_tokens: 0,
+      total_tokens: 7,
+    }
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    mountTimeline()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Request timeline' })
+    )
+    expect(
+      await screen.findByText(
+        'Earlier records contain only a summary; upstream field presence was not retained.'
+      )
+    ).toBeVisible()
+    expect(screen.getByText('Input 3 · Output Unknown · Total 7')).toBeVisible()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Completion recorded fields' })
+    )
+    expect(screen.getByText(/"usage_summary"/)).toBeVisible()
+  })
+})
+
+describe('conflicting upstream usage aliases', () => {
+  it('preserves both reported values instead of silently choosing one', async () => {
+    const response = recordedResponse()
+    response.timeline.upstream_usage_capture = 'captured'
+    response.timeline.upstream_usage = {
+      prompt_tokens: 3,
+      input_tokens: 7,
+      completion_tokens: 2,
+      output_tokens: 2,
+      total_tokens: 9,
+    }
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    mountTimeline()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Request timeline' })
+    )
+    expect(
+      await screen.findByText(
+        'Input prompt_tokens: 3; input_tokens: 7 · Output 2 · Total 9'
+      )
+    ).toBeVisible()
+  })
+})
+
+describe('truncated upstream usage', () => {
+  it('displays and copies the saved prefix as text without inventing a complete object', async () => {
+    const response = recordedResponse()
+    const prefix =
+      '{"prompt_tokens":7,"vendor":"<script>unsafe()</script>未完成'
+    response.timeline.upstream_usage_capture = 'truncated'
+    response.timeline.upstream_usage_preview = prefix
+    response.timeline.upstream_usage_bytes = 9000
+    response.timeline.returned_usage = {
+      input_tokens: 7,
+      output_tokens: 0,
+      total_tokens: 7,
+    }
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    const user = userEvent.setup()
+    mountTimeline()
+    await user.click(screen.getByRole('button', { name: 'Request timeline' }))
+    expect(
+      await screen.findByText(
+        'Upstream usage was truncated (original size: 9,000 B). The saved prefix is text, not complete JSON.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.queryByText('Input 7 · Output Unknown · Total 7')
+    ).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', { name: 'Truncated upstream usage' })
+    )
+    expect(screen.getByText(prefix)).toBeVisible()
+    expect(document.querySelector('script')).toBeNull()
+    await user.click(
+      screen.getByRole('button', { name: 'Copy recorded fields' })
+    )
+    expect(await navigator.clipboard.readText()).toBe(prefix)
   })
 })

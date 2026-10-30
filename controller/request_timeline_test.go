@@ -264,12 +264,14 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, model.MigrateRequestTimelines())
 	require.NoError(t, model.MigrateRequestTimelines())
 	assert.False(t, mainDB.Migrator().HasTable(&model.RequestTimeline{}))
-	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, RequestModel: "中文模型", TimingValid: true})
+	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, RequestModel: "中文模型", TimingValid: true, UpstreamUsage: []byte(`{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`), UpstreamUsageCapture: "captured"})
+	require.NoError(t, err)
+	truncatedPayload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, UpstreamUsageCapture: "truncated", UpstreamUsagePreview: `{"vendor":"未完成`, UpstreamUsageBytes: 9000})
 	require.NoError(t, err)
 	size, status := int64(0), 200
 	entries := []*model.RequestTimeline{
 		{RequestID: "Timeline-Case", UserID: 7, CreatedAt: 1000, Result: "success", UpstreamStatus: &status, UpstreamRequestBodyBytes: &size, Data: string(payload)},
-		{RequestID: "timeline-case", UserID: 8, CreatedAt: 1001, Result: "unknown", Data: string(payload)},
+		{RequestID: "timeline-case", UserID: 8, CreatedAt: 1001, Result: "unknown", Data: string(truncatedPayload)},
 	}
 	require.NoError(t, model.InsertRequestTimelines(context.Background(), entries))
 	require.NoError(t, model.InsertRequestTimelines(context.Background(), entries))
@@ -283,9 +285,16 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(8), lower.UserID)
 	assert.Nil(t, lower.UpstreamRequestBodyBytes)
+	var truncatedData requesttimeline.Data
+	require.NoError(t, common.UnmarshalJsonStr(lower.Data, &truncatedData))
+	assert.Equal(t, "truncated", truncatedData.UpstreamUsageCapture)
+	assert.Equal(t, `{"vendor":"未完成`, truncatedData.UpstreamUsagePreview)
+	assert.Equal(t, 9000, truncatedData.UpstreamUsageBytes)
 	var decoded requesttimeline.Data
 	require.NoError(t, common.UnmarshalJsonStr(found.Data, &decoded))
 	assert.Equal(t, "中文模型", decoded.RequestModel)
+	assert.JSONEq(t, `{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`, string(decoded.UpstreamUsage))
+	assert.Equal(t, "captured", decoded.UpstreamUsageCapture)
 	var count int64
 	require.NoError(t, db.Model(&model.RequestTimeline{}).Count(&count).Error)
 	assert.Equal(t, int64(2), count)
@@ -967,4 +976,146 @@ func TestRequestTimelineDistinguishesCancellationDeadlineAndWriteErrors(t *testi
 	require.NotNil(t, record.ErrorKind)
 	assert.Equal(t, "timeout", *record.ErrorKind)
 	assert.Equal(t, "deadline_exceeded", record.Data.FirstError.Code)
+}
+
+func TestRequestTimelineRetainsUpstreamUsageWithoutChangingBilling(t *testing.T) {
+	old := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = old })
+	for _, tc := range []struct {
+		name, body, field string
+		handler           func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+	}{
+		{"chat", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"total_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cached_creation_tokens\":2,\"provider_note\":\"provider-extension\"},\"unexpected\":\"provider-extension\"}}\n\ndata: [DONE]\n\n", "prompt_tokens", openai.OaiStreamHandler},
+		{"responses", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"created_at\":1700000000,\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":6,\"total_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":2},\"unexpected\":\"provider-extension\"}}}\n\ndata: [DONE]\n\n", "input_tokens", openai.OaiResponsesStreamHandler},
+		{"converted", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"created_at\":1700000000,\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":6,\"total_tokens\":9,\"unexpected\":\"provider-extension\"}}}\n\ndata: [DONE]\n\n", "input_tokens", openai.OaiResponsesToChatStreamHandler},
+	} {
+		for _, oversized := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/oversized=%v", tc.name, oversized), func(t *testing.T) {
+				body := tc.body
+				if oversized {
+					body = strings.ReplaceAll(body, "provider-extension", strings.Repeat("x", 9000))
+				}
+				var outputs []string
+				var usages []*dto.Usage
+				for _, enabled := range []bool{false, true} {
+					w := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(w)
+					c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+					c.Set(common.RequestIdKey, "raw-usage-test")
+					info := relaycommon.GenRelayInfoOpenAI(c, nil)
+					info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "model"}
+					// The converted case also proves usage is captured when the client did not request a usage frame.
+					info.IsStream, info.DisablePing, info.ShouldIncludeUsage = true, true, tc.name != "converted"
+					if enabled {
+						info.Timeline = requesttimeline.New(info.StartTime, tc.name, 7, "model")
+						restore := helper.ObserveRequestTimelineWriter(c, info.Timeline)
+						defer restore()
+					}
+					usage, relayErr := tc.handler(c, info, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))})
+					require.Nil(t, relayErr)
+					outputs = append(outputs, w.Body.String())
+					usages = append(usages, usage)
+					if enabled {
+						record := info.Timeline.Freeze(nil)
+						if oversized {
+							assert.Equal(t, "truncated", record.Data.UpstreamUsageCapture)
+							assert.NotEmpty(t, record.Data.UpstreamUsagePreview)
+							assert.Empty(t, record.Data.UpstreamUsage)
+							continue
+						}
+						encoded, err := common.Marshal(record.Data)
+						require.NoError(t, err)
+						var data map[string]any
+						require.NoError(t, common.Unmarshal(encoded, &data))
+						raw, ok := data["upstream_usage"].(map[string]any)
+						require.True(t, ok)
+						assert.Contains(t, raw, tc.field)
+						assert.NotContains(t, raw, "completion_tokens")
+						assert.Contains(t, string(encoded), "provider-extension")
+						assert.Equal(t, "provider-extension", raw["unexpected"])
+						if tc.name == "chat" {
+							assert.Equal(t, float64(0), raw["prompt_tokens"])
+							assert.Equal(t, float64(4), raw["prompt_tokens_details"].(map[string]any)["cached_tokens"])
+							assert.Equal(t, float64(2), raw["prompt_tokens_details"].(map[string]any)["cached_creation_tokens"])
+						}
+					}
+				}
+				assert.Equal(t, outputs[0], outputs[1])
+				assert.Equal(t, usages[0], usages[1])
+			})
+		}
+	}
+}
+
+func TestRequestTimelineUsageCaptureBoundaries(t *testing.T) {
+	for _, tc := range []struct{ name, frame, want, status string }{
+		{"complete_object", `{"usage":{"prompt_tokens":0,"vendor":{"enabled":true,"note":"text","list":[1,"two",null]},"cost":0.125}}`, `{"prompt_tokens":0,"vendor":{"enabled":true,"note":"text","list":[1,"two",null]},"cost":0.125}`, "captured"},
+		{"duplicate_usage", `{"usage":{"prompt_tokens":1},"usage":{"prompt_tokens":2,"total_tokens":2}}`, `{"prompt_tokens":2,"total_tokens":2}`, "captured"},
+		{"large_unrelated_content", `{"padding":"` + strings.Repeat("x", 1<<20) + `","usage":{"prompt_tokens":1}}`, `{"prompt_tokens":1}`, "captured"},
+		{"large_usage", `{"usage":{"prompt_tokens":2,"extra":"` + strings.Repeat("x", 9000) + `"}}`, "", "truncated"},
+		{"escaped_size", `{"usage":{"note":"` + strings.Repeat("<", 2000) + `"}}`, "", "truncated"},
+		{"unicode_boundary", `{"usage":{"note":"` + strings.Repeat("中文", 2000) + `"}}`, "", "truncated"},
+		{"empty_object", `{"usage":{}}`, `{}`, "captured"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := requesttimeline.New(time.Now(), tc.name, 7, "model")
+			var event struct {
+				Usage requesttimeline.StreamUsage `json:"usage"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(`{"usage":{"prompt_tokens":99}}`, &event))
+			trace.CaptureUpstreamUsage(event.Usage)
+			event.Usage = requesttimeline.StreamUsage{}
+			require.NoError(t, common.UnmarshalJsonStr(tc.frame, &event))
+			trace.CaptureUpstreamUsage(event.Usage)
+			record := trace.Freeze(nil)
+			assert.Equal(t, tc.status, record.Data.UpstreamUsageCapture)
+			if tc.want == "" {
+				assert.Empty(t, record.Data.UpstreamUsage)
+				assert.NotEmpty(t, record.Data.UpstreamUsagePreview)
+				assert.True(t, utf8.ValidString(record.Data.UpstreamUsagePreview))
+				assert.True(t, strings.HasPrefix(tc.frame, `{"usage":`+record.Data.UpstreamUsagePreview))
+				assert.Greater(t, record.Data.UpstreamUsageBytes, len(record.Data.UpstreamUsagePreview))
+				encoded, err := common.Marshal(record.Data)
+				require.NoError(t, err)
+				assert.LessOrEqual(t, len(encoded), requesttimeline.MaxDataBytes)
+			} else {
+				assert.JSONEq(t, tc.want, string(record.Data.UpstreamUsage))
+			}
+		})
+	}
+}
+
+func TestRequestTimelineMassRequestIDHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"lowercase", map[string]string{"x-mass-requestid": "mass-lower"}, "mass-lower"},
+		{"mixed_case", map[string]string{"X-MaSs-ReQuEsTiD": "mass-mixed"}, "mass-mixed"},
+		{"oneapi_priority", map[string]string{"X-Oneapi-Request-Id": "oneapi", "X-Request-Id": "standard", "Request-Id": "legacy", "x-mass-requestid": "mass"}, "oneapi"},
+		{"standard_priority", map[string]string{"X-Request-Id": "standard", "Request-Id": "legacy", "x-mass-requestid": "mass"}, "standard"},
+		{"legacy_priority", map[string]string{"Request-Id": "legacy", "x-mass-requestid": "mass"}, "legacy"},
+		{"empty_preferred_header", map[string]string{"X-Oneapi-Request-Id": "", "x-mass-requestid": "mass-fallback"}, "mass-fallback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Preserve wire casing here; the real HTTP client parses the response.
+				for key, value := range tc.headers {
+					w.Header()[key] = []string{value}
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+			response, err := upstream.Client().Get(upstream.URL)
+			require.NoError(t, err)
+			defer response.Body.Close()
+			trace := requesttimeline.New(time.Now(), tc.name, 7, "model")
+			trace.Response(response, nil)
+			record := trace.Freeze(nil)
+			require.NotNil(t, record)
+			assert.Equal(t, tc.want, record.Data.UpstreamRequestID)
+		})
+	}
 }

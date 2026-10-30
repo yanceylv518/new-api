@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "No upstream usage was recorded",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "The first frame may contain only role information; identifiers and the model may arrive later.",
+    "Upstream usage summary": "Upstream usage summary",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "Complete usage object from the last parsed usage frame received from the directly connected upstream.",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.",
+    "Truncated upstream usage": "Truncated upstream usage",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "Earlier records contain only a summary; upstream field presence was not retained.",
+    "Upstream response recorded fields": "Upstream response recorded fields",
+    "Completion recorded fields": "Completion recorded fields",
     "Record streaming request timeline": "Record streaming request timeline",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.",
     "End marker received": "Received",

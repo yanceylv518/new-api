@@ -136,6 +136,33 @@ func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, res
 	return nil
 }
 
+// Reuse the response parse to retain usage without rescanning or copying the
+// rest of a potentially large response.completed event.
+func decodeTimelineResponsesFrame(data string, timeline *requesttimeline.Trace) (dto.ResponsesStreamResponse, error) {
+	if timeline == nil {
+		var response dto.ResponsesStreamResponse
+		err := common.UnmarshalJsonStr(data, &response)
+		return response, err
+	}
+	var captured struct {
+		dto.ResponsesStreamResponse
+		Response *struct {
+			dto.OpenAIResponsesResponse
+			Usage requesttimeline.StreamUsage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := common.UnmarshalJsonStr(data, &captured); err != nil {
+		return dto.ResponsesStreamResponse{}, err
+	}
+	response := captured.ResponsesStreamResponse
+	if captured.Response != nil {
+		captured.Response.OpenAIResponsesResponse.Usage = captured.Response.Usage.Value
+		response.Response = &captured.Response.OpenAIResponsesResponse
+		timeline.CaptureUpstreamUsage(captured.Response.Usage)
+	}
+	return response, nil
+}
+
 func processTokenData(relayMode int, data string, responseTextBuilder *strings.Builder, toolCount *int, timeline *requesttimeline.Trace) error {
 	switch relayMode {
 	case relayconstant.RelayModeChatCompletions:
@@ -149,10 +176,13 @@ func processTokenData(relayMode int, data string, responseTextBuilder *strings.B
 		var streamResponse struct {
 			dto.ChatCompletionsStreamResponse
 			Error requesttimeline.StreamError `json:"error"`
+			Usage requesttimeline.StreamUsage `json:"usage"`
 		}
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			return err
 		}
+		streamResponse.ChatCompletionsStreamResponse.Usage = streamResponse.Usage.Value
+		timeline.CaptureUpstreamUsage(streamResponse.Usage)
 		timeline.ObserveChat(streamResponse.ChatCompletionsStreamResponse, streamResponse.Error)
 		return ProcessStreamResponse(streamResponse.ChatCompletionsStreamResponse, responseTextBuilder, toolCount)
 	case relayconstant.RelayModeCompletions:

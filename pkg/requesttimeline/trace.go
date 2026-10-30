@@ -3,6 +3,7 @@ package requesttimeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -98,24 +99,28 @@ type Failure struct {
 }
 
 type Data struct {
-	Version           int      `json:"version"`
-	StartedAtMS       int64    `json:"started_at_ms"`
-	RequestSentMS     *int64   `json:"request_sent_ms"`
-	FirstResponseMS   *int64   `json:"first_response_ms"`
-	FirstWriteMS      *int64   `json:"first_write_ms"`
-	EndedMS           *int64   `json:"ended_ms"`
-	TimingValid       bool     `json:"timing_valid"`
-	RequestModel      string   `json:"request_model"`
-	ChannelID         int      `json:"channel_id"`
-	UpstreamRequestID string   `json:"upstream_request_id,omitempty"`
-	ResponseID        string   `json:"response_id,omitempty"`
-	ResponseModel     string   `json:"response_model,omitempty"`
-	FirstChunkType    string   `json:"first_chunk_type,omitempty"`
-	FinishReason      string   `json:"finish_reason,omitempty"`
-	EndReason         string   `json:"end_reason,omitempty"`
-	EndMarkerReceived bool     `json:"end_marker_received"`
-	ReturnedUsage     *Usage   `json:"returned_usage"`
-	FirstError        *Failure `json:"first_error"`
+	Version              int             `json:"version"`
+	StartedAtMS          int64           `json:"started_at_ms"`
+	RequestSentMS        *int64          `json:"request_sent_ms"`
+	FirstResponseMS      *int64          `json:"first_response_ms"`
+	FirstWriteMS         *int64          `json:"first_write_ms"`
+	EndedMS              *int64          `json:"ended_ms"`
+	TimingValid          bool            `json:"timing_valid"`
+	RequestModel         string          `json:"request_model"`
+	ChannelID            int             `json:"channel_id"`
+	UpstreamRequestID    string          `json:"upstream_request_id,omitempty"`
+	ResponseID           string          `json:"response_id,omitempty"`
+	ResponseModel        string          `json:"response_model,omitempty"`
+	FirstChunkType       string          `json:"first_chunk_type,omitempty"`
+	FinishReason         string          `json:"finish_reason,omitempty"`
+	EndReason            string          `json:"end_reason,omitempty"`
+	EndMarkerReceived    bool            `json:"end_marker_received"`
+	ReturnedUsage        *Usage          `json:"returned_usage"`
+	UpstreamUsage        json.RawMessage `json:"upstream_usage,omitempty"`
+	UpstreamUsageCapture string          `json:"upstream_usage_capture,omitempty"`
+	UpstreamUsagePreview string          `json:"upstream_usage_preview,omitempty"`
+	UpstreamUsageBytes   int             `json:"upstream_usage_bytes,omitempty"`
+	FirstError           *Failure        `json:"first_error"`
 }
 
 type Record struct {
@@ -237,7 +242,7 @@ func (t *Trace) Response(resp *http.Response, err error) {
 	if resp != nil {
 		status := resp.StatusCode
 		t.record.UpstreamStatus = &status
-		for _, key := range []string{common.RequestIdKey, "X-Request-Id", "Request-Id"} {
+		for _, key := range []string{common.RequestIdKey, "X-Request-Id", "Request-Id", "X-Mass-Requestid"} {
 			if value := resp.Header.Get(key); value != "" {
 				t.record.Data.UpstreamRequestID = bounded(value, 256)
 				break
@@ -418,6 +423,73 @@ func (t *Trace) StreamEnd(reason string, clientErr error, processingError bool) 
 		t.fail("failed", "local_error", "response_processing", "panic", "Stream processing panicked")
 	case processingError:
 		t.fail("failed", "local_error", "response_processing", "stream_processing_error", "Stream processing reported an error")
+	}
+}
+
+// StreamUsage decodes the existing billing DTO and keeps the complete usage
+// object during that same parse. Diagnostic retention never changes the DTO.
+type StreamUsage struct {
+	Value   *dto.Usage
+	Raw     json.RawMessage
+	Preview string
+	Bytes   int
+}
+
+func (u *StreamUsage) UnmarshalJSON(data []byte) error {
+	u.Raw = nil
+	u.Preview = ""
+	u.Bytes = len(data)
+	if err := common.Unmarshal(data, &u.Value); err != nil {
+		return err
+	}
+	if u.Value == nil {
+		return nil
+	}
+	// Bound the encoded size too: JSON escaping may expand provider text.
+	if len(data) <= 8192 {
+		encoded, err := common.Marshal(json.RawMessage(data))
+		if err == nil && len(encoded) <= 8192 {
+			u.Raw = encoded
+			return nil
+		}
+	}
+	// Only copy a bounded prefix for diagnostics; the original DTO above still
+	// receives its normal input. Never serialize the whole oversized object.
+	prefix := data[:min(len(data), 8192)]
+	for !utf8.Valid(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	u.Preview = string(prefix)
+	for {
+		encoded, err := common.Marshal(u.Preview)
+		if err != nil {
+			u.Preview = ""
+			break
+		}
+		if len(encoded) <= 8192 {
+			break
+		}
+		size := max(0, len(u.Preview)*8192/len(encoded)-1)
+		u.Preview = bounded(u.Preview, size)
+	}
+	return nil
+}
+
+func (t *Trace) CaptureUpstreamUsage(usage StreamUsage) {
+	if t == nil || usage.Value == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.skipped {
+		return
+	}
+	t.record.Data.UpstreamUsage = usage.Raw
+	t.record.Data.UpstreamUsagePreview = usage.Preview
+	t.record.Data.UpstreamUsageBytes = usage.Bytes
+	t.record.Data.UpstreamUsageCapture = "captured"
+	if len(usage.Raw) == 0 {
+		t.record.Data.UpstreamUsageCapture = "truncated"
 	}
 }
 

@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "Aucune consommation amont enregistrée",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "La première réponse peut ne contenir qu’un rôle ; les identifiants et le modèle peuvent arriver plus tard.",
+    "Upstream usage summary": "Résumé de consommation amont",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "Objet usage complet du dernier fragment d’utilisation analysé reçu de l’amont directement connecté.",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "L’objet usage amont a été tronqué (taille d’origine : {{bytes}} B). Le préfixe enregistré est du texte, pas un JSON complet.",
+    "Truncated upstream usage": "Usage amont tronqué",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "Les anciennes entrées ne conservent qu’un résumé, sans présence des champs amont.",
+    "Upstream response recorded fields": "Champs enregistrés de la réponse amont",
+    "Completion recorded fields": "Champs enregistrés à la fin",
     "Record streaming request timeline": "Enregistrer la chronologie des requêtes en flux",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "Collecte les temps et certains champs des réponses en flux pris en charge, hors tests de modèles. Affecte les nouvelles requêtes ; les chronologies existantes restent consultables.",
     "End marker received": "Reçu",

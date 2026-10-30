@@ -1,5 +1,14 @@
 {
   "translation": {
+    "No upstream usage was recorded": "上流の使用量は記録されていません",
+    "The first frame may contain only role information; identifiers and the model may arrive later.": "最初の応答はロール情報のみの場合があり、識別子やモデルは後から届くことがあります。",
+    "Upstream usage summary": "上流の使用量の概要",
+    "Complete usage object from the last parsed usage frame received from the directly connected upstream.": "直接接続された上流から最後に受信・解析した使用量フレームの完全な usage オブジェクト。",
+    "Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.": "上流の usage は切り詰められました（元のサイズ：{{bytes}} B）。保存された先頭部分はテキストであり、完全な JSON ではありません。",
+    "Truncated upstream usage": "切り詰められた上流 usage",
+    "Earlier records contain only a summary; upstream field presence was not retained.": "過去の記録には概要のみがあり、上流フィールドの有無は保存されていません。",
+    "Upstream response recorded fields": "上流応答の記録フィールド",
+    "Completion recorded fields": "終了時の記録フィールド",
     "Record streaming request timeline": "ストリーミングリクエストのタイムラインを記録",
     "Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.": "対応するストリーミングリクエストの時刻と主要な応答フィールドを記録します。モデルテストは対象外です。保存後は新しいリクエストに適用され、既存の記録は引き続き参照できます。",
     "End marker received": "受信済み",

@@ -196,6 +196,40 @@ function TimelineNode(props: {
   )
 }
 
+function RecordedFields(props: {
+  label: string
+  value?: unknown
+  raw?: string
+}) {
+  const { t } = useTranslation()
+  const value = props.raw ?? JSON.stringify(props.value, null, 2) ?? ''
+  return (
+    <Collapsible className='min-w-0'>
+      <CollapsibleTrigger
+        render={<Button size='sm' variant='ghost' aria-label={props.label} />}
+      >
+        {t('View recorded fields')}
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className='bg-background/60 relative min-w-0 overflow-hidden rounded-md border'>
+          <CopyButton
+            value={value}
+            aria-label={t('Copy recorded fields')}
+            className='absolute top-1 right-1 size-7'
+          />
+          <pre
+            tabIndex={0}
+            aria-label={props.label}
+            className='max-h-40 overflow-auto p-3 pr-10 font-mono text-[11px] whitespace-pre'
+          >
+            {value}
+          </pre>
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  )
+}
+
 function TimelineDetails(props: {
   timeline: TimelineData
   record: NonNullable<TimelineResponse['record']>
@@ -233,24 +267,83 @@ function TimelineDetails(props: {
     }
     return `${(to - from).toLocaleString()} ms`
   }
-  const selected = JSON.stringify({ ...record, ...data }, null, 2)
+  const upstreamCount = (...keys: string[]): string => {
+    const reported: Array<{ key: string; value: number }> = []
+    for (const key of keys) {
+      const value = data.upstream_usage?.[key]
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        reported.push({ key, value })
+      }
+    }
+    const first = reported[0]
+    if (!first) return absent
+    if (reported.every((entry) => entry.value === first.value)) {
+      return first.value.toLocaleString()
+    }
+    return reported
+      .map((entry) => `${entry.key}: ${entry.value.toLocaleString()}`)
+      .join('; ')
+  }
+  let usageSummary = t('No upstream usage was recorded')
+  if (data.upstream_usage) {
+    usageSummary = t('Input {{input}} · Output {{output}} · Total {{total}}', {
+      input: upstreamCount('prompt_tokens', 'input_tokens'),
+      output: upstreamCount('completion_tokens', 'output_tokens'),
+      total: upstreamCount('total_tokens'),
+    })
+  } else if (data.upstream_usage_capture === 'truncated') {
+    usageSummary = t(
+      'Upstream usage was truncated (original size: {{bytes}} B). The saved prefix is text, not complete JSON.',
+      {
+        bytes: data.upstream_usage_bytes?.toLocaleString() ?? t('Unknown'),
+      }
+    )
+  } else if (data.returned_usage) {
+    usageSummary = t('Input {{input}} · Output {{output}} · Total {{total}}', {
+      input:
+        data.returned_usage.input_tokens === 0
+          ? t('Unknown')
+          : data.returned_usage.input_tokens.toLocaleString(),
+      output:
+        data.returned_usage.output_tokens === 0
+          ? t('Unknown')
+          : data.returned_usage.output_tokens.toLocaleString(),
+      total:
+        data.returned_usage.total_tokens === 0
+          ? t('Unknown')
+          : data.returned_usage.total_tokens.toLocaleString(),
+    })
+  }
   return (
     <div className='min-w-0 space-y-4 rounded-md border p-3'>
-      <div className='flex flex-wrap items-center gap-2'>
-        <StatusBadge label={result} variant={variant} copyable={false} />
-        {record.upstream_status != null && (
-          <StatusBadge
-            label={`HTTP ${record.upstream_status}`}
-            variant='neutral'
-            copyable={false}
-          />
-        )}
+      <div className='bg-muted/30 grid grid-cols-2 gap-3 rounded-md border p-3 sm:grid-cols-[1fr_1fr_auto]'>
+        <div>
+          <p className='text-muted-foreground text-xs'>
+            {t('Existing first-response time')}
+          </p>
+          <p className='mt-1 font-mono text-base font-semibold tabular-nums'>
+            {duration(0, data.first_response_ms)}
+          </p>
+        </div>
+        <div>
+          <p className='text-muted-foreground text-xs'>
+            {t('Total output time')}
+          </p>
+          <p className='mt-1 font-mono text-base font-semibold tabular-nums'>
+            {duration(0, data.ended_ms)}
+          </p>
+        </div>
+        <div className='col-span-2 flex flex-wrap items-center gap-2 sm:col-span-1 sm:self-center'>
+          <StatusBadge label={result} variant={variant} copyable={false} />
+          {record.upstream_status != null && (
+            <StatusBadge
+              label={`HTTP ${record.upstream_status}`}
+              variant='neutral'
+              copyable={false}
+            />
+          )}
+        </div>
       </div>
-      <p className='text-muted-foreground text-xs'>
-        {t(
-          'Recorded inside this service. A completed write does not confirm receipt by the client.'
-        )}
-      </p>
       {!data.timing_valid && (
         <p role='status' className='text-destructive text-xs'>
           {t(
@@ -272,16 +365,6 @@ function TimelineDetails(props: {
         <DetailRow
           label={t('Forwarding first response')}
           value={duration(data.first_response_ms, data.first_write_ms)}
-          mono
-        />
-        <DetailRow
-          label={t('Existing first-response time')}
-          value={duration(0, data.first_response_ms)}
-          mono
-        />
-        <DetailRow
-          label={t('Total output time')}
-          value={duration(0, data.ended_ms)}
           mono
         />
       </DetailSection>
@@ -345,9 +428,19 @@ function TimelineDetails(props: {
           />
           <p className='text-muted-foreground text-xs'>
             {t(
-              'Uses the existing first-response endpoint; the first response may contain role information rather than text.'
+              'The first frame may contain only role information; identifiers and the model may arrive later.'
             )}
           </p>
+          <RecordedFields
+            label={t('Upstream response recorded fields')}
+            value={{
+              upstream_status: record.upstream_status,
+              upstream_request_id: data.upstream_request_id,
+              response_id: data.response_id,
+              response_model: data.response_model,
+              first_chunk_type: data.first_chunk_type,
+            }}
+          />
         </TimelineNode>
         <TimelineNode
           {...point}
@@ -358,6 +451,11 @@ function TimelineDetails(props: {
           <p className='text-muted-foreground text-xs'>
             {t(
               'First payload write and flush completed. Heartbeats are excluded.'
+            )}
+          </p>
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'Recorded inside this service. A completed write does not confirm receipt by the client.'
             )}
           </p>
         </TimelineNode>
@@ -378,19 +476,48 @@ function TimelineDetails(props: {
           />
           <DetailRow
             label={t('Upstream end marker')}
-            value={data.end_marker_received ? t('End marker received') : t('Not received')}
-          />
-          <DetailRow
-            label={t('Returned token usage')}
             value={
-              data.returned_usage
-                ? t('Input {{input}} · Output {{output}} · Total {{total}}', {
-                    input: data.returned_usage.input_tokens,
-                    output: data.returned_usage.output_tokens,
-                    total: data.returned_usage.total_tokens,
-                  })
-                : t('Not returned by upstream')
+              data.end_marker_received
+                ? t('End marker received')
+                : t('Not received')
             }
+          />
+          <DetailRow label={t('Upstream usage summary')} value={usageSummary} />
+          {data.upstream_usage && (
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'Complete usage object from the last parsed usage frame received from the directly connected upstream.'
+              )}
+            </p>
+          )}
+          {!data.upstream_usage &&
+            !data.upstream_usage_capture &&
+            data.returned_usage && (
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Earlier records contain only a summary; upstream field presence was not retained.'
+                )}
+              </p>
+            )}
+          {data.upstream_usage_capture === 'truncated' && (
+            <RecordedFields
+              label={t('Truncated upstream usage')}
+              raw={data.upstream_usage_preview ?? ''}
+            />
+          )}
+          <RecordedFields
+            label={t('Completion recorded fields')}
+            value={{
+              end_reason: data.end_reason,
+              finish_reason: data.finish_reason,
+              end_marker_received: data.end_marker_received,
+              usage: data.upstream_usage,
+              usage_capture: data.upstream_usage_capture,
+              usage_summary:
+                data.upstream_usage || data.upstream_usage_capture
+                  ? undefined
+                  : data.returned_usage,
+            }}
           />
         </TimelineNode>
       </ol>
@@ -422,22 +549,6 @@ function TimelineDetails(props: {
           )}
         </DetailSection>
       )}
-      <Collapsible className='min-w-0'>
-        <CollapsibleTrigger render={<Button size='sm' variant='ghost' />}>
-          {t('View recorded fields')}
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className='flex justify-end'>
-            <CopyButton
-              value={selected}
-              aria-label={t('Copy recorded fields')}
-            />
-          </div>
-          <pre className='bg-muted max-h-64 min-w-0 overflow-auto rounded p-2 text-xs break-all whitespace-pre-wrap'>
-            {selected}
-          </pre>
-        </CollapsibleContent>
-      </Collapsible>
     </div>
   )
 }

@@ -38,6 +38,10 @@ const timelineSchema = z.object({
   finish_reason: z.string().optional(),
   end_reason: z.string().optional(),
   end_marker_received: z.boolean(),
+  upstream_usage: z.record(z.string(), z.unknown()).optional(),
+  upstream_usage_capture: z.enum(['captured', 'truncated']).optional(),
+  upstream_usage_preview: z.string().optional(),
+  upstream_usage_bytes: z.number().int().nonnegative().optional(),
   returned_usage: z
     .object({
       input_tokens: z.number(),
