@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -78,9 +79,29 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 
 	var (
-		newAPIError *types.NewAPIError
-		ws          *websocket.Conn
+		newAPIError           *types.NewAPIError
+		ws                    *websocket.Conn
+		timeline              *requesttimeline.Trace
+		restoreTimelineWriter func()
 	)
+	// Registered before the existing response/error defers, so submission runs last.
+	defer func() {
+		if timeline == nil {
+			return
+		}
+		if recovered := recover(); recovered != nil {
+			timeline.LocalError("panic", "Relay processing panicked")
+			service.EnqueueRequestTimeline(timeline.Freeze(nil))
+			restoreTimelineWriter()
+			panic(recovered)
+		}
+		var finalError error
+		if newAPIError != nil {
+			finalError = newAPIError
+		}
+		service.EnqueueRequestTimeline(timeline.Freeze(finalError))
+		restoreTimelineWriter()
+	}()
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
 		var err error
@@ -127,6 +148,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
+	}
+
+	timeline = service.BeginRequestTimeline(c, relayInfo)
+	relayInfo.Timeline = timeline
+	if timeline != nil {
+		restoreTimelineWriter = helper.ObserveRequestTimelineWriter(c, timeline)
 	}
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
@@ -197,6 +224,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
+		if relayInfo.RetryIndex > 0 {
+			timeline.Skip()
+		}
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())

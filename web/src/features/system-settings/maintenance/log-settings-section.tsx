@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -80,12 +80,14 @@ import type { LogCleanupTask } from '../types'
 
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
+  RequestTimelineEnabled: z.boolean(),
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
+  defaultTimelineEnabled?: boolean
 }
 
 type ServerLogInfo = {
@@ -141,13 +143,19 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
 
 export function LogSettingsSection({
   defaultEnabled,
+  defaultTimelineEnabled = false,
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
+  const previousDefaults = useRef<LogSettingsFormValues>({
+    LogConsumeEnabled: defaultEnabled,
+    RequestTimelineEnabled: defaultTimelineEnabled,
+  })
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
+      RequestTimelineEnabled: defaultTimelineEnabled,
     },
   })
 
@@ -174,8 +182,27 @@ export function LogSettingsSection({
   }, [])
 
   useEffect(() => {
-    form.reset({ LogConsumeEnabled: defaultEnabled })
-  }, [defaultEnabled, form])
+    const draft = form.getValues()
+    const nextDefaults = {
+      LogConsumeEnabled: defaultEnabled,
+      RequestTimelineEnabled: defaultTimelineEnabled,
+    }
+    form.reset(nextDefaults)
+    // A successful first save can refresh both defaults while the second is
+    // still pending. Preserve unsaved choices; acknowledge server-matched ones.
+    for (const key of [
+      'LogConsumeEnabled',
+      'RequestTimelineEnabled',
+    ] as const) {
+      if (
+        draft[key] !== previousDefaults.current[key] &&
+        draft[key] !== nextDefaults[key]
+      ) {
+        form.setValue(key, draft[key], { shouldDirty: true })
+      }
+    }
+    previousDefaults.current = nextDefaults
+  }, [defaultEnabled, defaultTimelineEnabled, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -257,11 +284,23 @@ export function LogSettingsSection({
   }, [logCleanupActive, logCleanupTaskId, t])
 
   const onSubmit = async (values: LogSettingsFormValues) => {
-    if (values.LogConsumeEnabled === defaultEnabled) return
-    await updateOption.mutateAsync({
-      key: 'LogConsumeEnabled',
-      value: values.LogConsumeEnabled,
-    })
+    try {
+      if (values.LogConsumeEnabled !== defaultEnabled) {
+        const result = await updateOption.mutateAsync({
+          key: 'LogConsumeEnabled',
+          value: values.LogConsumeEnabled,
+        })
+        if (!result.success) return
+      }
+      if (values.RequestTimelineEnabled !== defaultTimelineEnabled) {
+        await updateOption.mutateAsync({
+          key: 'RequestTimelineEnabled',
+          value: values.RequestTimelineEnabled,
+        })
+      }
+    } catch {
+      // The mutation hook reports the error; retain input for retry.
+    }
   }
 
   const handleRequestCleanLogs = () => {
@@ -353,6 +392,32 @@ export function LogSettingsSection({
                   <FormDescription>
                     {t(
                       'Track per-request consumption to power usage analytics. Keeping this on increases database writes.'
+                    )}
+                  </FormDescription>
+                </SettingsSwitchContent>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+                <FormMessage />
+              </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='RequestTimelineEnabled'
+            render={({ field }) => (
+              <SettingsSwitchItem>
+                <SettingsSwitchContent>
+                  <FormLabel>
+                    {t('Record streaming request timeline')}
+                  </FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>

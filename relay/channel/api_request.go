@@ -529,7 +529,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	req = info.Timeline.Request(req, info.ChannelId, info.ApiKey)
 	resp, err := relayClient.Do(req)
+	info.Timeline.Response(resp, err)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))

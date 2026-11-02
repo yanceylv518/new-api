@@ -250,13 +250,14 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
-		var streamResp dto.ResponsesStreamResponse
-		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
+		streamResp, err := decodeTimelineResponsesFrame(data, info.Timeline)
+		if err != nil {
 			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
 			sr.Error(err)
 			return
 		}
 
+		info.Timeline.ObserveResponses(streamResp, streamResp.Code, streamResp.Message)
 		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
