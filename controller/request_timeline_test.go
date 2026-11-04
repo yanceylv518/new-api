@@ -363,7 +363,8 @@ func TestRequestTimelineAdminLookupAndCandidateGate(t *testing.T) {
 		}
 	}
 
-	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: time.Now().UnixMilli(), TimingValid: true})
+	headers := map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "5120", "Msh-Usage-Cache-Write-Tokens-1h": "0"}
+	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: time.Now().UnixMilli(), TimingValid: true, UpstreamResponseHeaders: headers})
 	require.NoError(t, err)
 	require.NoError(t, model.InsertRequestTimelines(context.Background(), []*model.RequestTimeline{{RequestID: "lookup", UserID: int64(admin.Id), CreatedAt: time.Now().Unix(), Result: "unknown", Data: string(payload)}}))
 	r := gin.New()
@@ -375,6 +376,13 @@ func TestRequestTimelineAdminLookupAndCandidateGate(t *testing.T) {
 	assert.Contains(t, response.Body.String(), `"found":true`)
 	assert.Contains(t, response.Body.String(), `"enabled":false`)
 	assert.Contains(t, response.Body.String(), `"status":"available"`)
+	var lookup struct {
+		Data struct {
+			Timeline requesttimeline.Data `json:"timeline"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &lookup))
+	assert.Equal(t, headers, lookup.Data.Timeline.UpstreamResponseHeaders)
 	assert.Equal(t, 401, auditRequest(r, "GET", "/api/request-timelines/lookup", "wrong-token").Code)
 	ordinaryToken := "ordinary-timeline-token"
 	ordinary := &model.User{Username: "timeline-user", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &ordinaryToken, AuthVersion: 1, AffCode: "timeline-user"}
@@ -444,7 +452,8 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, model.MigrateRequestTimelines())
 	assert.False(t, mainDB.Migrator().HasTable(&model.RequestTimeline{}))
 	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, RequestModel: "中文模型", TimingValid: true, UpstreamUsage: []byte(`{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`), UpstreamUsageCapture: "captured",
-		AttemptCount: 2, Attempts: []requesttimeline.Attempt{
+		UpstreamResponseHeaders: map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "5120", "Msh-Usage-Cache-Write-Tokens-1h": "0"},
+		AttemptCount:            2, Attempts: []requesttimeline.Attempt{
 			{Number: 1, RetryIndex: 0, Result: "failed", Data: requesttimeline.Data{Version: 1, StartedAtMS: 1000000, ChannelID: 1, FirstError: &requesttimeline.Failure{Kind: "upstream_http_error", Code: "502", Message: "上游失败"}}},
 			{Number: 2, RetryIndex: 1, StartedMS: 100, Result: "success", Data: requesttimeline.Data{Version: 1, StartedAtMS: 1000000, ChannelID: 2, ReturnedUsage: &requesttimeline.Usage{InputTokens: 3, OutputTokens: 6, TotalTokens: 9}}},
 		}})
@@ -478,6 +487,8 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	assert.Equal(t, "中文模型", decoded.RequestModel)
 	assert.JSONEq(t, `{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`, string(decoded.UpstreamUsage))
 	assert.Equal(t, "captured", decoded.UpstreamUsageCapture)
+	assert.Equal(t, map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "5120", "Msh-Usage-Cache-Write-Tokens-1h": "0"}, decoded.UpstreamResponseHeaders)
+	assert.Nil(t, truncatedData.UpstreamResponseHeaders, "historical records must not gain invented header values")
 	require.Len(t, decoded.Attempts, 2)
 	assert.Equal(t, "上游失败", decoded.Attempts[0].Data.FirstError.Message)
 	assert.Equal(t, "success", decoded.Attempts[1].Result)
@@ -1321,6 +1332,75 @@ func TestRequestTimelineUsageCaptureBoundaries(t *testing.T) {
 	}
 }
 
+func TestRequestTimelineUpstreamResponseHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		want    map[string]string
+	}{
+		{"reported_zero", map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "5120", "Msh-Usage-Cache-Write-Tokens-1h": "0", "Set-Cookie": "session=private"}, map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "5120", "Msh-Usage-Cache-Write-Tokens-1h": "0"}},
+		{"only_1h", map[string]string{"Msh-Usage-Cache-Write-Tokens-1h": "17"}, map[string]string{"Msh-Usage-Cache-Write-Tokens-1h": "17"}},
+		{"missing", map[string]string{"Set-Cookie": "session=private"}, nil},
+		{"empty", map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "", "Msh-Usage-Cache-Write-Tokens-1h": ""}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
+			for name, value := range tc.headers {
+				response.Header.Set(name, value)
+			}
+			original := response.Header.Clone()
+			trace := requesttimeline.New(time.Now(), tc.name, 7, "model")
+			trace.Response(response, nil)
+			record := trace.Freeze(nil)
+			require.NotNil(t, record)
+			raw, err := record.MarshalData()
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, common.Unmarshal(raw, &fields))
+			if tc.want == nil {
+				assert.NotContains(t, fields, "upstream_response_headers")
+			} else {
+				var decoded struct {
+					Headers map[string]string `json:"upstream_response_headers"`
+				}
+				require.NoError(t, common.Unmarshal(raw, &decoded))
+				assert.Equal(t, tc.want, decoded.Headers)
+			}
+			assert.Equal(t, original, response.Header, "diagnostics must not modify forwarded headers")
+			assert.Nil(t, record.Data.FirstResponseMS, "receiving HTTP headers must not count as the first streamed payload")
+			assert.Empty(t, record.Data.UpstreamUsage)
+			assert.Nil(t, record.Data.ReturnedUsage, "response headers must not become billable usage")
+		})
+	}
+}
+
+func TestRequestTimelineResponseHeaderBoundsAndFallbackIsolation(t *testing.T) {
+	value := strings.Repeat("9", 20<<10)
+	response := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
+	response.Header.Set("Msh-Usage-Cache-Write-Tokens-5m", value)
+	response.Header.Set("Msh-Usage-Cache-Write-Tokens-1h", "0")
+	trace := requesttimeline.New(time.Now(), "header-bounds", 7, "model")
+	trace.BeginAttempt(0)
+	trace.Response(response, nil)
+	trace.EndAttempt(errors.New("retry upstream"))
+	trace.BeginAttempt(1)
+	trace.Response(&http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, nil)
+	record := trace.Freeze(nil)
+	require.NotNil(t, record)
+	require.Len(t, record.Data.Attempts, 2)
+	assert.Nil(t, record.Data.UpstreamResponseHeaders)
+	assert.Nil(t, record.Data.Attempts[1].Data.UpstreamResponseHeaders, "fallback must not inherit the previous attempt's headers")
+	first := record.Data.Attempts[0].Data
+	assert.Equal(t, "0", first.UpstreamResponseHeaders["Msh-Usage-Cache-Write-Tokens-1h"])
+	require.NotEmpty(t, first.UpstreamResponseHeaders["Msh-Usage-Cache-Write-Tokens-5m"])
+	assert.Less(t, len(first.UpstreamResponseHeaders["Msh-Usage-Cache-Write-Tokens-5m"]), len(value))
+	assert.True(t, first.DetailsTruncated)
+	assert.Equal(t, value, response.Header.Get("Msh-Usage-Cache-Write-Tokens-5m"))
+	raw, err := record.MarshalData()
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), requesttimeline.MaxDataBytes)
+}
+
 func TestRequestTimelineMassRequestIDHeader(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1575,6 +1655,11 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 				requestMu.Unlock()
 				index := attempts.Add(1)
 				w.Header().Set("X-Request-Id", fmt.Sprintf("upstream-%d", index))
+				if index == 1 {
+					w.Header().Set("Msh-Usage-Cache-Write-Tokens-5m", "0")
+				} else {
+					w.Header().Set("Msh-Usage-Cache-Write-Tokens-1h", "17")
+				}
 				if index == 1 || allFail {
 					w.WriteHeader(http.StatusBadGateway)
 					_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"type":"upstream_error","message":"provider rejected %s"}}`, r.Header.Get("Authorization")))
@@ -1654,6 +1739,9 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 					assert.Equal(t, "upstream-1", data.Attempts[0].Data.UpstreamRequestID)
 					assert.Equal(t, 102, data.Attempts[1].Data.ChannelID)
 					assert.Equal(t, "upstream-2", data.Attempts[1].Data.UpstreamRequestID)
+					assert.Equal(t, map[string]string{"Msh-Usage-Cache-Write-Tokens-5m": "0"}, data.Attempts[0].Data.UpstreamResponseHeaders)
+					assert.Equal(t, map[string]string{"Msh-Usage-Cache-Write-Tokens-1h": "17"}, data.Attempts[1].Data.UpstreamResponseHeaders)
+					assert.Equal(t, data.Attempts[1].Data.UpstreamResponseHeaders, data.UpstreamResponseHeaders)
 					assert.NotContains(t, entry.Data, "sk-first-secret")
 					assert.NotContains(t, entry.Data, "sk-second-secret")
 					assert.LessOrEqual(t, len(entry.Data), requesttimeline.MaxDataBytes)

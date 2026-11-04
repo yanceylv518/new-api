@@ -590,6 +590,7 @@ function TimelineDetails(props: {
             value={{
               upstream_status: record.upstream_status,
               upstream_request_id: data.upstream_request_id,
+              upstream_response_headers: data.upstream_response_headers,
               response_id: data.response_id,
               response_model: data.response_model,
               first_chunk_type: data.first_chunk_type,

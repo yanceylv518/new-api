@@ -32,6 +32,7 @@ const spanSchema = z.object({
   request_model: z.string(),
   channel_id: z.number().int(),
   upstream_request_id: z.string().optional(),
+  upstream_response_headers: z.record(z.string(), z.string()).optional(),
   response_id: z.string().optional(),
   response_model: z.string().optional(),
   first_chunk_type: z.string().optional(),

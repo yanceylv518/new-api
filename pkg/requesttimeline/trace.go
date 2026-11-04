@@ -100,32 +100,33 @@ type Failure struct {
 }
 
 type Data struct {
-	Version              int             `json:"version"`
-	StartedAtMS          int64           `json:"started_at_ms"`
-	RequestSentMS        *int64          `json:"request_sent_ms"`
-	FirstResponseMS      *int64          `json:"first_response_ms"`
-	FirstWriteMS         *int64          `json:"first_write_ms"`
-	EndedMS              *int64          `json:"ended_ms"`
-	TimingValid          bool            `json:"timing_valid"`
-	RequestModel         string          `json:"request_model"`
-	ChannelID            int             `json:"channel_id"`
-	UpstreamRequestID    string          `json:"upstream_request_id,omitempty"`
-	ResponseID           string          `json:"response_id,omitempty"`
-	ResponseModel        string          `json:"response_model,omitempty"`
-	FirstChunkType       string          `json:"first_chunk_type,omitempty"`
-	FinishReason         string          `json:"finish_reason,omitempty"`
-	EndReason            string          `json:"end_reason,omitempty"`
-	EndMarkerReceived    bool            `json:"end_marker_received"`
-	ReturnedUsage        *Usage          `json:"returned_usage"`
-	UpstreamUsage        json.RawMessage `json:"upstream_usage,omitempty"`
-	UpstreamUsageCapture string          `json:"upstream_usage_capture,omitempty"`
-	UpstreamUsagePreview string          `json:"upstream_usage_preview,omitempty"`
-	UpstreamUsageBytes   int             `json:"upstream_usage_bytes,omitempty"`
-	FirstError           *Failure        `json:"first_error"`
-	AttemptCount         int             `json:"attempt_count,omitempty"`
-	AttemptsOmitted      int             `json:"attempts_omitted,omitempty"`
-	Attempts             []Attempt       `json:"attempts,omitempty"`
-	DetailsTruncated     bool            `json:"details_truncated,omitempty"`
+	Version                 int               `json:"version"`
+	StartedAtMS             int64             `json:"started_at_ms"`
+	RequestSentMS           *int64            `json:"request_sent_ms"`
+	FirstResponseMS         *int64            `json:"first_response_ms"`
+	FirstWriteMS            *int64            `json:"first_write_ms"`
+	EndedMS                 *int64            `json:"ended_ms"`
+	TimingValid             bool              `json:"timing_valid"`
+	RequestModel            string            `json:"request_model"`
+	ChannelID               int               `json:"channel_id"`
+	UpstreamRequestID       string            `json:"upstream_request_id,omitempty"`
+	UpstreamResponseHeaders map[string]string `json:"upstream_response_headers,omitempty"`
+	ResponseID              string            `json:"response_id,omitempty"`
+	ResponseModel           string            `json:"response_model,omitempty"`
+	FirstChunkType          string            `json:"first_chunk_type,omitempty"`
+	FinishReason            string            `json:"finish_reason,omitempty"`
+	EndReason               string            `json:"end_reason,omitempty"`
+	EndMarkerReceived       bool              `json:"end_marker_received"`
+	ReturnedUsage           *Usage            `json:"returned_usage"`
+	UpstreamUsage           json.RawMessage   `json:"upstream_usage,omitempty"`
+	UpstreamUsageCapture    string            `json:"upstream_usage_capture,omitempty"`
+	UpstreamUsagePreview    string            `json:"upstream_usage_preview,omitempty"`
+	UpstreamUsageBytes      int               `json:"upstream_usage_bytes,omitempty"`
+	FirstError              *Failure          `json:"first_error"`
+	AttemptCount            int               `json:"attempt_count,omitempty"`
+	AttemptsOmitted         int               `json:"attempts_omitted,omitempty"`
+	Attempts                []Attempt         `json:"attempts,omitempty"`
+	DetailsTruncated        bool              `json:"details_truncated,omitempty"`
 }
 
 // Offsets in every attempt use the original request start, so fallback gaps
@@ -405,6 +406,22 @@ func (t *Trace) Response(resp *http.Response, err error) {
 	if resp != nil {
 		status := resp.StatusCode
 		t.record.UpstreamStatus = &status
+		// 只记录指定的缓存写入响应头；缺失值省略，原始字符串和显式 0 保留。
+		var headers map[string]string
+		for _, key := range []string{"Msh-Usage-Cache-Write-Tokens-5m", "Msh-Usage-Cache-Write-Tokens-1h"} {
+			value := resp.Header.Get(key)
+			if value == "" {
+				continue
+			}
+			if headers == nil {
+				headers = make(map[string]string, 2)
+			}
+			headers[key] = bounded(value, 256)
+			if len(value) > 256 {
+				t.record.Data.DetailsTruncated = true
+			}
+		}
+		t.record.Data.UpstreamResponseHeaders = headers
 		for _, key := range []string{common.RequestIdKey, "X-Request-Id", "Request-Id", "X-Mass-Requestid"} {
 			if value := resp.Header.Get(key); value != "" {
 				t.record.Data.UpstreamRequestID = bounded(value, 256)
@@ -860,6 +877,17 @@ func (t *Trace) Freeze(localErr error) *Record {
 // compactAttemptData bounds retained history independently of the retry count.
 // The presence of truncated details is explicit; no usage values are invented.
 func compactAttemptData(data *Data, limit int) {
+	if len(data.UpstreamResponseHeaders) > 0 {
+		// 压缩尝试快照时复制映射，避免改写最终尝试保留的原始值。
+		headers := make(map[string]string, len(data.UpstreamResponseHeaders))
+		for key, value := range data.UpstreamResponseHeaders {
+			headers[key] = bounded(value, limit)
+			if len(value) > limit {
+				data.DetailsTruncated = true
+			}
+		}
+		data.UpstreamResponseHeaders = headers
+	}
 	for _, value := range []*string{&data.RequestModel, &data.UpstreamRequestID, &data.ResponseID, &data.ResponseModel, &data.FirstChunkType, &data.FinishReason, &data.EndReason} {
 		if len(*value) > limit {
 			*value = bounded(*value, limit)

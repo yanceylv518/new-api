@@ -97,6 +97,55 @@ afterEach(() => {
 })
 
 describe('request timeline', () => {
+  it.each([
+    {
+      name: 'reported values including zero',
+      headers: {
+        'Msh-Usage-Cache-Write-Tokens-5m': '5120',
+        'Msh-Usage-Cache-Write-Tokens-1h': '0',
+      },
+    },
+    {
+      name: 'only one reported header',
+      headers: { 'Msh-Usage-Cache-Write-Tokens-1h': '17' },
+    },
+    { name: 'historical record without headers', headers: undefined },
+  ])(
+    'includes $name in the existing upstream recorded fields and copied JSON',
+    async ({ headers }) => {
+      const original = recordedResponse()
+      const response = {
+        ...original,
+        timeline: { ...original.timeline, upstream_response_headers: headers },
+      }
+      vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+      const user = userEvent.setup()
+      mountTimeline()
+      await user.click(screen.getByRole('button', { name: 'Request timeline' }))
+      await user.click(
+        await screen.findByRole('button', {
+          name: 'Upstream response recorded fields',
+        })
+      )
+      const fields = screen.getByLabelText(
+        'Upstream response recorded fields',
+        { selector: 'pre' }
+      )
+      const displayed = JSON.parse(fields.textContent ?? '')
+      expect(displayed.upstream_status).toBe(200)
+      expect(displayed.upstream_response_headers).toEqual(headers)
+      if (!headers) {
+        expect(displayed).not.toHaveProperty('upstream_response_headers')
+      }
+      await user.click(
+        screen.getByRole('button', { name: 'Copy recorded fields' })
+      )
+      expect(JSON.parse(await navigator.clipboard.readText())).toEqual(
+        displayed
+      )
+    }
+  )
+
   it('reports omitted intermediate attempts and truncated fields without hiding the final failure', async () => {
     const response = recordedResponse()
     const span = { ...response.timeline, details_truncated: true }
@@ -175,7 +224,13 @@ describe('request timeline', () => {
                 started_ms: 0,
                 ...response.record,
                 upstream_status: 502,
-                data: response.timeline,
+                data: {
+                  ...response.timeline,
+                  upstream_response_headers: {
+                    'Msh-Usage-Cache-Write-Tokens-5m': '5120',
+                    'Msh-Usage-Cache-Write-Tokens-1h': '0',
+                  },
+                },
               },
               {
                 number: 2,
@@ -222,6 +277,18 @@ describe('request timeline', () => {
     expect(
       within(finalPanel).getByText(/"vendor_note": "complete final usage"/)
     ).toBeVisible()
+    await user.click(
+      within(finalPanel).getByRole('button', {
+        name: 'Upstream response recorded fields',
+      })
+    )
+    expect(
+      JSON.parse(
+        within(finalPanel).getByLabelText('Upstream response recorded fields', {
+          selector: 'pre',
+        }).textContent ?? ''
+      )
+    ).not.toHaveProperty('upstream_response_headers')
     expect(
       screen.queryByText('<script>unsafe()</script>')
     ).not.toBeInTheDocument()
@@ -235,6 +302,21 @@ describe('request timeline', () => {
     ).toBeVisible()
     expect(document.querySelector('script')).toBeNull()
     expect(within(firstPanel).getByText('HTTP 502')).toBeVisible()
+    await user.click(
+      within(firstPanel).getByRole('button', {
+        name: 'Upstream response recorded fields',
+      })
+    )
+    expect(
+      JSON.parse(
+        within(firstPanel).getByLabelText('Upstream response recorded fields', {
+          selector: 'pre',
+        }).textContent ?? ''
+      ).upstream_response_headers
+    ).toEqual({
+      'Msh-Usage-Cache-Write-Tokens-5m': '5120',
+      'Msh-Usage-Cache-Write-Tokens-1h': '0',
+    })
     expect(screen.getByLabelText('Final result')).toHaveTextContent('Completed')
   })
 
