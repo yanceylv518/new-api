@@ -24,8 +24,8 @@ func SysLog(s string) {
 func SysError(s string) {
 	t := time.Now()
 	LogWriterMu.RLock()
+	defer LogWriterMu.RUnlock()
 	_, _ = fmt.Fprintf(gin.DefaultErrorWriter, "[SYS] %v | %s \n", t.Format("2006/01/02 - 15:04:05"), s)
-	LogWriterMu.RUnlock()
 }
 
 func FatalLog(v ...any) {

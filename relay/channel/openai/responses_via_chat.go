@@ -115,6 +115,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		chunk, decodeErr := decodeTimelineChatFrame(data, info.Timeline)
 		var errorResp dto.OpenAITextResponse
 		if err := common.UnmarshalJsonStr(data, &errorResp); err == nil {
 			if oaiError := errorResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
@@ -128,9 +129,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			}
 		}
 
-		var chunk dto.ChatCompletionsStreamResponse
-		if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
+		if err := decodeErr; err != nil {
 			logger.LogError(c, "failed to unmarshal chat stream response: "+err.Error())
+			info.Timeline.LocalError(string(types.ErrorCodeBadResponseBody), err.Error())
 			if failResponsesStream(err) {
 				sr.Stop(streamErr)
 				return

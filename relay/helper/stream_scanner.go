@@ -245,6 +245,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			wg.Done()
 		}()
 
+		firstTimelineFrame := true
 		for scanner.Scan() {
 			// 检查是否需要停止
 			select {
@@ -272,6 +273,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
+				// Each fallback attempt needs its own first frame, independent of
+				// the request-level timestamp used by the existing relay/billing.
+				if firstTimelineFrame {
+					firstTimelineFrame = false
+					if info.Timeline != nil {
+						info.Timeline.FirstResponse(time.Now())
+					}
+				}
 				info.ReceivedResponseCount++
 
 				select {

@@ -99,6 +99,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			finalError = newAPIError
 		}
+		if contextErr := c.Request.Context().Err(); contextErr != nil {
+			finalError = contextErr
+		}
 		service.EnqueueRequestTimeline(timeline.Freeze(finalError))
 		restoreTimelineWriter()
 	}()
@@ -224,9 +227,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
-		if relayInfo.RetryIndex > 0 {
-			timeline.Skip()
-		}
+		timeline.BeginAttempt(relayInfo.RetryIndex)
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
@@ -234,6 +235,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		addUsedChannel(c, channel.Id)
+		timeline.SelectChannel(channel.Id, common.GetContextKeyString(c, constant.ContextKeyChannelKey))
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
 			break
@@ -268,6 +270,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+		timeline.EndAttempt(newAPIError)
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)

@@ -40,6 +40,7 @@ import {
 } from '../components/dialogs/log-detail-layout'
 import {
   getRequestTimeline,
+  type TimelineAttempt,
   type TimelineData,
   type TimelineResponse,
 } from './api'
@@ -147,7 +148,126 @@ function TimelineQuery(props: {
       />
     )
   }
+  if (data.timeline.attempts?.length) {
+    return <FallbackTimeline timeline={data.timeline} record={data.record} />
+  }
   return <TimelineDetails timeline={data.timeline} record={data.record} />
+}
+
+function FallbackTimeline(props: {
+  timeline: TimelineData
+  record: NonNullable<TimelineResponse['record']>
+}) {
+  const { t } = useTranslation()
+  const results = {
+    success: { label: t('Completed'), variant: 'green' },
+    failed: { label: t('Failed'), variant: 'red' },
+    interrupted: { label: t('Interrupted'), variant: 'amber' },
+    unknown: { label: t('Unconfirmed end'), variant: 'neutral' },
+  } as const
+  const result = results[props.record.result]
+  return (
+    <div className='min-w-0 space-y-3'>
+      <DetailSection label={t('Request summary')}>
+        <div aria-label={t('Final result')}>
+          <DetailRow
+            label={t('Final result')}
+            value={
+              <StatusBadge
+                label={result.label}
+                variant={result.variant}
+                copyable={false}
+              />
+            }
+          />
+        </div>
+        <DetailRow label={t('Attempts')} value={props.timeline.attempt_count} />
+        <DetailRow
+          label={t('Total output time')}
+          value={
+            props.timeline.timing_valid && props.timeline.ended_ms != null
+              ? `${props.timeline.ended_ms.toLocaleString()} ms`
+              : t('Not recorded')
+          }
+          mono
+        />
+      </DetailSection>
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'All time points are relative to the original request start. Durations within each attempt exclude earlier attempts.'
+        )}
+      </p>
+      {!!props.timeline.attempts_omitted && (
+        <p role='status' className='text-muted-foreground text-xs'>
+          {t(
+            '{{count}} intermediate attempts omitted to keep this timeline within its recording limit.',
+            { count: props.timeline.attempts_omitted }
+          )}
+        </p>
+      )}
+      {props.timeline.attempts?.map((attempt) => (
+        <AttemptTimeline
+          key={attempt.number}
+          attempt={attempt}
+          timeline={
+            attempt.number === props.timeline.attempt_count
+              ? props.timeline
+              : attempt.data
+          }
+          requestId={props.record.request_id}
+          final={attempt.number === props.timeline.attempt_count}
+        />
+      ))}
+    </div>
+  )
+}
+
+function AttemptTimeline(props: {
+  attempt: TimelineAttempt
+  timeline: TimelineData
+  requestId: string
+  final: boolean
+}) {
+  const { t } = useTranslation()
+  let label = t('Attempt {{number}} · Channel {{channel}}', {
+    number: props.attempt.number,
+    channel: props.attempt.data.channel_id,
+  })
+  if (props.attempt.data.channel_id <= 0) {
+    label = t('Attempt {{number}} · No channel selected', {
+      number: props.attempt.number,
+    })
+  }
+  const results = {
+    success: t('Completed'),
+    failed: t('Failed'),
+    interrupted: t('Interrupted'),
+    unknown: t('Unconfirmed end'),
+  }
+  return (
+    <Collapsible defaultOpen={props.final} className='min-w-0 space-y-2'>
+      <CollapsibleTrigger
+        render={
+          <Button
+            variant='outline'
+            className='h-auto w-full justify-between gap-2 whitespace-normal'
+          />
+        }
+      >
+        <span className='min-w-0 text-left break-words'>{label}</span>
+        <span className='shrink-0 text-xs'>
+          {results[props.attempt.result]}
+        </span>
+      </CollapsibleTrigger>
+      <CollapsibleContent role='region' aria-label={label}>
+        <TimelineDetails
+          timeline={props.timeline}
+          record={{ ...props.attempt, request_id: props.requestId }}
+          attemptStart={props.attempt.started_ms}
+        />
+      </CollapsibleContent>
+    </Collapsible>
+  )
 }
 
 function TimelineNode(props: {
@@ -233,11 +353,13 @@ function RecordedFields(props: {
 function TimelineDetails(props: {
   timeline: TimelineData
   record: NonNullable<TimelineResponse['record']>
+  attemptStart?: number
 }) {
   const { t } = useTranslation()
   const data = props.timeline
   const record = props.record
   const absent = t('Not recorded')
+  const start = props.attemptStart ?? 0
   const point = { start: data.started_at_ms, valid: data.timing_valid }
   let result = t('Unconfirmed end')
   let variant: 'green' | 'red' | 'amber' | 'neutral' = 'neutral'
@@ -267,10 +389,21 @@ function TimelineDetails(props: {
     }
     return `${(to - from).toLocaleString()} ms`
   }
+  let upstreamUsage = data.upstream_usage
+  let hasUsageEvents = false
+  for (const event of ['message_start', 'message_delta']) {
+    const usage = data.upstream_usage?.[event]
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+      // Claude deltas are partial cumulative snapshots. Preserve omitted
+      // fields from the start event and respect explicitly reported zeros.
+      upstreamUsage = { ...upstreamUsage, ...usage }
+      hasUsageEvents = true
+    }
+  }
   const upstreamCount = (...keys: string[]): string => {
     const reported: Array<{ key: string; value: number }> = []
     for (const key of keys) {
-      const value = data.upstream_usage?.[key]
+      const value = upstreamUsage?.[key]
       if (typeof value === 'number' && Number.isFinite(value)) {
         reported.push({ key, value })
       }
@@ -319,18 +452,22 @@ function TimelineDetails(props: {
       <div className='bg-muted/30 grid grid-cols-2 gap-3 rounded-md border p-3 sm:grid-cols-[1fr_1fr_auto]'>
         <div>
           <p className='text-muted-foreground text-xs'>
-            {t('Existing first-response time')}
+            {props.attemptStart == null
+              ? t('Existing first-response time')
+              : t('Attempt first-response time')}
           </p>
           <p className='mt-1 font-mono text-base font-semibold tabular-nums'>
-            {duration(0, data.first_response_ms)}
+            {duration(start, data.first_response_ms)}
           </p>
         </div>
         <div>
           <p className='text-muted-foreground text-xs'>
-            {t('Total output time')}
+            {props.attemptStart == null
+              ? t('Total output time')
+              : t('Attempt duration')}
           </p>
           <p className='mt-1 font-mono text-base font-semibold tabular-nums'>
-            {duration(0, data.ended_ms)}
+            {duration(start, data.ended_ms)}
           </p>
         </div>
         <div className='col-span-2 flex flex-wrap items-center gap-2 sm:col-span-1 sm:self-center'>
@@ -351,10 +488,17 @@ function TimelineDetails(props: {
           )}
         </p>
       )}
+      {data.details_truncated && (
+        <p role='status' className='text-muted-foreground text-xs'>
+          {t(
+            'Some recorded fields were truncated to keep this timeline within its recording limit.'
+          )}
+        </p>
+      )}
       <DetailSection label={t('First-response breakdown')}>
         <DetailRow
           label={t('Before sending')}
-          value={duration(0, data.request_sent_ms)}
+          value={duration(start, data.request_sent_ms)}
           mono
         />
         <DetailRow
@@ -369,10 +513,20 @@ function TimelineDetails(props: {
         />
       </DetailSection>
       <ol aria-label={t('Request timeline')} className='ml-1 min-w-0'>
-        <TimelineNode {...point} label={t('Processing started')} offset={0}>
+        <TimelineNode
+          {...point}
+          label={
+            props.attemptStart == null
+              ? t('Processing started')
+              : t('Attempt started')
+          }
+          offset={start}
+        >
           <DetailRow
             label={t('Time')}
-            value={dayjs(data.started_at_ms).format('YYYY-MM-DD HH:mm:ss.SSS')}
+            value={dayjs(data.started_at_ms + start).format(
+              'YYYY-MM-DD HH:mm:ss.SSS'
+            )}
             mono
           />
           <DetailRow
@@ -390,7 +544,7 @@ function TimelineDetails(props: {
           {...point}
           label={t('Request sent to upstream')}
           offset={data.request_sent_ms}
-          previous={0}
+          previous={start}
         >
           <DetailRow
             label={t('Request body size')}
@@ -485,9 +639,13 @@ function TimelineDetails(props: {
           <DetailRow label={t('Upstream usage summary')} value={usageSummary} />
           {data.upstream_usage && (
             <p className='text-muted-foreground text-xs'>
-              {t(
-                'Complete usage object from the last parsed usage frame received from the directly connected upstream.'
-              )}
+              {hasUsageEvents
+                ? t(
+                    'Usage objects received in message_start and message_delta events from the directly connected upstream.'
+                  )
+                : t(
+                    'Complete usage object from the last parsed usage frame received from the directly connected upstream.'
+                  )}
             </p>
           )}
           {!data.upstream_usage &&

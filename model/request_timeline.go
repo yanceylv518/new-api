@@ -93,7 +93,12 @@ func InsertRequestTimelines(ctx context.Context, entries []*RequestTimeline) err
 	if len(entries) == 0 {
 		return nil
 	}
-	return LOG_DB.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&entries).Error
+	// GORM's implicit create transaction does not defer rollback around a
+	// panicking callback. Roll back before the worker recovers, so optional
+	// diagnostics cannot leave a transaction or shared DB connection behind.
+	return LOG_DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&entries).Error
+	})
 }
 
 func FindRequestTimeline(ctx context.Context, requestID string) (*RequestTimeline, error) {

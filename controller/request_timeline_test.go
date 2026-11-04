@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +23,20 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/requesttimeline"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
+	"github.com/QuantumNous/new-api/relay/channel/zhipu_4v"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -77,10 +85,35 @@ func TestRequestTimelineUnknownLengthAndRepeatedSend(t *testing.T) {
 	retried := requesttimeline.New(time.Now(), "retry", 7, "model")
 	req = retried.Request(httptest.NewRequest("POST", "http://upstream.invalid", nil), 1, "")
 	hook = httptrace.ContextClientTrace(req.Context())
+	hook.WroteRequest(httptrace.WroteRequestInfo{Err: io.ErrUnexpectedEOF})
 	hook.WroteRequest(httptrace.WroteRequestInfo{})
-	hook.WroteRequest(httptrace.WroteRequestInfo{})
-	assert.False(t, retried.Candidate())
-	assert.Nil(t, retried.Freeze(nil))
+	assert.True(t, retried.Candidate())
+	repeated := retried.Freeze(nil)
+	require.NotNil(t, repeated)
+	require.Len(t, repeated.Data.Attempts, 2)
+	assert.Equal(t, "failed", repeated.Data.Attempts[0].Result)
+	assert.Equal(t, "unknown", repeated.Data.Attempts[1].Result)
+	assert.Equal(t, 2, repeated.Data.AttemptCount)
+
+	// A late callback from a failed attempt must not create an extra retry or
+	// overwrite the new attempt's timing. Retry indices can reset across groups.
+	guarded := requesttimeline.New(time.Now(), "late-callback", 7, "model")
+	guarded.BeginAttempt(0)
+	oldRequest := guarded.Request(httptest.NewRequest("POST", "http://first.invalid", nil), 1, "")
+	oldHook := httptrace.ContextClientTrace(oldRequest.Context())
+	oldHook.WroteRequest(httptrace.WroteRequestInfo{})
+	guarded.EndAttempt(errors.New("first failed"))
+	guarded.BeginAttempt(0)
+	oldHook.WroteRequest(httptrace.WroteRequestInfo{})
+	guarded.SelectChannel(2, "")
+	guarded.EndAttempt(errors.New("conversion failed before sending"))
+	guarded.BeginAttempt(0)
+	last := guarded.Freeze(errors.New("no available channel"))
+	require.Len(t, last.Data.Attempts, 3)
+	assert.Equal(t, 1, last.Data.Attempts[0].Data.ChannelID)
+	assert.Equal(t, 2, last.Data.Attempts[1].Data.ChannelID)
+	assert.Nil(t, last.Data.Attempts[1].Data.RequestSentMS)
+	assert.Equal(t, 0, last.Data.Attempts[2].Data.ChannelID)
 }
 
 func TestRequestTimelineResponseWriterIgnoresHeartbeat(t *testing.T) {
@@ -108,12 +141,16 @@ func TestRequestTimelineQueueDrainsAndReportsWriteFailures(t *testing.T) {
 		written = append(written, rows...)
 		return nil
 	})
+	invalid := requesttimeline.New(time.Now(), "invalid-diagnostic", 7, "model").Freeze(nil)
+	invalid.Data.UpstreamUsage = []byte(`{"broken":`)
+	assert.True(t, w.Enqueue(invalid))
 	t1 := requesttimeline.New(time.Now(), "queue-1", 7, "model")
 	assert.True(t, w.Enqueue(t1.Freeze(nil)))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, w.Shutdown(ctx))
 	require.Len(t, written, 1)
+	assert.Equal(t, int64(1), w.Stats().Dropped, "one malformed diagnostic must not prevent the next record from being written")
 	assert.Equal(t, "queue-1", written[0].RequestID)
 	var payload requesttimeline.Data
 	require.NoError(t, common.UnmarshalJsonStr(written[0].Data, &payload))
@@ -124,6 +161,122 @@ func TestRequestTimelineQueueDrainsAndReportsWriteFailures(t *testing.T) {
 	assert.True(t, failed.Enqueue(requesttimeline.New(time.Now(), "failed-write", 7, "model").Freeze(nil)))
 	require.NoError(t, failed.Shutdown(ctx))
 	assert.Equal(t, int64(1), failed.Stats().Failed)
+}
+
+type timelinePanickingError struct{}
+
+func (timelinePanickingError) Error() string { panic("diagnostic error formatting failed") }
+
+func TestRequestTimelineObservationPanicDisablesOnlyThatTrace(t *testing.T) {
+	for _, phase := range []string{"transport", "write", "finalize"} {
+		t.Run(phase, func(t *testing.T) {
+			trace := requesttimeline.New(time.Now(), "observation-panic", 7, "model")
+			require.NotPanics(t, func() {
+				switch phase {
+				case "transport":
+					trace.Response(nil, timelinePanickingError{})
+				case "write":
+					trace.PayloadWritten(timelinePanickingError{})
+				case "finalize":
+					assert.Nil(t, trace.Freeze(timelinePanickingError{}))
+				}
+			})
+			assert.False(t, trace.Candidate())
+			assert.Nil(t, trace.Freeze(nil))
+			// A disabled observer still passes through the original HTTP request.
+			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader("original body"))
+			assert.Same(t, req, trace.Request(req, 1, "secret"))
+			body, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			assert.Equal(t, "original body", string(body))
+		})
+	}
+}
+
+func TestRequestTimelineWriterPanicReleasesDatabaseAndStopsDiagnostics(t *testing.T) {
+	user, _ := setupAccessTokenAudit(t)
+	preserveTimelineOption(t)
+	model.RequestTimelineCaptureEnabled.Store(true)
+	sqlDB, err := model.DB.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	writer := service.InitRequestTimeline()
+	require.NotNil(t, writer)
+	t.Cleanup(func() { _ = writer.Shutdown(context.Background()) })
+	entered := make(chan struct{})
+	require.NoError(t, model.LOG_DB.Callback().Create().Before("gorm:create").Register("timeline:panic-insert", func(db *gorm.DB) {
+		if db.Statement.Table == "request_timelines" {
+			close(entered)
+			panic("injected timeline insert panic")
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.LOG_DB.Callback().Create().Remove("timeline:panic-insert")) })
+	require.True(t, writer.Enqueue(requesttimeline.New(time.Now(), "writer-panic", user.Id, "model").Freeze(nil)))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeline insert did not run")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, writer.Shutdown(ctx))
+	assert.False(t, service.RequestTimelineEnabled())
+	assert.False(t, writer.Enqueue(requesttimeline.New(time.Now(), "after-panic", user.Id, "model").Freeze(nil)))
+	assert.Equal(t, int64(1), writer.Stats().Failed)
+	// The diagnostic transaction must not hold the shared DB's only connection.
+	var stored model.User
+	require.NoError(t, model.DB.WithContext(ctx).First(&stored, user.Id).Error)
+	assert.Equal(t, user.Username, stored.Username)
+}
+
+type timelinePanickingLog struct{}
+
+func (timelinePanickingLog) Write([]byte) (int, error) { panic("diagnostic log sink failed") }
+
+func TestRequestTimelineLogFailureAndShutdownRemainIsolated(t *testing.T) {
+	common.LogWriterMu.Lock()
+	original := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = timelinePanickingLog{}
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = original
+		common.LogWriterMu.Unlock()
+	})
+	failed := service.NewRequestTimelineWriter(1, func(context.Context, []*model.RequestTimeline) error {
+		return errors.New("database unavailable")
+	})
+	require.True(t, failed.Enqueue(requesttimeline.New(time.Now(), "log-sink-failure", 7, "model").Freeze(nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, failed.Shutdown(ctx))
+	assert.Equal(t, int64(1), failed.Stats().Failed)
+	// A recovered logger panic must not strand the lock used for log rotation.
+	if common.LogWriterMu.TryLock() {
+		common.LogWriterMu.Unlock()
+	} else {
+		t.Fatal("diagnostic logging retained the shared log-writer lock")
+	}
+
+	entered := make(chan struct{})
+	var once sync.Once
+	blocked := service.NewRequestTimelineWriter(1, func(ctx context.Context, _ []*model.RequestTimeline) error {
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	require.True(t, blocked.Enqueue(requesttimeline.New(time.Now(), "cancel-writer", 7, "model").Freeze(nil)))
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("timeline insert did not start")
+	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	shutdownCancel()
+	assert.ErrorIs(t, blocked.Shutdown(shutdownCtx), context.Canceled)
+	require.NoError(t, blocked.Shutdown(ctx), "canceling shutdown must also cancel the in-flight insert")
+	assert.Zero(t, blocked.Stats().Pending)
+	assert.False(t, blocked.Enqueue(requesttimeline.New(time.Now(), "after-shutdown", 7, "model").Freeze(nil)))
 }
 
 func preserveTimelineOption(t *testing.T) {
@@ -191,6 +344,24 @@ func TestRequestTimelineAdminLookupAndCandidateGate(t *testing.T) {
 	info.IsStream = true
 	info.RelayFormat = types.RelayFormatOpenAIRealtime
 	assert.Nil(t, service.BeginRequestTimeline(c, info))
+	for _, channelType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeZhipu_v4, constant.ChannelTypeAdvancedCustom, constant.ChannelTypeAnthropic} {
+		common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
+		for _, protocol := range []struct {
+			format types.RelayFormat
+			mode   int
+			want   bool
+		}{
+			{types.RelayFormatOpenAI, relayconstant.RelayModeChatCompletions, true},
+			{types.RelayFormatOpenAIResponses, relayconstant.RelayModeResponses, true},
+			{types.RelayFormatClaude, relayconstant.RelayModeUnknown, true},
+			{types.RelayFormatOpenAI, relayconstant.RelayModeCompletions, false},
+			{types.RelayFormatOpenAIImage, relayconstant.RelayModeImagesGenerations, false},
+			{types.RelayFormatOpenAIRealtime, relayconstant.RelayModeRealtime, false},
+		} {
+			info.RelayFormat, info.RelayMode = protocol.format, protocol.mode
+			assert.Equal(t, protocol.want, service.BeginRequestTimeline(c, info) != nil, "channel=%d protocol=%s mode=%d", channelType, protocol.format, protocol.mode)
+		}
+	}
 
 	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: time.Now().UnixMilli(), TimingValid: true})
 	require.NoError(t, err)
@@ -211,6 +382,14 @@ func TestRequestTimelineAdminLookupAndCandidateGate(t *testing.T) {
 	assert.Equal(t, 403, auditRequest(r, "GET", "/api/request-timelines/lookup", ordinaryToken).Code)
 	assert.Equal(t, 400, auditRequest(r, "GET", "/api/request-timelines/bad!", token).Code)
 	assert.Contains(t, auditRequest(r, "GET", "/api/request-timelines/absent", token).Body.String(), `"status":"missing"`)
+	require.NoError(t, model.LOG_DB.Callback().Query().Before("gorm:query").Register("timeline:query-failure", func(db *gorm.DB) {
+		if db.Statement.Table == "request_timelines" {
+			db.AddError(errors.New("injected timeline query failure"))
+		}
+	}))
+	assert.Equal(t, http.StatusInternalServerError, auditRequest(r, "GET", "/api/request-timelines/lookup", token).Code)
+	require.NoError(t, model.LOG_DB.Callback().Query().Remove("timeline:query-failure"))
+	assert.Equal(t, http.StatusOK, auditRequest(r, "GET", "/api/request-timelines/lookup", token).Code)
 }
 
 func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
@@ -264,7 +443,11 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, model.MigrateRequestTimelines())
 	require.NoError(t, model.MigrateRequestTimelines())
 	assert.False(t, mainDB.Migrator().HasTable(&model.RequestTimeline{}))
-	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, RequestModel: "中文模型", TimingValid: true, UpstreamUsage: []byte(`{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`), UpstreamUsageCapture: "captured"})
+	payload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, RequestModel: "中文模型", TimingValid: true, UpstreamUsage: []byte(`{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`), UpstreamUsageCapture: "captured",
+		AttemptCount: 2, Attempts: []requesttimeline.Attempt{
+			{Number: 1, RetryIndex: 0, Result: "failed", Data: requesttimeline.Data{Version: 1, StartedAtMS: 1000000, ChannelID: 1, FirstError: &requesttimeline.Failure{Kind: "upstream_http_error", Code: "502", Message: "上游失败"}}},
+			{Number: 2, RetryIndex: 1, StartedMS: 100, Result: "success", Data: requesttimeline.Data{Version: 1, StartedAtMS: 1000000, ChannelID: 2, ReturnedUsage: &requesttimeline.Usage{InputTokens: 3, OutputTokens: 6, TotalTokens: 9}}},
+		}})
 	require.NoError(t, err)
 	truncatedPayload, err := common.Marshal(requesttimeline.Data{Version: 1, StartedAtMS: 1000000, UpstreamUsageCapture: "truncated", UpstreamUsagePreview: `{"vendor":"未完成`, UpstreamUsageBytes: 9000})
 	require.NoError(t, err)
@@ -295,6 +478,10 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	assert.Equal(t, "中文模型", decoded.RequestModel)
 	assert.JSONEq(t, `{"prompt_tokens":0,"total_tokens":9,"prompt_tokens_details":{"cached_creation_tokens":2},"vendor":{"note":"完整文本","enabled":true,"values":[null,1]}}`, string(decoded.UpstreamUsage))
 	assert.Equal(t, "captured", decoded.UpstreamUsageCapture)
+	require.Len(t, decoded.Attempts, 2)
+	assert.Equal(t, "上游失败", decoded.Attempts[0].Data.FirstError.Message)
+	assert.Equal(t, "success", decoded.Attempts[1].Result)
+	assert.Equal(t, 9, decoded.Attempts[1].Data.ReturnedUsage.TotalTokens)
 	var count int64
 	require.NoError(t, db.Model(&model.RequestTimeline{}).Count(&count).Error)
 	assert.Equal(t, int64(2), count)
@@ -302,6 +489,28 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, db.First(&retained, legacy.Id).Error)
 	assert.Equal(t, legacy.Quota, retained.Quota)
 	assert.Equal(t, legacy.Other, retained.Other)
+
+	// Exercise panic rollback against each real supported database, including
+	// a write that reached the server before its callback failed.
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, db.Callback().Create().After("gorm:create").Before("gorm:save_after_associations").Register("timeline:rollback", func(tx *gorm.DB) {
+		if tx.Statement.Table == "request_timelines" {
+			panic("injected failure after diagnostic insert")
+		}
+	}))
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rollbackCancel()
+	rollbackEntry := &model.RequestTimeline{RequestID: "rolled-back", UserID: 7, CreatedAt: 1000, Result: "unknown", Data: string(payload)}
+	require.Panics(t, func() {
+		_ = model.InsertRequestTimelines(rollbackCtx, []*model.RequestTimeline{rollbackEntry})
+	})
+	require.NoError(t, db.Callback().Create().Remove("timeline:rollback"))
+	_, err = model.FindRequestTimeline(rollbackCtx, rollbackEntry.RequestID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound, "partial diagnostic inserts must roll back and release the connection")
+	require.NoError(t, db.WithContext(rollbackCtx).First(&retained, legacy.Id).Error)
+	assert.Equal(t, legacy.Quota, retained.Quota)
 
 	// Additive fields must preserve both existing records and old writers.
 	for _, column := range []struct{ name, ddl string }{
@@ -343,6 +552,27 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	require.NoError(t, db.Exec("ALTER TABLE request_timelines ADD COLUMN future_required TEXT NOT NULL").Error)
 	t.Cleanup(func() { require.NoError(t, db.Migrator().DropColumn(&model.RequestTimeline{}, "future_required")) })
 	require.ErrorContains(t, model.MigrateRequestTimelines(), "extra required column")
+	previousMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = previousMaster })
+	startupWriter := service.InitRequestTimeline()
+	if startupWriter != nil {
+		_ = startupWriter.Shutdown(context.Background())
+	}
+	assert.Nil(t, startupWriter, "an incompatible timeline table must disable diagnostics without failing startup")
+	assert.False(t, service.RequestTimelineStorageReady())
+	initializationPanicked := false
+	require.NoError(t, db.Callback().Row().Before("gorm:row").Register("timeline:initialization-panic", func(*gorm.DB) {
+		initializationPanicked = true
+		panic("injected timeline metadata query panic")
+	}))
+	require.NotPanics(t, func() { startupWriter = service.InitRequestTimeline() })
+	require.NoError(t, db.Callback().Row().Remove("timeline:initialization-panic"))
+	assert.True(t, initializationPanicked, "the startup failure injection must actually run")
+	assert.Nil(t, startupWriter)
+	assert.False(t, service.RequestTimelineStorageReady())
+	require.NoError(t, db.First(&retained, legacy.Id).Error)
+	assert.Equal(t, legacy.Quota, retained.Quota)
 }
 
 func TestRequestTimelineRealStreamAndFailureAdapters(t *testing.T) {
@@ -1051,7 +1281,7 @@ func TestRequestTimelineRetainsUpstreamUsageWithoutChangingBilling(t *testing.T)
 func TestRequestTimelineUsageCaptureBoundaries(t *testing.T) {
 	for _, tc := range []struct{ name, frame, want, status string }{
 		{"complete_object", `{"usage":{"prompt_tokens":0,"vendor":{"enabled":true,"note":"text","list":[1,"two",null]},"cost":0.125}}`, `{"prompt_tokens":0,"vendor":{"enabled":true,"note":"text","list":[1,"two",null]},"cost":0.125}`, "captured"},
-		{"duplicate_usage", `{"usage":{"prompt_tokens":1},"usage":{"prompt_tokens":2,"total_tokens":2}}`, `{"prompt_tokens":2,"total_tokens":2}`, "captured"},
+		{"duplicate_usage", `{"usage":{"prompt_tokens":1},"usage":{"completion_tokens":2,"total_tokens":3}}`, `{"completion_tokens":2,"total_tokens":3}`, "captured"},
 		{"large_unrelated_content", `{"padding":"` + strings.Repeat("x", 1<<20) + `","usage":{"prompt_tokens":1}}`, `{"prompt_tokens":1}`, "captured"},
 		{"large_usage", `{"usage":{"prompt_tokens":2,"extra":"` + strings.Repeat("x", 9000) + `"}}`, "", "truncated"},
 		{"escaped_size", `{"usage":{"note":"` + strings.Repeat("<", 2000) + `"}}`, "", "truncated"},
@@ -1067,6 +1297,11 @@ func TestRequestTimelineUsageCaptureBoundaries(t *testing.T) {
 			trace.CaptureUpstreamUsage(event.Usage)
 			event.Usage = requesttimeline.StreamUsage{}
 			require.NoError(t, common.UnmarshalJsonStr(tc.frame, &event))
+			var billing struct {
+				Usage *dto.Usage `json:"usage"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(tc.frame, &billing))
+			assert.Equal(t, billing.Usage, event.Usage.Value, "raw capture must preserve DTO decoding semantics")
 			trace.CaptureUpstreamUsage(event.Usage)
 			record := trace.Freeze(nil)
 			assert.Equal(t, tc.status, record.Data.UpstreamUsageCapture)
@@ -1118,4 +1353,425 @@ func TestRequestTimelineMassRequestIDHeader(t *testing.T) {
 			assert.Equal(t, tc.want, record.Data.UpstreamRequestID)
 		})
 	}
+}
+
+func TestRequestTimelineClaudeFailuresAndCaptureBounds(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	for _, tc := range []struct {
+		name, body, result, kind string
+	}{
+		{"business_error", "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream rejected sk-test\"}}\n\n", "failed", "upstream_business_error"},
+		{"missing_stop", "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n", "unknown", "unconfirmed_end"},
+		{"duplicate_usage", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"r1\",\"model\":\"model\",\"usage\":{\"input_tokens\":2},\"usage\":{\"cache_read_input_tokens\":3}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "success", ""},
+		{"malformed", "data: {not-json}\n\n", "failed", "local_error"},
+		{"oversized_usage", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"r1\",\"model\":\"model\",\"usage\":{\"input_tokens\":2,\"provider\":\"" + strings.Repeat("x", 9000) + "\"}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "success", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outputs []string
+			var usages []*dto.Usage
+			var relayErrors []*types.NewAPIError
+			for _, enabled := range []bool{false, true} {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+				info := relaycommon.GenRelayInfoClaude(c, nil)
+				info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "model"}
+				info.IsStream, info.DisablePing = true, true
+				if enabled {
+					info.Timeline = requesttimeline.New(info.StartTime, tc.name, 7, "model")
+					info.Timeline.Request(httptest.NewRequest("POST", "http://upstream.invalid", nil), 187, "sk-test")
+					restore := helper.ObserveRequestTimelineWriter(c, info.Timeline)
+					defer restore()
+				}
+				resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(tc.body))}
+				usage, relayErr := claude.ClaudeStreamHandler(c, resp, info)
+				outputs, usages, relayErrors = append(outputs, w.Body.String()), append(usages, usage), append(relayErrors, relayErr)
+				if enabled {
+					record := info.Timeline.Freeze(nil)
+					require.NotNil(t, record)
+					assert.Equal(t, tc.result, record.Result)
+					if tc.kind != "" {
+						require.NotNil(t, record.ErrorKind)
+						assert.Equal(t, tc.kind, *record.ErrorKind)
+					}
+					if tc.name == "business_error" {
+						assert.Equal(t, "overloaded_error", record.Data.FirstError.Code)
+						assert.NotContains(t, record.Data.FirstError.Message, "sk-test")
+					}
+					if tc.name == "oversized_usage" {
+						assert.Equal(t, "truncated", record.Data.UpstreamUsageCapture)
+						assert.Empty(t, record.Data.UpstreamUsage)
+						assert.Equal(t, 5, record.Data.ReturnedUsage.TotalTokens)
+					}
+					encoded, err := common.Marshal(record.Data)
+					require.NoError(t, err)
+					assert.LessOrEqual(t, len(encoded), requesttimeline.MaxDataBytes)
+				}
+			}
+			assert.Equal(t, outputs[0], outputs[1])
+			assert.Equal(t, usages[0], usages[1])
+			assert.Equal(t, relayErrors[0], relayErrors[1])
+		})
+	}
+}
+
+func TestRequestTimelineProtocolRoutes(t *testing.T) {
+	setupAccessTokenAudit(t)
+	preserveTimelineOption(t)
+	model.RequestTimelineCaptureEnabled.Store(true)
+	writer := service.InitRequestTimeline()
+	require.NotNil(t, writer)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, writer.Shutdown(ctx))
+	})
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	chat := "data: {\"id\":\"r1\",\"created\":1700000000,\"model\":\"model\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\ndata: [DONE]\n\n"
+	responses := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"model\":\"model\",\"created_at\":1700000000,\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n"
+	claudeBody := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"r1\",\"model\":\"model\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":0,\"provider_extension\":\"retained\"}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	for _, tc := range []struct {
+		name, path, body, converter string
+		channelType                 int
+		format                      types.RelayFormat
+	}{
+		{"custom_chat", "/v1/chat/completions", chat, "", constant.ChannelTypeAdvancedCustom, types.RelayFormatOpenAI},
+		{"custom_responses", "/v1/responses", responses, "", constant.ChannelTypeAdvancedCustom, types.RelayFormatOpenAIResponses},
+		{"custom_claude", "/v1/messages", claudeBody, "", constant.ChannelTypeAdvancedCustom, types.RelayFormatClaude},
+		{"custom_chat_to_claude", "/v1/chat/completions", claudeBody, relayconvert.ConverterOpenAIChatToClaudeMessages, constant.ChannelTypeAdvancedCustom, types.RelayFormatOpenAI},
+		{"custom_chat_to_responses", "/v1/chat/completions", responses, relayconvert.ConverterOpenAIChatToOpenAIResponses, constant.ChannelTypeAdvancedCustom, types.RelayFormatOpenAI},
+		{"custom_responses_to_chat", "/v1/responses", chat, relayconvert.ConverterOpenAIResponsesToOpenAIChat, constant.ChannelTypeAdvancedCustom, types.RelayFormatOpenAIResponses},
+		{"custom_claude_to_chat", "/v1/messages", chat, relayconvert.ConverterClaudeMessagesToOpenAIChat, constant.ChannelTypeAdvancedCustom, types.RelayFormatClaude},
+		{"anthropic_responses", "/v1/responses", claudeBody, "", constant.ChannelTypeAnthropic, types.RelayFormatOpenAIResponses},
+		{"zhipu_chat", "/v1/chat/completions", chat, "", constant.ChannelTypeZhipu_v4, types.RelayFormatOpenAI},
+		{"zhipu_claude", "/v1/messages", claudeBody, "", constant.ChannelTypeZhipu_v4, types.RelayFormatClaude},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-Request-Id", "upstream-route")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer upstream.Close()
+			var outputs []string
+			var usages []any
+			for _, enabled := range []bool{false, true} {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest("POST", tc.path, strings.NewReader(`{"model":"model","stream":true}`))
+				c.Request.Header.Set("Content-Type", "application/json")
+				c.Set(common.RequestIdKey, "protocol-route")
+				common.SetContextKey(c, constant.ContextKeyChannelType, tc.channelType)
+				info := relaycommon.GenRelayInfoOpenAI(c, nil)
+				if tc.format == types.RelayFormatClaude {
+					info = relaycommon.GenRelayInfoClaude(c, nil)
+				} else if tc.format == types.RelayFormatOpenAIResponses {
+					info = relaycommon.GenRelayInfoResponses(c, &dto.OpenAIResponsesRequest{})
+				}
+				info.IsStream, info.DisablePing, info.ShouldIncludeUsage = true, true, true
+				info.OriginModelName = "model"
+				info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 187, ChannelType: tc.channelType, ChannelBaseUrl: upstream.URL, UpstreamModelName: "model", ApiKey: "sk-test"}
+				var adaptor channel.Adaptor = &zhipu_4v.Adaptor{}
+				if tc.channelType == constant.ChannelTypeAdvancedCustom {
+					info.ChannelOtherSettings.AdvancedCustom = &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: tc.path, UpstreamPath: tc.path, Converter: tc.converter}}}
+					adaptor = &advancedcustom.Adaptor{}
+				} else if tc.channelType == constant.ChannelTypeAnthropic {
+					adaptor = &claude.Adaptor{}
+				}
+				adaptor.Init(info)
+				if enabled {
+					info.Timeline = service.BeginRequestTimeline(c, info)
+					require.NotNil(t, info.Timeline)
+					restore := helper.ObserveRequestTimelineWriter(c, info.Timeline)
+					defer restore()
+				}
+				requestBody := `{"model":"model","stream":true}`
+				if tc.converter != "" {
+					var converted any
+					var err error
+					switch tc.format {
+					case types.RelayFormatClaude:
+						converted, err = adaptor.ConvertClaudeRequest(c, info, &dto.ClaudeRequest{Model: "model", Stream: common.GetPointer(true), Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}}})
+					case types.RelayFormatOpenAIResponses:
+						converted, err = adaptor.ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{Model: "model", Stream: common.GetPointer(true), Input: []byte(`"hello"`)})
+					default:
+						converted, err = adaptor.ConvertOpenAIRequest(c, info, &dto.GeneralOpenAIRequest{Model: "model", Stream: common.GetPointer(true), Messages: []dto.Message{{Role: "user", Content: "hello"}}})
+					}
+					require.NoError(t, err)
+					raw, err := common.Marshal(converted)
+					require.NoError(t, err)
+					requestBody = string(raw)
+				}
+				response, err := adaptor.DoRequest(c, info, strings.NewReader(requestBody))
+				require.NoError(t, err)
+				usage, relayErr := adaptor.DoResponse(c, response.(*http.Response), info)
+				require.Nil(t, relayErr)
+				outputs = append(outputs, w.Body.String())
+				usages = append(usages, usage)
+				if enabled {
+					record := info.Timeline.Freeze(nil)
+					require.NotNil(t, record)
+					assert.Equal(t, "success", record.Result)
+					assert.Equal(t, "upstream-route", record.Data.UpstreamRequestID)
+					assert.Equal(t, "r1", record.Data.ResponseID)
+					require.NotNil(t, record.Data.RequestSentMS)
+					require.NotNil(t, record.Data.FirstResponseMS)
+					require.NotNil(t, record.Data.FirstWriteMS)
+					assert.True(t, record.Data.EndMarkerReceived)
+					require.NotNil(t, record.Data.ReturnedUsage)
+					assert.Equal(t, 8, record.Data.ReturnedUsage.TotalTokens)
+					if tc.body == claudeBody {
+						assert.Equal(t, "end_turn", record.Data.FinishReason)
+						assert.JSONEq(t, `{"message_start":{"input_tokens":2,"cache_read_input_tokens":3,"output_tokens":0,"provider_extension":"retained"},"message_delta":{"output_tokens":3}}`, string(record.Data.UpstreamUsage))
+					}
+				}
+			}
+			// Converters may generate timestamps at the time of each request.
+			timestamps := regexp.MustCompile(`"created(?:_at)?":\d+`)
+			assert.Equal(t, timestamps.ReplaceAllString(outputs[0], `"created":0`), timestamps.ReplaceAllString(outputs[1], `"created":0`), "timeline must preserve the returned stream")
+			assert.Equal(t, usages[0], usages[1], "timeline must preserve billing usage")
+		})
+	}
+}
+
+func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
+	for _, allFail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("all_fail=%v", allFail), func(t *testing.T) {
+			previousCache := common.MemoryCacheEnabled
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousCache
+				if previousCache && model.DB != nil {
+					model.InitChannelCache()
+				}
+			})
+			user, _ := setupAccessTokenAudit(t)
+			sqlDB, err := model.DB.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			preserveTimelineOption(t)
+			allowPrivateTaskMediaTest(t)
+			previousRatios := ratio_setting.ModelRatio2JSONString()
+			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-3.5-turbo":1}`))
+			require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.Channel{}, &model.Ability{}, &model.Option{}))
+			previousRetry, previousCount, previousTimeout := common.RetryTimes, constant.CountToken, constant.StreamingTimeout
+			common.MemoryCacheEnabled, common.RetryTimes, constant.CountToken, constant.StreamingTimeout = true, 1, false, 30
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled, common.RetryTimes, constant.CountToken = previousCache, previousRetry, previousCount
+				constant.StreamingTimeout = previousTimeout
+			})
+			var upstreamRequests []string
+			var requestMu sync.Mutex
+			var attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				requestMu.Lock()
+				upstreamRequests = append(upstreamRequests, string(body))
+				requestMu.Unlock()
+				index := attempts.Add(1)
+				w.Header().Set("X-Request-Id", fmt.Sprintf("upstream-%d", index))
+				if index == 1 || allFail {
+					w.WriteHeader(http.StatusBadGateway)
+					_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"type":"upstream_error","message":"provider rejected %s"}}`, r.Header.Get("Authorization")))
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"id\":\"stable\",\"created\":1700000000,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\n\ndata: [DONE]\n\n")
+			}))
+			defer upstream.Close()
+			channels := []model.Channel{
+				{Id: 101, Name: "first", Type: constant.ChannelTypeOpenAI, Key: "sk-first-secret", BaseURL: &upstream.URL, Models: "gpt-3.5-turbo", Group: "default", Priority: common.GetPointer(int64(100)), AutoBan: common.GetPointer(0)},
+				{Id: 102, Name: "fallback", Type: constant.ChannelTypeOpenAI, Key: "sk-second-secret", BaseURL: &upstream.URL, Models: "gpt-3.5-turbo", Group: "default", Priority: common.GetPointer(int64(90)), AutoBan: common.GetPointer(0)},
+			}
+			require.NoError(t, model.BatchInsertChannels(channels))
+			model.InitChannelCache()
+			token := model.Token{UserId: user.Id, Key: "timeline-test-token", Name: "timeline", Status: common.TokenStatusEnabled, RemainQuota: 10000000}
+			require.NoError(t, model.DB.Create(&token).Error)
+			var outputs []string
+			var charges []int
+			var tokenCharges []int
+			var requestBodies [][]string
+			for _, enabled := range []bool{false, true} {
+				attempts.Store(0)
+				requestMu.Lock()
+				upstreamRequests = nil
+				requestMu.Unlock()
+				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"quota": 10000000, "used_quota": 0, "request_count": 0}).Error)
+				require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"used_quota": 0, "remain_quota": 10000000}).Error)
+				model.RequestTimelineCaptureEnabled.Store(enabled)
+				var writer *service.RequestTimelineWriter
+				if enabled {
+					writer = service.InitRequestTimeline()
+					require.NotNil(t, writer)
+				}
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-3.5-turbo","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`))
+				c.Request.Header.Set("Content-Type", "application/json")
+				c.Set(common.RequestIdKey, "fallback-relay")
+				common.SetContextKey(c, constant.ContextKeyUserId, user.Id)
+				common.SetContextKey(c, constant.ContextKeyUserQuota, 10000000)
+				common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+				common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+				common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+				common.SetContextKey(c, constant.ContextKeyTokenId, token.Id)
+				common.SetContextKey(c, constant.ContextKeyTokenKey, token.Key)
+				common.SetContextKey(c, constant.ContextKeyTokenUnlimited, false)
+				common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-3.5-turbo")
+				common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
+				require.Nil(t, middleware.SetupContextForSelectedChannel(c, &channels[0], "gpt-3.5-turbo"))
+				Relay(c, types.RelayFormatOpenAI)
+				// The real relay submits refund and performance samples to the
+				// existing pool. Drain them before checking balances or restoring
+				// global DB/Redis settings in this test fixture.
+				require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
+				assert.Equal(t, int32(2), attempts.Load())
+				outputs = append(outputs, w.Body.String())
+				requestMu.Lock()
+				requestBodies = append(requestBodies, append([]string(nil), upstreamRequests...))
+				requestMu.Unlock()
+				var storedUser model.User
+				require.NoError(t, model.DB.First(&storedUser, user.Id).Error)
+				charges = append(charges, 10000000-storedUser.Quota)
+				require.NoError(t, model.DB.First(&token, token.Id).Error)
+				tokenCharges = append(tokenCharges, token.UsedQuota)
+				if enabled {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					require.NoError(t, writer.Shutdown(ctx))
+					cancel()
+					entry, err := model.FindRequestTimeline(context.Background(), "fallback-relay")
+					require.NoError(t, err)
+					var data requesttimeline.Data
+					require.NoError(t, common.UnmarshalJsonStr(entry.Data, &data))
+					require.Len(t, data.Attempts, 2)
+					assert.Equal(t, 101, data.Attempts[0].Data.ChannelID)
+					assert.Equal(t, "failed", data.Attempts[0].Result)
+					assert.Equal(t, "upstream-1", data.Attempts[0].Data.UpstreamRequestID)
+					assert.Equal(t, 102, data.Attempts[1].Data.ChannelID)
+					assert.Equal(t, "upstream-2", data.Attempts[1].Data.UpstreamRequestID)
+					assert.NotContains(t, entry.Data, "sk-first-secret")
+					assert.NotContains(t, entry.Data, "sk-second-secret")
+					assert.LessOrEqual(t, len(entry.Data), requesttimeline.MaxDataBytes)
+					if allFail {
+						assert.Equal(t, "failed", entry.Result)
+						assert.Equal(t, "failed", data.Attempts[1].Result)
+						assert.Equal(t, 0, charges[len(charges)-1], "all attempts failed: pre-consumption must be refunded")
+					} else {
+						assert.Equal(t, "success", entry.Result)
+						assert.Equal(t, "success", data.Attempts[1].Result)
+						assert.Nil(t, data.FirstError)
+						require.NotNil(t, data.ReturnedUsage)
+						assert.Equal(t, 150, data.ReturnedUsage.TotalTokens)
+						assert.Greater(t, charges[len(charges)-1], 0, "successful fallback must actually settle paid usage")
+					}
+				}
+			}
+			assert.Equal(t, outputs[0], outputs[1], "timeline must not alter the client response")
+			assert.Equal(t, requestBodies[0], requestBodies[1], "timeline must not alter upstream requests")
+			assert.Equal(t, charges[0], charges[1], "wallet charge/refund must be identical")
+			assert.Equal(t, tokenCharges[0], tokenCharges[1], "token accounting must be identical")
+		})
+	}
+}
+
+func TestRequestTimelineFallbackTerminalAndBoundedHistory(t *testing.T) {
+	for _, terminal := range []error{context.Canceled, context.DeadlineExceeded, nil} {
+		t.Run(fmt.Sprint(terminal), func(t *testing.T) {
+			trace := requesttimeline.New(time.Now(), "bounded-fallback", 7, strings.Repeat("<", 256))
+			var usage requesttimeline.StreamUsage
+			require.NoError(t, common.UnmarshalJsonStr(`{"prompt_tokens":2,"vendor":"`+strings.Repeat("<", 2000)+`"}`, &usage))
+			for attempt := 0; attempt < requesttimeline.MaxAttempts+2; attempt++ {
+				trace.BeginAttempt(attempt)
+				trace.SelectChannel(100+attempt, "sk-test-key")
+				trace.ObserveChat(dto.ChatCompletionsStreamResponse{Id: strings.Repeat("<", 256), Model: strings.Repeat("<", 256)}, requesttimeline.StreamError{})
+				trace.CaptureUpstreamUsage(usage)
+				trace.BusinessError(strings.Repeat("<", 128), "upstream rejected sk-test-key "+strings.Repeat("<", 2048))
+				trace.EndAttempt(errors.New("failure"))
+			}
+			trace.BeginAttempt(requesttimeline.MaxAttempts + 2)
+			if terminal == nil {
+				trace.ObserveChat(dto.ChatCompletionsStreamResponse{Id: strings.Repeat("<", 256), Model: strings.Repeat("<", 256)}, requesttimeline.StreamError{})
+				trace.CaptureUpstreamUsage(usage)
+				trace.FirstResponse(time.Now())
+				trace.PayloadWritten(nil)
+				trace.StreamEnd("done", nil, false)
+			}
+			record := trace.Freeze(terminal)
+			require.NotNil(t, record)
+			raw, err := record.MarshalData()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, len(raw), requesttimeline.MaxDataBytes)
+			assert.NotContains(t, string(raw), "sk-test-key")
+			assert.Equal(t, requesttimeline.MaxAttempts+3, record.Data.AttemptCount)
+			require.GreaterOrEqual(t, len(record.Data.Attempts), 2)
+			assert.Equal(t, 1, record.Data.Attempts[0].Number)
+			assert.Equal(t, requesttimeline.MaxAttempts+3, record.Data.Attempts[len(record.Data.Attempts)-1].Number)
+			assert.Equal(t, record.Data.AttemptCount-len(record.Data.Attempts), record.Data.AttemptsOmitted)
+			if terminal == nil {
+				assert.Equal(t, "success", record.Result)
+				assert.Nil(t, record.Data.FirstError)
+			} else {
+				assert.Equal(t, "interrupted", record.Result)
+				require.NotNil(t, record.Data.FirstError)
+			}
+		})
+	}
+}
+
+func TestRequestTimelineClaudeFallbackUsageIsolation(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	bodies := []string{
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"failed\",\"model\":\"model\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":200}}}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"first attempt failed\"}}\n\n",
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"success\",\"model\":\"model\",\"usage\":{\"input_tokens\":2}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+	}
+	var outputs []string
+	var usages []*dto.Usage
+	for _, enabled := range []bool{false, true} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+		info := relaycommon.GenRelayInfoClaude(c, nil)
+		info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "model"}
+		info.IsStream, info.DisablePing = true, true
+		if enabled {
+			info.Timeline = requesttimeline.New(info.StartTime, "claude-fallback", 7, "model")
+			restore := helper.ObserveRequestTimelineWriter(c, info.Timeline)
+			defer restore()
+		}
+		var firstResponse time.Time
+		for index, body := range bodies {
+			info.Timeline.BeginAttempt(index)
+			info.Timeline.SelectChannel(index+1, "")
+			usage, relayErr := claude.ClaudeStreamHandler(c, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, info)
+			if index == 0 {
+				firstResponse = info.FirstResponseTime
+				info.Timeline.EndAttempt(relayErr)
+			} else {
+				require.Nil(t, relayErr)
+				usages = append(usages, usage)
+				assert.Equal(t, firstResponse, info.FirstResponseTime, "diagnostics must not reset the relay's request-level first response")
+			}
+		}
+		outputs = append(outputs, w.Body.String())
+		if enabled {
+			record := info.Timeline.Freeze(nil)
+			require.Len(t, record.Data.Attempts, 2)
+			assert.Equal(t, "failed", record.Data.Attempts[0].Result)
+			assert.Equal(t, 300, record.Data.Attempts[0].Data.ReturnedUsage.InputTokens)
+			assert.Equal(t, "success", record.Result)
+			assert.Nil(t, record.Data.FirstError)
+			assert.Equal(t, 5, record.Data.ReturnedUsage.TotalTokens, "failed attempt cache usage must not leak into the fallback")
+			require.NotNil(t, record.Data.Attempts[1].Data.FirstResponseMS)
+			assert.True(t, record.Data.Attempts[1].Data.TimingValid)
+		}
+	}
+	assert.Equal(t, outputs[0], outputs[1])
+	assert.Equal(t, usages[0], usages[1])
 }

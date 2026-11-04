@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -22,7 +21,14 @@ var timelineStorageReady atomic.Bool
 
 // InitRequestTimeline runs after LOG_DB is initialized. This optional feature
 // cannot turn a healthy relay into a failed startup when its own table fails.
-func InitRequestTimeline() *RequestTimelineWriter {
+func InitRequestTimeline() (writer *RequestTimelineWriter) {
+	defer func() {
+		if recover() != nil {
+			timelineStorageReady.Store(false)
+			writer = nil
+			reportRequestTimelineError("request timeline disabled: storage initialization panicked")
+		}
+	}()
 	timelineStorageReady.Store(false)
 	if !model.RequestTimelineStorageSupported() {
 		return nil
@@ -31,7 +37,7 @@ func InitRequestTimeline() *RequestTimelineWriter {
 	// without restarting or disrupting requests already being observed.
 	if common.IsMasterNode {
 		if err := model.MigrateRequestTimelines(); err != nil {
-			common.SysError("request timeline disabled: " + err.Error())
+			reportRequestTimelineError("request timeline disabled: " + err.Error())
 			return nil
 		}
 	}
@@ -40,7 +46,7 @@ func InitRequestTimeline() *RequestTimelineWriter {
 	cancel()
 	timelineStorageReady.Store(ready)
 	if !ready {
-		common.SysError("request timeline disabled: storage is not ready")
+		reportRequestTimelineError("request timeline disabled: storage is not ready")
 		return nil
 	}
 	w := NewRequestTimelineWriter(256, model.InsertRequestTimelines)
@@ -69,19 +75,23 @@ func BeginRequestTimeline(c *gin.Context, info *relaycommon.RelayInfo) *requestt
 	if !RequestTimelineEnabled() || info == nil || !info.IsStream || info.IsChannelTest {
 		return nil
 	}
-	if info.RelayFormat != types.RelayFormatOpenAI && info.RelayFormat != types.RelayFormatOpenAIResponses {
-		return nil
-	}
-	if info.RelayMode != relayconstant.RelayModeChatCompletions && info.RelayMode != relayconstant.RelayModeResponses {
-		return nil
-	}
-	apiType, _ := common.ChannelType2APIType(common.GetContextKeyInt(c, constant.ContextKeyChannelType))
-	switch apiType {
-	case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference, constant.APITypeCodex, constant.APITypeNewAPI, constant.APITypeSub2API:
-		return requesttimeline.New(info.StartTime, c.GetString(common.RequestIdKey), info.UserId, info.OriginModelName)
+	// Admission follows the client protocol, not the provider/channel label.
+	// Response handlers observe their actual upstream protocol before conversion.
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI:
+		if info.RelayMode != relayconstant.RelayModeChatCompletions {
+			return nil
+		}
+	case types.RelayFormatOpenAIResponses:
+		if info.RelayMode != relayconstant.RelayModeResponses {
+			return nil
+		}
+	case types.RelayFormatClaude:
+		// Native Messages uses its own format; it has no dedicated relay mode.
 	default:
 		return nil
 	}
+	return requesttimeline.New(info.StartTime, c.GetString(common.RequestIdKey), info.UserId, info.OriginModelName)
 }
 
 type RequestTimelineWriter struct {
@@ -93,6 +103,13 @@ type RequestTimelineWriter struct {
 	insert                   func(context.Context, []*model.RequestTimeline) error
 	dropped, failed, written atomic.Int64
 	reportedDrops            int64 // Owned exclusively by run.
+}
+
+// Diagnostic reporting must not turn a failed optional feature into a second
+// panic. Never include the recovered panic value: it can contain credentials.
+func reportRequestTimelineError(message string) {
+	defer func() { _ = recover() }()
+	common.SysError(message)
 }
 
 // A record contains only bounded metadata, never a request context or body.
@@ -137,29 +154,49 @@ func (w *RequestTimelineWriter) Stats() RequestTimelineWriterStats {
 func (w *RequestTimelineWriter) reportDrops() {
 	dropped := w.dropped.Load()
 	if dropped != w.reportedDrops {
-		common.SysError(fmt.Sprintf("request timeline diagnostic records dropped: total=%d, new=%d", dropped, dropped-w.reportedDrops))
+		reportRequestTimelineError(fmt.Sprintf("request timeline diagnostic records dropped: total=%d, new=%d", dropped, dropped-w.reportedDrops))
 		w.reportedDrops = dropped
 	}
 }
 
 func (w *RequestTimelineWriter) run(ctx context.Context) {
-	defer close(w.done)
+	batch := make([]*model.RequestTimeline, 0, 32)
+	inFlight := 0
+	defer func() {
+		panicked := recover() != nil
+		w.stopAccepting()
+		w.cancel()
+		activeTimelineWriter.CompareAndSwap(w, nil)
+		if panicked {
+			w.failed.Add(int64(inFlight))
+			w.dropped.Add(int64(len(w.queue)))
+		}
+		// Release queued records even after cancellation or an unexpected failure.
+		for range w.queue {
+		}
+		close(w.done)
+		if panicked {
+			reportRequestTimelineError("request timeline disabled: diagnostic writer panicked")
+		}
+	}()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-	batch := make([]*model.RequestTimeline, 0, 32)
 	lastDropReport := time.Now()
 	for {
 		select {
 		case record, ok := <-w.queue:
 			if !ok {
 				w.flush(ctx, batch)
+				inFlight = 0
 				w.reportDrops()
 				return
 			}
-			raw, err := common.Marshal(record.Data)
+			inFlight++
+			raw, err := record.MarshalData()
 			if err != nil || len(raw) > requesttimeline.MaxDataBytes {
+				inFlight--
 				if w.dropped.Add(1)%100 == 1 {
-					common.SysError("request timeline rejected: invalid or oversized diagnostic payload")
+					reportRequestTimelineError("request timeline rejected: invalid or oversized diagnostic payload")
 				}
 				continue
 			}
@@ -167,6 +204,7 @@ func (w *RequestTimelineWriter) run(ctx context.Context) {
 				Result: record.Result, ErrorKind: record.ErrorKind, UpstreamRequestBodyBytes: record.RequestBodyBytes, Data: string(raw)})
 			if len(batch) == cap(batch) {
 				w.flush(ctx, batch)
+				inFlight = 0
 				clear(batch)
 				batch = batch[:0]
 			}
@@ -176,11 +214,13 @@ func (w *RequestTimelineWriter) run(ctx context.Context) {
 				lastDropReport = now
 			}
 			w.flush(ctx, batch)
+			inFlight = 0
 			clear(batch)
 			batch = batch[:0]
 		case <-ctx.Done():
 			w.dropped.Add(int64(len(batch) + len(w.queue)))
-			common.SysError("request timeline shutdown deadline reached; pending records discarded")
+			inFlight = 0
+			reportRequestTimelineError("request timeline shutdown deadline reached; pending records discarded")
 			return
 		}
 	}
@@ -193,6 +233,7 @@ func (w *RequestTimelineWriter) flush(ctx context.Context, batch []*model.Reques
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel() // Also release the deadline if an insert callback panics.
 		err = w.insert(writeCtx, batch)
 		cancel()
 		if err == nil {
@@ -204,18 +245,22 @@ func (w *RequestTimelineWriter) flush(ctx context.Context, batch []*model.Reques
 		}
 	}
 	w.failed.Add(int64(len(batch)))
-	common.SysError(fmt.Sprintf("request timeline write failed (%d records): %v", len(batch), err))
+	reportRequestTimelineError(fmt.Sprintf("request timeline write failed (%d records): %v", len(batch), err))
+}
+
+func (w *RequestTimelineWriter) stopAccepting() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped.Swap(true) {
+		close(w.queue)
+	}
 }
 
 func (w *RequestTimelineWriter) Shutdown(ctx context.Context) error {
 	if w == nil {
 		return nil
 	}
-	w.mu.Lock()
-	if !w.stopped.Swap(true) {
-		close(w.queue)
-	}
-	w.mu.Unlock()
+	w.stopAccepting()
 	defer activeTimelineWriter.CompareAndSwap(w, nil)
 	select {
 	case <-w.done:

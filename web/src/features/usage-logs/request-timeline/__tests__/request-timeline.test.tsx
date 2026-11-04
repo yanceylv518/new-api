@@ -97,6 +97,147 @@ afterEach(() => {
 })
 
 describe('request timeline', () => {
+  it('reports omitted intermediate attempts and truncated fields without hiding the final failure', async () => {
+    const response = recordedResponse()
+    const span = { ...response.timeline, details_truncated: true }
+    response.timeline.details_truncated = true
+    response.timeline.channel_id = 0
+    response.timeline.attempt_count = 20
+    response.timeline.attempts_omitted = 18
+    response.timeline.attempts = [
+      {
+        ...response.record,
+        number: 1,
+        retry_index: 0,
+        started_ms: 0,
+        data: span,
+      },
+      {
+        ...response.record,
+        number: 20,
+        retry_index: 19,
+        started_ms: 100,
+        upstream_status: null,
+        data: { ...span, channel_id: 0 },
+      },
+    ]
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    mountTimeline()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Request timeline' })
+    )
+    expect(await screen.findByLabelText('Final result')).toHaveTextContent(
+      'Failed'
+    )
+    expect(
+      screen.getByText(
+        '18 intermediate attempts omitted to keep this timeline within its recording limit.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        'Some recorded fields were truncated to keep this timeline within its recording limit.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByRole('button', { name: /Attempt 20 · No channel selected/ })
+    ).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('shows a successful fallback separately from the failed first attempt and uses attempt-relative durations', async () => {
+    const response = recordedResponse()
+    const successful = {
+      ...response.timeline,
+      channel_id: 2,
+      request_sent_ms: 220,
+      first_response_ms: 320,
+      first_write_ms: 325,
+      ended_ms: 400,
+      first_error: null,
+      upstream_usage: {
+        input_tokens: 2,
+        output_tokens: 3,
+        vendor_note: 'complete final usage',
+      },
+    }
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        data: {
+          ...response,
+          record: { ...response.record, result: 'success', error_kind: null },
+          timeline: {
+            ...successful,
+            attempt_count: 2,
+            attempts: [
+              {
+                number: 1,
+                retry_index: 0,
+                started_ms: 0,
+                ...response.record,
+                upstream_status: 502,
+                data: response.timeline,
+              },
+              {
+                number: 2,
+                retry_index: 1,
+                started_ms: 200,
+                ...response.record,
+                result: 'success',
+                error_kind: null,
+                data: {
+                  ...successful,
+                  upstream_usage: undefined,
+                  upstream_usage_capture: 'truncated',
+                  upstream_usage_preview: 'saved-prefix',
+                },
+              },
+            ],
+          },
+        },
+      },
+    })
+    const user = userEvent.setup()
+    mountTimeline()
+    await user.click(screen.getByRole('button', { name: 'Request timeline' }))
+    const first = await screen.findByRole('button', {
+      name: /Attempt 1 · Channel 1/,
+    })
+    const last = screen.getByRole('button', { name: /Attempt 2 · Channel 2/ })
+    expect(first).toHaveAttribute('aria-expanded', 'false')
+    expect(last).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByLabelText('Final result')).toHaveTextContent('Completed')
+    expect(screen.getByText('400 ms')).toBeVisible()
+    const finalPanel = screen.getByRole('region', {
+      name: /Attempt 2 · Channel 2/,
+    })
+    const beforeSend =
+      within(finalPanel).getByText('Before sending').parentElement
+    if (!beforeSend) throw new Error('Missing before-send timing row')
+    expect(within(beforeSend).getByText('20 ms')).toBeVisible()
+    await user.click(
+      within(finalPanel).getByRole('button', {
+        name: 'Completion recorded fields',
+      })
+    )
+    expect(
+      within(finalPanel).getByText(/"vendor_note": "complete final usage"/)
+    ).toBeVisible()
+    expect(
+      screen.queryByText('<script>unsafe()</script>')
+    ).not.toBeInTheDocument()
+    first.focus()
+    await user.keyboard('{Enter}')
+    const firstPanel = screen.getByRole('region', {
+      name: /Attempt 1 · Channel 1/,
+    })
+    expect(
+      within(firstPanel).getByText('<script>unsafe()</script>')
+    ).toBeVisible()
+    expect(document.querySelector('script')).toBeNull()
+    expect(within(firstPanel).getByText('HTTP 502')).toBeVisible()
+    expect(screen.getByLabelText('Final result')).toHaveTextContent('Completed')
+  })
+
   it('loads only after keyboard expansion and keeps HTTP 200 separate from a business failure', async () => {
     const get = vi
       .spyOn(api, 'get')
@@ -260,6 +401,52 @@ describe('request timeline', () => {
 })
 
 describe('upstream usage and per-point fields', () => {
+  it.each([
+    {
+      delta: { output_tokens: 3 },
+      expected: 'Input 2 · Output 3 · Total Not recorded',
+    },
+    {
+      delta: { input_tokens: 0, output_tokens: 0 },
+      expected: 'Input 0 · Output 0 · Total Not recorded',
+    },
+  ])(
+    'combines Claude usage events without inventing omitted fields: $expected',
+    async ({ delta, expected }) => {
+      const response = recordedResponse()
+      response.timeline.upstream_usage = {
+        message_start: {
+          input_tokens: 2,
+          output_tokens: 1,
+          cache_read_input_tokens: 5,
+        },
+        message_delta: delta,
+      }
+      response.timeline.returned_usage = {
+        input_tokens: 7,
+        output_tokens: 3,
+        total_tokens: 10,
+      }
+      vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+      mountTimeline()
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Request timeline' })
+      )
+      expect(await screen.findByText(expected)).toBeVisible()
+      expect(
+        screen.getByText(
+          'Usage objects received in message_start and message_delta events from the directly connected upstream.'
+        )
+      ).toBeVisible()
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Completion recorded fields' })
+      )
+      expect(screen.getByText(/"cache_read_input_tokens": 5/)).toBeVisible()
+      expect(screen.getByText(/"message_start"/)).toBeVisible()
+      expect(screen.getByText(/"message_delta"/)).toBeVisible()
+    }
+  )
+
   it('shows only actually returned token values and exposes the complete object at the completion point', async () => {
     const response = recordedResponse()
     response.timeline.upstream_usage = {

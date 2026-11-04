@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -84,9 +85,41 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	return relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
 }
 
-func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
+// Decode upstream Claude events before any native usage patch or conversion.
+func decodeTimelineClaudeFrame(data string, timeline *requesttimeline.Trace) (dto.ClaudeResponse, error) {
 	var claudeResponse dto.ClaudeResponse
-	err := common.UnmarshalJsonStr(data, &claudeResponse)
+	var err error
+	if timeline == nil {
+		err = common.UnmarshalJsonStr(data, &claudeResponse)
+	} else {
+		var captured struct {
+			dto.ClaudeResponse
+			Usage   requesttimeline.ClaudeStreamUsage `json:"usage"`
+			Message *struct {
+				dto.ClaudeMediaMessage
+				Usage requesttimeline.ClaudeStreamUsage `json:"usage"`
+			} `json:"message"`
+		}
+		err = common.UnmarshalJsonStr(data, &captured)
+		if err == nil {
+			claudeResponse = captured.ClaudeResponse
+			claudeResponse.Usage = captured.Usage.Value
+			usage := captured.Usage
+			if captured.Message != nil {
+				captured.Message.ClaudeMediaMessage.Usage = captured.Message.Usage.Value
+				claudeResponse.Message = &captured.Message.ClaudeMediaMessage
+				if claudeResponse.Type == "message_start" {
+					usage = captured.Message.Usage
+				}
+			}
+			timeline.ObserveClaude(claudeResponse, usage)
+		}
+	}
+	return claudeResponse, err
+}
+
+func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
+	claudeResponse, err := decodeTimelineClaudeFrame(data, info.Timeline)
 	if err != nil {
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return types.NewError(err, types.ErrorCodeBadResponseBody)

@@ -163,34 +163,48 @@ func decodeTimelineResponsesFrame(data string, timeline *requesttimeline.Trace) 
 	return response, nil
 }
 
+func decodeTimelineChatFrame(data string, timeline *requesttimeline.Trace) (dto.ChatCompletionsStreamResponse, error) {
+	if timeline == nil {
+		var streamResponse dto.ChatCompletionsStreamResponse
+		err := common.UnmarshalJsonStr(data, &streamResponse)
+		return streamResponse, err
+	}
+	var streamResponse struct {
+		dto.ChatCompletionsStreamResponse
+		Error requesttimeline.StreamError `json:"error"`
+		Usage requesttimeline.StreamUsage `json:"usage"`
+	}
+	if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		return dto.ChatCompletionsStreamResponse{}, err
+	}
+	streamResponse.ChatCompletionsStreamResponse.Usage = streamResponse.Usage.Value
+	timeline.CaptureUpstreamUsage(streamResponse.Usage)
+	timeline.ObserveChat(streamResponse.ChatCompletionsStreamResponse, streamResponse.Error)
+	return streamResponse.ChatCompletionsStreamResponse, nil
+}
+
 func processTokenData(relayMode int, data string, responseTextBuilder *strings.Builder, toolCount *int, timeline *requesttimeline.Trace) error {
 	switch relayMode {
 	case relayconstant.RelayModeChatCompletions:
-		if timeline == nil {
-			var streamResponse dto.ChatCompletionsStreamResponse
-			if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-				return err
-			}
-			return ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount)
-		}
-		var streamResponse struct {
-			dto.ChatCompletionsStreamResponse
-			Error requesttimeline.StreamError `json:"error"`
-			Usage requesttimeline.StreamUsage `json:"usage"`
-		}
-		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		streamResponse, err := decodeTimelineChatFrame(data, timeline)
+		if err != nil {
 			return err
 		}
-		streamResponse.ChatCompletionsStreamResponse.Usage = streamResponse.Usage.Value
-		timeline.CaptureUpstreamUsage(streamResponse.Usage)
-		timeline.ObserveChat(streamResponse.ChatCompletionsStreamResponse, streamResponse.Error)
-		return ProcessStreamResponse(streamResponse.ChatCompletionsStreamResponse, responseTextBuilder, toolCount)
+		return ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount)
 	case relayconstant.RelayModeCompletions:
 		var streamResponse dto.CompletionsStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			return err
 		}
 		processCompletionsStreamResponse(streamResponse, responseTextBuilder)
+	default:
+		// Messages clients can use this Chat upstream handler without a Chat
+		// relay mode. Observe the upstream protocol while preserving token accounting.
+		if timeline != nil {
+			if _, err := decodeTimelineChatFrame(data, timeline); err != nil {
+				timeline.LocalError(string(types.ErrorCodeBadResponseBody), err.Error())
+			}
+		}
 	}
 	return nil
 }

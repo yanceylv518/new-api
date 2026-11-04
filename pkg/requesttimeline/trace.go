@@ -20,6 +20,7 @@ import (
 
 const Version = 1
 const MaxDataBytes = 16 << 10
+const MaxAttempts = 16
 
 const maxErrorCaptureBytes = 8 << 10
 
@@ -121,6 +122,23 @@ type Data struct {
 	UpstreamUsagePreview string          `json:"upstream_usage_preview,omitempty"`
 	UpstreamUsageBytes   int             `json:"upstream_usage_bytes,omitempty"`
 	FirstError           *Failure        `json:"first_error"`
+	AttemptCount         int             `json:"attempt_count,omitempty"`
+	AttemptsOmitted      int             `json:"attempts_omitted,omitempty"`
+	Attempts             []Attempt       `json:"attempts,omitempty"`
+	DetailsTruncated     bool            `json:"details_truncated,omitempty"`
+}
+
+// Offsets in every attempt use the original request start, so fallback gaps
+// remain visible. Data contains no nested attempts in an attempt snapshot.
+type Attempt struct {
+	Number           int     `json:"number"`
+	RetryIndex       int     `json:"retry_index"`
+	StartedMS        int64   `json:"started_ms"`
+	UpstreamStatus   *int    `json:"upstream_status"`
+	Result           string  `json:"result"`
+	ErrorKind        *string `json:"error_kind"`
+	RequestBodyBytes *int64  `json:"upstream_request_body_bytes"`
+	Data             Data    `json:"data"`
 }
 
 type Record struct {
@@ -142,10 +160,18 @@ type Trace struct {
 	secret           string
 	firstErrorAt     time.Time
 	record           Record
+	claudeUsage      *dto.ClaudeUsage
+	claudeStartUsage json.RawMessage
+	attempts         []Attempt
+	attemptNumber    int
+	retryIndex       int
+	attemptStartedMS int64
+	attemptEnded     bool
+	attemptBegun     bool
 }
 
 func New(start time.Time, requestID string, userID int, model string) *Trace {
-	return &Trace{start: start, record: Record{RequestID: requestID, UserID: int64(userID), Result: "unknown", Data: Data{
+	return &Trace{start: start, attemptNumber: 1, record: Record{RequestID: requestID, UserID: int64(userID), Result: "unknown", Data: Data{
 		Version: Version, StartedAtMS: start.UnixMilli(), RequestModel: bounded(model, 256), TimingValid: true,
 	}}}
 }
@@ -166,12 +192,23 @@ func (t *Trace) offset(at time.Time) int64 {
 	return (at.Sub(t.start) + time.Duration(t.start.Nanosecond()%int(time.Millisecond))).Milliseconds()
 }
 
+// Every observation owns mu and is diagnostic only. A collector bug disables
+// this trace instead of unwinding an HTTP transport callback or stream writer.
+// Do not log here: logging must never block the request being observed.
+func (t *Trace) finishObservation() {
+	if recover() != nil {
+		t.skipped = true
+		t.secret = ""
+	}
+	t.mu.Unlock()
+}
+
 func (t *Trace) Candidate() bool {
 	if t == nil {
 		return false
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	return !t.skipped
 }
 
@@ -180,26 +217,145 @@ func (t *Trace) Skip() {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if !t.closed {
 		t.skipped = true
 	}
 }
 
-func (t *Trace) Request(req *http.Request, channelID int, secret string) *http.Request {
+// BeginAttempt observes the controller's existing retry loop; it never decides
+// whether to retry, selects a channel, or resets relay/billing state.
+func (t *Trace) BeginAttempt(retryIndex int) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.finishObservation()
+	if t.closed || t.skipped {
+		return
+	}
+	if !t.attemptBegun && t.attemptNumber == 1 && t.requests == 0 && !t.attemptEnded {
+		t.attemptBegun = true
+		t.retryIndex = retryIndex
+		t.attemptStartedMS = t.offset(time.Now())
+		return
+	}
+	t.nextAttempt()
+	t.retryIndex = retryIndex
+}
+
+func (t *Trace) SelectChannel(channelID int, secret string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.finishObservation()
+	if !t.closed && !t.skipped {
+		t.record.Data.ChannelID, t.secret = channelID, secret
+	}
+}
+
+func (t *Trace) EndAttempt(err error) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.finishObservation()
+	if !t.closed && !t.skipped {
+		t.finishAttempt(err)
+	}
+}
+
+// finishAttempt and nextAttempt require mu. Each attempt owns its diagnostic
+// state, including error priority, credentials used for redaction and usage.
+func (t *Trace) finishAttempt(err error) {
+	if err != nil && (t.record.Data.FirstError == nil || t.record.Data.FirstError.Stage == "upstream_response") {
+		at := time.Now()
+		result, kind, stage, code := "failed", "local_error", "relay", "relay_error"
+		if t.record.Data.FirstError != nil {
+			at, result, kind, stage, code = t.firstErrorAt, t.record.Result, *t.record.ErrorKind, "upstream_response", t.record.Data.FirstError.Code
+			t.record.Data.FirstError = nil
+		} else if errors.Is(err, context.Canceled) {
+			result, kind, code = "interrupted", "client_disconnected", "client_disconnected"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			result, kind, code = "interrupted", "timeout", "deadline_exceeded"
+		}
+		t.failAt(at, result, kind, stage, code, err.Error(), 0)
+	}
+	if !t.attemptEnded {
+		if t.record.Data.EndedMS == nil || err != nil {
+			t.markEnd()
+		}
+		t.attemptEnded = true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		kind := "client_disconnected"
+		if errors.Is(err, context.DeadlineExceeded) {
+			kind = "timeout"
+		}
+		t.record.Result, t.record.ErrorKind = "interrupted", &kind
+	}
+	if t.record.Data.FirstError == nil {
+		if t.record.Data.EndMarkerReceived && t.record.Data.FirstWriteMS != nil && t.record.Data.FinishReason != "response.incomplete" && t.record.Data.FinishReason != "response.cancelled" && t.record.Data.FinishReason != "response.canceled" {
+			t.record.Result, t.record.ErrorKind = "success", nil
+		} else {
+			kind := "unconfirmed_end"
+			t.record.Result, t.record.ErrorKind = "unknown", &kind
+		}
+	}
+	previous := t.attemptStartedMS
+	for _, point := range []*int64{t.record.Data.RequestSentMS, t.record.Data.FirstResponseMS, t.record.Data.FirstWriteMS, t.record.Data.EndedMS} {
+		if point != nil {
+			if *point < previous {
+				t.record.Data.TimingValid = false
+			}
+			previous = *point
+		}
+	}
+}
+
+func (t *Trace) snapshotAttempt() Attempt {
+	data := t.record.Data
+	// Keep bounded summaries for each attempt; the top-level final attempt can
+	// still retain the complete upstream usage under its existing size limit.
+	compactAttemptData(&data, 512)
+	return Attempt{Number: t.attemptNumber, RetryIndex: t.retryIndex, StartedMS: t.attemptStartedMS,
+		UpstreamStatus: t.record.UpstreamStatus, Result: t.record.Result, ErrorKind: t.record.ErrorKind,
+		RequestBodyBytes: t.record.RequestBodyBytes, Data: data}
+}
+
+func (t *Trace) nextAttempt() {
+	t.finishAttempt(nil)
+	if len(t.attempts) == MaxAttempts-1 {
+		// Retain the first attempt and the most recent attempts.
+		copy(t.attempts[1:], t.attempts[2:])
+		t.attempts = t.attempts[:len(t.attempts)-1]
+	}
+	t.attempts = append(t.attempts, t.snapshotAttempt())
+	t.record = Record{RequestID: t.record.RequestID, UserID: t.record.UserID, Result: "unknown", Data: Data{
+		Version: Version, StartedAtMS: t.start.UnixMilli(), RequestModel: t.record.Data.RequestModel, TimingValid: true,
+	}}
+	t.attemptNumber++
+	t.attemptBegun = true
+	t.attemptStartedMS = t.offset(time.Now())
+	t.requests, t.writes, t.secret, t.firstErrorAt = 0, 0, "", time.Time{}
+	t.claudeUsage, t.claudeStartUsage, t.attemptEnded = nil, nil, false
+}
+
+func (t *Trace) Request(req *http.Request, channelID int, secret string) (observed *http.Request) {
+	observed = req // Preserve the original request if diagnostic setup panics.
 	if t == nil {
 		return req
 	}
 	t.mu.Lock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
-		t.mu.Unlock()
 		return req
 	}
 	t.requests++
 	if t.requests > 1 {
-		t.skipped = true
-		t.mu.Unlock()
-		return req
+		t.nextAttempt()
+		t.requests = 1
 	}
 	t.record.Data.ChannelID, t.secret = channelID, secret
 	if req.ContentLength > 0 || req.Body == nil || req.Body == http.NoBody {
@@ -209,24 +365,31 @@ func (t *Trace) Request(req *http.Request, channelID int, secret string) *http.R
 		}
 		t.record.RequestBodyBytes = &size
 	}
-	t.mu.Unlock()
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{WroteRequest: t.wroteRequest}))
+	sequence := t.attemptNumber
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		t.wroteRequest(&sequence, info)
+	}}))
 }
 
-func (t *Trace) wroteRequest(info httptrace.WroteRequestInfo) {
+func (t *Trace) wroteRequest(sequence *int, info httptrace.WroteRequestInfo) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed || t.skipped {
+	defer t.finishObservation()
+	if t.closed || t.skipped || *sequence != t.attemptNumber {
 		return
 	}
 	t.writes++
 	if t.writes > 1 {
-		t.skipped = true
-		return
+		channelID, secret, size := t.record.Data.ChannelID, t.secret, t.record.RequestBodyBytes
+		t.nextAttempt()
+		t.record.Data.ChannelID, t.secret, t.record.RequestBodyBytes = channelID, secret, size
+		t.requests, t.writes = 1, 1
+		*sequence = t.attemptNumber
 	}
 	if info.Err == nil {
 		now := t.offset(time.Now())
 		t.record.Data.RequestSentMS = &now
+	} else {
+		t.transportError(info.Err)
 	}
 }
 
@@ -235,7 +398,7 @@ func (t *Trace) Response(resp *http.Response, err error) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
@@ -253,20 +416,26 @@ func (t *Trace) Response(resp *http.Response, err error) {
 		}
 	}
 	if err != nil {
-		kind := "upstream_request_error"
-		var timeout interface{ Timeout() bool }
-		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
-			kind = "timeout"
-		}
-		if errors.Is(err, context.Canceled) {
-			kind = "client_disconnected"
-		}
-		result := "failed"
-		if kind == "client_disconnected" || kind == "timeout" {
-			result = "interrupted"
-		}
-		t.fail(result, kind, "upstream_request", kind, err.Error())
+		t.transportError(err)
 	}
+}
+
+// transportError requires mu and also observes failed writes that the HTTP
+// transport transparently retries before returning a final response.
+func (t *Trace) transportError(err error) {
+	kind := "upstream_request_error"
+	var timeout interface{ Timeout() bool }
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+		kind = "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		kind = "client_disconnected"
+	}
+	result := "failed"
+	if kind == "client_disconnected" || kind == "timeout" {
+		result = "interrupted"
+	}
+	t.fail(result, kind, "upstream_request", kind, err.Error())
 }
 
 func (t *Trace) FirstResponse(at time.Time) {
@@ -274,7 +443,7 @@ func (t *Trace) FirstResponse(at time.Time) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped || t.record.Data.FirstResponseMS != nil {
 		return
 	}
@@ -299,7 +468,7 @@ func (t *Trace) PayloadWritten(err error) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
@@ -365,7 +534,7 @@ func (t *Trace) ProcessingError(at time.Time, message string) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if !t.closed && !t.skipped {
 		t.failAt(at, "failed", "local_error", "response_processing", "stream_processing_error", message, 0)
 	}
@@ -376,7 +545,7 @@ func (t *Trace) BusinessError(code, message string) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if !t.closed && !t.skipped {
 		t.fail("failed", "upstream_business_error", "upstream_read", code, message)
 	}
@@ -387,7 +556,7 @@ func (t *Trace) LocalError(code, message string) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if !t.closed && !t.skipped {
 		t.fail("failed", "local_error", "relay", code, message)
 		t.markEnd()
@@ -399,7 +568,7 @@ func (t *Trace) StreamEnd(reason string, clientErr error, processingError bool) 
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
@@ -436,21 +605,26 @@ type StreamUsage struct {
 }
 
 func (u *StreamUsage) UnmarshalJSON(data []byte) error {
-	u.Raw = nil
-	u.Preview = ""
-	u.Bytes = len(data)
+	u.Raw, u.Preview, u.Bytes = nil, "", len(data)
 	if err := common.Unmarshal(data, &u.Value); err != nil {
 		return err
 	}
 	if u.Value == nil {
 		return nil
 	}
+	u.capture(data)
+	return nil
+}
+
+// capture bounds raw usage independently of its protocol-specific billing DTO.
+func (u *StreamUsage) capture(data []byte) {
+	u.Raw, u.Preview, u.Bytes = nil, "", len(data)
 	// Bound the encoded size too: JSON escaping may expand provider text.
 	if len(data) <= 8192 {
 		encoded, err := common.Marshal(json.RawMessage(data))
 		if err == nil && len(encoded) <= 8192 {
 			u.Raw = encoded
-			return nil
+			return
 		}
 	}
 	// Only copy a bounded prefix for diagnostics; the original DTO above still
@@ -472,6 +646,23 @@ func (u *StreamUsage) UnmarshalJSON(data []byte) error {
 		size := max(0, len(u.Preview)*8192/len(encoded)-1)
 		u.Preview = bounded(u.Preview, size)
 	}
+}
+
+// ClaudeStreamUsage preserves unknown provider usage fields without changing
+// the Claude DTO used by the existing relay and billing path.
+type ClaudeStreamUsage struct {
+	Value   *dto.ClaudeUsage
+	Capture StreamUsage
+}
+
+func (u *ClaudeStreamUsage) UnmarshalJSON(data []byte) error {
+	u.Capture = StreamUsage{}
+	if err := common.Unmarshal(data, &u.Value); err != nil {
+		return err
+	}
+	if u.Value != nil {
+		u.Capture.capture(data)
+	}
 	return nil
 }
 
@@ -480,10 +671,15 @@ func (t *Trace) CaptureUpstreamUsage(usage StreamUsage) {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
+	t.captureUpstreamUsage(usage)
+}
+
+// captureUpstreamUsage requires mu. The caller verifies usage is present.
+func (t *Trace) captureUpstreamUsage(usage StreamUsage) {
 	t.record.Data.UpstreamUsage = usage.Raw
 	t.record.Data.UpstreamUsagePreview = usage.Preview
 	t.record.Data.UpstreamUsageBytes = usage.Bytes
@@ -493,12 +689,72 @@ func (t *Trace) CaptureUpstreamUsage(usage StreamUsage) {
 	}
 }
 
+// ObserveClaude runs before usage patching or protocol conversion. Claude sends
+// initial input usage in message_start and cumulative output in message_delta;
+// retain both raw objects rather than replacing the first with a partial delta.
+func (t *Trace) ObserveClaude(response dto.ClaudeResponse, usage ClaudeStreamUsage) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.finishObservation()
+	if t.closed || t.skipped {
+		return
+	}
+	if t.record.Data.FirstChunkType == "" && response.Type != "ping" {
+		t.record.Data.FirstChunkType = bounded(response.Type, 128)
+	}
+	if message := response.Message; response.Type == "message_start" && message != nil {
+		t.record.Data.ResponseID = bounded(message.Id, 256)
+		t.record.Data.ResponseModel = bounded(message.Model, 256)
+	}
+	if response.StopReason != "" {
+		t.record.Data.FinishReason = bounded(response.StopReason, 64)
+	}
+	if response.Delta != nil && response.Delta.StopReason != nil && *response.Delta.StopReason != "" {
+		t.record.Data.FinishReason = bounded(*response.Delta.StopReason, 64)
+	}
+	if response.Type == "message_stop" {
+		t.record.Data.EndMarkerReceived = true
+	}
+	if apiError := captureUpstreamError(response.Error); apiError.Present {
+		t.failAt(time.Now(), "failed", "upstream_business_error", "upstream_read", apiError.Code, apiError.Message, apiError.OmittedBytes)
+	}
+	if usage.Value == nil {
+		return
+	}
+	t.claudeUsage = dto.MergeClaudeUsageNonZero(t.claudeUsage, usage.Value)
+	u := t.claudeUsage
+	input := u.InputTokens + u.CacheReadInputTokens + u.GetCacheCreationTotalTokens()
+	t.record.Data.ReturnedUsage = &Usage{InputTokens: input, OutputTokens: u.OutputTokens, TotalTokens: input + u.OutputTokens}
+	if response.Type == "message_start" {
+		t.claudeStartUsage = usage.Capture.Raw
+	}
+	if len(usage.Capture.Raw) == 0 {
+		t.captureUpstreamUsage(usage.Capture)
+		return
+	}
+	// A truncated initial object cannot be recovered by a smaller final delta.
+	if t.record.Data.UpstreamUsageCapture == "truncated" {
+		return
+	}
+	parts := map[string]json.RawMessage{response.Type: usage.Capture.Raw}
+	if len(t.claudeStartUsage) > 0 {
+		parts["message_start"] = t.claudeStartUsage
+	}
+	if raw, err := common.Marshal(parts); err == nil {
+		var captured StreamUsage
+		captured.capture(raw)
+		t.captureUpstreamUsage(captured)
+	}
+}
+
 func (t *Trace) ObserveChat(response dto.ChatCompletionsStreamResponse, apiError StreamError) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
@@ -541,7 +797,7 @@ func (t *Trace) ObserveResponses(response dto.ResponsesStreamResponse, code, mes
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed || t.skipped {
 		return
 	}
@@ -582,7 +838,7 @@ func (t *Trace) Freeze(localErr error) *Record {
 		return nil
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.finishObservation()
 	if t.closed {
 		return nil
 	}
@@ -591,26 +847,66 @@ func (t *Trace) Freeze(localErr error) *Record {
 	if t.skipped {
 		return nil
 	}
-	if localErr != nil && t.record.Data.FirstError == nil {
-		t.fail("failed", "local_error", "relay", "relay_error", localErr.Error())
-	}
-	if t.record.Data.FirstError == nil {
-		if t.record.Data.EndMarkerReceived && t.record.Data.FirstWriteMS != nil && t.record.Data.FinishReason != "response.incomplete" && t.record.Data.FinishReason != "response.cancelled" && t.record.Data.FinishReason != "response.canceled" {
-			t.record.Result = "success"
-		} else {
-			kind := "unconfirmed_end"
-			t.record.ErrorKind = &kind
-		}
-	}
-	previous := int64(0)
-	for _, point := range []*int64{t.record.Data.RequestSentMS, t.record.Data.FirstResponseMS, t.record.Data.FirstWriteMS, t.record.Data.EndedMS} {
-		if point != nil {
-			if *point < previous {
-				t.record.Data.TimingValid = false
-			}
-			previous = *point
-		}
+	t.finishAttempt(localErr)
+	if t.attemptNumber > 1 {
+		t.record.Data.Attempts = append(t.attempts, t.snapshotAttempt())
+		t.record.Data.AttemptCount = t.attemptNumber
+		t.record.Data.AttemptsOmitted = t.attemptNumber - len(t.record.Data.Attempts)
 	}
 	t.record.CreatedAt = time.Now().Unix()
 	return &t.record
+}
+
+// compactAttemptData bounds retained history independently of the retry count.
+// The presence of truncated details is explicit; no usage values are invented.
+func compactAttemptData(data *Data, limit int) {
+	for _, value := range []*string{&data.RequestModel, &data.UpstreamRequestID, &data.ResponseID, &data.ResponseModel, &data.FirstChunkType, &data.FinishReason, &data.EndReason} {
+		if len(*value) > limit {
+			*value = bounded(*value, limit)
+			data.DetailsTruncated = true
+		}
+	}
+	if data.FirstError != nil {
+		failure := *data.FirstError
+		if len(failure.Message) > limit {
+			failure.Message, failure.MessageTruncated = bounded(failure.Message, limit), true
+			data.DetailsTruncated = true
+		}
+		if len(failure.Code) > limit {
+			failure.Code = bounded(failure.Code, limit)
+			data.DetailsTruncated = true
+		}
+		data.FirstError = &failure
+	}
+	if len(data.UpstreamUsage) > 512 || len(data.UpstreamUsagePreview) > limit {
+		preview := data.UpstreamUsagePreview
+		if len(data.UpstreamUsage) > 0 {
+			preview = string(data.UpstreamUsage)
+		}
+		data.UpstreamUsage, data.UpstreamUsagePreview = nil, bounded(preview, limit)
+		data.UpstreamUsageCapture, data.DetailsTruncated = "truncated", true
+	}
+}
+
+// MarshalData runs in the asynchronous writer. Size pressure trims intermediate
+// attempts with an explicit count, while always keeping the first and final one.
+func (r *Record) MarshalData() ([]byte, error) {
+	raw, err := common.Marshal(r.Data)
+	if err == nil && len(raw) > MaxDataBytes && len(r.Data.Attempts) > 0 {
+		for i := range r.Data.Attempts {
+			compactAttemptData(&r.Data.Attempts[i].Data, 64)
+		}
+		raw, err = common.Marshal(r.Data)
+	}
+	if err == nil && len(raw) > MaxDataBytes && len(r.Data.Attempts) > 0 {
+		compactAttemptData(&r.Data, 64)
+		r.Data.DetailsTruncated = true
+		raw, err = common.Marshal(r.Data)
+	}
+	for err == nil && len(raw) > MaxDataBytes && len(r.Data.Attempts) > 2 {
+		r.Data.Attempts = append(r.Data.Attempts[:1], r.Data.Attempts[2:]...)
+		r.Data.AttemptsOmitted++
+		raw, err = common.Marshal(r.Data)
+	}
+	return raw, err
 }

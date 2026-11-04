@@ -21,7 +21,7 @@ import { z } from 'zod'
 import { api } from '@/lib/api'
 
 const milliseconds = z.number().int().nullable()
-const timelineSchema = z.object({
+const spanSchema = z.object({
   version: z.literal(1),
   started_at_ms: z.number().int().positive(),
   request_sent_ms: milliseconds,
@@ -59,6 +59,26 @@ const timelineSchema = z.object({
       message_truncated: z.boolean(),
     })
     .nullable(),
+  details_truncated: z.boolean().optional(),
+})
+
+const recordSchema = z.object({
+  request_id: z.string(),
+  upstream_status: z.number().int().nullable(),
+  result: z.enum(['success', 'failed', 'interrupted', 'unknown']),
+  error_kind: z.string().nullable(),
+  upstream_request_body_bytes: z.number().int().nonnegative().nullable(),
+})
+const attemptSchema = recordSchema.omit({ request_id: true }).extend({
+  number: z.number().int().positive(),
+  retry_index: z.number().int().nonnegative(),
+  started_ms: z.number().int().nonnegative(),
+  data: spanSchema,
+})
+const timelineSchema = spanSchema.extend({
+  attempt_count: z.number().int().positive().optional(),
+  attempts_omitted: z.number().int().nonnegative().optional(),
+  attempts: z.array(attemptSchema).max(16).optional(),
 })
 
 const responseSchema = z.object({
@@ -71,20 +91,13 @@ const responseSchema = z.object({
     'invalid_data',
     'unsupported_version',
   ]),
-  record: z
-    .object({
-      request_id: z.string(),
-      upstream_status: z.number().int().nullable(),
-      result: z.enum(['success', 'failed', 'interrupted', 'unknown']),
-      error_kind: z.string().nullable(),
-      upstream_request_body_bytes: z.number().int().nonnegative().nullable(),
-    })
-    .nullable(),
+  record: recordSchema.nullable(),
   timeline: timelineSchema.nullable(),
 })
 
 export type TimelineResponse = z.infer<typeof responseSchema>
 export type TimelineData = z.infer<typeof timelineSchema>
+export type TimelineAttempt = z.infer<typeof attemptSchema>
 
 export async function getRequestTimeline(
   requestId: string,
