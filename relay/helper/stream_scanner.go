@@ -46,12 +46,17 @@ func NewStreamScanner(reader io.Reader) *bufio.Scanner {
 	return scanner
 }
 
-func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
+func copyUpstreamSSEHeaders(c *gin.Context, resp *http.Response) {
 	if c == nil || c.Writer == nil || resp == nil {
 		return
 	}
-	// codex
-	for _, name := range []string{"X-Reasoning-Included", "X-Codex-Turn-State"} {
+	// 在首次发送 SSE 数据、提交响应头之前，保留上游提供的指定元数据。
+	for _, name := range []string{
+		"X-Reasoning-Included",
+		"X-Codex-Turn-State",
+		"Msh-Usage-Cache-Write-Tokens-5m",
+		"Msh-Usage-Cache-Write-Tokens-1h",
+	} {
 		values := resp.Header.Values(name)
 		if !service.ShouldCopyUpstreamHeader(c, name, values) {
 			continue
@@ -141,7 +146,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	scanner.Split(bufio.ScanLines)
-	copyCodexSSEHeaders(c, resp)
+	copyUpstreamSSEHeaders(c, resp)
 	SetEventStreamHeaders(c)
 
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
