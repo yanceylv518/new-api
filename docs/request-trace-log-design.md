@@ -69,7 +69,8 @@
 
 ### 本次验证
 
-- 提交前复查补充：上游请求 ID 按 `X-Oneapi-Request-Id`、`X-Request-Id`、`Request-Id`、`X-Mass-Requestid` 的顺序取首个非空值；真实 HTTP 用例覆盖大小写和优先级。若上游同时返回数值不同的 `prompt_tokens` / `input_tokens` 或 `completion_tokens` / `output_tokens`，界面并列字段名与数值，不静默选择其中一个。
+- 上游请求 ID 优先取 `X-Oneapi-Request-Id`、`X-Request-Id`、`Request-Id` 中首个非空值。若均为空，按「日志维护 → 额外的上游请求 ID 响应头」的配置顺序查找，默认 `x-maas-requestid`。多个名称用英文逗号分隔，留空仅使用内置名称。每个新请求使用本节点当时的配置，包含该请求后续的 fallback 尝试。
+- 若上游同时返回数值不同的 `prompt_tokens` / `input_tokens` 或 `completion_tokens` / `output_tokens`，界面并列字段名与数值，不静默选择其中一个。
 
 - 完整 usage 与截断修订（2026-10-30）：时间线专项、相关转发及计费测试通过；前端相关测试、类型检查、lint 与生产构建通过。SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 18.6 验证完整扩展字段（文本、数组、布尔值、null）和截断前缀/原始大小往返，未改动表结构。usage 超限、UTF-8 边界和 JSON 转义膨胀均有覆盖；三种流式路径在截断时的输出及计费结果与关闭采集时一致。 Linux/amd64 Go 1.26.1 的 `go test -race -p=2 ./controller -run "^TestRequestTimeline" -count=1 -timeout=180s` 通过；前端相关 145 项通过后移除旧省略状态的 1 项测试，最终时间线专项 10 项、类型检查、lint、前后端构建通过，并检查了真实浏览器中的截断展示。 本次本机正常流对照使用前述 `BenchmarkRequestTimelineStream`（`-benchtime=1s -count=3`）：修改前开启 4.584–5.372 ms/请求，修改后 3.494–4.490 ms/请求，无丢记录；每请求分配约增加 4–8 KiB。测试期间有其他构建负载，不能据此宣称提速或推断生产尾延迟。
 

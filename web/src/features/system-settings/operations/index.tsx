@@ -45,6 +45,7 @@ const defaultOperationsSettings: OperationsSettings = {
   WorkerAllowHttpImageRequestEnabled: false,
   LogConsumeEnabled: false,
   RequestTimelineEnabled: false,
+  RequestTimelineRequestIDHeaders: 'x-maas-requestid',
   'performance_setting.disk_cache_enabled': false,
   'performance_setting.disk_cache_threshold_mb': 10,
   'performance_setting.disk_cache_max_size_mb': 1024,

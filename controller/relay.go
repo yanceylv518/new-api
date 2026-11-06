@@ -99,10 +99,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			finalError = newAPIError
 		}
-		if contextErr := c.Request.Context().Err(); contextErr != nil {
-			finalError = contextErr
-		}
-		service.EnqueueRequestTimeline(timeline.Freeze(finalError))
+		service.EnqueueRequestTimeline(timeline.FreezeWithContext(finalError, c.Request.Context().Err()))
 		restoreTimelineWriter()
 	}()
 

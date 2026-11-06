@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "The header list must be at most 2048 bytes.",
+    "Separate header names with an English comma (,).": "Separate header names with an English comma (,).",
+    "Remove the extra comma or enter a header name.": "Remove the extra comma or enter a header name.",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).",
+    "Sensitive headers cannot be used as request IDs.": "Sensitive headers cannot be used as request IDs.",
+    "Enter at most 16 additional header names.": "Enter at most 16 additional header names.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "Recommended to keep this high to avoid upstream throttling.",
     "Record IP Address": "Record IP Address",
     "Record quota usage": "Record quota usage",
+    "Additional upstream request ID headers": "Additional upstream request ID headers",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.",
     "Record streaming request timeline": "Record streaming request timeline",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "Recorded inside this service. A completed write does not confirm receipt by the client.",
     "Recover auto-disabled channels only": "Recover auto-disabled channels only",

@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "响应头列表不能超过 2048 字节。",
+    "Separate header names with an English comma (,).": "请用英文逗号 (,) 分隔响应头名称。",
+    "Remove the extra comma or enter a header name.": "请删除多余的逗号，或补全响应头名称。",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "请输入有效的 HTTP 响应头名称，每个最多 128 个字符。多个名称请用英文逗号 (,) 分隔。",
+    "Sensitive headers cannot be used as request IDs.": "不能使用敏感响应头作为请求 ID。",
+    "Enter at most 16 additional header names.": "最多可以填写 16 个额外的响应头名称。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "建议保持此值较高，以避免上游限流。",
     "Record IP Address": "记录 IP 地址",
     "Record quota usage": "记录配额使用量",
+    "Additional upstream request ID headers": "额外的上游请求 ID 响应头",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "按优先级填写响应头名称，用英文逗号分隔。内置请求 ID 响应头优先匹配。",
     "Record streaming request timeline": "记录流式请求时间线",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "时间记录于本服务内部。写出完成不代表客户端已收到。",
     "Recover auto-disabled channels only": "仅恢复自动禁用的渠道",

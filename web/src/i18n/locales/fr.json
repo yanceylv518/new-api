@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "La liste est limitée à 2048 octets.",
+    "Separate header names with an English comma (,).": "Séparez les noms par une virgule (,).",
+    "Remove the extra comma or enter a header name.": "Supprimez la virgule en trop ou saisissez un nom.",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "Saisissez des noms d’en-têtes HTTP valides de 128 caractères maximum, séparés par des virgules (,).",
+    "Sensitive headers cannot be used as request IDs.": "Les en-têtes sensibles ne peuvent pas servir d’identifiants de requête.",
+    "Enter at most 16 additional header names.": "Saisissez au maximum 16 noms supplémentaires.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "Il est recommandé de maintenir cette valeur élevée pour éviter la limitation en amont.",
     "Record IP Address": "Enregistrer l'adresse IP",
     "Record quota usage": "Enregistrer l'utilisation du quota",
+    "Additional upstream request ID headers": "En-têtes supplémentaires pour l’identifiant de requête amont",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "Saisissez les noms par ordre de priorité, séparés par des virgules. Les en-têtes intégrés sont vérifiés en premier.",
     "Record streaming request timeline": "Enregistrer la chronologie des requêtes en flux",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "Mesures internes au service. Une écriture terminée ne confirme pas la réception par le client.",
     "Recover auto-disabled channels only": "Restaurer uniquement les canaux désactivés automatiquement",
