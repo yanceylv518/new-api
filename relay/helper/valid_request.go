@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -40,6 +41,27 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		request, err = GetAndValidateResponsesCompactionRequest(c)
 	case types.RelayFormatOpenAIAlphaSearch:
 		request, err = GetAndValidateAlphaSearchRequest(c)
+	case types.RelayFormatZhipuWebSearch:
+		if cached, ok := common.GetContextKeyType[*dto.ZhipuWebSearchRequest](c, constant.ContextKeyZhipuSearchRequest); ok && cached != nil {
+			request = cached
+			break
+		}
+		search := &dto.ZhipuWebSearchRequest{}
+		err = common.UnmarshalBodyReusable(c, search)
+		if err == nil {
+			var storage common.BodyStorage
+			storage, err = common.GetBodyStorage(c)
+			if err == nil {
+				search.RawBody, err = storage.Bytes()
+			}
+		}
+		if err == nil {
+			err = dto.ValidateZhipuSearchEngineField(search.RawBody)
+		}
+		if err == nil {
+			err = search.Validate()
+		}
+		request = search
 
 	case types.RelayFormatOpenAIImage:
 		request, err = GetAndValidOpenAIImageRequest(c, relayMode)

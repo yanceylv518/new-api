@@ -1,12 +1,16 @@
 package middleware
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -24,7 +28,62 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"golang.org/x/sync/semaphore"
 )
+
+const zhipuSearchRequestBudgetBytes int64 = 256 << 20
+const zhipuSearchSmallRequestBytes int64 = 1 << 20
+const zhipuSearchSmallRequestBudgetBytes int64 = 32 << 20
+const zhipuSearchRequestProbeBudgetBytes int64 = 32 << 20
+const zhipuSearchBufferWaitTimeout = 3 * time.Minute
+
+var zhipuSearchRequestBudget = semaphore.NewWeighted(zhipuSearchRequestBudgetBytes)
+var zhipuSearchSmallRequestBudget = semaphore.NewWeighted(zhipuSearchSmallRequestBudgetBytes)
+var zhipuSearchRequestProbeBudget = semaphore.NewWeighted(zhipuSearchRequestProbeBudgetBytes)
+var zhipuSearchReadDeadlineWarning sync.Once
+
+func acquireZhipuSearchRequestBudget(ctx context.Context, budget *semaphore.Weighted, weight int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if budget.TryAcquire(weight) {
+		if err := ctx.Err(); err != nil {
+			budget.Release(weight)
+			return err
+		}
+		return nil
+	}
+	waitContext, cancel := context.WithTimeout(ctx, zhipuSearchBufferWaitTimeout)
+	defer cancel()
+	return budget.Acquire(waitContext, weight)
+}
+
+func startZhipuSearchReadDeadline(c *gin.Context) (func(), error) {
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetReadDeadline(time.Now().Add(zhipuSearchBufferWaitTimeout)); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			zhipuSearchReadDeadlineWarning.Do(func() { logger.LogWarn(c, "search request read deadline is not supported") })
+			return func() {}, nil
+		}
+		return nil, err
+	}
+	return sync.OnceFunc(func() {
+		if err := controller.SetReadDeadline(time.Time{}); err != nil {
+			logger.LogWarn(c, "failed to clear search request read deadline: "+err.Error())
+		}
+	}), nil
+}
+
+func zhipuSearchRequestErrorStatus(err error) int {
+	if common.IsRequestBodyTooLargeError(err) {
+		return http.StatusRequestEntityTooLarge
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return http.StatusRequestTimeout
+	}
+	return http.StatusBadRequest
+}
 
 type ModelRequest struct {
 	Model string `json:"model"`
@@ -33,6 +92,77 @@ type ModelRequest struct {
 
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
+			weight := c.Request.ContentLength
+			if weight < 0 || c.GetBool(contextKeyDecompressedRequest) {
+				originalBody := c.Request.Body
+				probeWeight := zhipuSearchSmallRequestBytes + 1
+				if err := acquireZhipuSearchRequestBudget(c.Request.Context(), zhipuSearchRequestProbeBudget, probeWeight); err != nil {
+					_ = originalBody.Close()
+					abortWithOpenAiMessage(c, http.StatusRequestTimeout, "search request timed out or was cancelled while waiting for buffer")
+					return
+				}
+				releaseProbe := sync.OnceFunc(func() { zhipuSearchRequestProbeBudget.Release(probeWeight) })
+				defer releaseProbe()
+				stopReadDeadline, deadlineErr := startZhipuSearchReadDeadline(c)
+				if deadlineErr != nil {
+					_ = originalBody.Close()
+					abortWithOpenAiMessage(c, http.StatusInternalServerError, "failed to set search request read deadline")
+					return
+				}
+				prefix, err := io.ReadAll(io.LimitReader(originalBody, zhipuSearchSmallRequestBytes+1))
+				stopReadDeadline()
+				if err != nil {
+					_ = originalBody.Close()
+					abortWithOpenAiMessage(c, zhipuSearchRequestErrorStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+					return
+				}
+				c.Request.Body = &readCloser{Reader: io.MultiReader(bytes.NewReader(prefix), originalBody), closeFn: func() error {
+					defer releaseProbe()
+					return originalBody.Close()
+				}}
+				if int64(len(prefix)) <= zhipuSearchSmallRequestBytes {
+					weight = int64(len(prefix))
+				} else {
+					maxMB := constant.MaxRequestBodyMB
+					if maxMB <= 0 {
+						maxMB = 128
+					}
+					if maxMB >= int(zhipuSearchRequestBudgetBytes>>20) {
+						weight = zhipuSearchRequestBudgetBytes
+					} else {
+						weight = int64(maxMB) << 20
+					}
+				}
+			}
+			if weight > zhipuSearchRequestBudgetBytes {
+				weight = zhipuSearchRequestBudgetBytes
+			}
+			if weight > 0 {
+				budget := zhipuSearchSmallRequestBudget
+				if weight > zhipuSearchSmallRequestBytes {
+					budget = zhipuSearchRequestBudget
+				}
+				if err := acquireZhipuSearchRequestBudget(c.Request.Context(), budget, weight); err != nil {
+					_ = c.Request.Body.Close()
+					abortWithOpenAiMessage(c, http.StatusRequestTimeout, "search request timed out or was cancelled while waiting for buffer")
+					return
+				}
+				defer budget.Release(weight)
+			}
+			stopReadDeadline, err := startZhipuSearchReadDeadline(c)
+			if err != nil {
+				_ = c.Request.Body.Close()
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, "failed to set search request read deadline")
+				return
+			}
+			defer stopReadDeadline()
+			body := c.Request.Body
+			c.Request.Body = &readCloser{Reader: body, closeFn: func() error {
+				defer stopReadDeadline()
+				return body.Close()
+			}}
+		}
 		var channel *model.Channel
 		constraints := service.GetChannelConstraints(c)
 		constraints.AddFilter(taskdto.ChannelFilter{
@@ -42,7 +172,11 @@ func Distribute() func(c *gin.Context) {
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+			statusCode := http.StatusBadRequest
+			if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
+				statusCode = zhipuSearchRequestErrorStatus(err)
+			}
+			abortWithOpenAiMessage(c, statusCode, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
 		if pin, found, overridden := constraints.ResolvedPin(); found {
@@ -419,7 +553,35 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	var modelRequest ModelRequest
 	shouldSelectChannel := true
 	var err error
-	if modelName := c.GetString("resolved_task_model"); modelName != "" {
+	if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
+		request := &dto.ZhipuWebSearchRequest{}
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, false, err
+		}
+		body, err := storage.Bytes()
+		if err != nil {
+			return nil, false, err
+		}
+		if storage.IsDisk() && strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+			// 搜索接口需要原文校验和转发，复用已读取的数据避免解码器再缓冲整份请求。
+			if err := common.Unmarshal(body, request); err != nil {
+				return nil, false, err
+			}
+			c.Request.Body = io.NopCloser(storage)
+		} else if err := common.UnmarshalBodyReusable(c, request); err != nil {
+			return nil, false, err
+		}
+		if err := dto.ValidateZhipuSearchEngineField(body); err != nil {
+			return nil, false, err
+		}
+		if err := request.Validate(); err != nil {
+			return nil, false, err
+		}
+		request.RawBody = body
+		common.SetContextKey(c, constant.ContextKeyZhipuSearchRequest, request)
+		modelRequest.Model = request.SearchEngine
+	} else if modelName := c.GetString("resolved_task_model"); modelName != "" {
 		modelRequest.Model = modelName
 	} else if strings.Contains(c.Request.URL.Path, "/mj/") {
 		relayMode := relayconstant.Path2RelayModeMidjourney(c.Request.URL.Path)

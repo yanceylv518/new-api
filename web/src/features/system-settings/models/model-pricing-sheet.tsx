@@ -77,6 +77,7 @@ import {
   createInitialLaneState,
   createModelPricingSchema,
   hasValue,
+  isZhipuWebSearchEngine,
   laneConfigs,
   numericDraftRegex,
   ratioFieldByLane,
@@ -197,6 +198,7 @@ export const ModelPricingEditorPanel = forwardRef<
     },
   })
   const watchedValues = form.watch()
+  const isWebSearch = isZhipuWebSearchEngine(watchedValues.name.trim())
   const usageSchemaByModel = useMemo(
     () =>
       new Map(
@@ -252,7 +254,9 @@ export const ModelPricingEditorPanel = forwardRef<
         audioCompletionRatio: editData.audioCompletionRatio || '',
       })
       let nextPricingMode: PricingMode = 'per-token'
-      if (editData.billingMode === 'tiered_expr') {
+      if (isZhipuWebSearchEngine(editData.name)) {
+        nextPricingMode = 'per-request'
+      } else if (editData.billingMode === 'tiered_expr') {
         nextPricingMode = 'tiered_expr'
       } else if (editData.price) {
         nextPricingMode = 'per-request'
@@ -286,6 +290,7 @@ export const ModelPricingEditorPanel = forwardRef<
 
   useEffect(() => {
     if (!editData) return
+    if (isZhipuWebSearchEngine(editData.name)) return
     if (editData.billingMode === 'tiered_expr') return
     if (editData.price || editData.ratio) return
 
@@ -298,8 +303,17 @@ export const ModelPricingEditorPanel = forwardRef<
   }, [editData, usageSchemaByModel, usageSchema])
 
   useEffect(() => {
+    if (isWebSearch && pricingMode !== 'per-request') {
+      setPricingMode('per-request')
+    }
+  }, [isWebSearch, pricingMode])
+
+  useEffect(() => {
     let originalMode: PricingMode = 'per-token'
-    if (editData?.billingMode === 'tiered_expr') originalMode = 'tiered_expr'
+    if (editData && isZhipuWebSearchEngine(editData.name))
+      originalMode = 'per-request'
+    else if (editData?.billingMode === 'tiered_expr')
+      originalMode = 'tiered_expr'
     else if (editData?.price) originalMode = 'per-request'
     onDirtyChange?.(
       form.formState.isDirty ||
@@ -657,16 +671,25 @@ export const ModelPricingEditorPanel = forwardRef<
                   onValueChange={handleModeChange}
                   className='gap-4'
                 >
-                  <TabsList className='grid w-full grid-cols-3'>
-                    <TabsTrigger value='per-token'>
-                      {t('Per-token')}
-                    </TabsTrigger>
+                  <TabsList
+                    className={cn(
+                      'grid w-full',
+                      isWebSearch ? 'grid-cols-1' : 'grid-cols-3'
+                    )}
+                  >
+                    {!isWebSearch && (
+                      <TabsTrigger value='per-token'>
+                        {t('Per-token')}
+                      </TabsTrigger>
+                    )}
                     <TabsTrigger value='per-request'>
                       {t('Per-request')}
                     </TabsTrigger>
-                    <TabsTrigger value='tiered_expr'>
-                      {t('Expression')}
-                    </TabsTrigger>
+                    {!isWebSearch && (
+                      <TabsTrigger value='tiered_expr'>
+                        {t('Expression')}
+                      </TabsTrigger>
+                    )}
                   </TabsList>
 
                   <TabsContent value='per-token' className='pt-0'>

@@ -16,6 +16,8 @@ type readCloser struct {
 	closeFn func() error
 }
 
+const contextKeyDecompressedRequest = "decompressed_request_body"
+
 func (rc *readCloser) Close() error {
 	if rc.closeFn != nil {
 		return rc.closeFn()
@@ -88,6 +90,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		}
 
 		if decompressed {
+			c.Set(contextKeyDecompressedRequest, true)
 			c.Request.Header.Del("Content-Encoding")
 		}
 

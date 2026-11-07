@@ -108,6 +108,9 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/alpha/search", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIAlphaSearch)
 		})
+		httpRouter.POST("/web_search", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatZhipuWebSearch)
+		})
 
 		// image related routes
 		httpRouter.POST("/edits", func(c *gin.Context) {
@@ -168,6 +171,12 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.GET("/fine-tunes/:id/events", controller.RelayNotImplemented)
 		httpRouter.DELETE("/models/:model", controller.RelayNotImplemented)
 	}
+
+	zhipuSearchRouter := router.Group("/api/paas/v4")
+	zhipuSearchRouter.Use(middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute())
+	zhipuSearchRouter.POST("/web_search", func(c *gin.Context) {
+		controller.Relay(c, types.RelayFormatZhipuWebSearch)
+	})
 
 	relayMjRouter := router.Group("/mj")
 	relayMjRouter.Use(middleware.RouteTag("relay"))

@@ -41,6 +41,15 @@ export type ModelPricingFormValues = z.infer<
 
 export type PricingMode = 'per-token' | 'per-request' | 'tiered_expr'
 
+export function isZhipuWebSearchEngine(name: string): boolean {
+  return [
+    'search_std',
+    'search_pro',
+    'search_pro_sogou',
+    'search_pro_quark',
+  ].includes(name)
+}
+
 export type LaneKey =
   | 'completion'
   | 'cache'

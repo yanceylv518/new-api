@@ -296,6 +296,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == "USDExchangeRate" || strings.HasPrefix(key, "billing_setting.") {
+		defer InvalidatePricingCache()
+	}
 	if key == retiredThemeOptionKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
@@ -667,7 +670,6 @@ func handleConfigUpdate(key, value string) bool {
 	if configName == "performance_setting" {
 		performance_setting.UpdateAndSync()
 	} else if configName == "billing_setting" {
-		InvalidatePricingCache()
 		ratio_setting.InvalidateExposedDataCache()
 	}
 

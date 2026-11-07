@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 
@@ -11,6 +12,53 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+func TestValidateJSONReaderBodyStorage(t *testing.T) {
+	previous := GetDiskCacheConfig()
+	SetDiskCacheConfig(DiskCacheConfig{Enabled: true, ThresholdMB: 1, MaxSizeMB: 64, Path: t.TempDir()})
+	t.Cleanup(func() { SetDiskCacheConfig(previous) })
+	for _, tc := range []struct {
+		name  string
+		body  string
+		valid bool
+	}{
+		{"object", `  {"value":"中文\\\"value","nested":[1,true,null]}  `, true},
+		{"array", `[1,{"value":2}]`, true},
+		{"scalar", `123.5`, true},
+		{"empty", ``, false},
+		{"truncated", `{"value":"unfinished`, false},
+		{"trailing JSON", `{} []`, false},
+		{"invalid token", `{"value":]}`, false},
+	} {
+		for _, disk := range []bool{false, true} {
+			t.Run(tc.name+map[bool]string{false: "/memory", true: "/disk"}[disk], func(t *testing.T) {
+				payload := []byte("prefix" + tc.body)
+				var storage BodyStorage
+				if disk {
+					var err error
+					storage, err = newDiskStorage(payload, GetDiskCachePath())
+					require.NoError(t, err)
+				} else {
+					storage = newMemoryStorage(payload)
+				}
+				t.Cleanup(func() { require.NoError(t, storage.Close()) })
+				_, err := storage.Seek(int64(len("prefix")), io.SeekStart)
+				require.NoError(t, err)
+				err = ValidateJSONReader(storage)
+				if !tc.valid {
+					require.Error(t, err)
+					require.Error(t, ValidateJSONReader(strings.NewReader(tc.body)))
+					return
+				}
+				require.NoError(t, err)
+				require.NoError(t, ValidateJSONReader(strings.NewReader(tc.body)))
+				offset, err := storage.Seek(0, io.SeekCurrent)
+				require.NoError(t, err)
+				assert.EqualValues(t, len(payload), offset)
+			})
+		}
+	}
+}
 
 func TestJsonRawMessageToString(t *testing.T) {
 	tests := []struct {

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	hosttypes "github.com/QuantumNous/new-api/types"
@@ -109,7 +110,9 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	other.SetPublic("user_group_ratio", userGroupRatio)
 	other.SetPublic(hosttypes.UserModelDiscountRatioKey, relayInfo.PriceData.UserModelDiscountMultiplier())
 	relayInfo.UserModelDiscountEvaluation.AddToLog(other)
-	other.SetPublic("frt", float64(relayInfo.FirstResponseTime.UnixMilli()-relayInfo.StartTime.UnixMilli()))
+	if relayInfo.RelayMode != relayconstant.RelayModeZhipuWebSearch {
+		other.SetPublic("frt", float64(relayInfo.FirstResponseTime.UnixMilli()-relayInfo.StartTime.UnixMilli()))
+	}
 	if relayInfo.ReasoningEffort != "" {
 		other.SetPublic("reasoning_effort", relayInfo.ReasoningEffort)
 	}
@@ -137,7 +140,11 @@ func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other *model.LogO
 	if relayInfo == nil || other == nil || len(relayInfo.ParamOverrideAudit) == 0 {
 		return
 	}
-	other.SetPublic("po", relayInfo.ParamOverrideAudit)
+	lines := make([]string, 0, len(relayInfo.ParamOverrideAudit))
+	for _, line := range relayInfo.ParamOverrideAudit {
+		lines = append(lines, common.MaskCredentials(line, relayInfo.RedactionKeys()...))
+	}
+	other.SetPublic("po", lines)
 }
 
 func appendStreamStatus(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {

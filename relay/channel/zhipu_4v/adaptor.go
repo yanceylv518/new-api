@@ -71,6 +71,11 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			return fmt.Sprintf("%s/api/paas/v4/images/generations", baseURL), nil
 		case relayconstant.RelayModeResponses:
 			return fmt.Sprintf("%s/api/v1/responses", baseURL), nil
+		case relayconstant.RelayModeZhipuWebSearch:
+			if hasSpecialPlan {
+				return "", errors.New("Zhipu Web Search API requires a standard API channel")
+			}
+			return fmt.Sprintf("%s/api/paas/v4/web_search", baseURL), nil
 		default:
 			if hasSpecialPlan && specialPlan.OpenAIBaseURL != "" {
 				return fmt.Sprintf("%s/chat/completions", specialPlan.OpenAIBaseURL), nil

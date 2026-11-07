@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -47,6 +48,64 @@ func UnmarshalJsonStr(data string, v any) error {
 
 func DecodeJson(reader io.Reader, v any) error {
 	return kitutil.DecodeJson(reader, v)
+}
+
+// ValidateJSONReader 验证完整 JSON，复用请求或响应存储中的数据。
+func ValidateJSONReader(reader io.Reader) error {
+	if storage, ok := reader.(BodyStorage); ok {
+		offset, err := storage.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if offset >= storage.Size() {
+			return io.EOF
+		}
+		data, err := storage.Bytes()
+		if err != nil {
+			return err
+		}
+		data = data[offset:]
+		if !kitutil.Valid(data) {
+			var raw json.RawMessage
+			if err := kitutil.Unmarshal(data, &raw); err != nil {
+				return err
+			}
+			return errors.New("invalid JSON")
+		}
+		_, err = storage.Seek(0, io.SeekEnd)
+		return err
+	}
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	depth := 0
+	if delimiter, ok := token.(json.Delim); ok && (delimiter == '{' || delimiter == '[') {
+		depth = 1
+	}
+	for depth > 0 {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 // DecodeJsonWithValidation decodes JSON and applies Gin's configured binding-tag

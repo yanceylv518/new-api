@@ -5,6 +5,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/discountexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -34,7 +35,8 @@ func PrepareUserModelDiscount(c *gin.Context, info *relaycommon.RelayInfo, input
 			if err != nil {
 				return err
 			}
-			if usageDependent {
+			// 独立搜索每次只计一次，不能用额外的 n 或时长字段改变用量条件。
+			if usageDependent && info.RelayMode != relayconstant.RelayModeZhipuWebSearch {
 				if duration := gjson.GetBytes(input.Body, "duration"); duration.Type == gjson.Number {
 					evaluation.Context.Seconds = duration.Float()
 				}

@@ -85,18 +85,36 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+	return relayErrorHandler(ctx, resp, showBodyWhenFail, 0)
+}
+
+func RelayErrorHandlerWithLimit(ctx context.Context, resp *http.Response, showBodyWhenFail bool, maxBytes int64, knownKeys ...string) *types.NewAPIError {
+	return relayErrorHandler(ctx, resp, showBodyWhenFail, maxBytes, knownKeys...)
+}
+
+func relayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool, maxBytes int64, knownKeys ...string) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
 	defer CloseResponseBodyGracefully(resp)
-	responseBody, err := io.ReadAll(resp.Body)
+	reader := io.Reader(resp.Body)
+	if maxBytes > 0 {
+		reader = io.LimitReader(reader, maxBytes+1)
+	}
+	responseBody, err := io.ReadAll(reader)
 	if err != nil {
 		newApiErr.Err = fmt.Errorf("read upstream error response: %w", err)
 		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, string(responseBody)))
 		return
 	}
+	if maxBytes > 0 && int64(len(responseBody)) > maxBytes {
+		responseBody = append(responseBody[:maxBytes], []byte(" [upstream error body truncated]")...)
+	}
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
+	if len(knownKeys) > 0 {
+		responseBodyPreview = common.LocalLogPreview(common.MaskCredentials(responseBodyText, knownKeys...))
+	}
 	buildErrWithBody := func(message string) error {
 		if message == "" {
 			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)

@@ -383,7 +383,14 @@ func updatePricing() {
 			pricing.VendorID = meta.VendorID
 		}
 		modelPrice, findPrice := ratio_setting.GetModelPrice(model, false)
-		if findPrice {
+		if dto.IsZhipuSearchEngine(model) {
+			price, err := ZhipuSearchPrice(model)
+			if err != nil {
+				continue
+			}
+			pricing.ModelPrice = price
+			pricing.QuotaType = 1
+		} else if findPrice {
 			pricing.ModelPrice = modelPrice
 			pricing.QuotaType = 1
 		} else {
