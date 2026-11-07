@@ -33,6 +33,9 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if info.RelayMode == relayconstant.RelayModeAlphaSearch {
 		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, "/v1/alpha/search", info.ChannelType), nil
 	}
+	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, "/v1/web_search", info.ChannelType), nil
+	}
 	return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, info.RequestURLPath, info.ChannelType), nil
 }
 

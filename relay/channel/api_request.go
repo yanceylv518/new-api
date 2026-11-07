@@ -321,6 +321,10 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
+	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		// 搜索可能按调用次数计费，连接失败后不能由传输层重放请求体。
+		req.GetBody = nil
+	}
 	headers := req.Header
 	err = a.SetupRequestHeader(c, &headers, info)
 	if err != nil {
@@ -333,6 +337,24 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, err
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
+	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		for name, values := range req.Header {
+			if !common.IsSensitiveHeaderName(name) {
+				continue
+			}
+			for _, value := range values {
+				value = strings.TrimSpace(value)
+				if value == "" {
+					continue
+				}
+				info.UpstreamCredentialValues = append(info.UpstreamCredentialValues, value)
+				if scheme, secret, ok := strings.Cut(value, " "); ok &&
+					(strings.EqualFold(scheme, "bearer") || strings.EqualFold(scheme, "basic")) && strings.TrimSpace(secret) != "" {
+					info.UpstreamCredentialValues = append(info.UpstreamCredentialValues, strings.TrimSpace(secret))
+				}
+			}
+		}
+	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -530,10 +552,14 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 
 	req = info.Timeline.Request(req, info.ChannelId, info.ApiKey)
+	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		// 本地准备失败可以换渠道；交给 HTTP 客户端后不能确定上游是否已执行。
+		info.ZhipuWebSearchAttempted = true
+	}
 	resp, err := relayClient.Do(req)
 	info.Timeline.Response(resp, err)
 	if err != nil {
-		logger.LogError(c, "do request failed: "+err.Error())
+		logger.LogError(c, "do request failed: "+common2.MaskCredentials(err.Error(), info.RedactionKeys()...))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {

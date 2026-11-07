@@ -44,6 +44,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu_4v"
+	"github.com/QuantumNous/new-api/relay/channel/zhipu_web_search"
 	"github.com/gin-gonic/gin"
 )
 
@@ -69,6 +70,8 @@ func GetAdaptor(apiType int) channel.Adaptor {
 		return &zhipu.Adaptor{}
 	case constant.APITypeZhipuV4:
 		return &zhipu_4v.Adaptor{}
+	case constant.APITypeZhipuWebSearch:
+		return &zhipu_web_search.Adaptor{}
 	case constant.APITypeOllama:
 		return &ollama.Adaptor{}
 	case constant.APITypePerplexity:

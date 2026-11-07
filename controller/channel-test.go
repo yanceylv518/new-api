@@ -16,6 +16,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -48,6 +49,9 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
 	}
 	if channel != nil && channel.Type == constant.ChannelTypeCodex {
 		return string(constant.EndpointTypeOpenAIResponse)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeZhipuWebSearch {
+		return string(constant.EndpointTypeZhipuWebSearch)
 	}
 	return normalized
 }
@@ -103,12 +107,22 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				testModel = strings.TrimSpace(models[0])
 			}
 			if testModel == "" {
-				testModel = "gpt-4o-mini"
+				if channel.Type == constant.ChannelTypeZhipuWebSearch {
+					testModel = dto.ZhipuSearchStd
+				} else {
+					testModel = "gpt-4o-mini"
+				}
 			}
 		}
 	}
 
 	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
+	if endpointType == "" && channel.Type == constant.ChannelTypeNewAPI && dto.IsZhipuSearchEngine(testModel) {
+		endpointType = string(constant.EndpointTypeZhipuWebSearch)
+	}
+	if constant.EndpointType(endpointType) == constant.EndpointTypeZhipuWebSearch {
+		isStream = false
+	}
 
 	requestPath := "/v1/chat/completions"
 
@@ -150,6 +164,14 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		requestPath = strings.Replace(requestPath, ":generateContent", ":streamGenerateContent", 1)
 	}
 	c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, requestPath, nil)
+	if channel.Type == constant.ChannelTypeZhipuWebSearch || constant.EndpointType(endpointType) == constant.EndpointTypeZhipuWebSearch {
+		if ok, _ := model.ChannelSatisfiesFilters(channel, testModel, []taskdto.ChannelFilter{
+			{Kind: taskdto.FilterRequestPath, RequestPath: requestPath},
+		}); !ok {
+			err := errors.New("channel does not support the selected test endpoint")
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
+		}
+	}
 
 	cache, err := model.GetUserCache(testUserID)
 	if err != nil {
@@ -198,6 +220,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			relayFormat = types.RelayFormatOpenAIImage
 		case constant.EndpointTypeEmbeddings:
 			relayFormat = types.RelayFormatEmbedding
+		case constant.EndpointTypeZhipuWebSearch:
+			relayFormat = types.RelayFormatZhipuWebSearch
 		default:
 			relayFormat = types.RelayFormatOpenAI
 		}
@@ -294,7 +318,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//logInfo.ApiKey = ""
 	common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
 
-	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+	var priceData hosttypes.PriceData
+	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		priceData, err = helper.ZhipuSearchPriceData(c, info)
+	} else {
+		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+	}
 	if err != nil {
 		return testResult{
 			context:     c,
@@ -308,6 +337,17 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	var convertedRequest any
 	// 根据 RelayMode 选择正确的转换函数
 	switch info.RelayMode {
+	case relayconstant.RelayModeZhipuWebSearch:
+		searchRequest, ok := request.(*dto.ZhipuWebSearchRequest)
+		if !ok {
+			err = errors.New("invalid web search request type")
+		} else if err = searchRequest.Validate(); err == nil {
+			if info.UpstreamModelName != info.OriginModelName {
+				err = errors.New("search_engine cannot be changed by channel model mapping")
+			} else {
+				convertedRequest = searchRequest
+			}
+		}
 	case relayconstant.RelayModeEmbeddings:
 		// Embedding 请求 - request 已经是正确的类型
 		if embeddingReq, ok := request.(*dto.EmbeddingRequest); ok {
@@ -430,6 +470,22 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			}
 		}
 	}
+	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		if err := dto.ValidateZhipuSearchEngineField(jsonData); err != nil {
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
+		}
+		var effective dto.ZhipuWebSearchRequest
+		if err := common.Unmarshal(jsonData, &effective); err != nil {
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
+		}
+		if effective.SearchEngine != info.OriginModelName {
+			err := errors.New("search_engine cannot be changed by channel parameters")
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
+		}
+		if err := effective.Validate(); err != nil {
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
+		}
+	}
 
 	requestBody := bytes.NewBuffer(jsonData)
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
@@ -444,7 +500,23 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	var httpResp *http.Response
 	if resp != nil {
 		httpResp = resp.(*http.Response)
+		if info.RelayMode == relayconstant.RelayModeZhipuWebSearch && httpResp.Request != nil {
+			for _, cookie := range httpResp.Request.Cookies() {
+				info.UpstreamCredentialValues = append(info.UpstreamCredentialValues, cookie.Value)
+			}
+		}
 		if httpResp.StatusCode != http.StatusOK {
+			if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+				body, readErr := io.ReadAll(httpResp.Body)
+				_ = httpResp.Body.Close()
+				safeBody := common.MaskCredentials(string(body), info.RedactionKeys()...)
+				if readErr != nil {
+					apiErr := types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+					apiErr.SetLogError(fmt.Errorf("read upstream search error: %w, partial body: %s", readErr, safeBody))
+					return testResult{context: c, localErr: apiErr, newAPIError: apiErr}
+				}
+				httpResp.Body = io.NopCloser(strings.NewReader(safeBody))
+			}
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(fmt.Sprintf(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -463,7 +535,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			}
 		}
 	}
-	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
+	responseAdaptor := adaptor
+	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		responseAdaptor = relay.GetAdaptor(constant.APITypeZhipuWebSearch)
+	}
+	usageA, respErr := responseAdaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
 			context:     c,
@@ -487,6 +563,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			localErr:    err,
 			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
 		}
+	}
+	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		respBody = []byte(common.MaskCredentials(string(respBody), info.RedactionKeys()...))
 	}
 	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
 		return testResult{
@@ -537,6 +616,9 @@ func attachTestBillingRequestInput(info *relaycommon.RelayInfo, request dto.Requ
 }
 
 func settleTestQuota(info *relaycommon.RelayInfo, priceData hosttypes.PriceData, usage *dto.Usage) (int, *billingexpr.TieredResult) {
+	if info != nil && info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
+		return priceData.QuotaToPreConsume, nil
+	}
 	if usage != nil && info != nil && info.TieredBillingSnapshot != nil {
 		isClaudeUsageSemantic := usage.UsageSemantic == "anthropic" || info.GetFinalRequestRelayFormat() == types.RelayFormatClaude
 		usedVars := billingexpr.UsedVars(info.TieredBillingSnapshot.ExprString)
@@ -704,6 +786,12 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 	// 根据端点类型构建不同的测试请求
 	if endpointType != "" {
 		switch constant.EndpointType(endpointType) {
+		case constant.EndpointTypeZhipuWebSearch:
+			return &dto.ZhipuWebSearchRequest{
+				SearchEngine: model,
+				SearchQuery:  "人工智能",
+				Count:        lo.ToPtr(1),
+			}
 		case constant.EndpointTypeEmbeddings:
 			// 返回 EmbeddingRequest
 			return &dto.EmbeddingRequest{

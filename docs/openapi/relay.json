@@ -16,6 +16,9 @@
       "name": "OpenAI格式(Responses)"
     },
     {
+      "name": "智谱网络搜索"
+    },
+    {
       "name": "图片生成"
     },
     {
@@ -244,6 +247,40 @@
           }
         ]
       }
+    },
+    "/v1/web_search": {
+      "post": {
+        "summary": "智谱独立网络搜索",
+        "description": "独立搜索接口，不调用对话模型。请创建智谱联网搜索渠道（类型 62），启用对应的 search_engine；该渠道专门服务 /v1/web_search 和 /api/paas/v4/web_search，不参与聊天等其他接口的选路。默认上游地址为 https://open.bigmodel.cn，使用智谱 API Key；也可使用支持此接口的 New API 上游。普通智谱及 Coding Plan 渠道不再承接搜索。升级时暂停搜索流量并排空在途请求，所有实例升级后再切换渠道配置并恢复搜索；旧版本不能使用类型 62。将仅用于搜索的旧智谱渠道改为类型 62；同时提供聊天和搜索的旧渠道需拆出独立搜索渠道，并从原渠道移除搜索引擎。保留搜索引擎名、分组、密钥、优先级、权重及相关搜索设置；价格和折扣继续使用原引擎名，无需重配。请求、模型定价和用户折扣均使用官方引擎名，例如 search_std；管理员应避免其他模型使用相同名称。默认价格按智谱人民币单次价格和系统汇率计算，可在模型定价中设置美元按次价格；分组倍率和用户模型折扣适用。旧版以 zhipu/web_search/<引擎名> 配置的价格和折扣不会自动沿用，升级前须按引擎名重新配置；混合版本期间需分别配置两个名称。由引入订阅跨周期结算的旧搜索版升级时，需排空该版本的在途订阅请求和异步退款，并避免在混合运行期间重置订阅。上游返回成功状态时按一次调用计费，包括空结果或响应体读取失败。上游 JSON 错误保留原始状态码和字段，渠道凭证及敏感认证信息会被遮盖；此接口不应用渠道状态码映射。请求体大小和上游超时沿用系统通用配置。错误体格式无效或无法安全脱敏时返回网关错误；请求发出后不自动重试。兼容路径为 /api/paas/v4/web_search。",
+        "operationId": "zhipuWebSearch",
+        "tags": ["智谱网络搜索"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/ZhipuWebSearchRequest"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "智谱搜索结果",
+            "content": {"application/json": {"schema": {"type": "object"}}}
+          },
+          "400": {
+            "description": "请求参数无效或上游返回错误；上游 JSON 错误保留原字段，网关错误使用 ErrorResponse。",
+            "content": {"application/json": {"schema": {}}}
+          },
+          "default": {
+            "description": "上游返回的其他错误状态。",
+            "content": {"application/json": {"schema": {}}}
+          }
+        },
+        "security": [{"BearerAuth": []}]
+      }
+    },
+    "/api/paas/v4/web_search": {
+      "$ref": "#/paths/~1v1~1web_search"
     },
     "/v1/responses": {
       "post": {
@@ -2651,6 +2688,30 @@
             "description": "JSON Schema 定义",
             "properties": {}
           }
+        }
+      },
+      "ZhipuWebSearchRequest": {
+        "type": "object",
+        "required": ["search_engine", "search_query"],
+        "properties": {
+          "search_engine": {
+            "type": "string",
+            "enum": ["search_std", "search_pro", "search_pro_sogou", "search_pro_quark"],
+            "description": "搜索引擎；不同引擎按各自的每次价格计费。"
+          },
+          "search_query": {"type": "string", "minLength": 1, "maxLength": 70},
+          "search_intent": {"type": "boolean", "description": "是否先判断搜索意图；建议显式填写，false 为直接搜索。"},
+          "count": {
+            "type": "integer", "minimum": 1, "maximum": 50,
+            "description": "结果条数；搜狗引擎当前接口实测接受 1 和 11，但智谱文档仅列出 10 的倍数。夸克引擎当前接口实测可用，但智谱文档未列入支持范围。智谱文档提示同时指定域名和时间过滤时 count 可能不生效，具体以实际响应为准。"
+          },
+          "search_domain_filter": {"type": "string", "description": "白名单域名；夸克引擎当前接口实测可用，但智谱文档未列入支持范围。"},
+          "search_recency_filter": {
+            "type": "string", "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"]
+          },
+          "content_size": {"type": "string", "enum": ["medium", "high"]},
+          "request_id": {"type": "string", "minLength": 6, "maxLength": 64},
+          "user_id": {"type": "string", "minLength": 6, "maxLength": 128}
         }
       },
       "ChatCompletionRequest": {

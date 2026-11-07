@@ -77,6 +77,7 @@ export const ENDPOINT_TYPES = {
   IMAGE_GENERATION: 'image-generation',
   EMBEDDINGS: 'embeddings',
   OPENAI_VIDEO: 'openai-video',
+  ZHIPU_WEB_SEARCH: 'zhipu-web-search',
 } as const
 
 export type EndpointTypeOption =
@@ -96,6 +97,7 @@ export function getEndpointTypeLabels(
     [ENDPOINT_TYPES.IMAGE_GENERATION]: t('Image'),
     [ENDPOINT_TYPES.EMBEDDINGS]: t('Embeddings'),
     [ENDPOINT_TYPES.OPENAI_VIDEO]: t('Video'),
+    [ENDPOINT_TYPES.ZHIPU_WEB_SEARCH]: t('Web Search'),
   }
 }
 

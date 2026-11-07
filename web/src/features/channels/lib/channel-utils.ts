@@ -22,6 +22,7 @@ import { formatTimestampToDate } from '@/lib/format'
 import {
   CHANNEL_STATUS_CONFIG,
   CHANNEL_TYPES,
+  CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
   MULTI_KEY_STATUS_CONFIG,
   RESPONSE_TIME_CONFIG,
   RESPONSE_TIME_THRESHOLDS,
@@ -73,6 +74,7 @@ export function getChannelTypeIcon(type: number): string {
     46: 'Baidu', // Baidu V2
     16: 'Zhipu', // Zhipu
     26: 'Zhipu', // Zhipu V4
+    [CHANNEL_TYPE_ZHIPU_WEB_SEARCH]: 'Zhipu',
     17: 'Qwen', // Ali
     18: 'Spark', // Xunfei
     23: 'Hunyuan', // Tencent

@@ -167,6 +167,8 @@ type RelayInfo struct {
 	IsChannelTest                         bool // channel test request
 	RetryIndex                            int
 	LastError                             *types.NewAPIError
+	ZhipuWebSearchAttempted               bool
+	UpstreamCredentialValues              []string `json:"-"`
 	RuntimeHeadersOverride                map[string]interface{}
 	UseRuntimeHeadersOverride             bool
 	ParamOverrideAudit                    []string
@@ -209,6 +211,17 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+func (info *RelayInfo) RedactionKeys(additional ...string) []string {
+	keys := append([]string(nil), additional...)
+	if info != nil {
+		if info.ChannelMeta != nil && info.ApiKey != "" {
+			keys = append(keys, info.ApiKey)
+		}
+		keys = append(keys, info.UpstreamCredentialValues...)
+	}
+	return keys
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
@@ -664,6 +677,14 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 			return GenRelayInfoAlphaSearch(c, request), nil
 		}
 		return nil, errors.New("request is not a AlphaSearchRequest")
+	case types.RelayFormatZhipuWebSearch:
+		if search, ok := request.(*dto.ZhipuWebSearchRequest); ok {
+			info = genBaseRelayInfo(c, search)
+			info.RelayMode = relayconstant.RelayModeZhipuWebSearch
+			info.RelayFormat = types.RelayFormatZhipuWebSearch
+			break
+		}
+		return nil, errors.New("request is not a ZhipuWebSearchRequest")
 	case types.RelayFormatTask:
 		info = genBaseRelayInfo(c, nil)
 		info.TaskRelayInfo = &TaskRelayInfo{}

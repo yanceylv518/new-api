@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
@@ -91,6 +92,12 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true
+		}
+		if relayconstant.Path2RelayMode(filter.RequestPath) == relayconstant.RelayModeZhipuWebSearch {
+			return ch.Type == constant.ChannelTypeZhipuWebSearch || ch.Type == constant.ChannelTypeNewAPI
+		}
+		if ch.Type == constant.ChannelTypeZhipuWebSearch {
+			return false
 		}
 		if ch.Type != constant.ChannelTypeAdvancedCustom {
 			return true

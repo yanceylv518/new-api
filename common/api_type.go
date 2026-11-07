@@ -27,6 +27,8 @@ func ChannelType2APIType(channelType int) (int, bool) {
 		apiType = constant.APITypeGemini
 	case constant.ChannelTypeZhipu_v4:
 		apiType = constant.APITypeZhipuV4
+	case constant.ChannelTypeZhipuWebSearch:
+		apiType = constant.APITypeZhipuWebSearch
 	case constant.ChannelTypeOllama:
 		apiType = constant.APITypeOllama
 	case constant.ChannelTypePerplexity:

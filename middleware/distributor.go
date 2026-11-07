@@ -419,7 +419,35 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	var modelRequest ModelRequest
 	shouldSelectChannel := true
 	var err error
-	if modelName := c.GetString("resolved_task_model"); modelName != "" {
+	if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
+		request := &dto.ZhipuWebSearchRequest{}
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, false, err
+		}
+		body, err := storage.Bytes()
+		if err != nil {
+			return nil, false, err
+		}
+		if storage.IsDisk() && strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+			// 搜索接口需要原文校验和转发，复用已读取的数据避免解码器再缓冲整份请求。
+			if err := common.Unmarshal(body, request); err != nil {
+				return nil, false, err
+			}
+			c.Request.Body = io.NopCloser(storage)
+		} else if err := common.UnmarshalBodyReusable(c, request); err != nil {
+			return nil, false, err
+		}
+		if err := dto.ValidateZhipuSearchEngineField(body); err != nil {
+			return nil, false, err
+		}
+		if err := request.Validate(); err != nil {
+			return nil, false, err
+		}
+		request.RawBody = body
+		common.SetContextKey(c, constant.ContextKeyZhipuSearchRequest, request)
+		modelRequest.Model = request.SearchEngine
+	} else if modelName := c.GetString("resolved_task_model"); modelName != "" {
 		modelRequest.Model = modelName
 	} else if strings.Contains(c.Request.URL.Path, "/mj/") {
 		relayMode := relayconstant.Path2RelayModeMidjourney(c.Request.URL.Path)

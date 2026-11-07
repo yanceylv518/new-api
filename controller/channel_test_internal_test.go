@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -13,15 +14,141 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestZhipuWebSearchChannelHealth(t *testing.T) {
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousCache := common.RedisEnabled, common.MemoryCacheEnabled
+	previousLogging, previousQuota := common.LogConsumeEnabled, common.QuotaPerUnit
+	previousPrice, previousRate := ratio_setting.ModelPrice2JSONString(), operation_setting.USDExchangeRate
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+		common.RedisEnabled, common.MemoryCacheEnabled = previousRedis, previousCache
+		common.LogConsumeEnabled, common.QuotaPerUnit = previousLogging, previousQuota
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrice))
+		operation_setting.USDExchangeRate = previousRate
+		model.InvalidatePricingCache()
+	})
+	database := setupModelListControllerTestDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Log{}, &model.Option{}))
+	common.MemoryCacheEnabled, common.LogConsumeEnabled, common.QuotaPerUnit = false, true, 500_000
+	operation_setting.USDExchangeRate = 7.3
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+	require.NoError(t, database.Create(&model.User{Id: 1, Username: "search-health", Status: common.UserStatusEnabled, Group: "default", Quota: 10_000_000}).Error)
+	service.InitHttpClient()
+	type capturedRequest struct {
+		path string
+		body []byte
+	}
+	requests := make(chan capturedRequest, 1)
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	var responseBody atomic.Value
+	responseBody.Store(`{"id":"search-health","search_result":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requests <- capturedRequest{path: r.URL.Path, body: body}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(int(status.Load()))
+		_, _ = io.WriteString(w, responseBody.Load().(string))
+	}))
+	t.Cleanup(server.Close)
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeZhipuWebSearch, Status: common.ChannelStatusEnabled, Key: "health-placeholder", BaseURL: &server.URL, Models: "search_std", Group: "default", AutoBan: common.GetPointer(0)}
+	require.NoError(t, database.Create(channel).Error)
+	for _, tc := range []struct {
+		engine string
+		quota  int
+	}{
+		{dto.ZhipuSearchStd, 685},
+		{dto.ZhipuSearchPro, 2055},
+		{dto.ZhipuSearchProSogou, 3425},
+		{dto.ZhipuSearchProQuark, 3425},
+	} {
+		t.Run(tc.engine, func(t *testing.T) {
+			result := testChannel(context.Background(), channel, 1, tc.engine, "", true)
+			require.NoError(t, result.localErr)
+			assert.Nil(t, result.newAPIError)
+			request := <-requests
+			assert.Equal(t, "/api/paas/v4/web_search", request.path)
+			var payload map[string]any
+			require.NoError(t, common.Unmarshal(request.body, &payload))
+			assert.Equal(t, tc.engine, payload["search_engine"])
+			assert.Equal(t, "人工智能", payload["search_query"])
+			assert.NotContains(t, payload, "messages")
+			assert.NotContains(t, payload, "stream")
+			var logged model.Log
+			require.NoError(t, database.Order("id desc").First(&logged).Error)
+			assert.Equal(t, tc.quota, logged.Quota)
+		})
+	}
+	require.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1}, testChannelForHealthCheck(context.Background(), channel, 1, true, 0))
+	<-requests
+	status.Store(http.StatusUnauthorized)
+	require.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, testChannelForHealthCheck(context.Background(), channel, 1, false, 0))
+	<-requests
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"json error", http.StatusUnauthorized, `{"error":{"message":"rejected health-placeholder"},"api_key":"health-placeholder"}`},
+		{"non-json error", http.StatusBadGateway, `upstream rejected health-placeholder`},
+		{"error in successful HTTP response", http.StatusOK, `{"error":{"message":"rejected health-placeholder"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status.Store(int32(tc.status))
+			responseBody.Store(tc.body)
+			result := testChannel(context.Background(), channel, 1, dto.ZhipuSearchStd, "", false)
+			require.Error(t, result.localErr)
+			assert.NotContains(t, result.localErr.Error(), "health-placeholder")
+			require.NotNil(t, result.newAPIError)
+			assert.NotContains(t, result.newAPIError.Error(), "health-placeholder")
+			assert.NotContains(t, result.newAPIError.LogErrorWithStatusCode(), "health-placeholder")
+			<-requests
+		})
+	}
+}
+
+func TestZhipuWebSearchAdaptorIsolation(t *testing.T) {
+	searchAPIType, ok := common.ChannelType2APIType(constant.ChannelTypeZhipuWebSearch)
+	require.True(t, ok)
+	searchAdaptor := relay.GetAdaptor(searchAPIType)
+	searchInfo := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeZhipuWebSearch, ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeZhipuWebSearch}}
+	url, err := searchAdaptor.GetRequestURL(searchInfo)
+	require.NoError(t, err)
+	assert.Equal(t, "https://open.bigmodel.cn/api/paas/v4/web_search", url)
+	searchInfo.RelayMode = relayconstant.RelayModeChatCompletions
+	_, err = searchAdaptor.GetRequestURL(searchInfo)
+	assert.Error(t, err)
+
+	codingAPIType, ok := common.ChannelType2APIType(constant.ChannelTypeZhipu_v4)
+	require.True(t, ok)
+	codingAdaptor := relay.GetAdaptor(codingAPIType)
+	for _, plan := range []string{"glm-coding-plan", "glm-coding-plan-international"} {
+		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeZhipu_v4, ChannelBaseUrl: plan}}
+		url, err := codingAdaptor.GetRequestURL(info)
+		require.NoError(t, err)
+		assert.Equal(t, constant.ChannelSpecialBases[plan].OpenAIBaseURL+"/chat/completions", url)
+		assert.NotContains(t, codingAdaptor.GetModelList(), dto.ZhipuSearchStd)
+	}
+}
 
 func TestValidateChannelProxy(t *testing.T) {
 	tests := []struct {

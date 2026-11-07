@@ -49,6 +49,7 @@ const (
 	RelayModeResponsesCompact
 
 	RelayModeAlphaSearch
+	RelayModeZhipuWebSearch
 )
 
 func Path2RelayMode(path string) int {
@@ -75,6 +76,8 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeResponses
 	} else if strings.HasPrefix(path, "/v1/alpha/search") {
 		relayMode = RelayModeAlphaSearch
+	} else if path == "/v1/web_search" || path == "/api/paas/v4/web_search" {
+		relayMode = RelayModeZhipuWebSearch
 	} else if strings.HasPrefix(path, "/v1/audio/speech") {
 		relayMode = RelayModeAudioSpeech
 	} else if strings.HasPrefix(path, "/v1/audio/transcriptions") {

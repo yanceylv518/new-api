@@ -132,6 +132,8 @@ import {
   CHANNEL_STATUS_LABELS,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
+  CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
+  ZHIPU_WEB_SEARCH_ENGINES,
   channelTypeOptionsForTaskPluginBind,
   CHANNEL_TYPE_WARNINGS,
   ERROR_MESSAGES,
@@ -863,10 +865,12 @@ export function ChannelMutateDrawer({
       : undefined
 
   // Get all models list
-  const allModelsList = useMemo(
-    () => allModelsData?.data?.map((model) => model.id).filter(Boolean) || [],
-    [allModelsData]
-  )
+  const allModelsList = useMemo(() => {
+    if (currentType === CHANNEL_TYPE_ZHIPU_WEB_SEARCH) {
+      return ZHIPU_WEB_SEARCH_ENGINES
+    }
+    return allModelsData?.data?.map((model) => model.id).filter(Boolean) || []
+  }, [allModelsData, currentType])
 
   // Get basic models for the current channel type
   const basicModels = useMemo(() => {

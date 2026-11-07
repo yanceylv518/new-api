@@ -415,6 +415,20 @@ func formatParamOverrideAuditValue(value interface{}) string {
 	}
 }
 
+func IsSensitiveHeaderName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "authorization" || name == "proxy-authorization" || name == "cookie" || name == "set-cookie" {
+		return true
+	}
+	compact := strings.ReplaceAll(strings.ReplaceAll(name, "-", ""), "_", "")
+	for _, part := range []string{"key", "token", "secret", "credential", "signature", "sessionid", "password", "passwd"} {
+		if strings.Contains(compact, part) {
+			return true
+		}
+	}
+	return compact == "auth" || strings.HasPrefix(compact, "xauth")
+}
+
 func buildParamOverrideAuditLine(mode, path, from, to string, value interface{}) string {
 	mode = strings.TrimSpace(mode)
 	path = strings.TrimSpace(path)
@@ -474,6 +488,9 @@ func buildParamOverrideAuditLine(mode, path, from, to string, value interface{})
 	case "set_header":
 		if path == "" {
 			return ""
+		}
+		if IsSensitiveHeaderName(path) {
+			return fmt.Sprintf("set_header %s = ***", path)
 		}
 		return fmt.Sprintf("set_header %s = %s", path, formatParamOverrideAuditValue(value))
 	case "delete_header":

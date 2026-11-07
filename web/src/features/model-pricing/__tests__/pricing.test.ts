@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { describe, expect, it } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
+import { createElement } from 'react'
+import { describe, expect, it, vi } from 'vitest'
+
+import { ModelPricingEditorPanel } from '@/features/system-settings/models/model-pricing-sheet'
 
 import { buildPricingChanges, type ModelPricingConfig } from '../api'
 import {
@@ -27,7 +31,31 @@ import {
   pricingRow,
 } from '../pricing'
 
+vi.mock('@/features/pricing/hooks/use-pricing-data', () => ({
+  usePricingData: () => ({ models: [] }),
+}))
+
 describe('shared model pricing', () => {
+  it('offers only per-request pricing for a search engine without a stored price', async () => {
+    render(
+      createElement(ModelPricingEditorPanel, {
+        editData: { name: 'search_std' },
+      })
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Per-request' })).toHaveAttribute(
+        'aria-selected',
+        'true'
+      )
+    )
+    expect(
+      screen.queryByRole('tab', { name: 'Per-token' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('tab', { name: 'Expression' })
+    ).not.toBeInTheDocument()
+  })
+
   it('preserves explicit zero prices and cache-write configuration', () => {
     expect(
       pricingFromDraft({
@@ -112,6 +140,55 @@ describe('shared model pricing', () => {
         model_name: 'edited',
         expected_version: 'v1',
         pricing: { ModelPrice: 2, 'billing_setting.billing_mode': 'ratio' },
+      },
+    ])
+  })
+
+  it('keeps the default search price dynamic until that price is edited', () => {
+    const options = pricingOptions({
+      ModelPrice: '{"edited":1,"search_std":0.00137}',
+    })
+    const snapshot: ModelPricingConfig = {
+      options,
+      empty_version: 'empty',
+      entries: [
+        {
+          model_name: 'edited',
+          version: 'v1',
+          configured: { ModelPrice: 1 },
+          effective: { ModelPrice: 1 },
+        },
+        {
+          model_name: 'search_std',
+          version: 'empty',
+          configured: {},
+          effective: { ModelPrice: 0.00137 },
+        },
+      ],
+    }
+    const otherPrice = applyPricingDraft(options, {
+      name: 'edited',
+      billingMode: 'per-request',
+      price: '2',
+    })
+    expect(buildPricingChanges(snapshot, options, otherPrice)).toEqual([
+      {
+        model_name: 'edited',
+        expected_version: 'v1',
+        pricing: { ModelPrice: 2, 'billing_setting.billing_mode': 'ratio' },
+      },
+    ])
+
+    const searchPrice = applyPricingDraft(options, {
+      name: 'search_std',
+      billingMode: 'per-request',
+      price: '0.002',
+    })
+    expect(buildPricingChanges(snapshot, options, searchPrice)).toEqual([
+      {
+        model_name: 'search_std',
+        expected_version: 'empty',
+        pricing: { ModelPrice: 0.002, 'billing_setting.billing_mode': 'ratio' },
       },
     ])
   })

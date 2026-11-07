@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -9,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -332,6 +334,10 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 }
 
 func HasModelBillingConfig(modelName string) bool {
+	if dto.IsZhipuSearchEngine(modelName) {
+		_, err := model.ZhipuSearchPrice(modelName)
+		return err == nil
+	}
 	if _, ok := ratio_setting.GetModelPrice(modelName, false); ok {
 		return true
 	}
@@ -343,6 +349,60 @@ func HasModelBillingConfig(modelName string) bool {
 	}
 	expr, ok := billing_setting.GetBillingExpr(modelName)
 	return ok && strings.TrimSpace(expr) != ""
+}
+
+// ZhipuSearchPriceData 将独立搜索作为一次请求计费并冻结价格及用户折扣。
+func ZhipuSearchPriceData(c *gin.Context, info *relaycommon.RelayInfo) (hosttypes.PriceData, error) {
+	price, err := model.ZhipuSearchPrice(info.OriginModelName)
+	if err != nil {
+		return hosttypes.PriceData{}, err
+	}
+	if err := PrepareUserModelDiscount(c, info, 0, 0, nil); err != nil {
+		return hosttypes.PriceData{}, err
+	}
+	group := HandleGroupRatio(c, info)
+	if group.GroupRatio < 0 || math.IsNaN(group.GroupRatio) || math.IsInf(group.GroupRatio, 0) {
+		return hosttypes.PriceData{}, fmt.Errorf("invalid group ratio for Zhipu search")
+	}
+	data := hosttypes.PriceData{ModelPrice: price, UsePrice: true, GroupRatioInfo: group}
+	addUserModelDiscount(info, &data)
+	before, after, err := ZhipuSearchQuota(data)
+	if err != nil {
+		return hosttypes.PriceData{}, err
+	}
+	data.QuotaToPreConsume = after
+	data.DiscountAmounts = hosttypes.NewDiscountAmounts(before, after)
+	data.FreeModel = after == 0
+	info.PriceData = data
+	info.ForcePreConsume = after > 0
+	return data, nil
+}
+
+// ZhipuSearchQuota 在渠道分组变更时使用同一价格和折扣重新计算预扣。
+func ZhipuSearchQuota(data hosttypes.PriceData) (int, int, error) {
+	ratio := data.GroupRatioInfo.GroupRatio
+	if ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return 0, 0, fmt.Errorf("invalid group ratio for Zhipu search")
+	}
+	if data.ModelPrice < 0 || math.IsNaN(data.ModelPrice) || math.IsInf(data.ModelPrice, 0) ||
+		common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) {
+		return 0, 0, fmt.Errorf("invalid price or quota conversion for Zhipu search")
+	}
+	base := decimal.NewFromFloat(data.ModelPrice).
+		Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
+		Mul(decimal.NewFromFloat(ratio))
+	before, err := common.QuotaFromDecimalStrict(base)
+	if err != nil {
+		return 0, 0, err
+	}
+	after, err := common.QuotaFromDecimalStrict(data.ApplyOtherRatiosToDecimal(base))
+	if err != nil {
+		return 0, 0, err
+	}
+	if before > 0 && after == 0 && data.UserModelDiscountMultiplier() < 1 {
+		after = 1
+	}
+	return before, after, nil
 }
 
 // HasPriceOrRatioEntry 保留原导出接口，管理目录和计费共用模型层的唯一解析逻辑。

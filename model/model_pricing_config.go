@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -44,6 +45,10 @@ type ModelPricingSnapshot struct {
 }
 
 var ErrModelPricingConflict = errors.New("model pricing changed; reload before saving")
+
+var zhipuSearchEngineNames = [...]string{
+	dto.ZhipuSearchStd, dto.ZhipuSearchPro, dto.ZhipuSearchProSogou, dto.ZhipuSearchProQuark,
+}
 
 // Lock order is stable across instances. Creating missing option rows inside
 // the transaction also serializes the first write to an unconfigured database.
@@ -121,6 +126,16 @@ func effectiveModelPricing(values map[string]map[string]any, name string) Pricin
 		}
 	}
 	mode, _ := result["billing_setting.billing_mode"].(string)
+	if dto.IsZhipuSearchEngine(name) {
+		_, hasRatio := result["ModelRatio"]
+		_, hasPrice := result["ModelPrice"]
+		if mode != billing_setting.BillingModeTieredExpr && !hasRatio && !hasPrice {
+			if price, err := operation_setting.ZhipuSearchDefaultPrice(name); err == nil {
+				result["ModelPrice"] = price
+			}
+		}
+		return result
+	}
 	if mode == "" {
 		_, hasPrice := result["ModelPrice"]
 		_, hasRatio := result["ModelRatio"]
@@ -167,6 +182,9 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 		for name := range billing_setting.GetBuiltinBillingExprCopy() {
 			nameSet[name] = true
 		}
+		for _, name := range zhipuSearchEngineNames {
+			nameSet[name] = true
+		}
 		for name := range nameSet {
 			names = append(names, name)
 		}
@@ -200,6 +218,14 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 			values["billing_setting.billing_expr"][name] = expression
 		}
 	}
+	for _, name := range zhipuSearchEngineNames {
+		effective := effectiveModelPricing(values, name)
+		if price, ok := effective["ModelPrice"]; ok {
+			if _, configured := values["ModelPrice"][name]; !configured {
+				values["ModelPrice"][name] = price
+			}
+		}
+	}
 	for key, entries := range values {
 		encoded, err := common.Marshal(entries)
 		if err != nil {
@@ -213,6 +239,14 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 func ValidateModelPricing(name string, values PricingValues) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("model name is required")
+	}
+	if dto.IsZhipuSearchEngine(name) {
+		if _, exists := values["ModelRatio"]; exists {
+			return fmt.Errorf("Zhipu search engine %s requires per-request pricing", name)
+		}
+		if values["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
+			return fmt.Errorf("Zhipu search engine %s requires per-request pricing", name)
+		}
 	}
 	for key, value := range values {
 		if !IsModelPricingOption(key) {

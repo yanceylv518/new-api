@@ -20,6 +20,8 @@ For commercial licensing, please contact support@quantumnous.com
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
   'Account deletion',
+  'Zhipu Web Search',
+  'Web Search (/v1/web_search)',
   // Model management and metadata synchronization
   'Model management',
   'Select models',

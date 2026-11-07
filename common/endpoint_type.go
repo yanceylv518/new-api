@@ -1,9 +1,15 @@
 package common
 
-import "github.com/QuantumNous/new-api/constant"
+import (
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+)
 
-// GetEndpointTypesByChannelType 获取渠道最优先端点类型（所有的渠道都支持 OpenAI 端点）
+// GetEndpointTypesByChannelType 获取渠道最优先端点类型。
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
+	if channelType == constant.ChannelTypeZhipuWebSearch || (channelType == constant.ChannelTypeNewAPI && dto.IsZhipuSearchEngine(modelName)) {
+		return []constant.EndpointType{constant.EndpointTypeZhipuWebSearch}
+	}
 	var endpointTypes []constant.EndpointType
 	switch channelType {
 	case constant.ChannelTypeJina:

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,8 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		err = relay.ResponsesHelper(c, info)
 	case relayconstant.RelayModeAlphaSearch:
 		err = relay.AlphaSearchHelper(c, info)
+	case relayconstant.RelayModeZhipuWebSearch:
+		err = relay.ZhipuWebSearchHelper(c, info)
 	default:
 		err = relay.TextHelper(c, info)
 	}
@@ -82,6 +85,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError           *types.NewAPIError
 		ws                    *websocket.Conn
 		timeline              *requesttimeline.Trace
+		relayInfo             *relaycommon.RelayInfo
 		restoreTimelineWriter func()
 	)
 	// Registered before the existing response/error defers, so submission runs last.
@@ -118,8 +122,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
-			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(common.MaskCredentials(newAPIError.Error(), common.GetContextKeyString(c, constant.ContextKeyChannelKey)))))
+			keys := relayInfo.RedactionKeys(common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(common.MaskCredentials(newAPIError.Error(), keys...))))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if relayFormat == types.RelayFormatZhipuWebSearch && c.Writer.Written() {
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -128,6 +136,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 					"type":  "error",
 					"error": newAPIError.ToClaudeError(),
 				})
+			case types.RelayFormatZhipuWebSearch:
+				payload, err := common.Marshal(gin.H{"error": newAPIError.ToOpenAIError()})
+				if err == nil {
+					masked := []byte(common.MaskCredentials(string(payload), keys...))
+					var validated json.RawMessage
+					if err = common.Unmarshal(masked, &validated); err == nil {
+						c.Data(newAPIError.StatusCode, "application/json; charset=utf-8", validated)
+						return
+					}
+				}
+				logger.LogError(c, "failed to sanitize search error response")
+				c.JSON(newAPIError.StatusCode, gin.H{"error": gin.H{
+					"message": common.MaskCredentials(newAPIError.Error(), keys...),
+					"type":    "new_api_error",
+					"code":    common.MaskCredentials(string(newAPIError.GetErrorCode()), keys...),
+				}})
 			default:
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"error": newAPIError.ToOpenAIError(),
@@ -147,7 +171,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
-	relayInfo, err := relaycommon.GenRelayInfo(c, relayFormat, request, ws)
+	relayInfo, err = relaycommon.GenRelayInfo(c, relayFormat, request, ws)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
@@ -186,7 +210,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
-	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	var priceData hosttypes.PriceData
+	if relayFormat == types.RelayFormatZhipuWebSearch {
+		priceData, err = helper.ZhipuSearchPriceData(c, relayInfo)
+	} else {
+		priceData, err = helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	}
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
@@ -275,6 +304,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 
+		if relayFormat == types.RelayFormatZhipuWebSearch && relayInfo.ZhipuWebSearchAttempted {
+			break
+		}
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
@@ -430,11 +462,12 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
-	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(common.MaskCredentials(err.Error(), channelError.UsingKey))))
+	keys := relayInfo.RedactionKeys(channelError.UsingKey)
+	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(common.MaskCredentials(err.Error(), keys...))))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannel(err) && channelError.AutoBan {
-		reason := common.MaskCredentials(err.ErrorWithStatusCode(), channelError.UsingKey)
+		reason := common.MaskCredentials(err.ErrorWithStatusCode(), keys...)
 		gopool.Go(func() {
 			service.DisableChannel(channelError, reason)
 		})
@@ -461,7 +494,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.LogErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other, channelError.UsingKey)
+		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.LogErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other, keys...)
 	}
 
 }

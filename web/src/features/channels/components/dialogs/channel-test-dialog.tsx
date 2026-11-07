@@ -82,6 +82,7 @@ import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { useIsMobile } from '@/hooks/use-mobile'
 
 import { updateChannel } from '../../api'
+import { CHANNEL_TYPE_ZHIPU_WEB_SEARCH } from '../../constants'
 import {
   channelsQueryKeys,
   formatResponseTime,
@@ -191,6 +192,7 @@ const endpointTypeOptions: Array<{ value: string; label: string }> = [
     label: 'Image Generation (/v1/images/generations)',
   },
   { value: 'embeddings', label: 'Embeddings (/v1/embeddings)' },
+  { value: 'zhipu-web-search', label: 'Web Search (/v1/web_search)' },
 ]
 
 
@@ -199,6 +201,7 @@ const STREAM_INCOMPATIBLE_ENDPOINTS = new Set([
   'image-generation',
   'jina-rerank',
   'openai-response-compact',
+  'zhipu-web-search',
 ])
 
 const MODEL_PRICE_ERROR_CODE = 'model_price_error'
@@ -319,6 +322,7 @@ function ChannelTestDialogContent({
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const currentChannelId = currentRow.id
+  const isWebSearchChannel = currentRow.type === CHANNEL_TYPE_ZHIPU_WEB_SEARCH
   const batchStopRequestedRef = useRef(false)
   const batchProgressToastIdRef = useRef<ReturnType<
     typeof toast.loading
@@ -348,11 +352,18 @@ function ChannelTestDialogContent({
   })
   const endpointSelectItems = useMemo(
     () =>
-      endpointTypeOptions.map((option) => ({
-        value: option.value,
-        label: t(option.label),
-      })),
-    [t]
+      endpointTypeOptions
+        .filter(
+          (option) =>
+            !isWebSearchChannel ||
+            option.value === 'auto' ||
+            option.value === 'zhipu-web-search'
+        )
+        .map((option) => ({
+          value: option.value,
+          label: t(option.label),
+        })),
+    [isWebSearchChannel, t]
   )
 
   const dismissBatchProgressToast = useCallback(() => {
@@ -406,7 +417,8 @@ function ChannelTestDialogContent({
     setPagination({ pageIndex: 0, pageSize: 30 })
   }, [])
 
-  const streamDisabled = STREAM_INCOMPATIBLE_ENDPOINTS.has(endpointType)
+  const streamDisabled =
+    isWebSearchChannel || STREAM_INCOMPATIBLE_ENDPOINTS.has(endpointType)
   const effectiveStreamTest = !streamDisabled && isStreamTest
 
   const handleEndpointTypeChange = useCallback((value: string | null) => {

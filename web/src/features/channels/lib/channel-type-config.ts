@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { CHANNEL_TYPES } from '../constants'
+import {
+  CHANNEL_TYPES,
+  CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
+  ZHIPU_WEB_SEARCH_ENGINES,
+} from '../constants'
 
 // ============================================================================
 // Channel Type Configuration
@@ -162,6 +166,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       baseUrl: 'Base URL is required for this channel type',
       key: 'Enter API key for this channel',
       models: 'Models',
+    },
+  },
+  [CHANNEL_TYPE_ZHIPU_WEB_SEARCH]: {
+    id: CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
+    name: CHANNEL_TYPES[CHANNEL_TYPE_ZHIPU_WEB_SEARCH],
+    icon: 'Zhipu',
+    defaultBaseUrl: 'https://open.bigmodel.cn',
+    supportedModels: ZHIPU_WEB_SEARCH_ENGINES,
+    hints: {
+      key: 'Enter API key for this channel',
     },
   },
 }

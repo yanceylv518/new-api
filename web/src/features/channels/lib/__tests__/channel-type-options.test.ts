@@ -21,10 +21,31 @@ import { describe, expect, test } from 'vitest'
 import {
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
+  CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
   channelTypeOptionsForTaskPluginBind,
 } from '../../constants'
+import { getChannelTypeConfig } from '../channel-type-config'
 
 describe('channel type options for task plugin bind', () => {
+  test('offers a separate web search channel with search engines when task plugin binding is unavailable', () => {
+    const options = channelTypeOptionsForTaskPluginBind(false)
+
+    expect(
+      options.find((option) => option.value === CHANNEL_TYPE_ZHIPU_WEB_SEARCH)
+    ).toEqual({
+      value: CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
+      label: 'Zhipu Web Search',
+    })
+    expect(
+      getChannelTypeConfig(CHANNEL_TYPE_ZHIPU_WEB_SEARCH).supportedModels
+    ).toEqual([
+      'search_std',
+      'search_pro',
+      'search_pro_sogou',
+      'search_pro_quark',
+    ])
+  })
+
   test('hides the task plugin type when the caller cannot bind', () => {
     const options = channelTypeOptionsForTaskPluginBind(false)
 
