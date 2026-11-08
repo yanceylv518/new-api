@@ -148,6 +148,7 @@ import { useChannelMutateForm } from '../../hooks/use-channel-mutate-form'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
   CHANNEL_TYPE_ADVANCED_CUSTOM,
+  MAX_RESPONSE_BODY_MIB,
   channelFormSchema,
   channelsQueryKeys,
   getAdvancedCustomStats,
@@ -284,6 +285,7 @@ const SENSITIVE_FORM_FIELDS = [
   'proxy',
   'http_protocol',
   'http2_connection_shards',
+  'max_response_body_mib',
   'pass_through_body_enabled',
   'system_prompt',
   'system_prompt_override',
@@ -337,6 +339,8 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.system_prompt?.trim() ||
     values.force_format ||
     values.thinking_to_content ||
+    (values.type === CHANNEL_TYPE_ZHIPU_WEB_SEARCH &&
+      (values.max_response_body_mib ?? 0) > 0) ||
     values.pass_through_body_enabled ||
     values.system_prompt_override ||
     (values.http_protocol && values.http_protocol !== 'auto') ||
@@ -736,6 +740,7 @@ export function ChannelMutateDrawer({
   const currentProxy = form.watch('proxy')
   const currentHttpProtocol = form.watch('http_protocol')
   const currentHttp2ConnectionShards = form.watch('http2_connection_shards')
+  const currentMaxResponseBodyMiB = form.watch('max_response_body_mib')
   const currentSystemPrompt = form.watch('system_prompt')
   const currentSystemPromptOverride = form.watch('system_prompt_override')
   const currentAllowServiceTier = form.watch('allow_service_tier')
@@ -1016,7 +1021,10 @@ export function ChannelMutateDrawer({
     currentSystemPrompt?.trim() ||
     currentSystemPromptOverride ||
     (currentHttpProtocol && currentHttpProtocol !== 'auto') ||
-    (currentHttp2ConnectionShards != null && currentHttp2ConnectionShards > 1)
+    (currentHttp2ConnectionShards != null &&
+      currentHttp2ConnectionShards > 1) ||
+    (currentType === CHANNEL_TYPE_ZHIPU_WEB_SEARCH &&
+      (currentMaxResponseBodyMiB ?? 0) > 0)
   )
   let fieldPassthroughConfigured = false
   if (OPENAI_FIELD_PASSTHROUGH_TYPES.has(currentType)) {
@@ -4328,6 +4336,45 @@ placeholder={t(
                                 )
                               }}
                             />
+
+                            {currentType === CHANNEL_TYPE_ZHIPU_WEB_SEARCH && (
+                              <FormField
+                                control={form.control}
+                                name='max_response_body_mib'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>
+                                      {t('Response body limit (MiB)')}
+                                    </FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        {...field}
+                                        type='number'
+                                        min={0}
+                                        max={MAX_RESPONSE_BODY_MIB}
+                                        step={1}
+                                        disabled={sensitiveLocked}
+                                        value={field.value ?? 0}
+                                        onChange={(event) =>
+                                          field.onChange(
+                                            event.currentTarget.value === ''
+                                              ? 0
+                                              : event.currentTarget
+                                                  .valueAsNumber
+                                          )
+                                        }
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        '0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+                            )}
 
                             <FormField
                               control={form.control}

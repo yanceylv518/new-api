@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/zhipu_web_search"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -507,7 +508,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 		if httpResp.StatusCode != http.StatusOK {
 			if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
-				body, readErr := io.ReadAll(httpResp.Body)
+				body, readErr := zhipu_web_search.ReadResponseBody(httpResp, info)
 				_ = httpResp.Body.Close()
 				safeBody := common.MaskCredentials(string(body), info.RedactionKeys()...)
 				if readErr != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/zhipu_web_search"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -108,11 +110,14 @@ func TestZhipuWebSearchChannelHealth(t *testing.T) {
 		status int
 		body   string
 	}{
+		{"oversized success", http.StatusOK, `{"detail":"` + strings.Repeat("x", 1<<20) + `"}`},
+		{"oversized error", http.StatusUnauthorized, `{"detail":"` + strings.Repeat("x", 1<<20) + `"}`},
 		{"json error", http.StatusUnauthorized, `{"error":{"message":"rejected health-placeholder"},"api_key":"health-placeholder"}`},
 		{"non-json error", http.StatusBadGateway, `upstream rejected health-placeholder`},
 		{"error in successful HTTP response", http.StatusOK, `{"error":{"message":"rejected health-placeholder"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			channel.Setting = common.GetPointer(`{"max_response_body_mib":1}`)
 			status.Store(int32(tc.status))
 			responseBody.Store(tc.body)
 			result := testChannel(context.Background(), channel, 1, dto.ZhipuSearchStd, "", false)
@@ -122,6 +127,63 @@ func TestZhipuWebSearchChannelHealth(t *testing.T) {
 			assert.NotContains(t, result.newAPIError.Error(), "health-placeholder")
 			assert.NotContains(t, result.newAPIError.LogErrorWithStatusCode(), "health-placeholder")
 			<-requests
+		})
+	}
+}
+
+func TestZhipuResponseBodyLimitReader(t *testing.T) {
+	const limit = 1 << 20
+	for _, tc := range []struct {
+		name        string
+		channelType int
+		limitMiB    int64
+		size        int
+		length      int64
+		wantRead    int
+		tooLarge    bool
+	}{
+		{"known exact limit", constant.ChannelTypeZhipuWebSearch, 1, limit, limit, limit, false},
+		{"known oversized", constant.ChannelTypeZhipuWebSearch, 1, limit + 1, limit + 1, 0, true},
+		{"unknown exact limit", constant.ChannelTypeZhipuWebSearch, 1, limit, -1, limit, false},
+		{"unknown oversized", constant.ChannelTypeZhipuWebSearch, 1, limit + 10, -1, limit + 1, true},
+		{"unlimited", constant.ChannelTypeZhipuWebSearch, 0, limit + 10, -1, limit + 10, false},
+		{"larger configured limit", constant.ChannelTypeZhipuWebSearch, 2, limit + 10, -1, limit + 10, false},
+		{"New API is unaffected", constant.ChannelTypeNewAPI, 1, limit + 10, -1, limit + 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := strings.Repeat("x", tc.size)
+			var observed bytes.Buffer
+			resp := &http.Response{ContentLength: tc.length, Body: io.NopCloser(io.TeeReader(strings.NewReader(payload), &observed))}
+			defer resp.Body.Close()
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: tc.channelType, ChannelSetting: dto.ChannelSettings{MaxResponseBodyMiB: tc.limitMiB}}}
+			body, err := zhipu_web_search.ReadResponseBody(resp, info)
+			if tc.tooLarge {
+				require.ErrorIs(t, err, zhipu_web_search.ErrResponseBodyTooLarge)
+				assert.Nil(t, body)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, payload, string(body))
+			}
+			assert.Equal(t, tc.wantRead, observed.Len())
+		})
+	}
+}
+
+func TestValidateChannelResponseBodyLimit(t *testing.T) {
+	for _, tc := range []struct {
+		setting string
+		valid   bool
+	}{
+		{`{"max_response_body_mib":0}`, true},
+		{`{"max_response_body_mib":8}`, true},
+		{`{"max_response_body_mib":-1}`, false},
+		{`{"max_response_body_mib":1.5}`, false},
+		{`{"max_response_body_mib":"8"}`, false},
+		{`{"max_response_body_mib":9223372036854775807}`, false},
+	} {
+		t.Run(tc.setting, func(t *testing.T) {
+			channel := &model.Channel{Type: constant.ChannelTypeZhipuWebSearch, Setting: &tc.setting}
+			assert.Equal(t, tc.valid, validateChannel(channel, false) == nil)
 		})
 	}
 }

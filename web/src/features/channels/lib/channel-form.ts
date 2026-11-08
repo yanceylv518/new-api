@@ -22,6 +22,7 @@ import {
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_TASK_PLUGIN,
+  CHANNEL_TYPE_ZHIPU_WEB_SEARCH,
   CHANNEL_STATUS,
   ERROR_MESSAGES,
   FIELD_PASSTHROUGH_TYPES,
@@ -77,6 +78,7 @@ function isOptionalProxyURL(value: string | undefined): boolean {
 export const HTTP_PROTOCOL_AUTO = 'auto'
 export const HTTP_PROTOCOL_HTTP1 = 'http1'
 export const MAX_HTTP2_CONNECTION_SHARDS = 8
+export const MAX_RESPONSE_BODY_MIB = 8_796_093_022_207
 
 export function normalizeHttpProtocol(
   value: string | undefined | null
@@ -263,6 +265,12 @@ export const channelFormSchema = z
       .refine(isOptionalProxyURL, ERROR_MESSAGES.INVALID_PROXY),
     http_protocol: z.enum(['auto', 'http1']).optional(),
     http2_connection_shards: z.number().int().optional(),
+    max_response_body_mib: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_RESPONSE_BODY_MIB)
+      .optional(),
     pass_through_body_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
     system_prompt_override: z.boolean().optional(),
@@ -444,6 +452,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   proxy: '',
   http_protocol: HTTP_PROTOCOL_AUTO,
   http2_connection_shards: 1,
+  max_response_body_mib: 0,
   pass_through_body_enabled: false,
   system_prompt: '',
   system_prompt_override: false,
@@ -485,6 +494,7 @@ export function transformChannelToFormDefaults(
     proxy: '',
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
     http2_connection_shards: 1,
+    max_response_body_mib: 0,
     pass_through_body_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
@@ -504,6 +514,7 @@ export function transformChannelToFormDefaults(
         proxy: parsed.proxy || '',
         http_protocol: protocol,
         http2_connection_shards: protocol === HTTP_PROTOCOL_HTTP1 ? 1 : shards,
+        max_response_body_mib: parsed.max_response_body_mib ?? 0,
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         system_prompt: parsed.system_prompt || '',
         system_prompt_override: parsed.system_prompt_override || false,
@@ -631,6 +642,12 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   }
 
   const protocol = normalizeHttpProtocol(formData.http_protocol)
+  if (
+    formData.type === CHANNEL_TYPE_ZHIPU_WEB_SEARCH &&
+    (formData.max_response_body_mib ?? 0) > 0
+  ) {
+    settingObj.max_response_body_mib = formData.max_response_body_mib
+  }
   const shards =
     protocol === HTTP_PROTOCOL_HTTP1
       ? 1

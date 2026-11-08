@@ -23,6 +23,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http/httpguts"
 )
 
 // ApplyUpstreamBodyMetadata restores metadata that net/http cannot infer from
@@ -510,6 +511,22 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		// 先完成本地校验，避免未发送请求就阻断备用渠道。
+		if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" {
+			return nil, errors.New("upstream URL must use http or https and include a host")
+		}
+		for name, values := range req.Header {
+			if !httpguts.ValidHeaderFieldName(name) {
+				return nil, errors.New("invalid upstream request header name")
+			}
+			for _, value := range values {
+				if !httpguts.ValidHeaderFieldValue(value) {
+					return nil, errors.New("invalid upstream request header value")
+				}
+			}
+		}
+	}
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)

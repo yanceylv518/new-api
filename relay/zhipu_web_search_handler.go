@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel/zhipu_web_search"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -234,7 +235,7 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 				info.UpstreamCredentialValues = append(info.UpstreamCredentialValues, cookie.Value)
 			}
 		}
-		errorBody, readErr := io.ReadAll(response.Body)
+		errorBody, readErr := zhipu_web_search.ReadResponseBody(response, info)
 		if readErr != nil {
 			apiErr := types.NewErrorWithStatusCode(fmt.Errorf("read upstream error response: %w", readErr), types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 			apiErr.SetLogError(fmt.Errorf("read upstream error response: %w, partial body: %s", readErr, errorBody))
@@ -251,7 +252,7 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 
 	// 上游已接受搜索，客户端断开也不能重试或退回已产生的费用。
 	defer service.PostTextConsumeQuota(c, info, &dto.Usage{}, []string{fmt.Sprintf("搜索引擎 %s 调用 1 次", effective.SearchEngine)})
-	responseBody, err := io.ReadAll(response.Body)
+	responseBody, err := zhipu_web_search.ReadResponseBody(response, info)
 	if err != nil {
 		return types.NewErrorWithStatusCode(fmt.Errorf("read upstream search response: %w", err), types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}

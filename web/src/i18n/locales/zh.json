@@ -6297,6 +6297,8 @@
     "Zhipu": "智谱",
     "Zhipu V4": "智谱 V4",
     "Zhipu Web Search": "智谱联网搜索",
+    "Response body limit (MiB)": "响应体大小上限（MiB）",
+    "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.": "0 表示不限。超限会返回错误；上游已成功的搜索仍按一次计费。",
     "Web Search (/v1/web_search)": "联网搜索 (/v1/web_search)",
     "Zoom": "缩放"
   }

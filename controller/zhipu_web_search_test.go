@@ -17,6 +17,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -36,14 +37,16 @@ import (
 )
 
 type zhipuSearchUpstream struct {
-	mu        sync.Mutex
-	status    int
-	body      string
-	truncated bool
-	closeNext bool
-	paths     []string
-	bodies    []string
-	auth      []string
+	mu          sync.Mutex
+	status      int
+	body        string
+	truncated   bool
+	closeNext   bool
+	knownLength bool
+	compressed  bool
+	paths       []string
+	bodies      []string
+	auth        []string
 }
 
 func TestZhipuSearchValidationWithoutDistributor(t *testing.T) {
@@ -84,6 +87,7 @@ func (u *zhipuSearchUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	u.bodies = append(u.bodies, string(body))
 	u.auth = append(u.auth, r.Header.Get("Authorization"))
 	status, response, truncated, closeNext := u.status, u.body, u.truncated, u.closeNext
+	knownLength, compressed := u.knownLength, u.compressed
 	u.closeNext = false
 	u.mu.Unlock()
 	if closeNext {
@@ -94,8 +98,18 @@ func (u *zhipuSearchUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if compressed {
+		var encoded bytes.Buffer
+		writer := gzip.NewWriter(&encoded)
+		_, _ = writer.Write([]byte(response))
+		_ = writer.Close()
+		response = encoded.String()
+		w.Header().Set("Content-Encoding", "gzip")
+	}
 	if truncated {
 		w.Header().Set("Content-Length", strconv.Itoa(len(response)+10))
+	} else if knownLength {
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
 	}
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, response)
@@ -186,7 +200,12 @@ func setupZhipuSearchContract(t *testing.T) (*gin.Engine, *gorm.DB, *zhipuSearch
 		gin.SetMode(previousMode)
 		_ = sqlDB.Close()
 	})
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.Model{}, &model.Vendor{}, &model.Option{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
+	schema := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.Model{}, &model.Vendor{}, &model.Option{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}}
+	if os.Getenv("ZHIPU_SEARCH_TEST_DISPOSABLE_DSN") != "" {
+		// 外部隔离测试库不会随连接关闭清空，避免不同用例共享夹具数据。
+		require.NoError(t, database.Migrator().DropTable(schema...))
+	}
+	require.NoError(t, database.AutoMigrate(schema...))
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
 	service.InitHttpClient()
 
@@ -294,7 +313,7 @@ func TestZhipuSearchChannelIsolation(t *testing.T) {
 
 func TestZhipuSearchPreflightFallback(t *testing.T) {
 	for _, cacheEnabled := range []bool{false, true} {
-		for _, failure := range []string{"request URL", "header override", "HTTP client", "sent request"} {
+		for _, failure := range []string{"request URL", "request URL without scheme", "request URL without host", "header override", "invalid header name", "invalid header value", "HTTP client", "sent request"} {
 			t.Run(fmt.Sprintf("cache_%t/%s", cacheEnabled, failure), func(t *testing.T) {
 				engine, database, upstream := setupZhipuSearchContract(t)
 				common.RetryTimes = 1
@@ -304,8 +323,16 @@ func TestZhipuSearchPreflightFallback(t *testing.T) {
 				switch failure {
 				case "request URL":
 					primary.BaseURL = common.GetPointer("http://[")
+				case "request URL without scheme":
+					primary.BaseURL = common.GetPointer("open.bigmodel.cn")
+				case "request URL without host":
+					primary.BaseURL = common.GetPointer("https://")
 				case "header override":
 					primary.HeaderOverride = common.GetPointer(`{"re:[":"*"}`)
+				case "invalid header name":
+					primary.HeaderOverride = common.GetPointer(`{"Invalid Header":"value"}`)
+				case "invalid header value":
+					primary.HeaderOverride = common.GetPointer(`{"X-Test":"invalid\nvalue"}`)
 				case "HTTP client":
 					primary.Setting = common.GetPointer(`{"proxy":"ftp://127.0.0.1:1"}`)
 				case "sent request":
@@ -334,6 +361,103 @@ func TestZhipuSearchPreflightFallback(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestZhipuSearchResponseBodyLimit(t *testing.T) {
+	const limit = 1 << 20
+	for _, tc := range []struct {
+		name           string
+		limitMiB       int
+		size           int
+		upstreamStatus int
+		knownLength    bool
+		compressed     bool
+		wantStatus     int
+		charge         int
+	}{
+		{"unlimited", 0, limit + 1, http.StatusOK, false, false, http.StatusOK, 685},
+		{"exact known", 1, limit, http.StatusOK, true, false, http.StatusOK, 685},
+		{"exact unknown", 1, limit, http.StatusOK, false, false, http.StatusOK, 685},
+		{"oversized known", 1, limit + 1, http.StatusOK, true, false, http.StatusBadGateway, 685},
+		{"oversized unknown", 1, limit + 1, http.StatusOK, false, false, http.StatusBadGateway, 685},
+		{"oversized decompressed", 1, limit + 1, http.StatusOK, true, true, http.StatusBadGateway, 685},
+		{"larger configured limit", 2, limit + 1, http.StatusOK, false, false, http.StatusOK, 685},
+		{"oversized error", 1, limit + 1, http.StatusUnauthorized, false, false, http.StatusBadGateway, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, database, upstream := setupZhipuSearchContract(t)
+			setting := fmt.Sprintf(`{"max_response_body_mib":%d}`, tc.limitMiB)
+			require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", 1).Update("setting", setting).Error)
+			prefix, suffix := `{"search_result":[],"detail":"`, `"}`
+			body := prefix + strings.Repeat("x", tc.size-len(prefix)-len(suffix)) + suffix
+			upstream.setResponse(tc.upstreamStatus, body)
+			upstream.mu.Lock()
+			upstream.knownLength, upstream.compressed = tc.knownLength, tc.compressed
+			upstream.mu.Unlock()
+			for _, path := range []string{"/v1/web_search", "/api/paas/v4/web_search"} {
+				beforeUser, beforeToken := zhipuSearchBalances(t, database, 1)
+				_, before := upstream.snapshot()
+				response := zhipuSearchRequest(engine, path, `{"search_engine":"search_std","search_query":"test"}`, "fixturetoken")
+				require.Equal(t, tc.wantStatus, response.Code, response.Body.String())
+				_, after := upstream.snapshot()
+				assert.Len(t, after, len(before)+1)
+				if tc.wantStatus == http.StatusOK {
+					assert.Equal(t, body, response.Body.String())
+				} else {
+					assert.Contains(t, response.Body.String(), "configured size limit")
+					assert.NotContains(t, response.Body.String(), "\"detail\"")
+				}
+				require.Eventually(t, func() bool {
+					afterUser, afterToken := zhipuSearchBalances(t, database, 1)
+					return beforeUser-afterUser == tc.charge && beforeToken-afterToken == tc.charge
+				}, 5*time.Second, 10*time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestZhipuSearchResponseBodyLimitSettings(t *testing.T) {
+	_, database, _ := setupZhipuSearchContract(t)
+	for _, limit := range []int{8, 0} {
+		body := fmt.Sprintf(`{"id":1,"type":62,"setting":"{\"max_response_body_mib\":%d}"}`, limit)
+		response := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(response)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel", strings.NewReader(body))
+		ctx.Set("id", 1)
+		ctx.Set("role", common.RoleRootUser)
+		controller.UpdateChannel(ctx)
+		require.True(t, gjson.Get(response.Body.String(), "success").Bool(), response.Body.String())
+		var saved model.Channel
+		require.NoError(t, database.First(&saved, 1).Error)
+		assert.EqualValues(t, limit, saved.GetSetting().MaxResponseBodyMiB)
+		assert.Equal(t, "upstream-placeholder", saved.Key)
+		assert.Equal(t, "search_std,search_pro,search_pro_sogou,search_pro_quark", saved.Models)
+		assert.Equal(t, "default", saved.Group)
+		assert.Equal(t, common.ChannelStatusEnabled, saved.Status)
+	}
+}
+
+func TestZhipuSearchResponseBodyLimitSubscription(t *testing.T) {
+	engine, database, upstream := setupZhipuSearchContract(t)
+	sqlDB, err := database.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(10)
+	require.NoError(t, database.Create(&model.SubscriptionPlan{Id: 1, Title: "response-limit", TotalAmount: 10_000_000}).Error)
+	require.NoError(t, database.Create(&model.UserSubscription{Id: 1, UserId: 1, PlanId: 1, AmountTotal: 10_000_000, StartTime: time.Now().Add(-time.Hour).Unix(), EndTime: time.Now().Add(time.Hour).Unix(), Status: "active"}).Error)
+	require.NoError(t, database.Model(&model.User{}).Where("id = ?", 1).Update("setting", `{"billing_preference":"subscription_only"}`).Error)
+	require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", 1).Update("setting", `{"max_response_body_mib":1}`).Error)
+	upstream.setResponse(http.StatusOK, `{"detail":"`+strings.Repeat("x", 1<<20)+`"}`)
+	beforeUser, beforeToken := zhipuSearchBalances(t, database, 1)
+	response := zhipuSearchRequest(engine, "/v1/web_search", `{"search_engine":"search_std","search_query":"test"}`, "fixturetoken")
+	require.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+	var subscription model.UserSubscription
+	require.NoError(t, database.First(&subscription, 1).Error)
+	assert.EqualValues(t, 685, subscription.AmountUsed)
+	afterUser, afterToken := zhipuSearchBalances(t, database, 1)
+	assert.Equal(t, beforeUser, afterUser)
+	assert.Equal(t, 685, beforeToken-afterToken)
+	paths, _ := upstream.snapshot()
+	assert.Len(t, paths, 1)
 }
 
 func TestZhipuSearchRequestBodyLimit(t *testing.T) {

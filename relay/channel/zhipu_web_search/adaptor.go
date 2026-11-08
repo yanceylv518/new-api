@@ -3,6 +3,7 @@ package zhipu_web_search
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -45,7 +46,7 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := ReadResponseBody(resp, info)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
@@ -63,4 +64,28 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return "zhipu_web_search"
+}
+
+var ErrResponseBodyTooLarge = errors.New("upstream response body exceeds configured size limit")
+
+// ReadResponseBody 按渠道上限读取响应；调用方负责关闭响应体，0 表示不限。
+func ReadResponseBody(resp *http.Response, info *relaycommon.RelayInfo) ([]byte, error) {
+	if info.ChannelType != constant.ChannelTypeZhipuWebSearch || info.ChannelSetting.MaxResponseBodyMiB == 0 {
+		return io.ReadAll(resp.Body)
+	}
+	if err := info.ChannelSetting.ValidateResponseBodyLimit(); err != nil {
+		return nil, err
+	}
+	maxBytes := info.ChannelSetting.MaxResponseBodyMiB << 20
+	if resp.ContentLength > maxBytes {
+		return nil, fmt.Errorf("%w: %d MiB", ErrResponseBodyTooLarge, info.ChannelSetting.MaxResponseBodyMiB)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return body, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("%w: %d MiB", ErrResponseBodyTooLarge, info.ChannelSetting.MaxResponseBodyMiB)
+	}
+	return body, nil
 }

@@ -135,20 +135,21 @@ func TestZhipuWebSearchLive(t *testing.T) {
 	defer server.Close()
 	client := &http.Client{Timeout: 150 * time.Second}
 	for _, tc := range []struct {
-		name          string
-		engine        string
-		quota         int
-		path          string
-		fullOptions   bool
-		searchIntent  bool
-		query         string
-		subscription  bool
-		upstreamError bool
+		name             string
+		engine           string
+		quota            int
+		path             string
+		fullOptions      bool
+		searchIntent     bool
+		query            string
+		subscription     bool
+		upstreamError    bool
+		responseLimitMiB int
 	}{
-		{name: dto.ZhipuSearchStd, engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search"},
-		{name: dto.ZhipuSearchPro, engine: dto.ZhipuSearchPro, quota: 1027, path: "/api/paas/v4/web_search"},
-		{name: dto.ZhipuSearchProSogou, engine: dto.ZhipuSearchProSogou, quota: 3425, path: "/v1/web_search"},
-		{name: dto.ZhipuSearchProQuark, engine: dto.ZhipuSearchProQuark, quota: 3425, path: "/v1/web_search"},
+		{name: dto.ZhipuSearchStd, engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", responseLimitMiB: 8},
+		{name: dto.ZhipuSearchPro, engine: dto.ZhipuSearchPro, quota: 1027, path: "/api/paas/v4/web_search", responseLimitMiB: 8},
+		{name: dto.ZhipuSearchProSogou, engine: dto.ZhipuSearchProSogou, quota: 3425, path: "/v1/web_search", responseLimitMiB: 8},
+		{name: dto.ZhipuSearchProQuark, engine: dto.ZhipuSearchProQuark, quota: 3425, path: "/v1/web_search", responseLimitMiB: 8},
 		{name: "intent_std", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", searchIntent: true},
 		{name: "intent_pro", engine: dto.ZhipuSearchPro, quota: 1027, path: "/api/paas/v4/web_search", searchIntent: true},
 		{name: "intent_sogou", engine: dto.ZhipuSearchProSogou, quota: 3425, path: "/v1/web_search", searchIntent: true},
@@ -159,6 +160,13 @@ func TestZhipuWebSearchLive(t *testing.T) {
 		{name: "upstream_auth_error", engine: dto.ZhipuSearchStd, path: "/v1/web_search", upstreamError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.responseLimitMiB > 0 {
+				setting := fmt.Sprintf(`{"max_response_body_mib":%d}`, tc.responseLimitMiB)
+				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", setting).Error)
+				t.Cleanup(func() {
+					require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", nil).Error)
+				})
+			}
 			if tc.upstreamError {
 				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("key", "invalid-test-key").Error)
 				constant.ErrorLogEnabled, common.RetryTimes = true, 2
@@ -275,6 +283,9 @@ func TestZhipuWebSearchLive(t *testing.T) {
 			}
 			assert.True(t, gjson.ValidBytes(data))
 			assert.True(t, bytes.Equal(upstreamBody.Bytes(), data), "成功响应应与上游原文一致")
+			if tc.responseLimitMiB > 0 {
+				assert.LessOrEqual(t, len(data), tc.responseLimitMiB<<20)
+			}
 			var logged model.Log
 			require.NoError(t, database.Where("user_id = ?", user.Id).Order("id DESC").First(&logged).Error)
 			assert.Equal(t, tc.engine, logged.ModelName)
@@ -298,7 +309,7 @@ func TestZhipuWebSearchLive(t *testing.T) {
 			if strings.Contains(logged.Content+logged.Other+string(data), key) {
 				t.Error("响应或消费日志包含上游密钥")
 			}
-			t.Logf("engine=%s status=%d intents=%d results=%d quota=%d", tc.engine, response.StatusCode, len(gjson.GetBytes(data, "search_intent").Array()), len(gjson.GetBytes(data, "search_result").Array()), logged.Quota)
+			t.Logf("engine=%s status=%d intents=%d results=%d quota=%d bytes=%d limit_mib=%d", tc.engine, response.StatusCode, len(gjson.GetBytes(data, "search_intent").Array()), len(gjson.GetBytes(data, "search_result").Array()), logged.Quota, len(data), tc.responseLimitMiB)
 		})
 	}
 }

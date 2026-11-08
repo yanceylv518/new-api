@@ -6297,6 +6297,8 @@
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
     "Zhipu Web Search": "Tìm kiếm web Zhipu",
+    "Response body limit (MiB)": "Giới hạn kích thước phản hồi (MiB)",
+    "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.": "0 là không giới hạn. Phản hồi quá lớn trả về lỗi; tìm kiếm thành công ở nhà cung cấp vẫn được tính phí.",
     "Web Search (/v1/web_search)": "Tìm kiếm web (/v1/web_search)",
     "Zoom": "Zoom"
   }
