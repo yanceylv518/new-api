@@ -456,8 +456,8 @@ func TestZhipuWebSearchContract(t *testing.T) {
 		{"standard", "/v1/web_search", `{"search_engine":"search_std","search_query":"test","search_intent":false,"count":10,"search_domain_filter":"www.example.com","search_recency_filter":"oneWeek","content_size":"high","request_id":"request-std-0001","user_id":"user-0001","extension":{"keep":true}}`, 685},
 		{"search intent", "/v1/web_search", `{"search_engine":"search_std","search_query":"test","search_intent":true}`, 685},
 		{"pro", "/api/paas/v4/web_search", `{"search_engine":"search_pro","search_query":"test","search_intent":false,"count":10}`, 1027},
-		{"sogou", "/v1/web_search", `{"search_engine":"search_pro_sogou","search_query":"test","search_intent":false,"count":11}`, 3425},
-		{"quark", "/v1/web_search", `{"search_engine":"search_pro_quark","search_query":"test","search_intent":false,"count":2,"search_domain_filter":"www.example.com"}`, 3425},
+		{"sogou", "/v1/web_search", `{"search_engine":"search_pro_sogou","search_query":"test","search_intent":false,"count":20}`, 3425},
+		{"quark", "/v1/web_search", `{"search_engine":"search_pro_quark","search_query":"test","search_intent":false,"search_recency_filter":"noLimit","content_size":"medium"}`, 3425},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			beforeUser, beforeToken := zhipuSearchBalances(t, database, 1)
@@ -480,23 +480,38 @@ func TestZhipuWebSearchContract(t *testing.T) {
 		})
 	}
 
+	t.Run("omitted search intent uses the official default", func(t *testing.T) {
+		for _, path := range []string{"/v1/web_search", "/api/paas/v4/web_search"} {
+			response := zhipuSearchRequest(engine, path, `{"search_engine":"search_std","search_query":"test"}`, "fixturetoken")
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			_, bodies := upstream.snapshot()
+			assert.JSONEq(t, `{"search_engine":"search_std","search_query":"test","search_intent":false}`, bodies[len(bodies)-1])
+		}
+	})
+
 	t.Run("invalid requests do not reach upstream", func(t *testing.T) {
 		cases := map[string]string{
-			"missing engine":        `{"search_query":"test"}`,
-			"unknown engine":        `{"search_engine":"search_unknown","search_query":"test"}`,
-			"duplicate engine":      `{"search_engine":"search_std","search_engine":"search_pro","search_query":"test"}`,
-			"escaped duplicate":     `{"search_engine":"search_std","search_\u0065ngine":"search_pro","search_query":"test"}`,
-			"case variant engine":   `{"search_engine":"search_pro","SEARCH_ENGINE":"search_std","search_query":"test"}`,
-			"case variant only":     `{"SEARCH_ENGINE":"search_std","search_query":"test"}`,
-			"unicode folded key":    `{"search_engine":"search_pro","\u017fearch_engine":"search_std","search_query":"test"}`,
-			"empty query":           `{"search_engine":"search_std","search_query":" "}`,
-			"long query":            fmt.Sprintf(`{"search_engine":"search_std","search_query":"%s"}`, strings.Repeat("x", 71)),
-			"zero count":            `{"search_engine":"search_std","search_query":"test","count":0}`,
-			"sogou count too large": `{"search_engine":"search_pro_sogou","search_query":"test","count":51}`,
-			"quark count too large": `{"search_engine":"search_pro_quark","search_query":"test","count":51}`,
-			"invalid recency":       `{"search_engine":"search_std","search_query":"test","search_recency_filter":"week"}`,
-			"invalid content size":  `{"search_engine":"search_std","search_query":"test","content_size":"small"}`,
-			"short request id":      `{"search_engine":"search_std","search_query":"test","request_id":"a"}`,
+			"case variant count":       `{"search_engine":"search_std","search_query":"test","count":51,"COUNT":1}`,
+			"case variant query":       `{"search_engine":"search_std","search_query":"test","search_query":"original","SEARCH_QUERY":"replacement"}`,
+			"null optional field":      `{"search_engine":"search_std","search_query":"test","count":null}`,
+			"sogou count outside enum": `{"search_engine":"search_pro_sogou","search_query":"test","count":11}`,
+			"quark unsupported count":  `{"search_engine":"search_pro_quark","search_query":"test","count":10}`,
+			"quark unsupported domain": `{"search_engine":"search_pro_quark","search_query":"test","search_domain_filter":"www.example.com"}`,
+			"missing engine":           `{"search_query":"test"}`,
+			"unknown engine":           `{"search_engine":"search_unknown","search_query":"test"}`,
+			"duplicate engine":         `{"search_engine":"search_std","search_engine":"search_pro","search_query":"test"}`,
+			"escaped duplicate":        `{"search_engine":"search_std","search_\u0065ngine":"search_pro","search_query":"test"}`,
+			"case variant engine":      `{"search_engine":"search_pro","SEARCH_ENGINE":"search_std","search_query":"test"}`,
+			"case variant only":        `{"SEARCH_ENGINE":"search_std","search_query":"test"}`,
+			"unicode folded key":       `{"search_engine":"search_pro","\u017fearch_engine":"search_std","search_query":"test"}`,
+			"empty query":              `{"search_engine":"search_std","search_query":" "}`,
+			"long query":               fmt.Sprintf(`{"search_engine":"search_std","search_query":"%s"}`, strings.Repeat("x", 71)),
+			"zero count":               `{"search_engine":"search_std","search_query":"test","count":0}`,
+			"sogou count too large":    `{"search_engine":"search_pro_sogou","search_query":"test","count":51}`,
+			"quark count too large":    `{"search_engine":"search_pro_quark","search_query":"test","count":51}`,
+			"invalid recency":          `{"search_engine":"search_std","search_query":"test","search_recency_filter":"week"}`,
+			"invalid content size":     `{"search_engine":"search_std","search_query":"test","content_size":"small"}`,
+			"short request id":         `{"search_engine":"search_std","search_query":"test","request_id":"a"}`,
 		}
 		for name, body := range cases {
 			t.Run(name, func(t *testing.T) {

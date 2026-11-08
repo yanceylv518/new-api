@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 const maxZhipuSearchErrorJSONDepth = 16
@@ -175,6 +176,14 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		}
 		if err := effective.Validate(); err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+	}
+
+	if effective.SearchIntent == nil {
+		var err error
+		jsonData, err = sjson.SetBytes(jsonData, "search_intent", false)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
 	}
 

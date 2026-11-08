@@ -2700,14 +2700,15 @@
             "description": "搜索引擎；不同引擎按各自的每次价格计费。"
           },
           "search_query": {"type": "string", "minLength": 1, "maxLength": 70},
-          "search_intent": {"type": "boolean", "description": "是否先判断搜索意图；建议显式填写，false 为直接搜索。"},
+          "search_intent": {"type": "boolean", "default": false, "description": "是否先判断搜索意图；false 为直接搜索。客户端省略时，网关在转发前补充官方默认值 false。官方字段须使用准确拼写，不能重复或传入 null。"},
           "count": {
             "type": "integer", "minimum": 1, "maximum": 50,
-            "description": "结果条数；搜狗引擎当前接口实测接受 1 和 11，但智谱文档仅列出 10 的倍数。夸克引擎当前接口实测可用，但智谱文档未列入支持范围。智谱文档提示同时指定域名和时间过滤时 count 可能不生效，具体以实际响应为准。"
+            "default": 10,
+            "description": "结果条数，范围 1–50，默认 10。支持 search_std、search_pro、search_pro_sogou；搜狗仅允许 10、20、30、40、50。搜狗同时指定 search_domain_filter 和 search_recency_filter 时，count 不生效。search_pro_quark 不支持此字段。"
           },
-          "search_domain_filter": {"type": "string", "description": "白名单域名；夸克引擎当前接口实测可用，但智谱文档未列入支持范围。"},
+          "search_domain_filter": {"type": "string", "description": "白名单域名，如 www.example.com；支持 search_std、search_pro、search_pro_sogou。search_pro_quark 不支持此字段。"},
           "search_recency_filter": {
-            "type": "string", "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"]
+            "type": "string", "default": "noLimit", "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"]
           },
           "content_size": {"type": "string", "enum": ["medium", "high"]},
           "request_id": {"type": "string", "minLength": 6, "maxLength": 64},

@@ -29,26 +29,43 @@ func IsZhipuSearchEngine(engine string) bool {
 	}
 }
 
+// 保留原导出入口，统一校验全部官方请求字段的拼写、重复项和 null 值。
 func ValidateZhipuSearchEngineField(body []byte) error {
 	trimmed := bytes.TrimSpace(body)
 	if !gjson.ValidBytes(body) || len(trimmed) == 0 || trimmed[0] != '{' {
 		return errors.New("search request must be a JSON object")
 	}
-	found, invalid := false, false
-	gjson.GetBytes(body, "@keys").ForEach(func(_, key gjson.Result) bool {
+	fields := [...]string{"search_engine", "search_query", "search_intent", "count", "search_domain_filter", "search_recency_filter", "content_size", "request_id", "user_id"}
+	seen := make(map[string]bool, len(fields))
+	var fieldErr error
+	gjson.ParseBytes(body).ForEach(func(key, value gjson.Result) bool {
 		name := key.String()
-		if !strings.EqualFold(name, "search_engine") {
+		officialName := ""
+		for _, field := range fields {
+			if strings.EqualFold(name, field) {
+				officialName = field
+				break
+			}
+		}
+		if officialName == "" {
 			return true
 		}
-		if found || name != "search_engine" {
-			invalid = true
+		if name != officialName || seen[officialName] {
+			fieldErr = fmt.Errorf("%s must be provided at most once with the correct spelling", officialName)
 			return false
 		}
-		found = true
+		if value.Type == gjson.Null {
+			fieldErr = fmt.Errorf("%s cannot be null", officialName)
+			return false
+		}
+		seen[officialName] = true
 		return true
 	})
-	if !found || invalid {
-		return errors.New("search_engine must be provided exactly once with the correct spelling")
+	if fieldErr != nil {
+		return fieldErr
+	}
+	if !seen["search_engine"] || !seen["search_query"] {
+		return errors.New("search_engine and search_query are required")
 	}
 	return nil
 }
@@ -77,6 +94,15 @@ func (r *ZhipuWebSearchRequest) Validate() error {
 		if *r.Count < 1 || *r.Count > 50 {
 			return errors.New("count must be between 1 and 50")
 		}
+		if r.SearchEngine == ZhipuSearchProSogou && *r.Count%10 != 0 {
+			return errors.New("search_pro_sogou count must be one of 10, 20, 30, 40, 50")
+		}
+		if r.SearchEngine == ZhipuSearchProQuark {
+			return errors.New("count is not supported by search_pro_quark")
+		}
+	}
+	if r.SearchEngine == ZhipuSearchProQuark && r.SearchDomainFilter != nil {
+		return errors.New("search_domain_filter is not supported by search_pro_quark")
 	}
 	if r.SearchRecencyFilter != nil {
 		switch *r.SearchRecencyFilter {

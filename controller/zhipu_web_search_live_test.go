@@ -215,11 +215,11 @@ func TestZhipuWebSearchLive(t *testing.T) {
 			if tc.engine == dto.ZhipuSearchStd || tc.engine == dto.ZhipuSearchPro {
 				payload["count"] = 3
 			} else if tc.engine == dto.ZhipuSearchProSogou {
-				payload["count"] = 11
-			} else if tc.engine == dto.ZhipuSearchProQuark {
-				payload["count"] = 2
+				payload["count"] = 20
 			}
-			payload["search_domain_filter"] = "www.sohu.com"
+			if tc.engine != dto.ZhipuSearchProQuark {
+				payload["search_domain_filter"] = "www.sohu.com"
+			}
 			if tc.fullOptions {
 				payload["search_domain_filter"] = "www.gov.cn"
 				payload["search_recency_filter"] = "oneYear"

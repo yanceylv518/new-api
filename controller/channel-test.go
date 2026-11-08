@@ -790,7 +790,7 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			return &dto.ZhipuWebSearchRequest{
 				SearchEngine: model,
 				SearchQuery:  "人工智能",
-				Count:        lo.ToPtr(1),
+				SearchIntent: lo.ToPtr(false),
 			}
 		case constant.EndpointTypeEmbeddings:
 			// 返回 EmbeddingRequest
