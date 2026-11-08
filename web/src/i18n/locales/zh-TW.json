@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "標頭清單不能超過 2048 位元組。",
+    "Separate header names with an English comma (,).": "請用半形逗號 (,) 分隔標頭名稱。",
+    "Remove the extra comma or enter a header name.": "請刪除多餘的逗號，或補上標頭名稱。",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "請輸入有效的 HTTP 標頭名稱，每個最多 128 個字元。多個名稱請用半形逗號 (,) 分隔。",
+    "Sensitive headers cannot be used as request IDs.": "不能使用敏感標頭作為請求 ID。",
+    "Enter at most 16 additional header names.": "最多可填寫 16 個額外標頭名稱。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "建議保持此值較高，以避免上游限流。",
     "Record IP Address": "記錄 IP 地址",
     "Record quota usage": "記錄配額使用量",
+    "Additional upstream request ID headers": "額外的上游請求 ID 回應標頭",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "按優先順序填寫標頭名稱，以半形逗號分隔。系統會優先檢查內建的請求 ID 標頭。",
     "Record streaming request timeline": "記錄串流請求時間線",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "時間記錄於本服務內部。寫出完成不代表用戶端已收到。",
     "Recover auto-disabled channels only": "僅恢復自動停用的渠道",

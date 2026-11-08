@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "ヘッダー一覧は 2048 バイト以内で入力してください。",
+    "Separate header names with an English comma (,).": "ヘッダー名は半角カンマ (,) で区切ってください。",
+    "Remove the extra comma or enter a header name.": "余分なカンマを削除するか、ヘッダー名を入力してください。",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "有効な HTTP ヘッダー名を各 128 文字以内で入力し、半角カンマ (,) で区切ってください。",
+    "Sensitive headers cannot be used as request IDs.": "機密ヘッダーはリクエスト ID として使用できません。",
+    "Enter at most 16 additional header names.": "追加ヘッダーは最大 16 個です。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "アップストリームのスロットリングを避けるため、これを高く保つことを推奨します。",
     "Record IP Address": "IPアドレスを記録",
     "Record quota usage": "クォータ使用量を記録",
+    "Additional upstream request ID headers": "上流リクエスト ID の追加ヘッダー",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "優先順にヘッダー名をカンマで区切って入力してください。標準のリクエスト ID ヘッダーが優先されます。",
     "Record streaming request timeline": "ストリーミングリクエストのタイムラインを記録",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "本サービス内部の記録です。書き出し完了はクライアントの受信を保証しません。",
     "Recover auto-disabled channels only": "自動無効化されたチャネルの復旧のみ",

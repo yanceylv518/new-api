@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import i18next from 'i18next'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -43,6 +44,7 @@ import {
   FormDescription,
   FormField,
   FormLabel,
+  FormItem,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
@@ -81,6 +83,34 @@ import type { LogCleanupTask } from '../types'
 const logSettingsSchema = z.object({
   LogConsumeEnabled: z.boolean(),
   RequestTimelineEnabled: z.boolean(),
+  RequestTimelineRequestIDHeaders: z.string().superRefine((raw, ctx) => {
+    const fail = (message: string) =>
+      ctx.addIssue({ code: 'custom', message: i18next.t(message) })
+    if (new TextEncoder().encode(raw).length > 2048) {
+      return fail('The header list must be at most 2048 bytes.')
+    }
+    if (/[，、；;|｜\r\n\t]/.test(raw)) {
+      return fail('Separate header names with an English comma (,).')
+    }
+    if (/^ *$/.test(raw)) return
+    const names = new Set(['x-oneapi-request-id', 'x-request-id', 'request-id'])
+    for (const part of raw.split(',')) {
+      const name = part.replaceAll(/^ +| +$/g, '')
+      if (!name) return fail('Remove the extra comma or enter a header name.')
+      if (!/^[A-Za-z0-9!#$%&'*+.^_`~-]{1,128}$/.test(name)) {
+        return fail(
+          'Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).'
+        )
+      }
+      if (
+        /authorization|cookie|token|secret|key|credential|password/i.test(name)
+      ) {
+        return fail('Sensitive headers cannot be used as request IDs.')
+      }
+      names.add(name.toLowerCase())
+    }
+    if (names.size > 19) fail('Enter at most 16 additional header names.')
+  }),
 })
 
 type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
@@ -88,6 +118,7 @@ type LogSettingsFormValues = z.infer<typeof logSettingsSchema>
 type LogSettingsSectionProps = {
   defaultEnabled: boolean
   defaultTimelineEnabled?: boolean
+  defaultRequestIDHeaders?: string
 }
 
 type ServerLogInfo = {
@@ -144,18 +175,21 @@ function isActiveLogCleanupTask(task: LogCleanupTask | null) {
 export function LogSettingsSection({
   defaultEnabled,
   defaultTimelineEnabled = false,
+  defaultRequestIDHeaders = 'x-maas-requestid',
 }: LogSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
   const previousDefaults = useRef<LogSettingsFormValues>({
     LogConsumeEnabled: defaultEnabled,
     RequestTimelineEnabled: defaultTimelineEnabled,
+    RequestTimelineRequestIDHeaders: defaultRequestIDHeaders,
   })
   const form = useForm<LogSettingsFormValues>({
     resolver: zodResolver(logSettingsSchema),
     defaultValues: {
       LogConsumeEnabled: defaultEnabled,
       RequestTimelineEnabled: defaultTimelineEnabled,
+      RequestTimelineRequestIDHeaders: defaultRequestIDHeaders,
     },
   })
 
@@ -186,6 +220,7 @@ export function LogSettingsSection({
     const nextDefaults = {
       LogConsumeEnabled: defaultEnabled,
       RequestTimelineEnabled: defaultTimelineEnabled,
+      RequestTimelineRequestIDHeaders: defaultRequestIDHeaders,
     }
     form.reset(nextDefaults)
     // A successful first save can refresh both defaults while the second is
@@ -193,6 +228,7 @@ export function LogSettingsSection({
     for (const key of [
       'LogConsumeEnabled',
       'RequestTimelineEnabled',
+      'RequestTimelineRequestIDHeaders',
     ] as const) {
       if (
         draft[key] !== previousDefaults.current[key] &&
@@ -202,7 +238,7 @@ export function LogSettingsSection({
       }
     }
     previousDefaults.current = nextDefaults
-  }, [defaultEnabled, defaultTimelineEnabled, form])
+  }, [defaultEnabled, defaultTimelineEnabled, defaultRequestIDHeaders, form])
 
   useEffect(() => {
     fetchServerLogInfo()
@@ -293,9 +329,16 @@ export function LogSettingsSection({
         if (!result.success) return
       }
       if (values.RequestTimelineEnabled !== defaultTimelineEnabled) {
-        await updateOption.mutateAsync({
+        const result = await updateOption.mutateAsync({
           key: 'RequestTimelineEnabled',
           value: values.RequestTimelineEnabled,
+        })
+        if (!result.success) return
+      }
+      if (values.RequestTimelineRequestIDHeaders !== defaultRequestIDHeaders) {
+        await updateOption.mutateAsync({
+          key: 'RequestTimelineRequestIDHeaders',
+          value: values.RequestTimelineRequestIDHeaders,
         })
       }
     } catch {
@@ -429,6 +472,30 @@ export function LogSettingsSection({
                 </FormControl>
                 <FormMessage />
               </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='RequestTimelineRequestIDHeaders'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>
+                  {t('Additional upstream request ID headers')}
+                </FormLabel>
+                <FormControl>
+                  <Input
+                    {...field}
+                    placeholder='x-maas-requestid, x-trace-id'
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(
+                    'Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
             )}
           />
 

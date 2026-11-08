@@ -99,6 +99,7 @@ const OPERATIONS_SECTIONS = [
       <LogSettingsSection
         defaultEnabled={Boolean(settings.LogConsumeEnabled)}
         defaultTimelineEnabled={Boolean(settings.RequestTimelineEnabled)}
+        defaultRequestIDHeaders={settings.RequestTimelineRequestIDHeaders}
       />
     ),
   },

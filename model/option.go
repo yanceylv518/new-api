@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -51,6 +52,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableChannelEnabled"] = strconv.FormatBool(common.AutomaticDisableChannelEnabled)
 	common.OptionMap["AutomaticEnableChannelEnabled"] = strconv.FormatBool(common.AutomaticEnableChannelEnabled)
 	common.OptionMap["LogConsumeEnabled"] = strconv.FormatBool(common.LogConsumeEnabled)
+	common.OptionMap[requesttimeline.RequestIDHeadersOption] = requesttimeline.DefaultRequestIDHeaders
 	common.OptionMap["RequestTimelineEnabled"] = strconv.FormatBool(RequestTimelineCaptureEnabled.Load())
 	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(common.DisplayInCurrencyEnabled)
 	common.OptionMap["DisplayTokenStatEnabled"] = strconv.FormatBool(common.DisplayTokenStatEnabled)
@@ -216,6 +218,10 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == requesttimeline.RequestIDHeadersOption {
+		_, err := requesttimeline.ParseRequestIDHeaders(value)
+		return err
+	}
 	if key == "RequestTimelineEnabled" && value != "true" && value != "false" {
 		return errors.New("RequestTimelineEnabled must be true or false")
 	}
@@ -233,7 +239,7 @@ func validateOptionValue(key string, value string) error {
 
 func UpdateOption(key string, value string) error {
 	// Keep persisted and runtime timeline state consistent if a save fails.
-	if key == "RequestTimelineEnabled" {
+	if key == "RequestTimelineEnabled" || key == requesttimeline.RequestIDHeadersOption {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
 	if IsModelPricingOption(key) {
@@ -307,6 +313,11 @@ func updateOptionMap(key string, value string) (err error) {
 	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
+	if key == requesttimeline.RequestIDHeadersOption {
+		if err := requesttimeline.ConfigureRequestIDHeaders(value); err != nil {
+			return err
+		}
+	}
 	common.OptionMap[key] = value
 
 	// 检查是否是模型配置 - 使用更规范的方式处理

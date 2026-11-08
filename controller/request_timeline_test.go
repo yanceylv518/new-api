@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -438,6 +439,12 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	var savedOption model.Option
 	require.NoError(t, model.DB.Where(&model.Option{Key: "RequestTimelineEnabled"}).Take(&savedOption).Error)
 	assert.Equal(t, "true", savedOption.Value)
+	t.Cleanup(func() { require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders)) })
+	require.NoError(t, model.UpdateOption(requesttimeline.RequestIDHeadersOption, "X-Provider-Trace"))
+	require.Error(t, model.UpdateOption(requesttimeline.RequestIDHeadersOption, "Set-Cookie"))
+	var headerOption model.Option
+	require.NoError(t, model.DB.Where(&model.Option{Key: requesttimeline.RequestIDHeadersOption}).Take(&headerOption).Error)
+	assert.Equal(t, "X-Provider-Trace", headerOption.Value)
 	var version string
 	query := "select version()"
 	if dbType == common.DatabaseTypeSQLite {
@@ -688,6 +695,80 @@ func TestRequestTimelineTransportAndTerminalStates(t *testing.T) {
 			assert.Equal(t, tc.want, row.Result)
 			require.NotNil(t, row.ErrorKind)
 			assert.Equal(t, tc.kind, *row.ErrorKind)
+		})
+	}
+}
+
+func TestRequestTimelineCancellationAfterResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		beforeEnd    func(*requesttimeline.Trace)
+		completion   error
+		skipComplete bool
+		afterEnd     func(*requesttimeline.Trace)
+		localErr     error
+		contextErr   error
+		want, kind   string
+	}{
+		{name: "cancel_after_completion", contextErr: context.Canceled, want: "success"},
+		{name: "deadline_after_completion", contextErr: context.DeadlineExceeded, want: "success"},
+		{name: "cancel_before_final_output", completion: context.Canceled, contextErr: context.Canceled, want: "interrupted", kind: "client_disconnected"},
+		{name: "marker_without_completed_output", skipComplete: true, contextErr: context.Canceled, want: "interrupted", kind: "client_disconnected"},
+		{name: "write_failed_before_completion", beforeEnd: func(tr *requesttimeline.Trace) { tr.PayloadWritten(io.ErrClosedPipe) }, contextErr: context.Canceled, want: "interrupted", kind: "downstream_write_error"},
+		{name: "write_failed_after_completion", afterEnd: func(tr *requesttimeline.Trace) { tr.PayloadWritten(io.ErrClosedPipe) }, contextErr: context.Canceled, want: "interrupted", kind: "downstream_write_error"},
+		{name: "observed_disconnect", beforeEnd: func(tr *requesttimeline.Trace) { tr.StreamEnd("client_gone", context.Canceled, false) }, contextErr: context.Canceled, want: "interrupted", kind: "client_disconnected"},
+		{name: "relay_error_not_context_snapshot", localErr: context.Canceled, contextErr: context.Canceled, want: "interrupted", kind: "client_disconnected"},
+		{name: "processing_error", beforeEnd: func(tr *requesttimeline.Trace) { tr.LocalError("parse_error", "invalid response") }, want: "failed", kind: "local_error"},
+		{name: "next_attempt_canceled", afterEnd: func(tr *requesttimeline.Trace) { tr.BeginAttempt(1) }, contextErr: context.Canceled, want: "interrupted", kind: "client_disconnected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := requesttimeline.New(time.Now(), tc.name, 7, "kimi-k3")
+			tr.BeginAttempt(0)
+			tr.FirstResponse(time.Now())
+			tr.PayloadWritten(nil)
+			if tc.beforeEnd != nil {
+				tc.beforeEnd(tr)
+			}
+			tr.StreamEnd("done", nil, false)
+			tr.PayloadWritten(nil) // Adapter flushes its buffered final output.
+			if !tc.skipComplete {
+				tr.ResponseCompleted(tc.completion)
+			}
+			if tc.afterEnd != nil {
+				tc.afterEnd(tr)
+			}
+			record := tr.FreezeWithContext(tc.localErr, tc.contextErr)
+			require.NotNil(t, record)
+			assert.Equal(t, tc.want, record.Result)
+			if tc.kind == "" {
+				assert.Nil(t, record.ErrorKind)
+				assert.Nil(t, record.Data.FirstError)
+			} else {
+				require.NotNil(t, record.ErrorKind)
+				assert.Equal(t, tc.kind, *record.ErrorKind)
+				require.NotNil(t, record.Data.FirstError)
+			}
+		})
+	}
+}
+
+func TestRequestTimelineUnconfirmedResponseCannotHideCancellation(t *testing.T) {
+	for _, reason := range []string{"eof", "response.incomplete", "response.cancelled", "response.canceled"} {
+		t.Run(reason, func(t *testing.T) {
+			tr := requesttimeline.New(time.Now(), reason, 7, "model")
+			tr.PayloadWritten(nil)
+			if reason != "eof" {
+				tr.ObserveResponses(dto.ResponsesStreamResponse{Type: reason}, "", "")
+				tr.StreamEnd("done", nil, false)
+			} else {
+				tr.StreamEnd(reason, nil, false)
+			}
+			tr.ResponseCompleted(nil)
+			record := tr.FreezeWithContext(nil, context.Canceled)
+			require.NotNil(t, record)
+			assert.Equal(t, "interrupted", record.Result)
+			require.NotNil(t, record.ErrorKind)
+			assert.Equal(t, "client_disconnected", *record.ErrorKind)
 		})
 	}
 }
@@ -1188,6 +1269,59 @@ func TestRequestTimelineRealHTTPClientCancellationDuringFlush(t *testing.T) {
 	}
 }
 
+func TestRequestTimelineRealHTTPClientCloseAfterCompletion(t *testing.T) {
+	completed := make(chan struct{})
+	records := make(chan *requesttimeline.Record, 1)
+	router := gin.New()
+	router.POST("/stream", func(c *gin.Context) {
+		trace := requesttimeline.New(time.Now(), "close-after-done", 7, "kimi-k3")
+		restore := helper.ObserveRequestTimelineWriter(c, trace)
+		defer restore()
+		trace.FirstResponse(time.Now())
+		helper.SetEventStreamHeaders(c)
+		_ = helper.StringData(c, `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		trace.StreamEnd("done", nil, false)
+		helper.Done(c)
+		trace.ResponseCompleted(c.Request.Context().Err())
+		close(completed)
+		// Keep the handler in its cleanup phase until the real client closes.
+		select {
+		case <-c.Request.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Error("server did not observe client closing the completed stream")
+		}
+		records <- trace.FreezeWithContext(nil, c.Request.Context().Err())
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/stream", nil)
+	require.NoError(t, err)
+	resp, err := server.Client().Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		if strings.TrimSpace(line) == "data: [DONE]" {
+			break
+		}
+	}
+	<-completed
+	require.NoError(t, resp.Body.Close())
+	select {
+	case record := <-records:
+		require.NotNil(t, record)
+		assert.Equal(t, "success", record.Result)
+		assert.Nil(t, record.ErrorKind)
+		assert.Nil(t, record.Data.FirstError)
+	case <-ctx.Done():
+		t.Fatal("completed request was not finalized")
+	}
+}
+
 func TestRequestTimelineDistinguishesCancellationDeadlineAndWriteErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -1401,18 +1535,18 @@ func TestRequestTimelineResponseHeaderBoundsAndFallbackIsolation(t *testing.T) {
 	assert.LessOrEqual(t, len(raw), requesttimeline.MaxDataBytes)
 }
 
-func TestRequestTimelineMassRequestIDHeader(t *testing.T) {
+func TestRequestTimelineMaasRequestIDHeader(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		headers map[string]string
 		want    string
 	}{
-		{"lowercase", map[string]string{"x-mass-requestid": "mass-lower"}, "mass-lower"},
-		{"mixed_case", map[string]string{"X-MaSs-ReQuEsTiD": "mass-mixed"}, "mass-mixed"},
-		{"oneapi_priority", map[string]string{"X-Oneapi-Request-Id": "oneapi", "X-Request-Id": "standard", "Request-Id": "legacy", "x-mass-requestid": "mass"}, "oneapi"},
-		{"standard_priority", map[string]string{"X-Request-Id": "standard", "Request-Id": "legacy", "x-mass-requestid": "mass"}, "standard"},
-		{"legacy_priority", map[string]string{"Request-Id": "legacy", "x-mass-requestid": "mass"}, "legacy"},
-		{"empty_preferred_header", map[string]string{"X-Oneapi-Request-Id": "", "x-mass-requestid": "mass-fallback"}, "mass-fallback"},
+		{"lowercase", map[string]string{"x-maas-requestid": "maas-lower"}, "maas-lower"},
+		{"mixed_case", map[string]string{"X-MaAs-ReQuEsTiD": "maas-mixed"}, "maas-mixed"},
+		{"oneapi_priority", map[string]string{"X-Oneapi-Request-Id": "oneapi", "X-Request-Id": "standard", "Request-Id": "legacy", "x-maas-requestid": "maas"}, "oneapi"},
+		{"standard_priority", map[string]string{"X-Request-Id": "standard", "Request-Id": "legacy", "x-maas-requestid": "maas"}, "standard"},
+		{"legacy_priority", map[string]string{"Request-Id": "legacy", "x-maas-requestid": "maas"}, "legacy"},
+		{"empty_preferred_header", map[string]string{"X-Oneapi-Request-Id": "", "x-maas-requestid": "maas-fallback"}, "maas-fallback"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1433,6 +1567,26 @@ func TestRequestTimelineMassRequestIDHeader(t *testing.T) {
 			assert.Equal(t, tc.want, record.Data.UpstreamRequestID)
 		})
 	}
+}
+
+func TestRequestTimelineConfiguredRequestIDHeaders(t *testing.T) {
+	t.Cleanup(func() {
+		require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders))
+	})
+	require.NoError(t, requesttimeline.ConfigureRequestIDHeaders("X-Trace-Id, x-trace-id, X-Other-Id"))
+	trace := requesttimeline.New(time.Now(), "before-update", 1, "model")
+	require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(""))
+	require.Error(t, requesttimeline.ConfigureRequestIDHeaders("X-Trace-Id, Authorization"))
+	require.Error(t, requesttimeline.ConfigureRequestIDHeaders("X Bad"))
+	for _, invalid := range []string{"X-A，X-B", "X-A;X-B", "X-A|X-B", "X-A X-B", "X-A,\nX-B", "X-A,,X-B", ",X-A", "X-A,"} {
+		require.Error(t, requesttimeline.ConfigureRequestIDHeaders(invalid), invalid)
+	}
+	resp := &http.Response{StatusCode: 200, Header: http.Header{"X-Trace-Id": {"first"}, "X-Other-Id": {"second"}}}
+	trace.Response(resp, nil)
+	assert.Equal(t, "first", trace.Freeze(nil).Data.UpstreamRequestID)
+	next := requesttimeline.New(time.Now(), "after-update", 1, "model")
+	next.Response(resp, nil)
+	assert.Empty(t, next.Freeze(nil).Data.UpstreamRequestID)
 }
 
 func TestRequestTimelineClaudeFailuresAndCaptureBounds(t *testing.T) {

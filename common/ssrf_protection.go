@@ -1,12 +1,15 @@
 package common
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 )
+
+var ErrPrivateIPNotAllowed = errors.New("private IP address not allowed")
 
 // SSRFProtection SSRF防护配置
 type SSRFProtection struct {
@@ -269,7 +272,7 @@ func (p *SSRFProtection) IsIPAccessAllowed(ip net.IP) bool {
 func (p *SSRFProtection) ipAccessError(host string, ip net.IP) error {
 	if host != "" {
 		if isPrivateIP(ip) && !p.AllowPrivateIp {
-			return fmt.Errorf("private IP address not allowed: %s resolves to %s", host, ip.String())
+			return fmt.Errorf("%w: %s resolves to %s", ErrPrivateIPNotAllowed, host, ip.String())
 		}
 		if p.IpFilterMode {
 			return fmt.Errorf("ip not in whitelist: %s resolves to %s", host, ip.String())
@@ -278,7 +281,7 @@ func (p *SSRFProtection) ipAccessError(host string, ip net.IP) error {
 	}
 
 	if isPrivateIP(ip) && !p.AllowPrivateIp {
-		return fmt.Errorf("private IP address not allowed: %s", ip.String())
+		return fmt.Errorf("%w: %s", ErrPrivateIPNotAllowed, ip.String())
 	}
 	if p.IpFilterMode {
 		return fmt.Errorf("ip not in whitelist: %s", ip.String())
@@ -366,7 +369,7 @@ func (p *SSRFProtection) ValidateURL(urlStr string) error {
 	// 解析域名对应IP并检查
 	ips, err := net.LookupIP(host)
 	if err != nil {
-		return fmt.Errorf("DNS resolution failed for %s: %v", host, err)
+		return fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 	}
 	for _, ip := range ips {
 		if err := p.ValidateResolvedIP(host, ip); err != nil {

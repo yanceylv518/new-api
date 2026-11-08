@@ -179,6 +179,7 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return nil, newApiErr
 		}
+		info.Timeline.ResponseCompleted(c.Request.Context().Err())
 		return usage, nil
 	}
 	if upstreamStream {

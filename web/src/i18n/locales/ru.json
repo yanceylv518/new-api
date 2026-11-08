@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "Список не должен превышать 2048 байт.",
+    "Separate header names with an English comma (,).": "Разделяйте имена заголовков запятой (,).",
+    "Remove the extra comma or enter a header name.": "Удалите лишнюю запятую или введите имя заголовка.",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "Введите допустимые имена HTTP-заголовков длиной до 128 символов, разделяя их запятой (,).",
+    "Sensitive headers cannot be used as request IDs.": "Конфиденциальные заголовки нельзя использовать как ID запроса.",
+    "Enter at most 16 additional header names.": "Введите не более 16 дополнительных имён.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "Рекомендуется поддерживать это значение высоким, чтобы избежать регулирования со стороны вышестоящего поставщика.",
     "Record IP Address": "Записывать IP-адрес",
     "Record quota usage": "Записывать использование квоты",
+    "Additional upstream request ID headers": "Дополнительные заголовки ID запроса к провайдеру",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "Введите имена через запятую в порядке приоритета. Встроенные заголовки ID запроса проверяются первыми.",
     "Record streaming request timeline": "Записывать временную шкалу потоковых запросов",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "Измерения внутри сервиса. Завершение записи не подтверждает получение клиентом.",
     "Recover auto-disabled channels only": "Только восстанавливать автоотключённые каналы",

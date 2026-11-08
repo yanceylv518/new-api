@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptrace"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"golang.org/x/net/http/httpguts"
 	"time"
 	"unicode/utf8"
 
@@ -17,6 +21,64 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
+
+const RequestIDHeadersOption = "RequestTimelineRequestIDHeaders"
+const DefaultRequestIDHeaders = "x-maas-requestid"
+
+var requestIDHeaders atomic.Value
+
+func init() {
+	headers, err := ParseRequestIDHeaders(DefaultRequestIDHeaders)
+	if err != nil {
+		panic(err)
+	}
+	requestIDHeaders.Store(headers)
+}
+
+// ParseRequestIDHeaders keeps the built-in priority and appends optional aliases.
+func ParseRequestIDHeaders(raw string) ([]string, error) {
+	headers := []string{common.RequestIdKey, "X-Request-Id", "Request-Id"}
+	if len(raw) > 2048 {
+		return nil, errors.New("request ID header list exceeds 2048 bytes")
+	}
+	if strings.ContainsAny(raw, "，、；;|｜\r\n\t") {
+		return nil, errors.New("separate request ID header names with an ASCII comma")
+	}
+	if strings.Trim(raw, " ") == "" {
+		return headers, nil
+	}
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.Trim(part, " ")
+		if name == "" {
+			return nil, errors.New("empty request ID header between or beside commas")
+		}
+		if !httpguts.ValidHeaderFieldName(name) || len(name) > 128 {
+			return nil, errors.New("invalid request ID header name")
+		}
+		lower := strings.ToLower(name)
+		for _, sensitive := range []string{"authorization", "cookie", "token", "secret", "key", "credential", "password"} {
+			if strings.Contains(lower, sensitive) {
+				return nil, errors.New("sensitive header names cannot be used as request IDs")
+			}
+		}
+		name = http.CanonicalHeaderKey(name)
+		if !slices.Contains(headers, name) {
+			if len(headers) >= 19 {
+				return nil, errors.New("at most 16 extra request ID headers are allowed")
+			}
+			headers = append(headers, name)
+		}
+	}
+	return headers, nil
+}
+
+func ConfigureRequestIDHeaders(raw string) error {
+	headers, err := ParseRequestIDHeaders(raw)
+	if err == nil {
+		requestIDHeaders.Store(headers)
+	}
+	return err
+}
 
 const Version = 1
 const MaxDataBytes = 16 << 10
@@ -169,10 +231,12 @@ type Trace struct {
 	attemptStartedMS int64
 	attemptEnded     bool
 	attemptBegun     bool
+	responseComplete bool
+	requestIDHeaders []string
 }
 
 func New(start time.Time, requestID string, userID int, model string) *Trace {
-	return &Trace{start: start, attemptNumber: 1, record: Record{RequestID: requestID, UserID: int64(userID), Result: "unknown", Data: Data{
+	return &Trace{start: start, requestIDHeaders: requestIDHeaders.Load().([]string), attemptNumber: 1, record: Record{RequestID: requestID, UserID: int64(userID), Result: "unknown", Data: Data{
 		Version: Version, StartedAtMS: start.UnixMilli(), RequestModel: bounded(model, 256), TimingValid: true,
 	}}}
 }
@@ -297,7 +361,7 @@ func (t *Trace) finishAttempt(err error) {
 		t.record.Result, t.record.ErrorKind = "interrupted", &kind
 	}
 	if t.record.Data.FirstError == nil {
-		if t.record.Data.EndMarkerReceived && t.record.Data.FirstWriteMS != nil && t.record.Data.FinishReason != "response.incomplete" && t.record.Data.FinishReason != "response.cancelled" && t.record.Data.FinishReason != "response.canceled" {
+		if t.completedSuccessfully() {
 			t.record.Result, t.record.ErrorKind = "success", nil
 		} else {
 			kind := "unconfirmed_end"
@@ -341,6 +405,28 @@ func (t *Trace) nextAttempt() {
 	t.attemptStartedMS = t.offset(time.Now())
 	t.requests, t.writes, t.secret, t.firstErrorAt = 0, 0, "", time.Time{}
 	t.claudeUsage, t.claudeStartUsage, t.attemptEnded = nil, nil, false
+	t.responseComplete = false
+}
+
+// completedSuccessfully requires mu. An upstream end marker alone does not
+// establish downstream completion: adapters may still have buffered output.
+func (t *Trace) completedSuccessfully() bool {
+	return t.record.Data.FirstError == nil && t.record.Data.EndMarkerReceived && t.record.Data.FirstWriteMS != nil &&
+		t.record.Data.FinishReason != "response.incomplete" && t.record.Data.FinishReason != "response.cancelled" && t.record.Data.FinishReason != "response.canceled"
+}
+
+// ResponseCompleted is called after the adapter has finished all response
+// writes, before billing/cleanup. Only a clean completion while the request is
+// still live allows a later context cancellation to be ignored at finalization.
+func (t *Trace) ResponseCompleted(clientErr error) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.finishObservation()
+	if !t.closed && !t.skipped && clientErr == nil && t.completedSuccessfully() {
+		t.responseComplete = true
+	}
 }
 
 func (t *Trace) Request(req *http.Request, channelID int, secret string) (observed *http.Request) {
@@ -422,7 +508,7 @@ func (t *Trace) Response(resp *http.Response, err error) {
 			}
 		}
 		t.record.Data.UpstreamResponseHeaders = headers
-		for _, key := range []string{common.RequestIdKey, "X-Request-Id", "Request-Id", "X-Mass-Requestid"} {
+		for _, key := range t.requestIDHeaders {
 			if value := resp.Header.Get(key); value != "" {
 				t.record.Data.UpstreamRequestID = bounded(value, 256)
 				break
@@ -851,6 +937,12 @@ func (t *Trace) ObserveResponses(response dto.ResponsesStreamResponse, code, mes
 }
 
 func (t *Trace) Freeze(localErr error) *Record {
+	return t.FreezeWithContext(localErr, nil)
+}
+
+// FreezeWithContext keeps a late context snapshot separate from an actual
+// relay error. Completion never suppresses observed write or processing errors.
+func (t *Trace) FreezeWithContext(localErr, clientErr error) *Record {
 	if t == nil {
 		return nil
 	}
@@ -863,6 +955,9 @@ func (t *Trace) Freeze(localErr error) *Record {
 	defer func() { t.secret = "" }()
 	if t.skipped {
 		return nil
+	}
+	if clientErr != nil && localErr == nil && t.record.Data.FirstError == nil && !t.responseComplete {
+		localErr = clientErr
 	}
 	t.finishAttempt(localErr)
 	if t.attemptNumber > 1 {

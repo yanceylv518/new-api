@@ -1,5 +1,11 @@
 {
   "translation": {
+    "The header list must be at most 2048 bytes.": "Danh sách không được vượt quá 2048 byte.",
+    "Separate header names with an English comma (,).": "Phân cách tên header bằng dấu phẩy (,).",
+    "Remove the extra comma or enter a header name.": "Xóa dấu phẩy thừa hoặc nhập tên header.",
+    "Use valid HTTP header names of up to 128 characters. Separate names with an English comma (,).": "Nhập tên header HTTP hợp lệ dài tối đa 128 ký tự và phân cách bằng dấu phẩy (,).",
+    "Sensitive headers cannot be used as request IDs.": "Không thể dùng header nhạy cảm làm ID yêu cầu.",
+    "Enter at most 16 additional header names.": "Nhập tối đa 16 tên header bổ sung.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",
@@ -4348,6 +4354,8 @@
     "Recommended to keep this high to avoid upstream throttling.": "Khuyến nghị giữ mức này cao để tránh điều tiết từ phía thượng nguồn.",
     "Record IP Address": "Ghi lại địa chỉ IP",
     "Record quota usage": "Ghi lại mức sử dụng hạn mức",
+    "Additional upstream request ID headers": "Header bổ sung cho ID yêu cầu thượng nguồn",
+    "Enter comma-separated header names in priority order. They are checked after the built-in request ID headers.": "Nhập tên header theo thứ tự ưu tiên, phân cách bằng dấu phẩy. Hệ thống kiểm tra các header ID yêu cầu tích hợp trước.",
     "Record streaming request timeline": "Ghi dòng thời gian yêu cầu truyền trực tiếp",
     "Recorded inside this service. A completed write does not confirm receipt by the client.": "Thời gian được ghi trong dịch vụ. Ghi hoàn tất không xác nhận máy khách đã nhận.",
     "Recover auto-disabled channels only": "Chỉ khôi phục kênh bị tự động vô hiệu hóa",

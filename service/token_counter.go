@@ -4,7 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/http"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -270,10 +274,13 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			// 而我们这里既然要计算 token，通常需要完整数据
 			cachedData, err := LoadFileSource(c, file.Source, "token_counter")
 			if err != nil {
-				if shouldFetchFiles {
-					return 0, fmt.Errorf("error getting file type: %v", err)
+				if !shouldFetchFiles {
+					continue
 				}
-				continue
+				if inputErr := invalidImageURLFetchError(info, file, err); inputErr != nil {
+					return 0, inputErr
+				}
+				return 0, fmt.Errorf("error getting file type: %v", err)
 			}
 			file.FileType = DetectFileType(cachedData.MimeType)
 		}
@@ -304,6 +311,58 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 
 	common.SetContextKey(c, constant.ContextKeyPromptTokens, tkm)
 	return tkm, nil
+}
+
+func invalidImageURLFetchError(info *relaycommon.RelayInfo, file *types.FileMeta, fetchErr error) *types.NewAPIError {
+	src, ok := file.Source.(*types.URLSource)
+	if !ok || file.FileType != types.FileTypeImage {
+		return nil
+	}
+	var reason string
+	switch {
+	case strings.ContainsAny(src.URL, "\x00\r\n\t"):
+		reason = "contains an invalid control character"
+	case errors.Is(fetchErr, errFileURLNotFound):
+		reason = "returned HTTP 404"
+	case errors.Is(fetchErr, common.ErrPrivateIPNotAllowed):
+		reason = "is not allowed"
+	default:
+		parsed, err := url.Parse(src.URL)
+		if err != nil {
+			return nil
+		}
+		var dnsErr *net.DNSError
+		if errors.As(fetchErr, &dnsErr) && dnsErr.IsNotFound && strings.EqualFold(dnsErr.Name, parsed.Hostname()) {
+			reason = "host could not be found"
+		} else if parsed.Port() != "" {
+			port, err := strconv.ParseUint(parsed.Port(), 10, 16)
+			if err == nil && port > 0 {
+				return nil
+			}
+			reason = "contains an invalid port"
+		} else {
+			return nil
+		}
+	}
+	var field string
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		return types.WithClaudeError(types.ClaudeError{
+			Type:    "invalid_request_error",
+			Message: "image URL " + reason,
+		}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	case types.RelayFormatOpenAIResponses:
+		field = "image_url"
+	case types.RelayFormatOpenAI:
+		if info.RelayMode != constant2.RelayModeChatCompletions {
+			return nil
+		}
+		field = "image_url.url"
+	default:
+		return nil
+	}
+	return types.NewError(fmt.Errorf("%s %s", field, reason), types.ErrorCodeInvalidRequest,
+		types.ErrOptionWithStatusCode(http.StatusBadRequest), types.ErrOptionWithSkipRetry())
 }
 
 func CountTokenRealtime(info *relaycommon.RelayInfo, request dto.RealtimeEvent, model string) (int, int, error) {

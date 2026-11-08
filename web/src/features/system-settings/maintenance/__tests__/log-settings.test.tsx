@@ -63,6 +63,58 @@ function mountLogSettings(enabled = false, liveOptions = false) {
 }
 
 describe('stream timeline system option', () => {
+  it('blocks all saves on malformed separators and accepts a corrected list', async () => {
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    mountLogSettings()
+    const input = screen.getByRole('textbox', {
+      name: 'Additional upstream request ID headers',
+    })
+    await user.click(screen.getByRole('switch', { name: 'Record quota usage' }))
+    const save = screen.getByRole('button', { name: 'Save log settings' })
+    for (const [value, error] of [
+      ['X-A，X-B', 'Separate header names with an English comma (,).'],
+      ['X-A;X-B', 'Separate header names with an English comma (,).'],
+      ['X-A,,X-B', 'Remove the extra comma or enter a header name.'],
+    ]) {
+      await user.clear(input)
+      await user.type(input, value)
+      await user.click(save)
+      expect(await screen.findByText(error)).toBeVisible()
+      expect(put).not.toHaveBeenCalled()
+    }
+    await user.clear(input)
+    await user.type(input, 'X-A, X-B')
+    await user.click(save)
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith('/api/option/', {
+        key: 'RequestTimelineRequestIDHeaders',
+        value: 'X-A, X-B',
+      })
+    )
+  })
+  it('saves the ordered upstream request ID aliases independently', async () => {
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    mountLogSettings()
+    const input = screen.getByRole('textbox', {
+      name: 'Additional upstream request ID headers',
+    })
+    expect(input).toHaveValue('x-maas-requestid')
+    await user.type(input, ', x-trace-id')
+    await user.click(screen.getByRole('button', { name: 'Save log settings' }))
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith('/api/option/', {
+        key: 'RequestTimelineRequestIDHeaders',
+        value: 'x-maas-requestid, x-trace-id',
+      })
+    )
+    expect(put).toHaveBeenCalledTimes(1)
+  })
   it('defaults to off and saves only the timeline option after a keyboard toggle', async () => {
     const put = vi
       .spyOn(api, 'put')
