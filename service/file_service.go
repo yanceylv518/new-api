@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/image/webp"
@@ -153,6 +155,8 @@ func CleanupFileSources(c *gin.Context) {
 	}
 }
 
+var errFileURLNotFound = errors.New("failed to download file, status code: 404")
+
 // loadFromURL 从 URL 加载文件
 func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFileData, error) {
 	// 下载文件
@@ -168,6 +172,10 @@ func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFil
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		// A worker's own 404 does not establish that the image is missing.
+		if resp.StatusCode == http.StatusNotFound && !system_setting.EnableWorker() {
+			return nil, errFileURLNotFound
+		}
 		return nil, fmt.Errorf("failed to download file, status code: %d", resp.StatusCode)
 	}
 
