@@ -6,24 +6,28 @@ import (
 )
 
 type InMemoryRateLimiter struct {
-	store               map[string]*[]int64
-	successReservations map[string]int
-	mutex               sync.Mutex
-	expirationDuration  time.Duration
+	initOnce           sync.Once
+	store              map[string]*[]int64
+	successWindows     map[string]*successWindow
+	mutex              sync.Mutex
+	expirationDuration time.Duration
+}
+
+type successWindow struct {
+	completed []int64
+	pending   int
+	duration  int64
 }
 
 func (l *InMemoryRateLimiter) Init(expirationDuration time.Duration) {
-	if l.store == nil {
-		l.mutex.Lock()
-		if l.store == nil {
-			l.store = make(map[string]*[]int64)
-			l.expirationDuration = expirationDuration
-			if expirationDuration > 0 {
-				go l.clearExpiredItems()
-			}
+	l.initOnce.Do(func() {
+		l.store = make(map[string]*[]int64)
+		l.successWindows = make(map[string]*successWindow)
+		l.expirationDuration = expirationDuration
+		if expirationDuration > 0 {
+			go l.clearExpiredItems()
 		}
-		l.mutex.Unlock()
-	}
+	})
 }
 
 func (l *InMemoryRateLimiter) clearExpiredItems() {
@@ -38,54 +42,52 @@ func (l *InMemoryRateLimiter) clearExpiredItems() {
 				delete(l.store, key)
 			}
 		}
+		for key, window := range l.successWindows {
+			n := len(window.completed)
+			if window.pending == 0 && (n == 0 || now-window.completed[n-1] >= window.duration) {
+				delete(l.successWindows, key)
+			}
+		}
 		l.mutex.Unlock()
 	}
 }
 
-// ReserveSuccess 预留成功名额；完成回调幂等，失败释放，成功按完成时间计入窗口。
+// ReserveSuccess 预留成功名额，失败后释放，成功按完成时间计入窗口。
 // duration 的单位是秒；不限制时返回 nil 回调。
-func (l *InMemoryRateLimiter) ReserveSuccess(key string, maxRequestNum int, duration int64) (func(bool), bool) {
-	if maxRequestNum <= 0 || duration <= 0 {
+func (l *InMemoryRateLimiter) ReserveSuccess(key string, limit int, duration int64) (func(bool), bool) {
+	if limit <= 0 || duration <= 0 {
 		return nil, true
 	}
 	l.mutex.Lock()
-	now := time.Now().Unix()
-	count := 0
-	if queue := l.store[key]; queue != nil {
-		expired := 0
-		for expired < len(*queue) && now-(*queue)[expired] >= duration {
-			expired++
-		}
-		*queue = (*queue)[expired:]
-		count = len(*queue)
+	defer l.mutex.Unlock()
+	window := l.successWindows[key]
+	if window == nil {
+		window = &successWindow{}
+		l.successWindows[key] = window
 	}
-	if count >= maxRequestNum || l.successReservations[key] >= maxRequestNum-count {
-		l.mutex.Unlock()
+	window.duration = duration
+	now := time.Now().Unix()
+	for len(window.completed) > 0 && now-window.completed[0] >= duration {
+		window.completed = window.completed[1:]
+	}
+	if len(window.completed)+window.pending >= limit {
 		return nil, false
 	}
-	if l.successReservations == nil {
-		l.successReservations = make(map[string]int)
-	}
-	l.successReservations[key]++
-	l.mutex.Unlock()
-	var once sync.Once
+	window.pending++
+	finished := false
 	return func(success bool) {
-		once.Do(func() {
-			l.mutex.Lock()
-			defer l.mutex.Unlock()
-			l.successReservations[key]--
-			if l.successReservations[key] == 0 {
-				delete(l.successReservations, key)
-			}
-			if success {
-				queue := l.store[key]
-				if queue == nil {
-					queue = &[]int64{}
-					l.store[key] = queue
-				}
-				*queue = append(*queue, time.Now().Unix())
-			}
-		})
+		l.mutex.Lock()
+		defer l.mutex.Unlock()
+		if finished {
+			return
+		}
+		finished = true
+		window.pending--
+		if success {
+			window.completed = append(window.completed, time.Now().Unix())
+		} else if window.pending == 0 && len(window.completed) == 0 {
+			delete(l.successWindows, key)
+		}
 	}, true
 }
 

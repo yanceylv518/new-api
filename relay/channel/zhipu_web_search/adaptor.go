@@ -89,9 +89,15 @@ func ReadResponseBody(resp *http.Response, info *relaycommon.RelayInfo) ([]byte,
 	}
 	decoded := false
 	if encoding != "" {
-		encodings := strings.Split(encoding, ",")
+		encodings := strings.Split(strings.ToLower(encoding), ",")
+		var zstdLayers int64
+		for _, coding := range encodings {
+			if strings.TrimSpace(coding) == "zstd" {
+				zstdLayers++
+			}
+		}
 		for i := len(encodings) - 1; i >= 0; i-- {
-			switch strings.ToLower(strings.TrimSpace(encodings[i])) {
+			switch strings.TrimSpace(encodings[i]) {
 			case "identity":
 			case "gzip":
 				gzipReader, err := gzip.NewReader(reader)
@@ -115,8 +121,16 @@ func ReadResponseBody(resp *http.Response, info *relaycommon.RelayInfo) ([]byte,
 			case "zstd":
 				var options []zstd.DOption
 				if maxBytes > 0 {
-					// 输出限额无法阻止解码器预先分配历史窗口，必须在读取帧头前约束窗口。
-					options = append(options, zstd.WithDecoderMaxMemory(uint64(maxBytes)))
+					// 嵌套解码器同时持有窗口，共用本次响应的窗口预算。
+					window := maxBytes / zstdLayers
+					if window < zstd.MinWindowSize {
+						return nil, ErrResponseBodyTooLarge
+					}
+					options = []zstd.DOption{
+						zstd.WithDecoderMaxMemory(uint64(window)),
+						zstd.WithDecoderConcurrency(1),
+						zstd.WithDecodeBuffersBelow(0),
+					}
 				}
 				zstdReader, err := zstd.NewReader(reader, options...)
 				if err != nil {
@@ -142,6 +156,9 @@ func ReadResponseBody(resp *http.Response, info *relaycommon.RelayInfo) ([]byte,
 		return nil, fmt.Errorf("%w: %d MiB", ErrResponseBodyTooLarge, info.ChannelSetting.MaxResponseBodyMiB)
 	}
 	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
+		return nil, fmt.Errorf("%w: %w", ErrResponseBodyTooLarge, err)
+	}
 	if err != nil {
 		return body, err
 	}

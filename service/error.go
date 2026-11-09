@@ -117,9 +117,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		return
 	}
 
-	if selectedError := dto.ExtractJSONError(responseBody); len(selectedError) > 0 {
-		errResponse.Error = selectedError
-	}
+	errResponse.Error = dto.ExtractJSONError(responseBody)
 	if common.GetJsonType(errResponse.Error) == "object" {
 		// General format error (OpenAI, Anthropic, Gemini, etc.)
 		oaiError := errResponse.TryToOpenAIError()

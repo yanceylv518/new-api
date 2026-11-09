@@ -95,6 +95,13 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 		end := match[1]
 		var decoded string
 		if err := UnmarshalJsonStr(value[match[0]:end], &decoded); err != nil {
+			// 普通文本中的英寸符号等引号不是 JSON 起始符。无转义时，
+			// 后续的明文密钥、认证头和字段脱敏仍然适用。
+			prefix := strings.TrimRight(value[:match[0]], " \t\r\n")
+			if len(prefix) > 0 && strings.IndexByte("{[:,", prefix[len(prefix)-1]) < 0 &&
+				!strings.Contains(value[match[0]:end], "\\") {
+				continue
+			}
 			// 未闭合或无法解码的字符串可能包含转义凭证，整体隐藏该片段。
 			result.WriteString(value[last:match[0]])
 			result.WriteString(`"***"`)

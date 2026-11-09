@@ -164,3 +164,12 @@ func TestMaskCredentialsDecodedKnownKey(t *testing.T) {
 	input := `{"message":"fixture-a\u0026b","code":"denied"}`
 	require.Equal(t, `{"message":"***","code":"denied"}`, MaskCredentials(input, "fixture-a&b"))
 }
+
+func TestMaskCredentialsPreservesQuotesInDiagnostics(t *testing.T) {
+	for _, text := range []string{
+		`The 24" display is unavailable; retry tomorrow.`,
+		`{"error":{"message":"The 24\" display is unavailable; retry tomorrow."}}`,
+	} {
+		require.Equal(t, text, MaskCredentials(text))
+	}
+}

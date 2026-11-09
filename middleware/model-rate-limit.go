@@ -11,7 +11,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/common/limiter"
 	"github.com/QuantumNous/new-api/constant"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting"
 
 	"github.com/gin-gonic/gin"
@@ -147,35 +146,19 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 			return
 		}
 
-		search := relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch
-		completed := false
-		if search {
-			finish, allowed := inMemoryRateLimiter.ReserveSuccess(successKey, successMaxCount, duration)
-			if !allowed {
-				c.AbortWithStatus(http.StatusTooManyRequests)
-				return
-			}
-			if finish != nil {
-				defer func() {
-					finish(completed && c.Writer.Status() < 400 && !common.GetContextKeyBool(c, constant.ContextKeyZhipuSearchBusinessError))
-				}()
-			}
-		} else {
-			checkKey := successKey + "_check"
-			if !inMemoryRateLimiter.Request(checkKey, successMaxCount, duration) {
-				c.AbortWithStatus(http.StatusTooManyRequests)
-				return
-			}
+		finish, allowed := inMemoryRateLimiter.ReserveSuccess(successKey, successMaxCount, duration)
+		if !allowed {
+			c.AbortWithStatus(http.StatusTooManyRequests)
+			return
 		}
-
-		// 3. 处理请求
+		if finish == nil {
+			c.Next()
+			return
+		}
+		success := false
+		defer func() { finish(success) }()
 		c.Next()
-		completed = true
-
-		// 4. 如果请求成功，记录到实际的成功请求计数中
-		if !search && c.Writer.Status() < 400 && !common.GetContextKeyBool(c, constant.ContextKeyZhipuSearchBusinessError) {
-			inMemoryRateLimiter.Request(successKey, successMaxCount, duration)
-		}
+		success = c.Writer.Status() < 400 && !common.GetContextKeyBool(c, constant.ContextKeyZhipuSearchBusinessError)
 	}
 }
 

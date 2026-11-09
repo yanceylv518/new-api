@@ -180,6 +180,11 @@ func (u *zhipuSearchUpstream) lastAuthorization() string {
 
 func setupZhipuSearchContract(t *testing.T) (*gin.Engine, *gorm.DB, *zhipuSearchUpstream) {
 	t.Helper()
+	return setupZhipuSearchContractForUser(t, 1)
+}
+
+func setupZhipuSearchContractForUser(t *testing.T, userID int) (*gin.Engine, *gorm.DB, *zhipuSearchUpstream) {
+	t.Helper()
 	baselineWorkers := gopool.WorkerCount()
 	require.NoError(t, i18n.Init())
 	previousDB, previousLogDB := model.DB, model.LOG_DB
@@ -242,7 +247,7 @@ func setupZhipuSearchContract(t *testing.T) (*gin.Engine, *gorm.DB, *zhipuSearch
 	upstream := &zhipuSearchUpstream{status: http.StatusOK, body: `{"id":"upstream-id","search_result":[{"title":"result"}],"extra":{"keep":true}}`}
 	upstreamServer := httptest.NewServer(upstream)
 	t.Cleanup(upstreamServer.Close)
-	user := model.User{Id: 1, Username: "search-fixture", Status: common.UserStatusEnabled, Group: "default", Quota: 10_000_000, Setting: `{"billing_preference":"wallet_only"}`}
+	user := model.User{Id: userID, Username: "search-fixture", Status: common.UserStatusEnabled, Group: "default", Quota: 10_000_000, Setting: `{"billing_preference":"wallet_only"}`}
 	token := model.Token{Id: 1, UserId: user.Id, Key: "fixturetoken", Name: "fixture", Status: common.TokenStatusEnabled, RemainQuota: 10_000_000, ExpiredTime: -1}
 	limited := model.Token{Id: 2, UserId: user.Id, Key: "limitedtoken", Name: "limited", Status: common.TokenStatusEnabled, RemainQuota: 10_000_000, ExpiredTime: -1, ModelLimitsEnabled: true, ModelLimits: "search_std"}
 	channel := model.Channel{Id: 1, Name: "search-fixture", Type: constant.ChannelTypeZhipuWebSearch, Status: common.ChannelStatusEnabled, Key: "upstream-placeholder", BaseURL: &upstreamServer.URL, Models: "search_std,search_pro,search_pro_sogou,search_pro_quark", Group: "default", AutoBan: common.GetPointer(0)}
@@ -271,8 +276,8 @@ func zhipuSearchBalances(t *testing.T, database *gorm.DB, tokenID int) (int, int
 	t.Helper()
 	var user model.User
 	var token model.Token
-	require.NoError(t, database.First(&user, 1).Error)
 	require.NoError(t, database.First(&token, tokenID).Error)
+	require.NoError(t, database.First(&user, token.UserId).Error)
 	return user.Quota, token.RemainQuota
 }
 
@@ -659,7 +664,7 @@ func TestZhipuSearchReportedIssues(t *testing.T) {
 
 	t.Run("empty error markers remain successful searches", func(t *testing.T) {
 		defer upstream.setResponse(http.StatusOK, success)
-		for _, tc := range []struct{ name, marker string }{{"null", "null"}, {"false", "false"}, {"empty string", `""`}} {
+		for _, tc := range []struct{ name, marker string }{{"null", "null"}, {"false", "false"}, {"empty string", `""`}, {"blank string", `"  "`}} {
 			t.Run(tc.name, func(t *testing.T) {
 				body := `{"error":` + tc.marker + `,"search_result":[{"title":"kept"}]}`
 				upstream.setResponse(http.StatusOK, body)
@@ -789,6 +794,41 @@ func TestZhipuSearchReportedIssues(t *testing.T) {
 func TestZhipuSearchZstdWindowLimit(t *testing.T) {
 	const payload = `{"search_engine":"search_std","search_query":"test"}`
 	const body = `{"search_result":[{"title":"kept"}]}`
+	t.Run("stacked windows share the channel budget", func(t *testing.T) {
+		engine, database, upstream := setupZhipuSearchContract(t)
+		data := []byte(body)
+		for range 2 {
+			var buf bytes.Buffer
+			writer, err := zstd.NewWriter(&buf, zstd.WithWindowSize(1<<20))
+			require.NoError(t, err)
+			_, err = writer.Write(data)
+			require.NoError(t, err)
+			require.NoError(t, writer.Flush())
+			require.NoError(t, writer.Close())
+			data = buf.Bytes()
+			var header zstd.Header
+			require.NoError(t, header.Decode(data))
+			require.EqualValues(t, 1<<20, header.WindowSize)
+		}
+		upstream.setResponse(http.StatusOK, string(data))
+		upstream.setResponseHeaders(http.Header{"Content-Encoding": {"zstd, zstd"}})
+		for _, limit := range []int{1, 2} {
+			require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", 1).
+				Update("setting", fmt.Sprintf(`{"max_response_body_mib":%d}`, limit)).Error)
+			before, beforeToken := zhipuSearchBalances(t, database, 1)
+			response := zhipuSearchRequest(engine, "/v1/web_search", payload, "fixturetoken")
+			if limit == 1 {
+				require.Equal(t, http.StatusBadGateway, response.Code)
+				require.Eventually(t, func() bool {
+					user, token := zhipuSearchBalances(t, database, 1)
+					return user == before && token == beforeToken
+				}, time.Second*5, 10*time.Millisecond)
+			} else {
+				require.Equal(t, http.StatusOK, response.Code)
+				require.Equal(t, body, response.Body.String())
+			}
+		}
+	})
 	for _, tc := range []struct {
 		name        string
 		channelType int
@@ -884,6 +924,35 @@ func TestZhipuSearchCompressedResponses(t *testing.T) {
 
 func TestZhipuSearchRedirects(t *testing.T) {
 	const payload = `{"search_engine":"search_std","search_query":"test"}`
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		charge int
+	}{
+		{"resource created", http.StatusCreated, `{"search_result":[{"title":"weather"}]}`, 685},
+		{"rate limited", http.StatusTooManyRequests, `{"error":{"message":"retry tomorrow"}}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, db, upstream := setupZhipuSearchContract(t)
+			headers := http.Header{"Location": {"https://catalog.example/resources/123"}}
+			if tc.status == http.StatusTooManyRequests {
+				headers.Set("Retry-After", "12")
+			}
+			upstream.setResponse(tc.status, tc.body)
+			upstream.setResponseHeaders(headers)
+			before, beforeToken := zhipuSearchBalances(t, db, 1)
+			res := zhipuSearchRequest(engine, "/v1/web_search", payload, "fixturetoken")
+			require.Equal(t, tc.status, res.Code, res.Body.String())
+			assert.Equal(t, tc.body, res.Body.String())
+			assert.Empty(t, res.Header().Get("Location"))
+			assert.Equal(t, headers.Get("Retry-After"), res.Header().Get("Retry-After"))
+			require.Eventually(t, func() bool {
+				user, token := zhipuSearchBalances(t, db, 1)
+				return before-user == tc.charge && beforeToken-token == tc.charge
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
 	t.Run("client credentials stay at gateway", func(t *testing.T) {
 		engine, database, upstream := setupZhipuSearchContract(t)
 		var targetCalls atomic.Int32
@@ -969,8 +1038,11 @@ func TestZhipuSearchRedirects(t *testing.T) {
 	})
 }
 
+var zhipuRateLimitTestUser atomic.Int64
+
 func TestZhipuSearchMemorySuccessLimit(t *testing.T) {
-	engine, database, responses := setupZhipuSearchContract(t)
+	// 限流状态跨请求及测试路由实例共享，为每轮测试分配独立用户。
+	engine, database, responses := setupZhipuSearchContractForUser(t, 100_000+int(zhipuRateLimitTestUser.Add(1)))
 	previousEnabled, previousTotal, previousSuccess := setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount
 	previousDuration := setting.ModelRequestRateLimitDurationMinutes
 	setting.ModelRequestRateLimitEnabled = true
@@ -1171,6 +1243,8 @@ func TestZhipuSearchErrorResponses(t *testing.T) {
 		compressed   bool
 	}{
 		{"plain error", "/v1/web_search", constant.ChannelTypeZhipuWebSearch, "/api/paas/v4/web_search", http.StatusTooManyRequests, "text/plain; charset=utf-8", "rate limit exceeded\n", "rate limit exceeded\n", false},
+		{"inch mark in text", "/v1/web_search", constant.ChannelTypeZhipuWebSearch, "/api/paas/v4/web_search", http.StatusBadRequest, "text/plain", `The 24" display is unavailable; retry tomorrow.`, `The 24" display is unavailable; retry tomorrow.`, false},
+		{"inch mark in JSON", "/v1/web_search", constant.ChannelTypeNewAPI, "/v1/web_search", http.StatusBadRequest, "application/json", `{"error":{"message":"The 24\" display is unavailable; retry tomorrow."}}`, `{"error":{"message":"The 24\" display is unavailable; retry tomorrow."}}`, false},
 		{"plain error with credential", "/api/paas/v4/web_search", constant.ChannelTypeNewAPI, "/v1/web_search", http.StatusUnauthorized, "text/plain; charset=utf-8", "upstream-placeholder rejected", "*** rejected", true},
 		{"JSON error without content type", "/v1/web_search", constant.ChannelTypeNewAPI, "/v1/web_search", http.StatusTooManyRequests, "", `{"error":{"code":"rate_limit","message":"limited"}}`, `{"error":{"code":"rate_limit","message":"limited"}}`, false},
 		{"success", "/api/paas/v4/web_search", constant.ChannelTypeZhipuWebSearch, "/api/paas/v4/web_search", http.StatusOK, "application/json", `{"id":"result","search_result":[]}`, `{"id":"result","search_result":[]}`, true},

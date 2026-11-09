@@ -301,7 +301,12 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		}
 	}
 	if err := sanitizeZhipuSearchRedirect(response, keys); err != nil {
-		return types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		response.Header.Del("Location")
+		switch response.StatusCode {
+		case http.StatusMultipleChoices, http.StatusMovedPermanently, http.StatusFound,
+			http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			return types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
 	}
 	successStatus := response.StatusCode >= 200 && response.StatusCode < 300
 	if c.Request.Method == http.MethodHead {

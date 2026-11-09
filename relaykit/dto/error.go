@@ -49,7 +49,8 @@ func ExtractJSONError(body []byte) json.RawMessage {
 	}
 	var exact, alias json.RawMessage
 	root.ForEach(func(key, value gjson.Result) bool {
-		if value.Type == gjson.Null || value.Type == gjson.False || (value.Type == gjson.String && value.Str == "") {
+		if value.Type == gjson.Null || value.Type == gjson.False ||
+			(value.Type == gjson.String && strings.TrimSpace(value.Str) == "") {
 			return true
 		}
 		name := key.String()
