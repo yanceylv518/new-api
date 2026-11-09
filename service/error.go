@@ -91,20 +91,18 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		newApiErr.Err = fmt.Errorf("read upstream error response: %w", err)
-		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, string(responseBody)))
+		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, common.SanitizeErrorLogContent(string(responseBody), knownKeys...)))
 		return
 	}
 	var errResponse dto.GeneralErrorResponse
-	responseBodyText := string(responseBody)
-	responseBodyPreview := common.LocalLogPreview(responseBodyText)
-	if len(knownKeys) > 0 {
-		responseBodyPreview = common.LocalLogPreview(common.MaskCredentials(responseBodyText, knownKeys...))
-	}
+	// 分别脱敏消息和正文，避免未闭合引号在拼接后改变 JSON 片段的识别边界。
+	responseBodyText := common.SanitizeErrorLogContent(string(responseBody), knownKeys...)
+	responseBodyPreview := common.LocalLogPreview(common.MaskCredentials(string(responseBody), knownKeys...))
 	buildErrWithBody := func(message string) error {
 		if message == "" {
 			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)
 		}
-		return fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, message, responseBodyText)
+		return fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, common.SanitizeErrorLogContent(message, knownKeys...), responseBodyText)
 	}
 
 	err = common.Unmarshal(responseBody, &errResponse)
@@ -119,6 +117,9 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		return
 	}
 
+	if selectedError := dto.ExtractJSONError(responseBody); len(selectedError) > 0 {
+		errResponse.Error = selectedError
+	}
 	if common.GetJsonType(errResponse.Error) == "object" {
 		// General format error (OpenAI, Anthropic, Gemini, etc.)
 		oaiError := errResponse.TryToOpenAIError()

@@ -6298,7 +6298,7 @@
     "Zhipu V4": "Zhipu V 4",
     "Zhipu Web Search": "Zhipu ウェブ検索",
     "Response body limit (MiB)": "レスポンスサイズの上限（MiB）",
-    "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.": "0 は無制限です。上限を超えるとエラーを返します。上流で成功した検索は課金されます。",
+    "0 means unlimited. Oversized responses return an error and refund the reserved quota.": "0 は無制限です。レスポンスが上限を超えるとエラーを返し、事前に差し引いたクォータを返還します。",
     "Web Search (/v1/web_search)": "ウェブ検索 (/v1/web_search)",
     "Zoom": "ズーム"
   }

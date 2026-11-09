@@ -3,6 +3,7 @@ package helper
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"strconv"
@@ -46,20 +47,16 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 			request = cached
 			break
 		}
-		search := &dto.ZhipuWebSearchRequest{}
-		err = common.UnmarshalBodyReusable(c, search)
+		var search *dto.ZhipuWebSearchRequest
+		var storage common.BodyStorage
+		storage, err = common.GetBodyStorage(c)
 		if err == nil {
-			var storage common.BodyStorage
-			storage, err = common.GetBodyStorage(c)
+			var body []byte
+			body, err = storage.Bytes()
 			if err == nil {
-				search.RawBody, err = storage.Bytes()
+				search, err = dto.ParseZhipuWebSearchRequest(body)
+				c.Request.Body = io.NopCloser(storage)
 			}
-		}
-		if err == nil {
-			err = dto.ValidateZhipuSearchEngineField(search.RawBody)
-		}
-		if err == nil {
-			err = search.Validate()
 		}
 		request = search
 

@@ -7,9 +7,11 @@ const (
 	ContextKeyPromptTokens    ContextKey = "prompt_tokens"
 	ContextKeyEstimatedTokens ContextKey = "estimated_tokens"
 
-	ContextKeyOriginalModel      ContextKey = "original_model"
-	ContextKeyRequestStartTime   ContextKey = "request_start_time"
-	ContextKeyZhipuSearchRequest ContextKey = "zhipu_search_request"
+	ContextKeyOriginalModel             ContextKey = "original_model"
+	ContextKeyRequestStartTime          ContextKey = "request_start_time"
+	ContextKeyZhipuSearchRequest        ContextKey = "zhipu_search_request"
+	ContextKeyZhipuSearchInvalidRequest ContextKey = "zhipu_search_invalid_request"
+	ContextKeyZhipuSearchBusinessError  ContextKey = "zhipu_search_business_error"
 
 	/* token related keys */
 	ContextKeyTokenUnlimited         ContextKey = "token_unlimited_quota"

@@ -6298,7 +6298,7 @@
     "Zhipu V4": "智譜 V4",
     "Zhipu Web Search": "智譜聯網搜尋",
     "Response body limit (MiB)": "回應內容大小上限（MiB）",
-    "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.": "0 表示不限。超限會傳回錯誤；上游已成功的搜尋仍按一次計費。",
+    "0 means unlimited. Oversized responses return an error and refund the reserved quota.": "0 表示不限。回應內容超限時會傳回錯誤，並退還預扣額度。",
     "Web Search (/v1/web_search)": "聯網搜尋 (/v1/web_search)",
     "Zoom": "縮放"
   }

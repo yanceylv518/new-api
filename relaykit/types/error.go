@@ -1,6 +1,7 @@
 package types
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +65,7 @@ const (
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
+	ErrorCodeRequestCancelled      ErrorCode = "request_cancelled"
 
 	// request error
 	ErrorCodeBadRequestBody ErrorCode = "bad_request_body"
@@ -332,6 +334,12 @@ func NewErrorWithStatusCode(err error, errorCode ErrorCode, statusCode int, ops 
 	return e
 }
 
+// NewRequestCancelledError 将客户端取消或截止时间到期标记为本地错误，避免重试和渠道处罚。
+func NewRequestCancelledError(err error) *NewAPIError {
+	return NewErrorWithStatusCode(err, ErrorCodeRequestCancelled, http.StatusRequestTimeout,
+		ErrOptionWithSkipRetry(), ErrOptionWithNoRecordErrorLog())
+}
+
 func WithOpenAIError(openAIError OpenAIError, statusCode int, ops ...NewAPIErrorOptions) *NewAPIError {
 	code, ok := openAIError.Code.(string)
 	if !ok {
@@ -394,6 +402,12 @@ func IsSkipRetryError(err *NewAPIError) bool {
 	}
 
 	return err.skipRetry
+}
+
+// IsRequestCancelledError 同时校验错误码和本地取消原因，避免上游同名错误绕过渠道处理。
+func IsRequestCancelledError(err *NewAPIError) bool {
+	return err != nil && err.errorCode == ErrorCodeRequestCancelled &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 func ErrOptionWithSkipRetry() NewAPIErrorOptions {

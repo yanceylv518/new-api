@@ -210,8 +210,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
+	skipZhipuSearchBilling := relayFormat == types.RelayFormatZhipuWebSearch && (common.GetContextKeyBool(c, constant.ContextKeyZhipuSearchInvalidRequest) || c.Request.Method == http.MethodHead || c.Request.Method == http.MethodOptions)
 	var priceData hosttypes.PriceData
-	if relayFormat == types.RelayFormatZhipuWebSearch {
+	if skipZhipuSearchBilling {
+		// 选路使用的引擎不代表实际请求，不能作为计费依据。
+		priceData.FreeModel = true
+		relayInfo.PriceData = priceData
+	} else if relayFormat == types.RelayFormatZhipuWebSearch {
 		priceData, err = helper.ZhipuSearchPriceData(c, relayInfo)
 	} else {
 		priceData, err = helper.ModelPriceHelper(c, relayInfo, tokens, meta)
@@ -223,9 +228,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)
 
-	if priceData.FreeModel {
+	if priceData.FreeModel && !skipZhipuSearchBilling {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
-	} else {
+	} else if !priceData.FreeModel {
 		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
 		relayInfo.ReservedDiscountAmounts = priceData.DiscountAmounts
 		if newAPIError != nil {
@@ -255,6 +260,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		if relayFormat == types.RelayFormatZhipuWebSearch {
+			if requestErr := c.Request.Context().Err(); requestErr != nil {
+				newAPIError = types.NewRequestCancelledError(requestErr)
+				break
+			}
+		}
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		timeline.BeginAttempt(relayInfo.RetryIndex)
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
@@ -302,6 +313,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		timeline.EndAttempt(newAPIError)
 		relayInfo.LastError = newAPIError
 
+		if types.IsRequestCancelledError(newAPIError) {
+			break
+		}
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 
 		if relayFormat == types.RelayFormatZhipuWebSearch && relayInfo.ZhipuWebSearchAttempted {
@@ -317,7 +331,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryLogStr := fmt.Sprintf("重试：%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
 		logger.LogInfo(c, retryLogStr)
 	}
-	if newAPIError != nil {
+	if newAPIError != nil && !types.IsRequestCancelledError(newAPIError) {
 		gopool.Go(func() {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
@@ -485,7 +499,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			other.SetPublic("request_path", c.Request.URL.Path)
 		}
 		other.SetPublic("error_type", err.GetErrorType())
-		other.SetPublic("error_code", err.GetErrorCode())
+		other.SetPublic("error_code", common.MaskCredentials(string(err.GetErrorCode()), keys...))
 		other.SetPublic("status_code", err.StatusCode)
 		service.AppendRelayLogAdminInfo(c, relayInfo, other)
 		service.AppendTaskPluginContextAuditInfo(c, other)

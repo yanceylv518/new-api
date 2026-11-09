@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -21,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/andybalholm/brotli"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -29,22 +32,35 @@ import (
 )
 
 type zhipuLiveTransport struct {
-	base         http.RoundTripper
-	key          string
-	calls        *atomic.Int32
-	responseBody *bytes.Buffer
+	base             http.RoundTripper
+	key              string
+	calls            *atomic.Int32
+	requestBody      *bytes.Buffer
+	responseBody     *bytes.Buffer
+	responseHeaders  *http.Header
+	autoDecompressed *bool
+	acceptEncoding   *string
+	legacyAuthHeader *string
 }
 
 func (t zhipuLiveTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request.URL.Hostname() == "open.bigmodel.cn" && request.URL.Path == "/api/paas/v4/web_search" {
 		t.calls.Add(1)
+		*t.acceptEncoding = request.Header.Get("Accept-Encoding")
+		*t.legacyAuthHeader = request.Header.Get("mj-api-secret")
+		request = request.Clone(request.Context())
 		if request.Header.Get("Authorization") == "Bearer test-placeholder" {
-			request = request.Clone(request.Context())
 			request.Header.Set("Authorization", "Bearer "+t.key)
 		}
+		request.Body = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.TeeReader(request.Body, t.requestBody), Closer: request.Body}
 	}
 	response, err := t.base.RoundTrip(request)
 	if err == nil && response.Body != nil {
+		*t.responseHeaders = response.Header.Clone()
+		*t.autoDecompressed = response.Uncompressed
 		response.Body = struct {
 			io.Reader
 			io.Closer
@@ -111,8 +127,13 @@ func TestZhipuWebSearchLive(t *testing.T) {
 	require.NoError(t, err)
 	previousTransport := upstreamClient.Transport
 	var upstreamCalls atomic.Int32
+	var upstreamRequestBody bytes.Buffer
 	var upstreamBody bytes.Buffer
-	upstreamClient.Transport = zhipuLiveTransport{base: previousTransport, key: key, calls: &upstreamCalls, responseBody: &upstreamBody}
+	var upstreamHeaders http.Header
+	var upstreamAutoDecompressed bool
+	var upstreamAcceptEncoding string
+	var upstreamLegacyAuthHeader string
+	upstreamClient.Transport = zhipuLiveTransport{base: previousTransport, key: key, calls: &upstreamCalls, requestBody: &upstreamRequestBody, responseBody: &upstreamBody, responseHeaders: &upstreamHeaders, autoDecompressed: &upstreamAutoDecompressed, acceptEncoding: &upstreamAcceptEncoding, legacyAuthHeader: &upstreamLegacyAuthHeader}
 	t.Cleanup(func() { upstreamClient.Transport = previousTransport })
 	user := model.User{Id: 1, Username: "zhipu-search", Password: "unused", Status: common.UserStatusEnabled, Group: "default", Quota: 10_000_000, Setting: `{"billing_preference":"wallet_only"}`}
 	token := model.Token{Id: 1, UserId: user.Id, Key: "zhipusearchtest", Name: "test", Status: common.TokenStatusEnabled, RemainQuota: 10_000_000, ExpiredTime: -1}
@@ -134,7 +155,7 @@ func TestZhipuWebSearchLive(t *testing.T) {
 	server := httptest.NewServer(engine)
 	defer server.Close()
 	client := &http.Client{Timeout: 150 * time.Second}
-	for _, tc := range []struct {
+	type zhipuLiveCase struct {
 		name             string
 		engine           string
 		quota            int
@@ -145,7 +166,19 @@ func TestZhipuWebSearchLive(t *testing.T) {
 		subscription     bool
 		upstreamError    bool
 		responseLimitMiB int
-	}{
+		overrides        map[string]any
+		omitSearchIntent bool
+		omitSearchQuery  bool
+		wantErrorCode    string
+		duplicateFields  bool
+		observeOutcome   bool
+		headerOverride   string
+		requestEncoding  string
+		legacyAuth       bool
+		method           string
+		errorStatus      int
+	}
+	testCases := []zhipuLiveCase{
 		{name: dto.ZhipuSearchStd, engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", responseLimitMiB: 8},
 		{name: dto.ZhipuSearchPro, engine: dto.ZhipuSearchPro, quota: 1027, path: "/api/paas/v4/web_search", responseLimitMiB: 8},
 		{name: dto.ZhipuSearchProSogou, engine: dto.ZhipuSearchProSogou, quota: 3425, path: "/v1/web_search", responseLimitMiB: 8},
@@ -158,8 +191,71 @@ func TestZhipuWebSearchLive(t *testing.T) {
 		{name: "options_and_price_override", engine: dto.ZhipuSearchStd, quota: 1500, path: "/v1/web_search", fullOptions: true},
 		{name: "subscription", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", subscription: true},
 		{name: "upstream_auth_error", engine: dto.ZhipuSearchStd, path: "/v1/web_search", upstreamError: true},
+		{name: "header_override_gzip_success", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", headerOverride: "gzip"},
+		{name: "header_override_br_success", engine: dto.ZhipuSearchStd, quota: 685, path: "/api/paas/v4/web_search", headerOverride: "br"},
+		{name: "header_override_gzip_error", engine: dto.ZhipuSearchStd, path: "/v1/web_search", headerOverride: "gzip", overrides: map[string]any{"search_query": ""}, wantErrorCode: "1214"},
+		{name: "header_override_br_error", engine: dto.ZhipuSearchStd, path: "/api/paas/v4/web_search", headerOverride: "br", overrides: map[string]any{"search_query": ""}, wantErrorCode: "1214"},
+		{name: "gzip_request_uppercase", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", requestEncoding: "GZip"},
+		{name: "legacy_auth_wildcard", engine: dto.ZhipuSearchStd, quota: 685, path: "/api/paas/v4/web_search", legacyAuth: true},
+		{name: "patch_business_error", engine: dto.ZhipuSearchStd, path: "/v1/web_search", method: http.MethodPatch, errorStatus: http.StatusOK, wantErrorCode: "500"},
+		{name: "array_count_error", engine: dto.ZhipuSearchStd, path: "/api/paas/v4/web_search", overrides: map[string]any{"count": []int{1}}, wantErrorCode: "400"},
+		{name: "passthrough_sogou_count", engine: dto.ZhipuSearchProSogou, quota: 3425, path: "/v1/web_search", overrides: map[string]any{"count": 11}},
+		{name: "passthrough_quark_options", engine: dto.ZhipuSearchProQuark, quota: 3425, path: "/api/paas/v4/web_search", overrides: map[string]any{"count": 1, "search_domain_filter": "www.sohu.com"}},
+		{name: "passthrough_numeric_query", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"search_query": 123, "count": "5"}},
+		{name: "passthrough_zero_count", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"count": 0}},
+		{name: "passthrough_fractional_count", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"count": 1.5}},
+		{name: "passthrough_pro_options", engine: dto.ZhipuSearchPro, quota: 1027, path: "/api/paas/v4/web_search", overrides: map[string]any{"count": 51, "content_size": "large"}},
+		{name: "passthrough_duplicate_fields", engine: dto.ZhipuSearchPro, quota: 1027, path: "/v1/web_search", duplicateFields: true},
+		{name: "passthrough_null_options", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"search_intent": nil, "count": nil}},
+		{name: "passthrough_long_query", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"search_query": strings.Repeat("天", 71), "count": 51}},
+		{name: "passthrough_unusual_options", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", overrides: map[string]any{"search_recency_filter": "yesterday", "content_size": "large"}},
+		{name: "passthrough_omitted_intent", engine: dto.ZhipuSearchStd, quota: 685, path: "/v1/web_search", omitSearchIntent: true},
+		{name: "upstream_rejects_null_query", engine: dto.ZhipuSearchStd, path: "/v1/web_search", overrides: map[string]any{"search_query": nil}, wantErrorCode: "1214"},
+		{name: "upstream_rejects_missing_query", engine: dto.ZhipuSearchStd, path: "/v1/web_search", omitSearchQuery: true, wantErrorCode: "1214"},
+		{name: "upstream_rejects_empty_query", engine: dto.ZhipuSearchStd, path: "/v1/web_search", overrides: map[string]any{"search_query": ""}, wantErrorCode: "1214"},
+		{name: "upstream_rejects_blank_query", engine: dto.ZhipuSearchStd, path: "/api/paas/v4/web_search", overrides: map[string]any{"search_query": "   "}, wantErrorCode: "1213"},
+		{name: "upstream_rejects_short_request_id", engine: dto.ZhipuSearchStd, path: "/api/paas/v4/web_search", overrides: map[string]any{"request_id": "abcde"}, wantErrorCode: "1214"},
+		{name: "upstream_rejects_short_user_id", engine: dto.ZhipuSearchStd, path: "/v1/web_search", overrides: map[string]any{"user_id": "abcde"}, wantErrorCode: "1214"},
+		{name: "upstream_rejects_object_intent", engine: dto.ZhipuSearchStd, path: "/v1/web_search", overrides: map[string]any{"search_intent": map[string]any{}}, wantErrorCode: "400"},
+	}
+	for _, engine := range []struct {
+		name  string
+		quota int
+	}{
+		{dto.ZhipuSearchStd, 685},
+		{dto.ZhipuSearchPro, 1027},
+		{dto.ZhipuSearchProSogou, 3425},
+		{dto.ZhipuSearchProQuark, 3425},
 	} {
+		for _, scenario := range []struct {
+			name      string
+			query     string
+			overrides map[string]any
+		}{
+			{"query_2048", strings.Repeat("\u6d4b", 2048), nil},
+			{"mixed_emoji", "中文搜索 \U0001f600\U0001f680 emoji test", nil},
+			{"count_1000", "", map[string]any{"count": 1000}},
+			{"invalid_recency", "", map[string]any{"search_recency_filter": "invalid_enum_value"}},
+			{"invalid_content_size", "", map[string]any{"content_size": "invalid_enum_value"}},
+		} {
+			testCases = append(testCases, zhipuLiveCase{name: scenario.name + "_" + engine.name, engine: engine.name, quota: engine.quota, path: "/v1/web_search", query: scenario.query, overrides: scenario.overrides, observeOutcome: true})
+		}
+	}
+	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.legacyAuth {
+				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", `{"*":""}`).Error)
+				t.Cleanup(func() {
+					_ = database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", "").Error
+				})
+			}
+			if tc.headerOverride != "" {
+				headerOverride := fmt.Sprintf(`{"Accept-Encoding":%q}`, tc.headerOverride)
+				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", headerOverride).Error)
+				t.Cleanup(func() {
+					require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", "").Error)
+				})
+			}
 			if tc.responseLimitMiB > 0 {
 				setting := fmt.Sprintf(`{"max_response_body_mib":%d}`, tc.responseLimitMiB)
 				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", setting).Error)
@@ -174,6 +270,11 @@ func TestZhipuWebSearchLive(t *testing.T) {
 					constant.ErrorLogEnabled, common.RetryTimes = previousErrorLog, 0
 					_ = database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("key", channel.Key).Error
 				})
+			}
+			if tc.wantErrorCode != "" || tc.observeOutcome {
+				previousErrorLog := constant.ErrorLogEnabled
+				constant.ErrorLogEnabled = true
+				t.Cleanup(func() { constant.ErrorLogEnabled = previousErrorLog })
 			}
 			if tc.fullOptions {
 				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"search_std":0.003}`))
@@ -220,12 +321,12 @@ func TestZhipuWebSearchLive(t *testing.T) {
 				"search_engine": tc.engine, "search_query": query, "search_intent": tc.searchIntent,
 				"search_recency_filter": "noLimit", "content_size": "high", "request_id": requestID, "user_id": "test-user-001",
 			}
-			if tc.engine == dto.ZhipuSearchStd || tc.engine == dto.ZhipuSearchPro {
+			if !tc.observeOutcome && (tc.engine == dto.ZhipuSearchStd || tc.engine == dto.ZhipuSearchPro) {
 				payload["count"] = 3
-			} else if tc.engine == dto.ZhipuSearchProSogou {
+			} else if !tc.observeOutcome && tc.engine == dto.ZhipuSearchProSogou {
 				payload["count"] = 20
 			}
-			if tc.engine != dto.ZhipuSearchProQuark {
+			if !tc.observeOutcome && tc.engine != dto.ZhipuSearchProQuark {
 				payload["search_domain_filter"] = "www.sohu.com"
 			}
 			if tc.fullOptions {
@@ -233,27 +334,99 @@ func TestZhipuWebSearchLive(t *testing.T) {
 				payload["search_recency_filter"] = "oneYear"
 				payload["content_size"] = "high"
 			}
+			for name, value := range tc.overrides {
+				payload[name] = value
+			}
+			if tc.omitSearchIntent {
+				delete(payload, "search_intent")
+			}
+			if tc.omitSearchQuery {
+				delete(payload, "search_query")
+			}
 			encoded, err := common.Marshal(payload)
 			require.NoError(t, err)
-			request, err := http.NewRequest(http.MethodPost, server.URL+tc.path, bytes.NewReader(encoded))
+			if tc.duplicateFields {
+				encoded = []byte(fmt.Sprintf(`{"search_engine":"search_std","search_engine":"search_pro","search_query":"first","search_query":"北京今日天气","SEARCH_QUERY":"ignored","search_intent":false,"count":1,"request_id":%q}`, requestID))
+			}
+			wireBody := encoded
+			if tc.requestEncoding != "" {
+				var compressed bytes.Buffer
+				writer := gzip.NewWriter(&compressed)
+				_, err = writer.Write(encoded)
+				require.NoError(t, err)
+				require.NoError(t, writer.Close())
+				wireBody = compressed.Bytes()
+			}
+			method := tc.method
+			if method == "" {
+				method = http.MethodPost
+			}
+			request, err := http.NewRequest(method, server.URL+tc.path, bytes.NewReader(wireBody))
 			require.NoError(t, err)
 			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			if tc.requestEncoding != "" {
+				request.Header.Set("Content-Encoding", tc.requestEncoding)
+			}
+			if tc.legacyAuth {
+				request.Header.Set("mj-api-secret", "sk-"+token.Key)
+			} else {
+				request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			}
 			callsBefore := upstreamCalls.Load()
+			upstreamRequestBody.Reset()
 			upstreamBody.Reset()
+			upstreamHeaders = nil
+			upstreamAutoDecompressed = false
+			upstreamAcceptEncoding = ""
+			upstreamLegacyAuthHeader = ""
 			response, err := client.Do(request)
 			if err != nil {
 				t.Fatalf("HTTP 请求失败: %s", strings.ReplaceAll(err.Error(), key, "[redacted]"))
 			}
-			data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+			data, err := io.ReadAll(response.Body)
 			_ = response.Body.Close()
 			require.NoError(t, err)
-			if tc.upstreamError {
-				require.GreaterOrEqual(t, response.StatusCode, http.StatusBadRequest)
-				select {
-				case <-completed:
-				case <-time.After(10 * time.Second):
-					t.Fatal("失败请求处理未完成")
+			select {
+			case <-completed:
+			case <-time.After(10 * time.Second):
+				t.Fatal("搜索请求处理未完成")
+			}
+			assert.True(t, bytes.Equal(encoded, upstreamRequestBody.Bytes()), "上游请求应与客户端原文一致")
+			upstreamData := upstreamBody.Bytes()
+			encoding := strings.ToLower(strings.TrimSpace(upstreamHeaders.Get("Content-Encoding")))
+			switch encoding {
+			case "gzip":
+				reader, err := gzip.NewReader(bytes.NewReader(upstreamData))
+				require.NoError(t, err)
+				upstreamData, err = io.ReadAll(reader)
+				require.NoError(t, err)
+				require.NoError(t, reader.Close())
+			case "br":
+				var err error
+				upstreamData, err = io.ReadAll(brotli.NewReader(bytes.NewReader(upstreamData)))
+				require.NoError(t, err)
+			case "", "identity":
+			default:
+				t.Fatalf("未覆盖的上游响应编码: %s", encoding)
+			}
+			t.Logf("headers:id=%t retry=%t encoding=%q auto_decompressed=%t", upstreamHeaders.Get("X-Request-Id") != "", upstreamHeaders.Get("Retry-After") != "", encoding, upstreamAutoDecompressed)
+			if value := upstreamHeaders.Get("Retry-After"); value != "" {
+				assert.Equal(t, value, response.Header.Get("Retry-After"), "上游重试提示应被转发")
+			}
+			if tc.headerOverride != "" {
+				assert.Equal(t, tc.headerOverride, upstreamAcceptEncoding)
+			}
+			if tc.legacyAuth {
+				assert.Empty(t, upstreamLegacyAuthHeader)
+			}
+			if tc.upstreamError || tc.wantErrorCode != "" || (tc.observeOutcome && response.StatusCode >= http.StatusBadRequest) {
+				if tc.errorStatus != 0 {
+					require.Equal(t, tc.errorStatus, response.StatusCode)
+				} else {
+					require.GreaterOrEqual(t, response.StatusCode, http.StatusBadRequest)
+				}
+				if tc.wantErrorCode != "" || tc.observeOutcome {
+					assert.True(t, bytes.Equal(upstreamData, data), "错误响应应与上游原文一致")
 				}
 				assert.EqualValues(t, 1, upstreamCalls.Load()-callsBefore)
 				require.Eventually(t, func() bool {
@@ -263,7 +436,12 @@ func TestZhipuWebSearchLive(t *testing.T) {
 						currentUser.Quota == before.Quota && currentToken.RemainQuota == beforeToken.RemainQuota
 				}, 5*time.Second, 10*time.Millisecond)
 				code := gjson.GetBytes(data, "error.code").String()
-				require.NotEmpty(t, code)
+				if !tc.observeOutcome {
+					require.NotEmpty(t, code)
+				}
+				if tc.wantErrorCode != "" {
+					assert.Equal(t, tc.wantErrorCode, code)
+				}
 				var logged model.Log
 				require.NoError(t, database.Where("user_id = ? AND type = ?", user.Id, model.LogTypeError).Order("id DESC").First(&logged).Error)
 				assert.Contains(t, logged.Content, code)
@@ -276,13 +454,15 @@ func TestZhipuWebSearchLive(t *testing.T) {
 			if response.StatusCode != http.StatusOK {
 				t.Fatalf("HTTP 状态 %d: %s", response.StatusCode, strings.ReplaceAll(string(data), key, "[redacted]"))
 			}
-			select {
-			case <-completed:
-			case <-time.After(10 * time.Second):
-				t.Fatal("搜索请求处理未完成")
-			}
 			assert.True(t, gjson.ValidBytes(data))
-			assert.True(t, bytes.Equal(upstreamBody.Bytes(), data), "成功响应应与上游原文一致")
+			assert.True(t, bytes.Equal(upstreamData, data), "成功响应应与上游原文一致")
+			if tc.observeOutcome {
+				echoedQuery := gjson.GetBytes(data, "search_intent.0.query").String()
+				t.Logf("obs=%d:%d:%d:%t:%d", response.StatusCode, utf8.RuneCountInString(query), utf8.RuneCountInString(echoedQuery), echoedQuery == query, len(gjson.GetBytes(data, "search_result").Array()))
+			}
+			if tc.duplicateFields {
+				assert.Equal(t, "北京今日天气", gjson.GetBytes(data, "search_intent.0.query").String())
+			}
 			if tc.responseLimitMiB > 0 {
 				assert.LessOrEqual(t, len(data), tc.responseLimitMiB<<20)
 			}

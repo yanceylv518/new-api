@@ -4367,7 +4367,7 @@ placeholder={t(
                                     </FormControl>
                                     <FormDescription>
                                       {t(
-                                        '0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.'
+                                        '0 means unlimited. Oversized responses return an error and refund the reserved quota.'
                                       )}
                                     </FormDescription>
                                     <FormMessage />

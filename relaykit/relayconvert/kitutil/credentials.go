@@ -19,7 +19,7 @@ var (
 	credentialCookieHeaderPattern  = regexp.MustCompile(`(?i)(\b(?:cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*`)
 	credentialCookieContextPattern = regexp.MustCompile(`"(?:\\.|[^"\\])*"|` + credentialCookieHeaderPattern.String())
 	credentialValuePattern         = regexp.MustCompile(`(?i)(\b` + credentialFieldNames + `\\?["']?\s*[:=]\s*)(\\"(?:\\.|[^"\\])*?\\"|\\'(?:\\.|[^'\\])*?\\'|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s,"'&;}\]]+|[^\s,"'&;{}\[\]\\]+)`)
-	credentialJSONStringPattern    = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
+	credentialJSONStringPattern    = regexp.MustCompile(`(?s)"(?:\\.|[^"\\])*(?:"|\\?\z)`)
 	credentialAuthPattern          = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)[a-z0-9._~+/=-]+`)
 	credentialPrivateKeyPattern    = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)`)
 )
@@ -95,6 +95,10 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 		end := match[1]
 		var decoded string
 		if err := UnmarshalJsonStr(value[match[0]:end], &decoded); err != nil {
+			// 未闭合或无法解码的字符串可能包含转义凭证，整体隐藏该片段。
+			result.WriteString(value[last:match[0]])
+			result.WriteString(`"***"`)
+			last = end
 			continue
 		}
 		var replacement string

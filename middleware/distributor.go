@@ -197,7 +197,8 @@ func Distribute() func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest &&
+			!common.GetContextKeyBool(c, constant.ContextKeyZhipuSearchBusinessError) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -415,12 +416,59 @@ func getJSONStringValue(result gjson.Result, field string) (string, error) {
 	return result.String(), nil
 }
 
+func selectZhipuSearchFallbackModel(c *gin.Context) (string, error) {
+	engines := [...]string{dto.ZhipuSearchStd, dto.ZhipuSearchPro, dto.ZhipuSearchProSogou, dto.ZhipuSearchProQuark}
+	modelLimitEnabled := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
+	value, _ := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
+	modelLimit, _ := value.(map[string]bool)
+	constraints := service.GetChannelConstraints(c)
+
+	if pin, found, _ := constraints.ResolvedPin(); found {
+		channel, err := model.CacheGetChannel(pin.ChannelId)
+		if err != nil {
+			return "", err
+		}
+		if channel.Status != common.ChannelStatusEnabled {
+			return "", nil
+		}
+		for _, engine := range engines {
+			if modelLimitEnabled && !tokenModelLimitAllows(modelLimit, engine) {
+				continue
+			}
+			if ok, _ := model.ChannelSatisfiesFilters(channel, engine, constraints.Filters); ok && slices.Contains(channel.GetModels(), engine) {
+				return engine, nil
+			}
+		}
+		return "", nil
+	}
+
+	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	groups := []string{usingGroup}
+	if usingGroup == "auto" {
+		groups = service.GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+	}
+	for _, group := range groups {
+		for _, engine := range engines {
+			if modelLimitEnabled && !tokenModelLimitAllows(modelLimit, engine) {
+				continue
+			}
+			channel, err := model.GetRandomSatisfiedChannel(group, engine, 0, constraints.Filters)
+			if err != nil {
+				return "", err
+			}
+			if channel != nil && channel.Status == common.ChannelStatusEnabled {
+				return engine, nil
+			}
+		}
+	}
+	return "", nil
+}
+
 func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	var modelRequest ModelRequest
 	shouldSelectChannel := true
 	var err error
 	if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
-		request := &dto.ZhipuWebSearchRequest{}
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return nil, false, err
@@ -429,22 +477,27 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		if storage.IsDisk() && strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
-			// 搜索接口需要原文校验和转发，复用已读取的数据避免解码器再缓冲整份请求。
-			if err := common.Unmarshal(body, request); err != nil {
+		request, err := dto.ParseZhipuWebSearchRequest(body)
+		if err != nil {
+			engine, routeErr := selectZhipuSearchFallbackModel(c)
+			if routeErr != nil {
+				return nil, false, routeErr
+			}
+			if engine == "" {
 				return nil, false, err
 			}
-			c.Request.Body = io.NopCloser(storage)
-		} else if err := common.UnmarshalBodyReusable(c, request); err != nil {
-			return nil, false, err
+			request = &dto.ZhipuWebSearchRequest{SearchEngine: engine, RawBody: body}
+			if gjson.ValidBytes(body) {
+				gjson.ParseBytes(body).ForEach(func(key, value gjson.Result) bool {
+					if key.String() == "search_query" {
+						request.SearchQuery = value.String()
+					}
+					return true
+				})
+			}
+			common.SetContextKey(c, constant.ContextKeyZhipuSearchInvalidRequest, true)
 		}
-		if err := dto.ValidateZhipuSearchEngineField(body); err != nil {
-			return nil, false, err
-		}
-		if err := request.Validate(); err != nil {
-			return nil, false, err
-		}
-		request.RawBody = body
+		c.Request.Body = io.NopCloser(storage)
 		common.SetContextKey(c, constant.ContextKeyZhipuSearchRequest, request)
 		modelRequest.Model = request.SearchEngine
 	} else if modelName := c.GetString("resolved_task_model"); modelName != "" {

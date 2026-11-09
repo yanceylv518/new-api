@@ -100,6 +100,15 @@ func TestZhipuWebSearchChannelHealth(t *testing.T) {
 			assert.Equal(t, tc.quota, logged.Quota)
 		})
 	}
+	channel.ParamOverride = common.GetPointer(`{"count":"5","search_recency_filter":"yesterday"}`)
+	result := testChannel(context.Background(), channel, 1, dto.ZhipuSearchStd, "", false)
+	require.NoError(t, result.localErr)
+	request := <-requests
+	var overridePayload map[string]any
+	require.NoError(t, common.Unmarshal(request.body, &overridePayload))
+	assert.Equal(t, "5", overridePayload["count"])
+	assert.Equal(t, "yesterday", overridePayload["search_recency_filter"])
+	channel.ParamOverride = nil
 	require.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1}, testChannelForHealthCheck(context.Background(), channel, 1, true, 0))
 	<-requests
 	status.Store(http.StatusUnauthorized)
@@ -115,18 +124,21 @@ func TestZhipuWebSearchChannelHealth(t *testing.T) {
 		{"json error", http.StatusUnauthorized, `{"error":{"message":"rejected health-placeholder"},"api_key":"health-placeholder"}`},
 		{"non-json error", http.StatusBadGateway, `upstream rejected health-placeholder`},
 		{"error in successful HTTP response", http.StatusOK, `{"error":{"message":"rejected health-placeholder"}}`},
+		{"alias cannot clear business error", http.StatusOK, `{"error":{"message":"rejected health-placeholder"},"ERROR":null}`},
+		{"alias business error", http.StatusOK, `{"ERROR":{"message":"rejected health-placeholder"}}`},
+		{"null cannot hide repeated error", http.StatusOK, `{"error":null,"error":{"message":"rejected health-placeholder"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			channel.Setting = common.GetPointer(`{"max_response_body_mib":1}`)
 			status.Store(int32(tc.status))
 			responseBody.Store(tc.body)
 			result := testChannel(context.Background(), channel, 1, dto.ZhipuSearchStd, "", false)
+			<-requests
 			require.Error(t, result.localErr)
 			assert.NotContains(t, result.localErr.Error(), "health-placeholder")
 			require.NotNil(t, result.newAPIError)
 			assert.NotContains(t, result.newAPIError.Error(), "health-placeholder")
 			assert.NotContains(t, result.newAPIError.LogErrorWithStatusCode(), "health-placeholder")
-			<-requests
 		})
 	}
 }

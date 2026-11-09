@@ -4,8 +4,10 @@ import (
 	"compress/gzip"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -41,7 +43,11 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		}
 		decompressed := false
 
-		switch c.GetHeader("Content-Encoding") {
+		encoding := c.GetHeader("Content-Encoding")
+		if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeZhipuWebSearch {
+			encoding = strings.ToLower(encoding)
+		}
+		switch encoding {
 		case "gzip":
 			gzipReader, err := gzip.NewReader(origBody)
 			if err != nil {
