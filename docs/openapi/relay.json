@@ -251,7 +251,7 @@
     "/v1/web_search": {
       "post": {
         "summary": "智谱独立网络搜索",
-        "description": "独立搜索接口，不调用对话模型。请创建智谱联网搜索渠道（类型 62），启用对应的 search_engine；该渠道专门服务 /v1/web_search 和 /api/paas/v4/web_search，不参与聊天等其他接口的选路。默认上游地址为 https://open.bigmodel.cn，使用智谱 API Key；也可使用支持此接口的 New API 上游。普通智谱及 Coding Plan 渠道不再承接搜索。升级时暂停搜索流量并排空在途请求，所有实例升级后再切换渠道配置并恢复搜索；旧版本不能使用类型 62。将仅用于搜索的旧智谱渠道改为类型 62；同时提供聊天和搜索的旧渠道需拆出独立搜索渠道，并从原渠道移除搜索引擎。保留搜索引擎名、分组、密钥、优先级、权重及相关搜索设置；价格和折扣继续使用原引擎名，无需重配。请求、模型定价和用户折扣均使用官方引擎名，例如 search_std；管理员应避免其他模型使用相同名称。默认价格按智谱人民币单次价格和系统汇率计算，可在模型定价中设置美元按次价格；分组倍率和用户模型折扣适用。旧版以 zhipu/web_search/<引擎名> 配置的价格和折扣不会自动沿用，升级前须按引擎名重新配置；混合版本期间需分别配置两个名称。由引入订阅跨周期结算的旧搜索版升级时，需排空该版本的在途订阅请求和异步退款，并避免在混合运行期间重置订阅。上游返回成功状态时按一次调用计费，包括空结果或响应体读取失败。上游 JSON 错误保留原始状态码和字段，渠道凭证及敏感认证信息会被遮盖；此接口不应用渠道状态码映射。请求体大小和上游超时沿用系统通用配置。智谱联网搜索渠道可通过 max_response_body_mib 设置单次响应体大小上限，单位为 MiB（1048576 字节），默认 0 表示不限。上限同时适用于成功和错误响应；超限停止读取并返回网关错误，不重试。上游已返回成功状态时仍按一次调用计费。错误体格式无效或无法安全脱敏时返回网关错误；请求发出后不自动重试。兼容路径为 /api/paas/v4/web_search。",
+        "description": "独立搜索接口，不调用对话模型。请创建智谱联网搜索渠道（类型 62），启用对应的 search_engine；该渠道专门服务 /v1/web_search 和 /api/paas/v4/web_search，不参与聊天等其他接口的选路。默认上游地址为 https://open.bigmodel.cn，使用智谱 API Key；也可使用支持此接口的 New API 上游。普通智谱及 Coding Plan 渠道不再承接搜索。升级时暂停搜索流量并排空在途请求，所有实例升级后再切换渠道配置并恢复搜索；旧版本不能使用类型 62。将仅用于搜索的旧智谱渠道改为类型 62；同时提供聊天和搜索的旧渠道需拆出独立搜索渠道，并从原渠道移除搜索引擎。保留搜索引擎名、分组、密钥、优先级、权重及相关搜索设置；价格和折扣继续使用原引擎名，无需重配。请求、模型定价和用户折扣均使用官方引擎名，例如 search_std；管理员应避免其他模型使用相同名称。默认价格按智谱人民币单次价格和系统汇率计算，可在模型定价中设置美元按次价格；分组倍率和用户模型折扣适用；搜索切换分组后的补充预扣仍原子检查钱包余额，余额不足返回 403 并退还已有预扣，不发送上游请求。旧版以 zhipu/web_search/<引擎名> 配置的价格和折扣不会自动沿用，升级前须按引擎名重新配置；混合版本期间需分别配置两个名称。由引入订阅跨周期结算的旧搜索版升级时，需排空该版本的在途订阅请求和异步退款，并避免在混合运行期间重置订阅。上游返回成功状态、响应体完整读取且未识别到业务错误时按一次调用计费，包括空结果；error 为 null、false、空字符串或纯空白字符串时不视为业务错误，后续空标记不能清除已出现的真实错误。此后向客户端写回失败仍按一次调用计费。响应体读取或解码失败时返回网关错误并退还预扣。上游 JSON 和文本错误保留原始状态码和内容，渠道凭证及敏感认证信息会被遮盖；HTTP 200 的非 JSON 或损坏 JSON 正文也会脱敏后返回；损坏的 JSON 字符串片段会脱敏，普通诊断文本中的英寸符号等引号会保留。保留上游响应的内容类型、Retry-After、Allow、Location 和未解码时的 Content-Encoding，不自动透传其他上游响应头；Location 必须解析到实际请求的上游同源地址（协议、主机和有效端口相同），脱敏后改写为网关相对路径；对跨源、含用户信息或存在解析歧义的目标，重定向响应返回 502 并退还预扣；其他状态仅移除该 Location，保留原状态、正文与计费结果。此接口不应用渠道状态码映射。同一用户的搜索和其他模型请求共享内存成功限额；启用时，在途请求预留成功名额，失败后释放，成功按完成时间计入窗口；成功次数上限为 0 时不限，总请求次数限制仍包含失败请求。压缩请求按系统通用逻辑解压；上游 gzip、deflate、br 和 zstd 压缩由网关解码，不支持的编码返回网关错误并退还预扣；204、205、304 的无正文响应跳过解码并保留状态和压缩元数据，205 沿用成功状态按次计费规则。渠道请求头覆盖中的 Accept-Encoding 按配置转发。通配或正则透传会跳过 Authorization、Proxy-Authorization、Cookie、Set-Cookie，以及名称忽略大小写、连字符和下划线后为 auth、以 xauth 开头或包含 key、token、secret、credential、signature、sessionid、password、passwd 的请求头；Idempotency-Key 除外。显式配置的请求头覆盖仍按配置转发。请求体大小和上游超时沿用系统通用配置；搜索请求绑定客户端取消信号，客户端断开时停止等待上游。客户端取消或客户端请求截止时间到期按 request_cancelled（HTTP 408）处理，不重试、不触发渠道自动禁用，也不计入上游失败统计。智谱联网搜索渠道可通过 max_response_body_mib 设置单次响应体大小上限，单位为 MiB（1048576 字节），默认 0 表示不限。正数上限也约束 zstd 声明的解码窗口，多个 zstd 编码层均分本次响应的窗口预算，即使正文较小，窗口超限也会返回网关错误并退还预扣。上限同时适用于成功和错误响应；超限停止读取并返回网关错误，不重试。上游已返回成功状态但响应体超限时也会退还预扣。错误体无法安全脱敏时返回网关错误；请求发出后不自动重试。兼容路径为 /api/paas/v4/web_search。",
         "operationId": "zhipuWebSearch",
         "tags": ["智谱网络搜索"],
         "requestBody": {
@@ -268,12 +268,12 @@
             "content": {"application/json": {"schema": {"type": "object"}}}
           },
           "400": {
-            "description": "请求参数无效或上游返回错误；上游 JSON 错误保留原字段，网关错误使用 ErrorResponse。",
-            "content": {"application/json": {"schema": {}}}
+            "description": "请求参数无效或上游返回错误；上游错误保留内容并隐藏凭证，网关错误使用 ErrorResponse。",
+            "content": {"application/json": {"schema": {}}, "text/plain": {"schema": {"type": "string"}}}
           },
           "default": {
             "description": "上游返回的其他错误状态。",
-            "content": {"application/json": {"schema": {}}}
+            "content": {"application/json": {"schema": {}}, "text/plain": {"schema": {"type": "string"}}}
           }
         },
         "security": [{"BearerAuth": []}]
@@ -2699,20 +2699,14 @@
             "enum": ["search_std", "search_pro", "search_pro_sogou", "search_pro_quark"],
             "description": "搜索引擎；不同引擎按各自的每次价格计费。"
           },
-          "search_query": {"type": "string", "minLength": 1, "maxLength": 70},
-          "search_intent": {"type": "boolean", "default": false, "description": "是否先判断搜索意图；false 为直接搜索。客户端省略时，网关在转发前补充官方默认值 false。官方字段须使用准确拼写，不能重复或传入 null。"},
-          "count": {
-            "type": "integer", "minimum": 1, "maximum": 50,
-            "default": 10,
-            "description": "结果条数，范围 1–50，默认 10。支持 search_std、search_pro、search_pro_sogou；搜狗仅允许 10、20、30、40、50。搜狗同时指定 search_domain_filter 和 search_recency_filter 时，count 不生效。search_pro_quark 不支持此字段。"
-          },
-          "search_domain_filter": {"type": "string", "description": "白名单域名，如 www.example.com；支持 search_std、search_pro、search_pro_sogou。search_pro_quark 不支持此字段。"},
-          "search_recency_filter": {
-            "type": "string", "default": "noLimit", "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"]
-          },
-          "content_size": {"type": "string", "enum": ["medium", "high"]},
-          "request_id": {"type": "string", "minLength": 6, "maxLength": 64},
-          "user_id": {"type": "string", "minLength": 6, "maxLength": 128}
+          "search_query": {"description": "搜索词，原样转发并由上游校验。"},
+          "search_intent": {"description": "是否判断搜索意图；原样转发，省略时由上游决定默认行为。"},
+          "count": {"description": "期望的结果条数，原样转发；实际返回数量由搜索引擎决定。"},
+          "search_domain_filter": {"description": "搜索域名过滤，原样转发并由上游处理。"},
+          "search_recency_filter": {"description": "搜索时间范围，原样转发并由上游处理。"},
+          "content_size": {"description": "网页摘要长度，原样转发并由上游处理。"},
+          "request_id": {"description": "请求标识，原样转发并由上游校验。"},
+          "user_id": {"description": "用户标识，原样转发并由上游校验。"}
         }
       },
       "ChatCompletionRequest": {

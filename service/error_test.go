@@ -33,6 +33,24 @@ func (b *failingErrorBody) Read(p []byte) (int, error) {
 
 func (b *failingErrorBody) Close() error { b.closed = true; return nil }
 
+func TestRelayErrorHandlerIgnoresEmptyErrorMarkers(t *testing.T) {
+	for _, marker := range []string{"false", `""`, `"  "`, "null"} {
+		body := fmt.Sprintf(`{"error":%s,"message":"retry tomorrow"}`, marker)
+		resp := &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(body))}
+		require.Equal(t, "retry tomorrow", RelayErrorHandler(t.Context(), resp, false).Error())
+	}
+	for _, raw := range []string{
+		`{"error":false,"ERROR":{"code":"busy","message":"retry tomorrow"}}`,
+		`{"ERROR":{"code":"busy","message":"retry tomorrow"},"error":""}`,
+		`{"error":{"code":"busy","message":"retry tomorrow"},"error":false}`,
+	} {
+		resp := &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(raw))}
+		err := RelayErrorHandler(t.Context(), resp, false)
+		require.Equal(t, "busy", string(err.GetErrorCode()))
+		require.Equal(t, "retry tomorrow", err.Error())
+	}
+}
+
 func TestRelayErrorHandlerPersistsInternalDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, diagnostic string

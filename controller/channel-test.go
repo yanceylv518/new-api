@@ -472,18 +472,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 	if info.RelayMode == relayconstant.RelayModeZhipuWebSearch {
-		if err := dto.ValidateZhipuSearchEngineField(jsonData); err != nil {
-			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
-		}
-		var effective dto.ZhipuWebSearchRequest
-		if err := common.Unmarshal(jsonData, &effective); err != nil {
+		effective, err := dto.ParseZhipuWebSearchRequest(jsonData)
+		if err != nil {
 			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
 		}
 		if effective.SearchEngine != info.OriginModelName {
 			err := errors.New("search_engine cannot be changed by channel parameters")
-			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
-		}
-		if err := effective.Validate(); err != nil {
 			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
 		}
 	}
@@ -759,14 +753,15 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 	if jsonBytes[0] != '{' && jsonBytes[0] != '[' {
 		return ""
 	}
-	errVal := gjson.GetBytes(jsonBytes, "error")
-	if !errVal.Exists() || errVal.Type == gjson.Null {
+	errorJSON := dto.ExtractJSONError(jsonBytes)
+	if len(errorJSON) == 0 {
 		return ""
 	}
+	errVal := gjson.ParseBytes(errorJSON)
 
-	message := gjson.GetBytes(jsonBytes, "error.message").String()
+	message := gjson.GetBytes(errorJSON, "message").String()
 	if message == "" {
-		message = gjson.GetBytes(jsonBytes, "error.error.message").String()
+		message = gjson.GetBytes(errorJSON, "error.message").String()
 	}
 	if message == "" && errVal.Type == gjson.String {
 		message = errVal.String()

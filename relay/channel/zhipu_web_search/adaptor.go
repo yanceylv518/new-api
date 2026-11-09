@@ -1,6 +1,8 @@
 package zhipu_web_search
 
 import (
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +18,9 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 )
 
 type Adaptor struct {
@@ -67,20 +71,94 @@ func (a *Adaptor) GetChannelName() string {
 }
 
 var ErrResponseBodyTooLarge = errors.New("upstream response body exceeds configured size limit")
+var ErrUnsupportedContentEncoding = errors.New("unsupported upstream response content encoding")
 
-// ReadResponseBody 按渠道上限读取响应；调用方负责关闭响应体，0 表示不限。
+// ReadResponseBody 按渠道上限读取响应并约束 zstd 解码窗口；调用方负责关闭响应体，0 表示不额外限制。
 func ReadResponseBody(resp *http.Response, info *relaycommon.RelayInfo) ([]byte, error) {
-	if info.ChannelType != constant.ChannelTypeZhipuWebSearch || info.ChannelSetting.MaxResponseBodyMiB == 0 {
-		return io.ReadAll(resp.Body)
+	var maxBytes int64
+	if info.ChannelType == constant.ChannelTypeZhipuWebSearch {
+		if err := info.ChannelSetting.ValidateResponseBodyLimit(); err != nil {
+			return nil, err
+		}
+		maxBytes = info.ChannelSetting.MaxResponseBodyMiB << 20
 	}
-	if err := info.ChannelSetting.ValidateResponseBodyLimit(); err != nil {
-		return nil, err
+	var reader io.Reader = resp.Body
+	encoding := strings.Join(resp.Header.Values("Content-Encoding"), ",")
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent || resp.StatusCode == http.StatusNotModified {
+		encoding = ""
 	}
-	maxBytes := info.ChannelSetting.MaxResponseBodyMiB << 20
+	decoded := false
+	if encoding != "" {
+		encodings := strings.Split(strings.ToLower(encoding), ",")
+		var zstdLayers int64
+		for _, coding := range encodings {
+			if strings.TrimSpace(coding) == "zstd" {
+				zstdLayers++
+			}
+		}
+		for i := len(encodings) - 1; i >= 0; i-- {
+			switch strings.TrimSpace(encodings[i]) {
+			case "identity":
+			case "gzip":
+				gzipReader, err := gzip.NewReader(reader)
+				if err != nil {
+					return nil, err
+				}
+				defer gzipReader.Close()
+				reader = gzipReader
+				decoded = true
+			case "deflate":
+				deflateReader, err := zlib.NewReader(reader)
+				if err != nil {
+					return nil, err
+				}
+				defer deflateReader.Close()
+				reader = deflateReader
+				decoded = true
+			case "br":
+				reader = brotli.NewReader(reader)
+				decoded = true
+			case "zstd":
+				var options []zstd.DOption
+				if maxBytes > 0 {
+					// 嵌套解码器同时持有窗口，共用本次响应的窗口预算。
+					window := maxBytes / zstdLayers
+					if window < zstd.MinWindowSize {
+						return nil, ErrResponseBodyTooLarge
+					}
+					options = []zstd.DOption{
+						zstd.WithDecoderMaxMemory(uint64(window)),
+						zstd.WithDecoderConcurrency(1),
+						zstd.WithDecodeBuffersBelow(0),
+					}
+				}
+				zstdReader, err := zstd.NewReader(reader, options...)
+				if err != nil {
+					return nil, err
+				}
+				defer zstdReader.Close()
+				reader = zstdReader
+				decoded = true
+			default:
+				return nil, fmt.Errorf("%w: %s", ErrUnsupportedContentEncoding, encoding)
+			}
+		}
+	}
+	if decoded {
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
+	}
+	if maxBytes == 0 {
+		return io.ReadAll(reader)
+	}
 	if resp.ContentLength > maxBytes {
 		return nil, fmt.Errorf("%w: %d MiB", ErrResponseBodyTooLarge, info.ChannelSetting.MaxResponseBodyMiB)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
+		return nil, fmt.Errorf("%w: %w", ErrResponseBodyTooLarge, err)
+	}
 	if err != nil {
 		return body, err
 	}

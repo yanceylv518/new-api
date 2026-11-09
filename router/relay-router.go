@@ -1,6 +1,8 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
@@ -15,6 +17,10 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
+	searchHandler := func(c *gin.Context) {
+		controller.Relay(c, types.RelayFormatZhipuWebSearch)
+	}
+	searchMethods := []string{http.MethodPost, http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions}
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
@@ -108,9 +114,9 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/alpha/search", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIAlphaSearch)
 		})
-		httpRouter.POST("/web_search", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatZhipuWebSearch)
-		})
+		for _, method := range searchMethods {
+			httpRouter.Handle(method, "/web_search", searchHandler)
+		}
 
 		// image related routes
 		httpRouter.POST("/edits", func(c *gin.Context) {
@@ -174,9 +180,9 @@ func SetRelayRouter(router *gin.Engine) {
 
 	zhipuSearchRouter := router.Group("/api/paas/v4")
 	zhipuSearchRouter.Use(middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute())
-	zhipuSearchRouter.POST("/web_search", func(c *gin.Context) {
-		controller.Relay(c, types.RelayFormatZhipuWebSearch)
-	})
+	for _, method := range searchMethods {
+		zhipuSearchRouter.Handle(method, "/web_search", searchHandler)
+	}
 
 	relayMjRouter := router.Group("/mj")
 	relayMjRouter.Use(middleware.RouteTag("relay"))

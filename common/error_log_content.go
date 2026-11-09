@@ -22,7 +22,7 @@ var (
 
 // SanitizeErrorLogContent 移除错误日志中的凭证和媒体编码，保留周围诊断文字。
 func SanitizeErrorLogContent(content string, knownKeys ...string) string {
-	content = MaskCredentials(content, knownKeys...)
+	// 先处理跨行媒体编码，保留其专用占位符，再隐藏无法安全解码的 JSON 片段。
 	content = errorLogMultilineBase64Pattern.ReplaceAllStringFunc(content, func(match string) string {
 		parts := errorLogMultilineBase64Pattern.FindStringSubmatch(match)
 		payload, suffix := parts[2], ""
@@ -41,7 +41,7 @@ func SanitizeErrorLogContent(content string, knownKeys ...string) string {
 	})
 	content = errorLogDataURLPattern.ReplaceAllString(content, "${1}"+errorLogBase64Placeholder)
 	content = errorLogBase64FieldPattern.ReplaceAllString(content, "${1}${2}"+errorLogBase64Placeholder+"${4}")
-	return errorLogBase64RunPattern.ReplaceAllStringFunc(content, func(encoded string) string {
+	content = errorLogBase64RunPattern.ReplaceAllStringFunc(content, func(encoded string) string {
 		// 无字段或 data URL 标记时只识别长编码，避免把普通错误码和请求 ID 当成媒体。
 		if len(encoded) < errorLogUnmarkedBase64MinLength {
 			return encoded
@@ -55,6 +55,7 @@ func SanitizeErrorLogContent(content string, knownKeys ...string) string {
 		}
 		return errorLogBase64Placeholder
 	})
+	return MaskCredentials(content, knownKeys...)
 }
 
 func isErrorLogBase64(payload string) bool {

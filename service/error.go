@@ -91,43 +91,45 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		newApiErr.Err = fmt.Errorf("read upstream error response: %w", err)
-		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, string(responseBody)))
+		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, common.SanitizeErrorLogContent(string(responseBody), knownKeys...)))
 		return
 	}
 	var errResponse dto.GeneralErrorResponse
-	responseBodyText := string(responseBody)
-	responseBodyPreview := common.LocalLogPreview(responseBodyText)
-	if len(knownKeys) > 0 {
-		responseBodyPreview = common.LocalLogPreview(common.MaskCredentials(responseBodyText, knownKeys...))
+	// 分别脱敏消息和正文，避免未闭合引号在拼接后改变 JSON 片段的识别边界。
+	responseBodyText := common.SanitizeErrorLogContent(string(responseBody), knownKeys...)
+	bodyPreview := func() string {
+		return common.LocalLogPreview(common.MaskCredentials(string(responseBody), knownKeys...))
 	}
-	buildErrWithBody := func(message string) error {
+	setLogError := func(message string) {
+		var logErr error
 		if message == "" {
-			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)
+			logErr = fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)
+		} else {
+			logErr = fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, common.SanitizeErrorLogContent(message, knownKeys...), responseBodyText)
 		}
-		return fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, message, responseBodyText)
+		newApiErr.SetLogError(logErr)
+		if showBodyWhenFail {
+			newApiErr.Err = logErr
+		}
 	}
 
 	err = common.Unmarshal(responseBody, &errResponse)
 	if err != nil {
-		newApiErr.SetLogError(buildErrWithBody(""))
-		if showBodyWhenFail {
-			newApiErr.Err = buildErrWithBody("")
-		} else {
-			logger.LogError(ctx, fmt.Sprintf("bad response status code %d, body: %s", resp.StatusCode, responseBodyPreview))
+		setLogError("")
+		if !showBodyWhenFail {
+			logger.LogError(ctx, fmt.Sprintf("bad response status code %d, body: %s", resp.StatusCode, bodyPreview()))
 			newApiErr.Err = fmt.Errorf("bad response status code %d", resp.StatusCode)
 		}
 		return
 	}
 
+	errResponse.Error = dto.ExtractJSONError(responseBody)
 	if common.GetJsonType(errResponse.Error) == "object" {
 		// General format error (OpenAI, Anthropic, Gemini, etc.)
 		oaiError := errResponse.TryToOpenAIError()
 		if oaiError != nil {
 			newApiErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
-			newApiErr.SetLogError(buildErrWithBody(newApiErr.Error()))
-			if showBodyWhenFail {
-				newApiErr.Err = buildErrWithBody(newApiErr.Error())
-			}
+			setLogError(newApiErr.Error())
 			return
 		}
 	}
@@ -135,13 +137,10 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	if message == "" {
 		// The body parsed as JSON but carried no usable error message; log the
 		// raw body so the upstream failure remains diagnosable.
-		logger.LogError(ctx, fmt.Sprintf("bad response status code %d with empty error message, body: %s", resp.StatusCode, responseBodyPreview))
+		logger.LogError(ctx, fmt.Sprintf("bad response status code %d with empty error message, body: %s", resp.StatusCode, bodyPreview()))
 	}
 	newApiErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
-	newApiErr.SetLogError(buildErrWithBody(newApiErr.Error()))
-	if showBodyWhenFail {
-		newApiErr.Err = buildErrWithBody(newApiErr.Error())
-	}
+	setLogError(newApiErr.Error())
 	return
 }
 

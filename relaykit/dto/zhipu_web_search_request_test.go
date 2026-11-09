@@ -1,49 +1,41 @@
 package dto
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestZhipuWebSearchOfficialFields(t *testing.T) {
-	for _, field := range []string{"search_engine", "search_query", "search_intent", "count", "search_domain_filter", "search_recency_filter", "content_size", "request_id", "user_id"} {
-		t.Run(field, func(t *testing.T) {
-			body := []byte(`{"search_engine":"search_std","search_query":"test","search_intent":false,"count":10,"search_domain_filter":"www.example.com","search_recency_filter":"noLimit","content_size":"medium","request_id":"request-1","user_id":"user-001"}`)
-			require.NoError(t, ValidateZhipuSearchEngineField(body))
-			variant := strings.Replace(string(body), `"`+field+`":`, `"`+strings.ToUpper(field)+`":`, 1)
-			assert.Error(t, ValidateZhipuSearchEngineField([]byte(variant)))
-			duplicate := string(body[:len(body)-1]) + fmt.Sprintf(`,"%s":null}`, field)
-			assert.Error(t, ValidateZhipuSearchEngineField([]byte(duplicate)))
-		})
-	}
+func TestZhipuWebSearchRequestParsing(t *testing.T) {
 	for _, tc := range []struct {
-		body  string
-		valid bool
+		name, body, engine, query string
+		valid                     bool
 	}{
-		{`{"search_engine":"search_std","search_query":"test","count":51,"COUNT":1}`, false},
-		{`{"search_engine":"search_std","search_query":"test","search_intent":null}`, false},
-		{`{"search_engine":"search_std","search_query":"test","count":null}`, false},
-		{`{"search_engine":"search_pro_sogou","search_query":"test","count":11}`, false},
-		{`{"search_engine":"search_pro_sogou","search_query":"test","count":20}`, true},
-		{`{"search_engine":"search_pro_quark","search_query":"test","count":10}`, false},
-		{`{"search_engine":"search_pro_quark","search_query":"test","search_domain_filter":"www.example.com"}`, false},
-		{`{"search_engine":"search_pro_quark","search_query":"test","search_recency_filter":"oneWeek","content_size":"high"}`, true},
+		{"uppercase engine with whitespace", `{"search_engine":" SEARCH_STD ","search_query":"test"}`, "search_std", "test", true},
+		{"optional values", `{"search_engine":"search_pro_quark","search_query":true,"count":"5","search_intent":null,"search_domain_filter":[]}`, "search_pro_quark", "true", true},
+		{"numeric query", `{"search_engine":"search_std","search_query":123}`, "search_std", "123", true},
+		{"long query", `{"search_engine":"search_std","search_query":"` + strings.Repeat("x", 71) + `"}`, "search_std", strings.Repeat("x", 71), true},
+		{"last matching fields", `{"search_engine":"search_std","search_engine":"search_pro","search_query":"first","search_query":"last","SEARCH_QUERY":"ignored"}`, "search_pro", "last", true},
+		{"valid final values", `{"search_engine":"unknown","search_engine":"search_std","search_query":"","search_query":"test"}`, "search_std", "test", true},
+		{"escaped matching engine", `{"search_engine":"search_std","search_\u0065ngine":"search_pro","search_query":"test"}`, "search_pro", "test", true},
+		{"missing query", `{"search_engine":"search_std"}`, "search_std", "", true},
+		{"missing engine", `{"search_query":"test"}`, "", "", false},
+		{"unknown final engine", `{"search_engine":"search_std","search_engine":"unknown","search_query":"test"}`, "", "", false},
+		{"upper case engine only", `{"SEARCH_ENGINE":"search_std","search_query":"test"}`, "", "", false},
+		{"invalid JSON", `{"search_engine":`, "", "", false},
 	} {
-		t.Run(tc.body, func(t *testing.T) {
-			err := ValidateZhipuSearchEngineField([]byte(tc.body))
-			if err == nil {
-				var request ZhipuWebSearchRequest
-				err = kitutil.Unmarshal([]byte(tc.body), &request)
-				if err == nil {
-					err = request.Validate()
-				}
+		t.Run(tc.name, func(t *testing.T) {
+			request, err := ParseZhipuWebSearchRequest([]byte(tc.body))
+			if !tc.valid {
+				require.Error(t, err)
+				return
 			}
-			assert.Equal(t, tc.valid, err == nil)
+			require.NoError(t, err)
+			assert.Equal(t, tc.engine, request.SearchEngine)
+			assert.Equal(t, tc.query, request.SearchQuery)
+			assert.Equal(t, tc.body, string(request.RawBody))
 		})
 	}
 }

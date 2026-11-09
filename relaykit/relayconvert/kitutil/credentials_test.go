@@ -1,10 +1,55 @@
 package kitutil
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+var longPathDiagnostic = `The 24" display profile at C:\temp\wide.icc could not be loaded. ` +
+	strings.Repeat("validation message for the provided field. ", 192)
+
+func BenchmarkMaskCredentialsLongPathDiagnostic(b *testing.B) {
+	const key = "upstream-placeholder"
+	if got := MaskCredentials(longPathDiagnostic, key); got != longPathDiagnostic {
+		b.Fatal("diagnostic text changed")
+	}
+	b.SetBytes(int64(len(longPathDiagnostic)))
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = MaskCredentials(longPathDiagnostic, key)
+	}
+}
+
+func TestMaskCredentialsLongPathDiagnostic(t *testing.T) {
+	const knownKey = "upstream-placeholder"
+	for _, tc := range []struct {
+		name, detail, want string
+	}{
+		{"no credential", "", ""},
+		{"known value", "server rejected upstream-placeholder; retry later", "server rejected ***; retry later"},
+		{"field", "X-API-Key = fixture-field; retry later", "X-API-Key = ***; retry later"},
+		{"adjacent assignments", "key=x-api key=fixture-field; retry later", "key=*** key=***; retry later"},
+		{"ordinary field boundaries", "monkey=capuchin; result_key_name=display; api_key: 'sample value'", "monkey=capuchin; result_key_name=display; api_key: '***'"},
+		{"authorization scheme", "proxy reported bAsIc fixture-auth; retry later", "proxy reported bAsIc ***; retry later"},
+		{"cookie", "cOoKiE: sid=fixture-cookie; theme=light\r\nretry later", "cOoKiE: ***\r\nretry later"},
+		{"URL query", "https://provider.example/search?access_token=fixture-query&trace=kept", "https://provider.example/search?access_token=***&trace=kept"},
+		{"escaped URL query", `https:\/\/provider.example\/search?access%5ftoken=fixture-query&trace=kept`, `https:\/\/provider.example\/search?access%5ftoken=***&trace=kept`},
+		{"private key block", "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY----- retry later", "*** retry later"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Exercise both a late credential and a long diagnostic after the credential.
+			for _, pair := range [][2]string{
+				{longPathDiagnostic + tc.detail, longPathDiagnostic + tc.want},
+				{tc.detail + "\n" + longPathDiagnostic, tc.want + "\n" + longPathDiagnostic},
+			} {
+				require.Equal(t, pair[1], MaskCredentials(pair[0], knownKey))
+				require.Equal(t, pair[1], MaskDiagnosticText(pair[0], knownKey))
+			}
+		})
+	}
+}
 
 func TestMaskCredentialsCookieHeaders(t *testing.T) {
 	tests := []struct {
@@ -163,4 +208,22 @@ func TestMaskCredentialsCookieHeaders(t *testing.T) {
 func TestMaskCredentialsDecodedKnownKey(t *testing.T) {
 	input := `{"message":"fixture-a\u0026b","code":"denied"}`
 	require.Equal(t, `{"message":"***","code":"denied"}`, MaskCredentials(input, "fixture-a&b"))
+}
+
+func TestMaskCredentialsPreservesQuotesInDiagnostics(t *testing.T) {
+	for _, text := range []string{
+		`The 24" display is unavailable; retry tomorrow.`,
+		`{"error":{"message":"The 24\" display is unavailable; retry tomorrow."}}`,
+		`The 24" display has no profile at C:\Profiles\wide.icc. Retry after installing it.`,
+		`{"error":{"message":"Could not read \"C:\\Profiles\\wide.icc\". Retry after installing it."}}`,
+		`Unexpected delimiter: " at column 18. Expected a number.`,
+		`Expected { before delimiter " at column 18.`,
+		`"C:\Profiles\wide.icc" was not found.`,
+	} {
+		require.Equal(t, text, MaskCredentials(text))
+	}
+	withCredential := `The 24" display at C:\temp\wide.icc is unavailable. Authorization: Bearer fixture-token`
+	require.Equal(t, `The 24" display at C:\temp\wide.icc is unavailable. Authorization: ***`, MaskCredentials(withCredential))
+	encodedCredential := `API returned "invalid\q: \u0066ixture-secret`
+	require.Equal(t, `API returned "***"`, MaskCredentials(encodedCredential, "fixture-secret"))
 }

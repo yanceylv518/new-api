@@ -37,7 +37,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -1865,20 +1864,31 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 				common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
 				require.Nil(t, middleware.SetupContextForSelectedChannel(c, &channels[0], "gpt-3.5-turbo"))
 				Relay(c, types.RelayFormatOpenAI)
-				// The real relay submits refund and performance samples to the
-				// existing pool. Drain them before checking balances or restoring
-				// global DB/Redis settings in this test fixture.
-				require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
 				assert.Equal(t, int32(2), attempts.Load())
 				outputs = append(outputs, w.Body.String())
 				requestMu.Lock()
 				requestBodies = append(requestBodies, append([]string(nil), upstreamRequests...))
 				requestMu.Unlock()
-				var storedUser model.User
-				require.NoError(t, model.DB.First(&storedUser, user.Id).Error)
-				charges = append(charges, 10000000-storedUser.Quota)
-				require.NoError(t, model.DB.First(&token, token.Id).Error)
-				tokenCharges = append(tokenCharges, token.UsedQuota)
+				// Refunds complete asynchronously. Wait for this account and token to
+				// reconcile; other tests can have unrelated work in the shared pool.
+				var charge, tokenCharge int
+				require.EventuallyWithT(t, func(check *assert.CollectT) {
+					var account model.User
+					var credential model.Token
+					require.NoError(check, model.DB.First(&account, user.Id).Error)
+					require.NoError(check, model.DB.First(&credential, token.Id).Error)
+					charge, tokenCharge = 10000000-account.Quota, credential.UsedQuota
+					assert.Equal(check, charge, account.UsedQuota)
+					assert.Equal(check, charge, tokenCharge)
+					assert.Equal(check, charge, 10000000-credential.RemainQuota)
+					if allFail {
+						assert.Zero(check, charge)
+					} else {
+						assert.Positive(check, charge)
+					}
+				}, 5*time.Second, time.Millisecond)
+				charges = append(charges, charge)
+				tokenCharges = append(tokenCharges, tokenCharge)
 				if enabled {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					require.NoError(t, writer.Shutdown(ctx))

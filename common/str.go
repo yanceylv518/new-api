@@ -146,3 +146,7 @@ func MaskSensitiveInfo(str string) string {
 func MaskCredentials(str string, knownKeys ...string) string {
 	return kitutil.MaskCredentials(str, knownKeys...)
 }
+
+func MaskDiagnosticText(str string, knownKeys ...string) string {
+	return kitutil.MaskDiagnosticText(str, knownKeys...)
+}

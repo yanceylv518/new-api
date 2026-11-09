@@ -6306,7 +6306,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zhipu Web Search": "Zhipu Web Search",
     "Response body limit (MiB)": "Response body limit (MiB)",
-    "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.": "0 means unlimited. Oversized responses return an error; successful upstream searches are still billed.",
+    "0 means unlimited. Oversized responses return an error and refund the reserved quota.": "0 means unlimited. Oversized responses return an error and refund the reserved quota.",
     "Web Search (/v1/web_search)": "Web Search (/v1/web_search)",
     "Zoom": "Zoom"
   }

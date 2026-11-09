@@ -241,7 +241,8 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			return nil, types.NewError(fmt.Errorf("missing request context for header passthrough"), types.ErrorCodeChannelHeaderOverrideInvalid)
 		}
 		for name := range c.Request.Header {
-			if shouldSkipPassthroughHeader(name) {
+			if shouldSkipPassthroughHeader(name) ||
+				(info.RelayMode == constant.RelayModeZhipuWebSearch && common.IsSensitiveHeaderName(name) && !strings.EqualFold(name, "Idempotency-Key")) {
 				continue
 			}
 			if !passAll {
@@ -321,8 +322,15 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
+	if info.RelayMode == constant.RelayModeZhipuWebSearch && c.Request.URL.RawQuery != "" {
+		if req.URL.RawQuery != "" {
+			req.URL.RawQuery += "&"
+		}
+		req.URL.RawQuery += c.Request.URL.RawQuery
+	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		req = req.WithContext(c.Request.Context())
 		// 搜索可能按调用次数计费，连接失败后不能由传输层重放请求体。
 		req.GetBody = nil
 	}
@@ -339,6 +347,11 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
 	if info.RelayMode == constant.RelayModeZhipuWebSearch {
+		// 搜索响应由自身处理压缩，避免 Go 提前解压多重编码。
+		if req.Header.Get("Accept-Encoding") == "" && req.Header.Get("Range") == "" && req.Method != http.MethodHead {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		req.Header.Del("Sec-WebSocket-Protocol")
 		for name, values := range req.Header {
 			if !common.IsSensitiveHeaderName(name) {
 				continue
@@ -576,6 +589,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := relayClient.Do(req)
 	info.Timeline.Response(resp, err)
 	if err != nil {
+		if info.RelayMode == constant.RelayModeZhipuWebSearch {
+			if requestErr := c.Request.Context().Err(); requestErr != nil && errors.Is(err, requestErr) {
+				return nil, types.NewRequestCancelledError(requestErr)
+			}
+		}
 		logger.LogError(c, "do request failed: "+common2.MaskCredentials(err.Error(), info.RedactionKeys()...))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
