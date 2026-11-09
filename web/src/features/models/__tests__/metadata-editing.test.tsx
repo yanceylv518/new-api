@@ -17,7 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import {
+  render,
+  screen,
+  waitFor,
+  cleanup,
+  fireEvent,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosError } from 'axios'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -170,7 +176,8 @@ describe('metadata editing', () => {
     expect(screen.getByText('Gemini.Color')).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Custom model icon' }))
     const icon = screen.getByRole('combobox', { name: 'Icon' })
-    await user.type(icon, 'Claude.Avatar')
+    await user.click(icon)
+    await user.paste('Claude.Avatar')
     await user.keyboard('{Escape}')
     expect(screen.getByText('Claude.Avatar')).toBeVisible()
     await user.click(
@@ -182,11 +189,10 @@ describe('metadata editing', () => {
     expect(screen.getByText('Gemini.Color')).toBeVisible()
     const vendorInput = screen.getByRole('combobox', { name: 'Vendor' })
     await user.click(vendorInput)
-    await user.type(vendorInput, 'Another')
+    await user.paste('Another')
     await user.click(screen.getByRole('option', { name: 'Another vendor' }))
     expect(vendorInput).toHaveValue('Another vendor')
-    await user.clear(description)
-    await user.type(description, 'Updated metadata')
+    fireEvent.change(description, { target: { value: 'Updated metadata' } })
     await user.click(
       screen.getByRole('button', { name: /Update Model|Save metadata/ })
     )
@@ -270,8 +276,9 @@ describe('metadata editing', () => {
     const description = await screen.findByLabelText('Description')
     await waitFor(() => expect(description).toHaveValue('Original'))
     const user = userEvent.setup()
-    await user.clear(description)
-    await user.type(description, 'Unsaved metadata draft')
+    fireEvent.change(description, {
+      target: { value: 'Unsaved metadata draft' },
+    })
     await user.click(screen.getByRole('tab', { name: 'Pricing' }))
     const price = await screen.findByPlaceholderText('0.01')
     await waitFor(() => expect(price).toHaveValue('1.5'))

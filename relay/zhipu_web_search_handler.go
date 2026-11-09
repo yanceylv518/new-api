@@ -109,7 +109,7 @@ func redactZhipuSearchErrorBody(body []byte, keys []string, depth int) ([]byte, 
 			}
 			masked = string(cleaned)
 		} else {
-			masked = common.MaskCredentials(masked, keys...)
+			masked = common.MaskDiagnosticText(masked, keys...)
 		}
 		if masked != value {
 			encoded, err := common.Marshal(masked)
@@ -329,11 +329,16 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		return apiErr
 	}
 	var responseObject struct{}
+	maskBody := common.MaskCredentials
+	mediaType, _, _ := strings.Cut(response.Header.Get("Content-Type"), ";")
+	if strings.EqualFold(strings.TrimSpace(mediaType), "text/plain") {
+		maskBody = common.MaskDiagnosticText
+	}
 	structuredError := false
 	if successStatus {
 		if err := common.Unmarshal(responseBody, &responseObject); err != nil {
 			// 格式损坏的错误正文也可能回显渠道凭证，不能绕过脱敏。
-			responseBody = []byte(common.MaskCredentials(string(responseBody), keys...))
+			responseBody = []byte(maskBody(string(responseBody), keys...))
 		} else {
 			structuredError = len(dto.ExtractJSONError(responseBody)) > 0
 		}
@@ -347,7 +352,7 @@ func ZhipuWebSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		if redactErr != nil {
 			var raw json.RawMessage
 			if common.Unmarshal(responseBody, &raw) != nil && utf8.Valid(responseBody) {
-				safeBody = []byte(common.MaskCredentials(string(responseBody), keys...))
+				safeBody = []byte(maskBody(string(responseBody), keys...))
 				redactErr = nil
 			}
 		}

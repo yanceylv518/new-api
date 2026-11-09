@@ -20,17 +20,28 @@ var (
 	credentialCookieContextPattern = regexp.MustCompile(`"(?:\\.|[^"\\])*"|` + credentialCookieHeaderPattern.String())
 	credentialValuePattern         = regexp.MustCompile(`(?i)(\b` + credentialFieldNames + `\\?["']?\s*[:=]\s*)(\\"(?:\\.|[^"\\])*?\\"|\\'(?:\\.|[^'\\])*?\\'|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s,"'&;}\]]+|[^\s,"'&;{}\[\]\\]+)`)
 	credentialJSONStringPattern    = regexp.MustCompile(`(?s)"(?:\\.|[^"\\])*(?:"|\\?\z)`)
+	credentialJSONEscapePattern    = regexp.MustCompile(`\\(?:u[[:xdigit:]]{4}(?:\\u[[:xdigit:]]{4})?|["\\/bfnrt])`)
 	credentialAuthPattern          = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)[a-z0-9._~+/=-]+`)
 	credentialPrivateKeyPattern    = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)`)
 )
 
 // MaskCredentials 保留诊断地址，只隐藏凭证；已知密钥也覆盖没有字段名的上游回显。
 func MaskCredentials(value string, knownKeys ...string) string {
-	return maskCredentials(value, 0, knownKeys...)
+	return maskCredentials(value, 0, true, knownKeys...)
 }
 
-func maskCredentials(value string, depth int, knownKeys ...string) string {
-	value = maskJSONCredentialValues(value, depth, knownKeys...)
+// MaskDiagnosticText handles decoded messages and text/plain bodies. They may
+// contain JSON fragments, but their own surrounding quotation marks are prose.
+func MaskDiagnosticText(value string, knownKeys ...string) string {
+	return maskCredentials(value, 0, false, knownKeys...)
+}
+
+func maskCredentials(value string, depth int, document bool, knownKeys ...string) string {
+	value = maskJSONCredentialValues(value, depth, document, knownKeys...)
+	return maskPlainCredentials(value, knownKeys...)
+}
+
+func maskPlainCredentials(value string, knownKeys ...string) string {
 	for _, key := range knownKeys {
 		if key == "" {
 			continue
@@ -85,25 +96,50 @@ func maskCredentials(value string, depth int, knownKeys ...string) string {
 }
 
 // 按 JSON 值边界替换敏感字段，保留周围文字、字段顺序和非凭证值的原始精度。
-func maskJSONCredentialValues(value string, depth int, knownKeys ...string) string {
+func maskJSONCredentialValues(value string, depth int, document bool, knownKeys ...string) string {
 	var result strings.Builder
-	last := 0
-	for _, match := range credentialJSONStringPattern.FindAllStringIndex(value, -1) {
-		if match[0] < last {
+	last, nesting := 0, 0
+	first := len(value) - len(strings.TrimLeft(value, " \t\r\n"))
+	for cursor := 0; cursor < len(value); {
+		next := strings.IndexAny(value[cursor:], "{}[]\"")
+		if next < 0 {
+			break
+		}
+		start := cursor + next
+		cursor = start + 1
+		switch value[start] {
+		case '{', '[':
+			if nesting > 0 || start == first || startsJSONContainer(value[start:]) {
+				nesting++
+			}
+			continue
+		case '}', ']':
+			if nesting > 0 {
+				nesting--
+			}
 			continue
 		}
-		end := match[1]
+		token := credentialJSONStringPattern.FindString(value[start:])
+		end := start + len(token)
+		cursor = end
+		// A prose quotation can end at the opening quote of an embedded JSON
+		// key. In that case start scanning at the container itself.
+		if nesting == 0 && start != first {
+			if inner := strings.IndexAny(token[1:], "{["); inner >= 0 {
+				open := start + 1 + inner
+				if startsJSONContainer(value[open:]) {
+					cursor = open
+					continue
+				}
+			}
+		}
 		var decoded string
-		if err := UnmarshalJsonStr(value[match[0]:end], &decoded); err != nil {
-			// 普通文本中的英寸符号等引号不是 JSON 起始符。无转义时，
-			// 后续的明文密钥、认证头和字段脱敏仍然适用。
-			prefix := strings.TrimRight(value[:match[0]], " \t\r\n")
-			if len(prefix) > 0 && strings.IndexByte("{[:,", prefix[len(prefix)-1]) < 0 &&
-				!strings.Contains(value[match[0]:end], "\\") {
+		if err := UnmarshalJsonStr(token, &decoded); err != nil {
+			standalone := document && start == first && strings.TrimSpace(value[end:]) == ""
+			if nesting == 0 && !standalone && !hasEscapedCredential(token[1:], depth, knownKeys...) {
 				continue
 			}
-			// 未闭合或无法解码的字符串可能包含转义凭证，整体隐藏该片段。
-			result.WriteString(value[last:match[0]])
+			result.WriteString(value[last:start])
 			result.WriteString(`"***"`)
 			last = end
 			continue
@@ -112,10 +148,10 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 		tail := strings.TrimLeft(value[end:], " \t\r\n")
 		if credentialNamePattern.MatchString(decoded) && strings.HasPrefix(tail, ":") {
 			tail = strings.TrimLeft(tail[1:], " \t\r\n")
-			start := len(value) - len(tail)
+			fieldStart := len(value) - len(tail)
 			var raw json.RawMessage
 			if err := DecodeJson(strings.NewReader(tail), &raw); err == nil && len(raw) > 0 {
-				end = start + len(raw)
+				end = fieldStart + len(raw)
 			} else {
 				// 值被截断时无法确定结束边界，保留字段前的诊断内容并隐藏剩余敏感片段。
 				end = len(value)
@@ -124,12 +160,13 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 			if strings.HasPrefix(tail, "[") {
 				masked = `["***"]`
 			}
-			replacement = value[match[0]:start] + masked
+			replacement = value[start:fieldStart] + masked
+			cursor = end
 		} else {
 			// 深层嵌套字符串整体隐藏，避免反复解码造成无界递归。
 			replacement = `"***"`
 			if depth < maxCredentialJSONDepth {
-				masked := maskCredentials(decoded, depth+1, knownKeys...)
+				masked := maskCredentials(decoded, depth+1, false, knownKeys...)
 				if masked == decoded {
 					continue
 				}
@@ -138,7 +175,7 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 				}
 			}
 		}
-		result.WriteString(value[last:match[0]])
+		result.WriteString(value[last:start])
 		result.WriteString(replacement)
 		last = end
 	}
@@ -147,6 +184,37 @@ func maskJSONCredentialValues(value string, depth int, knownKeys ...string) stri
 	}
 	result.WriteString(value[last:])
 	return result.String()
+}
+
+func startsJSONContainer(text string) bool {
+	next := strings.TrimLeft(text[1:], " \t\r\n")
+	if next == "" {
+		return false
+	}
+	if text[0] == '{' {
+		return next[0] == '"'
+	}
+	return strings.IndexByte("\"[{0123456789-", next[0]) >= 0 ||
+		strings.HasPrefix(next, "true") || strings.HasPrefix(next, "false") || strings.HasPrefix(next, "null")
+}
+
+// A broken quoted span in prose can still contain an escaped credential.
+// Inspect a decoded copy, leaving the original diagnostic untouched when safe.
+func hasEscapedCredential(text string, depth int, knownKeys ...string) bool {
+	if !credentialJSONEscapePattern.MatchString(text) {
+		return false
+	}
+	// 明文凭证会由外层按字段遮盖。只检查解码后才显现的凭证，
+	// 避免因同一行包含正常路径和认证头而丢失整段诊断。
+	text = maskPlainCredentials(text, knownKeys...)
+	decoded := credentialJSONEscapePattern.ReplaceAllStringFunc(text, func(escape string) string {
+		var s string
+		if UnmarshalJsonStr("\""+escape+"\"", &s) == nil {
+			return s
+		}
+		return escape
+	})
+	return decoded != text && (depth >= maxCredentialJSONDepth || maskCredentials(decoded, depth+1, false, knownKeys...) != decoded)
 }
 
 // JSON 字符串先解码再处理头行，避免转义换行和结束引号后的诊断内容被遮盖。

@@ -169,7 +169,16 @@ func TestMaskCredentialsPreservesQuotesInDiagnostics(t *testing.T) {
 	for _, text := range []string{
 		`The 24" display is unavailable; retry tomorrow.`,
 		`{"error":{"message":"The 24\" display is unavailable; retry tomorrow."}}`,
+		`The 24" display has no profile at C:\Profiles\wide.icc. Retry after installing it.`,
+		`{"error":{"message":"Could not read \"C:\\Profiles\\wide.icc\". Retry after installing it."}}`,
+		`Unexpected delimiter: " at column 18. Expected a number.`,
+		`Expected { before delimiter " at column 18.`,
+		`"C:\Profiles\wide.icc" was not found.`,
 	} {
 		require.Equal(t, text, MaskCredentials(text))
 	}
+	withCredential := `The 24" display at C:\temp\wide.icc is unavailable. Authorization: Bearer fixture-token`
+	require.Equal(t, `The 24" display at C:\temp\wide.icc is unavailable. Authorization: ***`, MaskCredentials(withCredential))
+	encodedCredential := `API returned "invalid\q: \u0066ixture-secret`
+	require.Equal(t, `API returned "***"`, MaskCredentials(encodedCredential, "fixture-secret"))
 }
