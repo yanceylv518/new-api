@@ -259,7 +259,7 @@ func taskModelName(task *model.Task) string {
 
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
-// 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
+// 返回资金来源是否已成功退还；失败时保留 quota，供后续重试。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {

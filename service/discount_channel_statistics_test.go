@@ -270,7 +270,7 @@ func TestDiscountTaskZeroDeltaPreservesPluginState(t *testing.T) {
 	_, err := model.CommitTaskSettlement(context.Background(), &stale, 1, types.NewDiscountAmounts(15, 1))
 	require.Error(t, err)
 	assert.EqualValues(t, 20, getChannelUsedQuota(t, 72))
-	// 快照落库失败时不继续变更渠道，便于重试或人工对账。
+	// 快照落库失败时不继续变更渠道，便于后续重试。
 	require.NoError(t, model.DB.Delete(task).Error)
 	RecalculateTaskQuotaWithAmounts(context.Background(), task, 1, types.NewDiscountAmounts(30, 1), "missing task")
 	assert.EqualValues(t, 20, getChannelUsedQuota(t, 72))

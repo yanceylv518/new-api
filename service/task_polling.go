@@ -959,11 +959,11 @@ func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *mo
 		// plugin could not interpret.
 		logger.LogWarn(ctx, fmt.Sprintf("task %s poll %s (failures=%d, http=%d): %s", task.TaskID, class, task.PrivateData.PollFailures, statusCode, detail))
 	}
-	// 连续失败阈值只标记对账；查询故障和超时都不能证明生成失败。
+	// 连续失败阈值只标记结果未确认；查询故障和超时都不能证明生成失败。
 	if constant.TaskPollMaxFailures > 0 && task.PrivateData.PollFailures >= constant.TaskPollMaxFailures {
 		task.PrivateData.ReconciliationRequired = true
 		task.PrivateData.ReconciliationReason = pollFailureReason(class, statusCode, detail)
-		logger.LogWarn(ctx, fmt.Sprintf("task %s requires reconciliation; reserve retained, failures=%d class=%s", task.TaskID, task.PrivateData.PollFailures, class))
+		logger.LogWarn(ctx, fmt.Sprintf("task %s result is pending; reserve retained, failures=%d class=%s", task.TaskID, task.PrivateData.PollFailures, class))
 	}
 	if _, err := task.UpdateWithStatus(fromStatus); err != nil {
 		return err

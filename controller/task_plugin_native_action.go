@@ -696,7 +696,7 @@ func executeTaskPluginNativeDelete(
 		return
 	}
 	if action == "deleted" && !retainTaskPluginUnsettledDeletion(c, task) {
-		respondTaskPluginNativeActionError(c, http.StatusServiceUnavailable, "task_settlement_unavailable", "Upstream task was deleted before final usage was available; reserved quota was retained for reconciliation")
+		respondTaskPluginNativeActionError(c, http.StatusServiceUnavailable, "task_settlement_unavailable", "Upstream task was deleted before final usage was available; reserved quota was retained")
 		return
 	}
 	if action == "cancelled" {
@@ -833,7 +833,7 @@ func taskPluginNativeTaskOwned(meta pluginruntime.Meta, task *model.Task) bool {
 }
 
 // retainTaskPluginUnsettledDeletion 防止查询与删除之间的上游状态变化被误算为失败退款。
-// 若其他轮询已获得终态则沿用其结算；否则保留预扣、延后查询并明确要求对账。
+// 若其他轮询已获得终态则沿用其结算；否则保留预扣并延后查询。
 func retainTaskPluginUnsettledDeletion(c *gin.Context, task *model.Task) bool {
 	for range 2 {
 		if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
@@ -847,12 +847,12 @@ func retainTaskPluginUnsettledDeletion(c *gin.Context, task *model.Task) bool {
 		task.FailReason = "upstream task deleted before final usage was available; reserved quota retained"
 		won, err := task.UpdateWithStatus(previousStatus)
 		if err != nil {
-			logger.LogError(c, fmt.Sprintf("删除任务待对账状态保存失败 task=%s err=%v", task.TaskID, err))
+			logger.LogError(c, fmt.Sprintf("删除任务未结算状态保存失败 task=%s err=%v", task.TaskID, err))
 			return false
 		}
 		if won {
 			service.RecordTaskPerformance(task)
-			logger.LogWarn(c, fmt.Sprintf("上游删除与完成竞态，保留预扣待对账 task=%s quota=%d", task.TaskID, task.Quota))
+			logger.LogWarn(c, fmt.Sprintf("上游删除与完成竞态，最终用量未确认，保留预扣 task=%s quota=%d", task.TaskID, task.Quota))
 			return false
 		}
 		latest, exists, loadErr := model.GetByTaskId(task.UserId, task.TaskID)
