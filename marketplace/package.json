@@ -1,0 +1,12 @@
+{
+  "name": "pinducloud-plugin-market",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "sync": "node build.mjs --sync"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,1027 @@
+{
+  "indexVersion": 1,
+  "name": "PinduCloud",
+  "plugins": [
+    {
+      "key": "alibaba",
+      "name": "Alibaba Bailian",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Alibaba Cloud Bailian image and video generation (Wan, Qwen-Image, Z-Image)",
+        "zh": "阿里云百炼图片与视频生成（万相、千问图像、Z-Image）"
+      },
+      "models": [
+        "wan3.0-video",
+        "wan3.0-video-prime",
+        "wan2.7-t2v",
+        "wan2.7-t2v-2026-04-25",
+        "wan2.7-t2v-2026-06-12",
+        "wan2.7-i2v",
+        "wan2.7-i2v-2026-04-25",
+        "wan2.7-r2v",
+        "wan2.7-r2v-2026-06-12",
+        "wan2.7-videoedit",
+        "wan2.6-t2v",
+        "wan2.6-t2v-us",
+        "wan2.6-i2v",
+        "wan2.6-i2v-flash",
+        "wan2.6-i2v-us",
+        "wan2.6-r2v",
+        "wan2.6-r2v-flash",
+        "wan2.5-t2v-preview",
+        "wan2.5-i2v-preview",
+        "wan2.2-t2v-plus",
+        "wan2.2-i2v-flash",
+        "wan2.2-i2v-plus",
+        "wan2.2-kf2v-flash",
+        "wan2.2-s2v",
+        "wan2.2-animate-move",
+        "wan2.2-animate-mix",
+        "wan2.2-s2v-detect",
+        "wanx2.1-t2v-plus",
+        "wanx2.1-t2v-turbo",
+        "wanx2.1-i2v-plus",
+        "wanx2.1-i2v-turbo",
+        "wanx2.1-kf2v-plus",
+        "wanx2.1-vace-plus",
+        "wan2.7-image-pro",
+        "wan2.7-image",
+        "wan2.6-image",
+        "wan2.6-t2i",
+        "wan2.5-t2i-preview",
+        "wan2.2-t2i-flash",
+        "wan2.2-t2i-plus",
+        "wanx2.1-t2i-turbo",
+        "wanx2.1-t2i-plus",
+        "wanx2.0-t2i-turbo",
+        "wan2.5-i2i-preview",
+        "wanx2.1-imageedit",
+        "qwen-image",
+        "qwen-image-plus",
+        "qwen-image-max",
+        "qwen-image-2.0",
+        "qwen-image-2.0-pro",
+        "qwen-image-3.0",
+        "qwen-image-3.0-pro",
+        "qwen-image-edit",
+        "qwen-image-edit-plus",
+        "qwen-image-edit-max",
+        "z-image-turbo",
+        "qwen-image-plus-2026-01-09",
+        "qwen-image-max-2025-12-30",
+        "qwen-image-2.0-2026-03-03",
+        "qwen-image-2.0-pro-2026-03-03",
+        "qwen-image-2.0-pro-2026-04-22",
+        "qwen-image-2.0-pro-2026-06-22",
+        "qwen-image-edit-plus-2025-10-30",
+        "qwen-image-edit-plus-2025-12-15",
+        "qwen-image-edit-max-2026-01-16"
+      ],
+      "latest": "1.5.2",
+      "icon": "Bailian.Color",
+      "channelTypes": [
+        17
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "models": [
+            "wan2.7-image-pro",
+            "wan2.7-image",
+            "wan2.6-image",
+            "wan2.6-t2i",
+            "wan2.5-t2i-preview",
+            "wan2.2-t2i-flash",
+            "wan2.2-t2i-plus",
+            "wanx2.1-t2i-turbo",
+            "wanx2.1-t2i-plus",
+            "wanx2.0-t2i-turbo",
+            "wan2.5-i2i-preview",
+            "wanx2.1-imageedit",
+            "qwen-image",
+            "qwen-image-plus",
+            "qwen-image-max",
+            "qwen-image-2.0",
+            "qwen-image-2.0-pro",
+            "qwen-image-3.0",
+            "qwen-image-3.0-pro",
+            "qwen-image-edit",
+            "qwen-image-edit-plus",
+            "qwen-image-edit-max",
+            "z-image-turbo",
+            "qwen-image-plus-2026-01-09",
+            "qwen-image-max-2025-12-30",
+            "qwen-image-2.0-2026-03-03",
+            "qwen-image-2.0-pro-2026-03-03",
+            "qwen-image-2.0-pro-2026-04-22",
+            "qwen-image-2.0-pro-2026-06-22",
+            "qwen-image-edit-plus-2025-10-30",
+            "qwen-image-edit-plus-2025-12-15",
+            "qwen-image-edit-max-2026-01-16",
+            "wan3.0-video",
+            "wan3.0-video-prime",
+            "wan2.7-t2v",
+            "wan2.7-i2v",
+            "wan2.7-r2v",
+            "wan2.7-videoedit",
+            "wan2.6-t2v",
+            "wan2.6-t2v-us",
+            "wan2.6-i2v",
+            "wan2.6-i2v-flash",
+            "wan2.6-i2v-us",
+            "wan2.6-r2v",
+            "wan2.6-r2v-flash",
+            "wan2.5-t2v-preview",
+            "wan2.5-i2v-preview",
+            "wan2.2-t2v-plus",
+            "wan2.2-i2v-flash",
+            "wan2.2-i2v-plus",
+            "wan2.2-kf2v-flash",
+            "wan2.2-s2v",
+            "wan2.2-animate-move",
+            "wan2.2-animate-mix",
+            "wanx2.1-t2v-plus",
+            "wanx2.1-t2v-turbo",
+            "wanx2.1-i2v-plus",
+            "wanx2.1-i2v-turbo",
+            "wanx2.1-kf2v-plus",
+            "wanx2.1-vace-plus",
+            "wan2.7-t2v-2026-04-25",
+            "wan2.7-t2v-2026-06-12",
+            "wan2.7-i2v-2026-04-25",
+            "wan2.7-r2v-2026-06-12"
+          ],
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        {
+          "name": "openai_video",
+          "models": [
+            "wan3.0-video",
+            "wan3.0-video-prime",
+            "wan2.7-t2v",
+            "wan2.7-i2v",
+            "wan2.7-r2v",
+            "wan2.7-videoedit",
+            "wan2.6-t2v",
+            "wan2.6-t2v-us",
+            "wan2.6-i2v",
+            "wan2.6-i2v-flash",
+            "wan2.6-i2v-us",
+            "wan2.6-r2v",
+            "wan2.6-r2v-flash",
+            "wan2.5-t2v-preview",
+            "wan2.5-i2v-preview",
+            "wan2.2-t2v-plus",
+            "wan2.2-i2v-flash",
+            "wan2.2-i2v-plus",
+            "wan2.2-kf2v-flash",
+            "wan2.2-s2v",
+            "wan2.2-animate-move",
+            "wan2.2-animate-mix",
+            "wanx2.1-t2v-plus",
+            "wanx2.1-t2v-turbo",
+            "wanx2.1-i2v-plus",
+            "wanx2.1-i2v-turbo",
+            "wanx2.1-kf2v-plus",
+            "wanx2.1-vace-plus",
+            "wan2.7-t2v-2026-04-25",
+            "wan2.7-t2v-2026-06-12",
+            "wan2.7-i2v-2026-04-25",
+            "wan2.7-r2v-2026-06-12"
+          ]
+        },
+        {
+          "name": "openai_image",
+          "models": [
+            "wan2.7-image-pro",
+            "wan2.7-image",
+            "wan2.6-image",
+            "wan2.6-t2i",
+            "wan2.5-t2i-preview",
+            "wan2.2-t2i-flash",
+            "wan2.2-t2i-plus",
+            "wanx2.1-t2i-turbo",
+            "wanx2.1-t2i-plus",
+            "wanx2.0-t2i-turbo",
+            "wan2.5-i2i-preview",
+            "wanx2.1-imageedit",
+            "qwen-image",
+            "qwen-image-plus",
+            "qwen-image-max",
+            "qwen-image-2.0",
+            "qwen-image-2.0-pro",
+            "qwen-image-3.0",
+            "qwen-image-3.0-pro",
+            "qwen-image-edit",
+            "qwen-image-edit-plus",
+            "qwen-image-edit-max",
+            "z-image-turbo",
+            "qwen-image-plus-2026-01-09",
+            "qwen-image-max-2025-12-30",
+            "qwen-image-2.0-2026-03-03",
+            "qwen-image-2.0-pro-2026-03-03",
+            "qwen-image-2.0-pro-2026-04-22",
+            "qwen-image-2.0-pro-2026-06-22",
+            "qwen-image-edit-plus-2025-10-30",
+            "qwen-image-edit-plus-2025-12-15",
+            "qwen-image-edit-max-2026-01-16"
+          ]
+        }
+      ],
+      "versions": [
+        {
+          "version": "1.5.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/alibaba/1.5.2/plugin.js",
+          "sha256": "0dc03e317c26330b093b1fef008099babc27afe78c021e86045339269365c6dc",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.5.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/alibaba/1.5.1/plugin.js",
+          "sha256": "9b02bee981722cda177ba2c0b006744944f6dd81d5329eccb4f3308be3be00ae",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "anyllm",
+      "name": "Doubao Video（AnyLLM）",
+      "author": {
+        "name": "PinduCloud"
+      },
+      "description": {
+        "en": "Seedance video generation, Seedream image generation and private assets",
+        "zh": "Seedance 视频生成、Seedream 图片生成与私域素材"
+      },
+      "models": [
+        "doubao-seedance-2-0-260128",
+        "doubao-seedance-2-0-fast-260128",
+        "doubao-seedance-2-0-mini-260615",
+        "doubao-seedance-2-5-260628",
+        "doubao-seedream-5-0-pro-260628",
+        "doubao-seedream-5-0-flash-260915"
+      ],
+      "latest": "1.2.3",
+      "icon": "text:SD",
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        {
+          "name": "openai_video",
+          "models": [
+            "doubao-seedance-2-0-260128",
+            "doubao-seedance-2-0-fast-260128",
+            "doubao-seedance-2-0-mini-260615",
+            "doubao-seedance-2-5-260628"
+          ]
+        },
+        {
+          "name": "openai_image",
+          "models": [
+            "doubao-seedream-5-0-pro-260628",
+            "doubao-seedream-5-0-flash-260915"
+          ]
+        }
+      ],
+      "versions": [
+        {
+          "version": "1.2.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.2.3/plugin.js",
+          "sha256": "2dab6fa7ad18d9de75ba44fad9ea86f73d431965274ca25c8e54c5bb1cf090a5",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.2.2/plugin.js",
+          "sha256": "c4bcd600127fbf0b6876abae611389ec9c4c1d857597892b2a645164d986e10d",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.5",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.1.5/plugin.js",
+          "sha256": "25600f3c17c35ed47f8058b8b73054d0873621452011c45ef960381e4b57e753",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.4",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.1.4/plugin.js",
+          "sha256": "57ef781dbd4a3a5edd8171ad67053147dfc1eb90c234e5602f26bf1e563826fd",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.1.3/plugin.js",
+          "sha256": "5627b426da23d944f6c9d280eabc28b1b25c6aa652157095959d4957a7d5c632",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.1.2/plugin.js",
+          "sha256": "4215c94d47063dda8fb6368814b1bd6d7daa9c19e6dce1da255ada7afeef92ff",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/anyllm/1.1.1/plugin.js",
+          "sha256": "73cad29eaeff47c9b24c3feb8b7c9235f44ecf9337aa942e99ae6ac1584ae3c9",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "doubao",
+      "name": "Doubao Video",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Volcengine Doubao Seedance video generation and Seedream image generation",
+        "zh": "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成"
+      },
+      "models": [
+        "doubao-seedance-1-0-pro-250528",
+        "doubao-seedance-1-0-lite-t2v",
+        "doubao-seedance-1-0-lite-i2v",
+        "doubao-seedance-1-5-pro-251215",
+        "doubao-seedance-2-0-260128",
+        "doubao-seedance-2-0",
+        "doubao-seedance-2-0-fast-260128",
+        "doubao-seedance-2-0-fast",
+        "doubao-seedance-2-0-mini-260615",
+        "doubao-seedance-2-0-mini",
+        "doubao-seedance-2-5-260628",
+        "doubao-seedance-2-5",
+        "doubao-seedream-5-0-pro-260628",
+        "doubao-seedream-5-0-flash-260915",
+        "doubao-seedream-5-0-lite-260128",
+        "doubao-seedream-5-0-260128",
+        "doubao-seedream-4-5-251128",
+        "doubao-seedream-4-0-250828"
+      ],
+      "latest": "1.2.14",
+      "icon": "Doubao.Color",
+      "channelTypes": [
+        54,
+        45
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        {
+          "name": "openai_video",
+          "models": [
+            "doubao-seedance-1-0-pro-250528",
+            "doubao-seedance-1-0-lite-t2v",
+            "doubao-seedance-1-0-lite-i2v",
+            "doubao-seedance-1-5-pro-251215",
+            "doubao-seedance-2-0-260128",
+            "doubao-seedance-2-0",
+            "doubao-seedance-2-0-fast-260128",
+            "doubao-seedance-2-0-fast",
+            "doubao-seedance-2-0-mini-260615",
+            "doubao-seedance-2-0-mini",
+            "doubao-seedance-2-5-260628",
+            "doubao-seedance-2-5"
+          ]
+        },
+        {
+          "name": "openai_image",
+          "models": [
+            "doubao-seedream-5-0-pro-260628",
+            "doubao-seedream-5-0-flash-260915",
+            "doubao-seedream-5-0-lite-260128",
+            "doubao-seedream-5-0-260128",
+            "doubao-seedream-4-5-251128",
+            "doubao-seedream-4-0-250828"
+          ]
+        }
+      ],
+      "versions": [
+        {
+          "version": "1.2.14",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.14/plugin.js",
+          "sha256": "edd24b798e29c1521804b142222eaca279c7a8b77b270f80b429d321aa472de1",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.13",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.13/plugin.js",
+          "sha256": "fbc5210832e4ff875e508a5f975d7b28f1272243b38b860d2318f4a6f6f91b4a",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.12",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.12/plugin.js",
+          "sha256": "f66793898917a23d34718fb127e050e7eb08c93662ce8c91b8963ccd32878115",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.11",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.11/plugin.js",
+          "sha256": "c8f84d7771b1c0442d477379cc97757a9a06f481f3f6269bad39bc7d9aba3a6d",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.10",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.10/plugin.js",
+          "sha256": "4c9f74f7645b513829b19e3825d1924fe633e08bca3fa0074c629c4395b1adf2",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.9",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.9/plugin.js",
+          "sha256": "d230cb5ef140c912bf58dbcc0c2c2b91468fe387def30dc61f5d23f7572aba02",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.5",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.5/plugin.js",
+          "sha256": "1b02ca3ea2136b728270e2d726674e3197b819da3addf0e3f52c4e29d6a8047b",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.4",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.4/plugin.js",
+          "sha256": "ec748347256ae50a983bb03fe7b0b3c6ad19919fef08a196b6d244e3f23103d5",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.3/plugin.js",
+          "sha256": "288d14b13574139fcf1e986603bb56de1427465b4167229c21be10f67eab4b3a",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.2.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/doubao/1.2.2/plugin.js",
+          "sha256": "e34f6bd20961b0b449a9da61cfeee7c9d085df04e37fd4de7e5fb3b27a9b4327",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "google",
+      "name": "Google Veo (Gemini API)",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
+        "zh": "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本"
+      },
+      "models": [
+        "veo-3.0-generate-001",
+        "veo-3.0-fast-generate-001",
+        "veo-3.1-generate-preview",
+        "veo-3.1-fast-generate-preview"
+      ],
+      "latest": "1.0.3",
+      "icon": "Gemini.Color",
+      "channelTypes": [
+        24
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.0.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/google/1.0.3/plugin.js",
+          "sha256": "8777e764e46e7c01aae04f8aa997dbc7d0b5e123fc206f715b6199c5c74bb36e",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.0.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/google/1.0.2/plugin.js",
+          "sha256": "11a0fa233ffbb659c64aaec57b20f4e176fc1674cd2601051e77fe797a5979c9",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "hailuo",
+      "name": "Hailuo Video",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
+        "zh": "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）"
+      },
+      "models": [
+        "MiniMax-H3",
+        "MiniMax-Hailuo-2.3",
+        "MiniMax-Hailuo-2.3-Fast",
+        "MiniMax-Hailuo-02",
+        "T2V-01-Director",
+        "T2V-01",
+        "I2V-01-Director",
+        "I2V-01-live",
+        "I2V-01",
+        "S2V-01"
+      ],
+      "latest": "1.3.9",
+      "icon": "Hailuo.Color",
+      "channelTypes": [
+        35
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.3.9",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/hailuo/1.3.9/plugin.js",
+          "sha256": "0855f1a325718e233743fc012e7a143ad904e96925e629e01df2c0170917efc2",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.3.8",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/hailuo/1.3.8/plugin.js",
+          "sha256": "932384388b14d03671559cf9f5f12d38d67d815ddcaf4131c8a006bdcead43d1",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "jimeng",
+      "name": "Jimeng",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Volcengine Jimeng video generation (text-to-video, image-to-video, and first-and-last-frame)",
+        "zh": "火山引擎即梦视频生成（文生视频、图生视频、首尾帧）"
+      },
+      "models": [
+        "jimeng_vgfm_t2v_l20"
+      ],
+      "latest": "1.1.2",
+      "icon": "Jimeng.Color",
+      "channelTypes": [
+        51
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.1.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/jimeng/1.1.2/plugin.js",
+          "sha256": "2e865f11647f0e81ba14ec3bbd98d9528a3d6e03b0c0c4a4c1e611b5cfc85c60",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/jimeng/1.1.1/plugin.js",
+          "sha256": "fa85fa7d1adac94951f5d077273a3a4c4427173ed008e0bef164d04b3b2907e6",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "kling",
+      "name": "Kling",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Kuaishou Kling video generation and media APIs",
+        "zh": "快手可灵视频生成及媒体接口"
+      },
+      "models": [
+        "kling-v1",
+        "kling-v1-5",
+        "kling-v1-6",
+        "kling-v2-master",
+        "kling-v2-1",
+        "kling-v2-1-master",
+        "kling-v2-5-turbo",
+        "kling-v2-6",
+        "kling-v3",
+        "kling-video-o1",
+        "kling-v3-omni",
+        "kling-3.0",
+        "kling-3.0-turbo",
+        "kling-3.0-omni",
+        "kling-o1",
+        "kling-2.6",
+        "kling-2.5-turbo"
+      ],
+      "latest": "1.3.6",
+      "icon": "Kling.Color",
+      "channelTypes": [
+        50
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.3.6",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/kling/1.3.6/plugin.js",
+          "sha256": "2ed9c91ae75e46916e57dcca1a788b894541a1a752e89954dbecabb40e86e3ec",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.3.5",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/kling/1.3.5/plugin.js",
+          "sha256": "1a05a0ebdc2e2d807747050f22f0802f5c6ed9f447e4d4750cada4d4147e3456",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.3.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/kling/1.3.3/plugin.js",
+          "sha256": "c0d7cc47f0085980659fdead5fc275854fa1629c576e8376b6ea052c0b4c3525",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "sora",
+      "name": "Sora",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
+        "zh": "OpenAI Sora 视频生成（文生视频、图生视频、remix）"
+      },
+      "models": [
+        "sora-2",
+        "sora-2-pro"
+      ],
+      "latest": "1.1.1",
+      "icon": "Sora.Color",
+      "channelTypes": [
+        55,
+        1
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.1.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/sora/1.1.1/plugin.js",
+          "sha256": "8e4f31aca68d73d78957b6c6e17f97437f937c1a73c5fa1db63ae376687e0358",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.0",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/sora/1.1.0/plugin.js",
+          "sha256": "a65370ae66fbf80cec7aa13d17e1fb237186ad3e6169c1dbf468abdc4e48fecd",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "sunoapi",
+      "name": "SunoAPI",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "SunoAPI project music and lyrics generation",
+        "zh": "SunoAPI 项目 音乐与歌词生成"
+      },
+      "models": [
+        "suno_music",
+        "suno_lyrics"
+      ],
+      "latest": "1.1.1",
+      "icon": "text",
+      "channelTypes": [
+        36
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        }
+      ],
+      "versions": [
+        {
+          "version": "1.1.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/sunoapi/1.1.1/plugin.js",
+          "sha256": "dba6d87859738add8a896f33761f537a06858bdcac87de20b08a0ef93a2c8a8b",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "vertex-ai",
+      "name": "Google Veo (Vertex AI)",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Google Veo video generation on Vertex AI (text-to-video and image-to-video)",
+        "zh": "Google Veo 视频生成（文生视频、图生视频），Vertex AI 版本"
+      },
+      "models": [
+        "veo-3.0-generate-001",
+        "veo-3.0-fast-generate-001",
+        "veo-3.1-generate-preview",
+        "veo-3.1-fast-generate-preview"
+      ],
+      "latest": "1.1.1",
+      "icon": "VertexAI.Color",
+      "channelTypes": [
+        41
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.1.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/vertex-ai/1.1.1/plugin.js",
+          "sha256": "eb802c120e709f8d2b2ca105aef169bb7185c99d6d29077535d17d53aae48f79",
+          "allowedHosts": [],
+          "auth": "oauth2_jwt"
+        },
+        {
+          "version": "1.0.2",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/vertex-ai/1.0.2/plugin.js",
+          "sha256": "52a50bd4b437758b7365fe5ef05e86826ce4819f951f3cdf63f2be99e3842302",
+          "allowedHosts": [],
+          "auth": "oauth2_jwt"
+        }
+      ]
+    },
+    {
+      "key": "vidu",
+      "name": "Vidu",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "Shengshu Vidu video generation and template workflows",
+        "zh": "生数 Vidu 视频生成及模板工作流"
+      },
+      "models": [
+        "viduq3-pro",
+        "viduq3-turbo",
+        "viduq3-pro-fast",
+        "viduq3-mix",
+        "viduq3",
+        "viduq2-pro-fast",
+        "viduq2-pro",
+        "viduq2-turbo",
+        "viduq2",
+        "viduq1",
+        "viduq1-classic",
+        "vidu2.0",
+        "vidu1.5"
+      ],
+      "latest": "1.1.4",
+      "icon": "Vidu.Color",
+      "channelTypes": [
+        52
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.1.4",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/vidu/1.1.4/plugin.js",
+          "sha256": "0f77a7eaf08ee55a0b5710a8ce7cee509a215aa21e1be025b67123c4523680e9",
+          "allowedHosts": [],
+          "auth": "api_key"
+        },
+        {
+          "version": "1.1.3",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/vidu/1.1.3/plugin.js",
+          "sha256": "352740aeab4438a36aa33d8ed7496d938a187bcd8dcd3eb7731067d92053d130",
+          "allowedHosts": [],
+          "auth": "api_key"
+        }
+      ]
+    },
+    {
+      "key": "xai",
+      "name": "xAI",
+      "author": {
+        "name": "QuantumNous"
+      },
+      "description": {
+        "en": "xAI Grok Imagine video generation (text-to-video, image-to-video, reference-to-video, video editing, and video extension)",
+        "zh": "xAI Grok Imagine 视频生成（文生视频、图生视频、参考生视频、视频编辑、视频延长）"
+      },
+      "models": [
+        "grok-imagine-video",
+        "grok-imagine-video-1.5",
+        "grok-imagine-video-1.5-lite"
+      ],
+      "latest": "1.0.1",
+      "icon": "XAI",
+      "channelTypes": [
+        48
+      ],
+      "protocols": [
+        {
+          "name": "openai_responses",
+          "supports": [
+            "stream",
+            "sync",
+            "background"
+          ]
+        },
+        "openai_video"
+      ],
+      "versions": [
+        {
+          "version": "1.0.1",
+          "kind": "task",
+          "minApiVersion": 1,
+          "path": "/plugins/xai/1.0.1/plugin.js",
+          "sha256": "330be18e9bcf067c988f877895aa65ccfb491dc4a3da24fe06e1ca48333db696",
+          "allowedHosts": [],
+          "auth": "api_key",
+          "baseUrl": "https://api.x.ai"
+        }
+      ]
+    }
+  ]
+}
