@@ -39,6 +39,12 @@ type seedanceReadyFixture struct {
 	high    *model.Channel
 }
 
+func setSeedanceReadyChannelSetting(t testing.TB, channel *model.Channel, setting kitdto.ChannelSettings) {
+	t.Helper()
+	channel.SetSetting(setting)
+	require.Equal(t, setting, channel.GetSetting())
+}
+
 func newSeedanceReadyFixture(t testing.TB) *seedanceReadyFixture {
 	t.Helper()
 	dsn := os.Getenv("SEEDANCE_READY_TEST_MYSQL_DSN")
@@ -97,20 +103,24 @@ func newSeedanceReadyFixture(t testing.TB) *seedanceReadyFixture {
 	high := &model.Channel{Id: 101, Type: constant.ChannelTypeTaskPlugin, Name: "high", Key: "high-test-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &baseURL, Priority: &highPriority}
 	low := &model.Channel{Id: 102, Type: constant.ChannelTypeTaskPlugin, Name: "low", Key: "low-test-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &baseURL, Priority: &lowPriority}
 	for _, channel := range []*model.Channel{high, low} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: assetURL}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: assetURL})
 		require.NoError(t, channel.Insert())
 	}
 	lowKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(low.Key)))
 	highKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(high.Key)))
 	lowAccount := model.SeedanceAssetAccountFingerprint(low, lowKey)
-	highAccount := model.SeedanceAssetAccountFingerprint(high, highKey)
+	lowModelAccount := model.SeedanceAssetModelScopeFingerprint(low, modelName, lowKey)
+	highAccount := model.SeedanceAssetModelScopeFingerprint(high, modelName, highKey)
 	group := &model.SeedanceAssetGroup{UserID: 1, ChannelID: low.Id, GroupID: "group-test", Name: "test", GroupType: "AIGC", Status: "Active", KeyFingerprint: lowKey, AccountFingerprint: lowAccount}
 	require.NoError(t, db.Create(group).Error)
-	asset := &model.SeedanceAsset{UserID: 1, ChannelID: low.Id, GroupID: group.GroupID, AssetID: "asset-test", Name: "test", AssetType: "Image", Status: "Active", SourceURL: "https://example.test/image.png", KeyFingerprint: lowKey, AccountFingerprint: lowAccount}
+	asset := &model.SeedanceAsset{UserID: 1, ChannelID: low.Id, GroupID: group.GroupID, AssetID: "asset-test", Name: "test", AssetType: "Image", Status: "Active", SourceURL: "https://example.test/image.png", KeyFingerprint: lowKey, AccountFingerprint: lowModelAccount}
 	require.NoError(t, db.Create(asset).Error)
-	replica := &model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: high.Id, AccountFingerprint: highAccount, KeyFingerprint: highKey, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: time.Now().Unix() + 60}
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"vip"}, []string{modelName}, 0)
+	require.NoError(t, err)
+	replica := &model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: high.Id, AccountFingerprint: highAccount, KeyFingerprint: highKey, SyncScope: scope, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: time.Now().Unix() + 60}
 	require.NoError(t, db.Create(replica).Error)
 	require.NoError(t, db.Create(&model.SeedanceAssetGroupReplica{UserID: 1, LocalGroupID: group.ID, ChannelID: high.Id, AccountFingerprint: highAccount, KeyFingerprint: highKey, UpstreamGroupID: "group-high", GroupName: group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
+	require.NoError(t, db.Create(&model.SeedanceAssetGroupReplica{UserID: 1, LocalGroupID: group.ID, ChannelID: low.Id, AccountFingerprint: lowModelAccount, KeyFingerprint: lowKey, UpstreamGroupID: group.GroupID, GroupName: group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
@@ -123,6 +133,13 @@ func newSeedanceReadyFixture(t testing.TB) *seedanceReadyFixture {
 		}
 		common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
 		common.SetContextKey(c, constant.ContextKeyUserGroup, "vip")
+		if group == "auto" {
+			common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{"vip", "aaa"})
+		}
+		if allowed := c.GetHeader("X-Test-Allowed-Model"); allowed != "" {
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{allowed: true})
+		}
 		if pin := c.GetHeader("X-Test-Pin"); pin != "" {
 			id, err := strconv.Atoi(pin)
 			if err == nil {
@@ -145,10 +162,6 @@ func newSeedanceReadyFixture(t testing.TB) *seedanceReadyFixture {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		if err := prepareVideoRouting(c, request.Model); err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
 		channel, _, selectErr := service.SelectChannelForRequest(c, request.Model, &service.RetryParam{
 			Ctx: c, ModelName: request.Model, TokenGroup: "vip", RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
 		})
@@ -164,6 +177,9 @@ func newSeedanceReadyFixture(t testing.TB) *seedanceReadyFixture {
 	}, func(c *gin.Context) {
 		c.Header("X-Test-Channel", strconv.Itoa(common.GetContextKeyInt(c, constant.ContextKeyChannelId)))
 		c.Header("X-Test-Key", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+		if mapping, ok := common.GetContextKeyType[map[string]string](c, constant.ContextKeySeedanceAssetMapping); ok {
+			c.Header("X-Test-Mapped-Asset", mapping["asset-test"])
+		}
 		c.Status(http.StatusOK)
 	})
 	return &seedanceReadyFixture{engine: engine, db: db, replica: replica, group: group, asset: asset, high: high}
@@ -174,11 +190,14 @@ func (fixture *seedanceReadyFixture) submit() *httptest.ResponseRecorder {
 	return fixture.submitWith(body, "", "")
 }
 
-func (fixture *seedanceReadyFixture) submitWith(body, group, pin string) *httptest.ResponseRecorder {
+func (fixture *seedanceReadyFixture) submitWith(body, group, pin string, allowed ...string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Test-Group", group)
 	request.Header.Set("X-Test-Pin", pin)
+	if len(allowed) > 0 {
+		request.Header.Set("X-Test-Allowed-Model", allowed[0])
+	}
 	response := httptest.NewRecorder()
 	fixture.engine.ServeHTTP(response, request)
 	return response
@@ -190,6 +209,7 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
 	require.NoError(t, fixture.db.Model(fixture.group).Update("group_type", "LivenessFace").Error)
+	require.NoError(t, fixture.db.Model(fixture.asset).Update("account_fingerprint", fixture.group.AccountFingerprint).Error)
 	response = fixture.submit()
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
@@ -199,7 +219,7 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 	humanBase := "https://video.example.test"
 	humanPriority := int64(100)
 	humanMulti := &model.Channel{Id: 106, Type: constant.ChannelTypeTaskPlugin, Name: "human-multi", Key: "high-test-key\nlow-test-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: "doubao-seedance-2-0-260128", BaseURL: &humanBase, Priority: &humanPriority, ChannelInfo: model.ChannelInfo{IsMultiKey: true}}
-	require.NoError(t, humanMulti.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"}))
+	setSeedanceReadyChannelSetting(t, humanMulti, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"})
 	require.NoError(t, humanMulti.Insert())
 	require.NoError(t, fixture.db.Model(fixture.asset).Update("status", "Processing").Error)
 	response = fixture.submit()
@@ -216,6 +236,9 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 		"provision_status": model.SeedanceAssetReplicaCreating, "status": "Pending", "upstream_asset_id": "", "next_poll_at": time.Now().Unix() + 60,
 	}).Error)
 	require.NoError(t, fixture.db.Model(fixture.group).Update("group_type", "AIGC").Error)
+	var low model.Channel
+	require.NoError(t, fixture.db.First(&low, 102).Error)
+	require.NoError(t, fixture.db.Model(fixture.asset).Update("account_fingerprint", model.SeedanceAssetModelScopeFingerprint(&low, "doubao-seedance-2-0-260128", fixture.asset.KeyFingerprint)).Error)
 
 	response = fixture.submitWith(`{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`, "vip", "101")
 	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
@@ -248,7 +271,7 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 		"provision_status": model.SeedanceAssetReplicaCreating, "status": "Pending", "next_poll_at": time.Now().Unix() + 60, "last_error": "",
 	}).Error)
 	highKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(fixture.high.Key)))
-	second := &model.SeedanceAsset{UserID: 1, ChannelID: fixture.high.Id, GroupID: fixture.group.GroupID, AssetID: "asset-second", Name: "second", AssetType: "Image", Status: "Active", SourceURL: "https://example.test/second.png", KeyFingerprint: highKey, AccountFingerprint: model.SeedanceAssetAccountFingerprint(fixture.high, highKey)}
+	second := &model.SeedanceAsset{UserID: 1, ChannelID: fixture.high.Id, GroupID: fixture.group.GroupID, AssetID: "asset-second", Name: "second", AssetType: "Image", Status: "Active", SourceURL: "https://example.test/second.png", KeyFingerprint: highKey, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(fixture.high, "doubao-seedance-2-0-260128", highKey)}
 	require.NoError(t, fixture.db.Create(second).Error)
 	response = fixture.submitWith(`{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}},{"type":"image_url","image_url":{"url":"asset://asset-second"}}]}`, "vip", "")
 	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
@@ -257,15 +280,17 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 	baseURL := "https://video.example.test"
 	priority := int64(100)
 	multi := &model.Channel{Id: 104, Type: constant.ChannelTypeTaskPlugin, Name: "multi", Key: "unready-test-key\nlow-test-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: "doubao-seedance-2-0-260128", BaseURL: &baseURL, Priority: &priority, ChannelInfo: model.ChannelInfo{IsMultiKey: true}}
-	require.NoError(t, multi.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"}))
+	setSeedanceReadyChannelSetting(t, multi, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"})
 	require.NoError(t, multi.Insert())
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetGroupReplica{UserID: 1, LocalGroupID: fixture.group.ID, ChannelID: multi.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(multi, "doubao-seedance-2-0-260128", fixture.asset.KeyFingerprint), KeyFingerprint: fixture.asset.KeyFingerprint, UpstreamGroupID: "group-multi", GroupName: fixture.group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetReplica{UserID: 1, LocalGroupID: fixture.group.ID, LocalAssetID: fixture.asset.ID, ChannelID: multi.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(multi, "doubao-seedance-2-0-260128", fixture.asset.KeyFingerprint), KeyFingerprint: fixture.asset.KeyFingerprint, UpstreamAssetID: "asset-multi", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active"}).Error)
 	response = fixture.submit()
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, "104", response.Header().Get("X-Test-Channel"))
 	require.Equal(t, "low-test-key", response.Header().Get("X-Test-Key"))
 
 	other := &model.Channel{Id: 105, Type: constant.ChannelTypeTaskPlugin, Name: "other-group", Key: "other-test-key", Status: common.ChannelStatusEnabled, Group: "aaa", Models: "doubao-seedance-2-0-260128", BaseURL: &baseURL, Priority: &priority}
-	require.NoError(t, other.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"}))
+	setSeedanceReadyChannelSetting(t, other, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"})
 	require.NoError(t, other.Insert())
 	response = fixture.submitWith(`{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`, "aaa", "")
 	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
@@ -273,6 +298,157 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 	response = fixture.submitWith(`{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`, "aaa", "102")
 	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
 	require.Empty(t, response.Header().Get("X-Test-Channel"))
+}
+
+func TestSeedanceModelModifierReadyFallbackMySQL(t *testing.T) {
+	fixture := newSeedanceReadyFixture(t)
+	const baseModel = "doubao-seedance-2-0-260128"
+	const requested = baseModel + "@temperature:0.2"
+	const forbidden = baseModel + "@temperature:0.3"
+	require.NoError(t, fixture.db.Model(fixture.high).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	var low model.Channel
+	require.NoError(t, fixture.db.First(&low, 102).Error)
+	low.Models = strings.Join([]string{baseModel, requested, forbidden}, ",")
+	require.NoError(t, low.Update())
+	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(low.Key)))
+	exactAccount := model.SeedanceAssetModelScopeFingerprint(&low, requested, key)
+	otherAccount := model.SeedanceAssetModelScopeFingerprint(&low, forbidden, key)
+	exactReplica := &model.SeedanceAssetReplica{
+		UserID: 1, LocalGroupID: fixture.group.ID, LocalAssetID: fixture.asset.ID, ChannelID: low.Id,
+		AccountFingerprint: exactAccount, KeyFingerprint: key, SyncScope: `{"version":1,"groups":["vip"],"models":["obsolete"],"pinned_channel":0}`,
+		ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: time.Now().Unix() + 60,
+	}
+	require.NoError(t, fixture.db.Create(exactReplica).Error)
+	body := `{"model":"` + requested + `","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		if memoryCache {
+			model.InitChannelCache()
+		}
+		response := fixture.submitWith(body, "vip", "", requested)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
+		require.Equal(t, "asset-test", response.Header().Get("X-Test-Mapped-Asset"))
+	}
+	var count int64
+	require.NoError(t, fixture.db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ? AND account_fingerprint = ?", fixture.asset.ID, otherAccount).Count(&count).Error)
+	require.Zero(t, count, "an unauthorized modifier must not acquire a synchronization target")
+	response := fixture.submitWith(strings.Replace(body, requested, forbidden, 1), "vip", "", requested)
+	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	require.NoError(t, fixture.db.First(exactReplica, exactReplica.ID).Error)
+	authorizedScope, err := service.EncodeSeedanceAssetSyncScope([]string{"vip"}, []string{requested}, 0)
+	require.NoError(t, err)
+	require.Equal(t, authorizedScope, exactReplica.SyncScope)
+	scopes, err := service.SeedanceAssetModelScopes(t.Context(), 1, []string{"vip"}, []string{requested}, 0)
+	require.NoError(t, err)
+	require.Len(t, scopes, 1)
+	require.ElementsMatch(t, []string{fixture.asset.AccountFingerprint, exactAccount}, scopes[baseModel])
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetGroupReplica{UserID: 1, LocalGroupID: fixture.group.ID, ChannelID: low.Id, AccountFingerprint: exactAccount, KeyFingerprint: key, UpstreamGroupID: "group-exact", GroupName: fixture.group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
+	require.NoError(t, fixture.db.Model(exactReplica).Updates(map[string]any{"provision_status": model.SeedanceAssetReplicaReady, "status": "Active", "upstream_asset_id": "asset-exact", "upstream_group_id": "group-exact", "next_poll_at": 0}).Error)
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		if memoryCache {
+			model.InitChannelCache()
+		}
+		response := fixture.submitWith(body, "vip", "", requested)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
+		require.Equal(t, "asset-exact", response.Header().Get("X-Test-Mapped-Asset"))
+	}
+	low.Models = baseModel
+	require.NoError(t, low.Update())
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+	low.Models = strings.Join([]string{baseModel, requested, forbidden}, ",")
+	require.NoError(t, low.Update())
+	response = fixture.submitWith(body, "vip", "", requested)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, "asset-test", response.Header().Get("X-Test-Mapped-Asset"), "the mapping must follow the ability actually selected from cache")
+	for _, request := range []struct{ group, pin string }{{"vip", "102"}, {"auto", ""}, {"auto", "102"}} {
+		response = fixture.submitWith(body, request.group, request.pin, requested)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
+		require.Equal(t, "asset-test", response.Header().Get("X-Test-Mapped-Asset"))
+	}
+	require.NoError(t, fixture.db.Model(&model.Channel{}).Where("id = ?", low.Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	response = fixture.submitWith(body, "vip", "", requested)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String(), "a disabled database channel must not be used from stale cache")
+	require.NoError(t, fixture.db.Model(&model.Channel{}).Where("id = ?", low.Id).Update("status", common.ChannelStatusEnabled).Error)
+	model.InitChannelCache()
+	oldSettings := low.GetSetting()
+	newSettings := oldSettings
+	newSettings.SeedanceAssetURL = "https://changed-assets.example.test"
+	setSeedanceReadyChannelSetting(t, &low, newSettings)
+	require.NoError(t, low.Update())
+	changedAccount := model.SeedanceAssetModelScopeFingerprint(&low, requested, key)
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetReplica{UserID: 1, LocalGroupID: fixture.group.ID, LocalAssetID: fixture.asset.ID, ChannelID: low.Id, AccountFingerprint: changedAccount, KeyFingerprint: key, UpstreamAssetID: "asset-changed", UpstreamGroupID: "group-changed", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active"}).Error)
+	response = fixture.submitWith(body, "vip", "", requested)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String(), "stale channel settings must not map a different account")
+	setSeedanceReadyChannelSetting(t, &low, oldSettings)
+	require.NoError(t, low.Update())
+	fixture.high.Status = common.ChannelStatusEnabled
+	require.NoError(t, fixture.high.Update())
+	require.NoError(t, fixture.db.Model(fixture.replica).Updates(map[string]any{"provision_status": model.SeedanceAssetReplicaReady, "status": "Active", "upstream_asset_id": "asset-high", "upstream_group_id": "group-high", "next_poll_at": 0}).Error)
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		if memoryCache {
+			model.InitChannelCache()
+		}
+		response := fixture.submitWith(body, "vip", "", requested)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "102", response.Header().Get("X-Test-Channel"), "a ready exact ability takes precedence over a higher-priority base ability")
+		require.Equal(t, "asset-exact", response.Header().Get("X-Test-Mapped-Asset"))
+	}
+	low.Key = "low-test-key\nsecond-test-key"
+	low.ChannelInfo.IsMultiKey = true
+	require.NoError(t, low.Update())
+	require.NoError(t, fixture.db.Model(exactReplica).Updates(map[string]any{"provision_status": model.SeedanceAssetReplicaCreating, "status": "Pending", "upstream_asset_id": "", "next_poll_at": time.Now().Unix() + 60}).Error)
+	secondKey := fmt.Sprintf("%x", common.Sha256Raw([]byte("second-test-key")))
+	secondAccount := model.SeedanceAssetModelScopeFingerprint(&low, requested, secondKey)
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetGroupReplica{UserID: 1, LocalGroupID: fixture.group.ID, ChannelID: low.Id, AccountFingerprint: secondAccount, KeyFingerprint: secondKey, UpstreamGroupID: "group-exact-second", GroupName: fixture.group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
+	require.NoError(t, fixture.db.Create(&model.SeedanceAssetReplica{UserID: 1, LocalGroupID: fixture.group.ID, LocalAssetID: fixture.asset.ID, ChannelID: low.Id, AccountFingerprint: secondAccount, KeyFingerprint: secondKey, UpstreamAssetID: "asset-exact-second", UpstreamGroupID: "group-exact-second", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active"}).Error)
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		if memoryCache {
+			model.InitChannelCache()
+		}
+		response := fixture.submitWith(body, "vip", "", requested)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
+		require.Equal(t, "second-test-key", response.Header().Get("X-Test-Key"))
+		require.Equal(t, "asset-exact-second", response.Header().Get("X-Test-Mapped-Asset"))
+	}
+}
+
+func TestOriginTaskPinRespectsTokenModelAndGroupMySQL(t *testing.T) {
+	fixture := newSeedanceReadyFixture(t)
+	const modelName = "doubao-seedance-2-0-260128"
+	for _, tc := range []struct {
+		name, group, allowed string
+		want                 int
+	}{
+		{"forbidden model", "vip", modelName + "@temperature:0.2", http.StatusForbidden},
+		{"forbidden group", "aaa", modelName, http.StatusForbidden},
+		{"allowed", "vip", modelName, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"`+modelName+`"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("id", 1)
+			c.Set("token_id", 1)
+			c.Set("expected_task_plugin_key", "doubao")
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, tc.group)
+			common.SetContextKey(c, constant.ContextKeyUserGroup, "vip")
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{tc.allowed: true})
+			service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: fixture.high.Id, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask})
+			Distribute()(c)
+			common.CleanupBodyStorage(c)
+			require.Equal(t, tc.want, recorder.Code, recorder.Body.String())
+		})
+	}
 }
 
 func TestSeedanceAsyncAccountSynchronizationMySQL(t *testing.T) {
@@ -304,7 +480,7 @@ func TestSeedanceAsyncAccountSynchronizationMySQL(t *testing.T) {
 	high := &model.Channel{Id: 201, Type: constant.ChannelTypeTaskPlugin, Name: "async-high", Key: "high-async-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL, Priority: &highPriority}
 	low := &model.Channel{Id: 202, Type: constant.ChannelTypeTaskPlugin, Name: "async-low", Key: "low-async-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL, Priority: &lowPriority}
 	for _, channel := range []*model.Channel{high, low} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL})
 		require.NoError(t, channel.Insert())
 	}
 	lowKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(low.Key)))
@@ -388,13 +564,15 @@ func TestSeedanceSlowAccountDoesNotBlockOtherAccountsMySQL(t *testing.T) {
 	high := &model.Channel{Id: 301, Type: constant.ChannelTypeTaskPlugin, Name: "gate-high", Key: "gate-high", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	low := &model.Channel{Id: 302, Type: constant.ChannelTypeTaskPlugin, Name: "gate-low", Key: "gate-low", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	for _, channel := range []*model.Channel{high, low} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL})
 		require.NoError(t, channel.Insert())
 	}
 	lowKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(low.Key)))
 	group := &model.SeedanceAssetGroup{UserID: 1, ChannelID: low.Id, GroupID: "group-gate", Name: "gate", GroupType: "AIGC", Status: "Active", KeyFingerprint: lowKey, AccountFingerprint: model.SeedanceAssetAccountFingerprint(low, lowKey)}
 	require.NoError(t, fixture.db.Create(group).Error)
 	targets := make([]model.SeedanceAssetReplica, 0, 5)
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"vip"}, nil, 0)
+	require.NoError(t, err)
 	localOnly := false
 	for index := range 5 {
 		asset := &model.SeedanceAsset{UserID: 1, ChannelID: low.Id, GroupID: group.GroupID, AssetID: fmt.Sprintf("asset-gate-%d", index), Name: "gate", AssetType: "Image", Status: "Processing", SourceURL: "https://8.8.8.8/fixture.png", KeyFingerprint: lowKey, AccountFingerprint: group.AccountFingerprint, LocalOnly: &localOnly}
@@ -404,7 +582,7 @@ func TestSeedanceSlowAccountDoesNotBlockOtherAccountsMySQL(t *testing.T) {
 			target = low
 		}
 		key := fmt.Sprintf("%x", common.Sha256Raw([]byte(target.Key)))
-		targets = append(targets, model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: target.Id, AccountFingerprint: model.SeedanceAssetAccountFingerprint(target, key), KeyFingerprint: key, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp()})
+		targets = append(targets, model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: target.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(target, modelName, key), KeyFingerprint: key, SyncScope: scope, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp()})
 	}
 	require.NoError(t, model.ScheduleSeedanceAssetSyncTargets(t.Context(), 1, targets[:4]))
 	type outcome struct {
@@ -500,7 +678,7 @@ func TestSeedanceSharedSyncRespectsTokenGroupMySQL(t *testing.T) {
 	aaa := &model.Channel{Id: 602, Type: constant.ChannelTypeTaskPlugin, Name: "aaa-shared", Key: "aaa-key", Status: common.ChannelStatusEnabled, Group: "aaa", Models: modelName, BaseURL: &upstream.URL}
 	vipAlt := &model.Channel{Id: 603, Type: constant.ChannelTypeTaskPlugin, Name: "vip-alternate", Key: "vip-alt-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	for _, channel := range []*model.Channel{vip, aaa, vipAlt} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "shared"}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "shared"})
 		require.NoError(t, channel.Insert())
 	}
 	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(vip.Key)))
@@ -546,7 +724,7 @@ func TestSeedanceModelScopeIgnoresUnrelatedMappingChanges(t *testing.T) {
 	baseURL := "https://video.example.test"
 	mapping := `{"video-alias":"intermediate","intermediate":"doubao-seedance-2-0-260128","other":"first"}`
 	channel := &model.Channel{Id: 501, Type: constant.ChannelTypeTaskPlugin, BaseURL: &baseURL, ModelMapping: &mapping}
-	require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"}))
+	setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"})
 	const alias, key = "video-alias", "key-fingerprint"
 	original := model.SeedanceAssetModelScopeFingerprint(channel, alias, key)
 	require.NotEmpty(t, original)
@@ -590,7 +768,7 @@ func TestSeedanceIndependentModelScopesSyncConcurrentlyMySQL(t *testing.T) {
 	service.InitHttpClient()
 	const firstModel, secondModel = "doubao-seedance-2-0-260128", "doubao-seedance-2-5-260628"
 	channel := &model.Channel{Id: 501, Type: constant.ChannelTypeTaskPlugin, Name: "same-account", Key: "same-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: firstModel + "," + secondModel, BaseURL: &upstream.URL}
-	require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL}))
+	setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL})
 	require.NoError(t, channel.Insert())
 	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(channel.Key)))
 	group := &model.SeedanceAssetGroup{UserID: 1, ChannelID: channel.Id, GroupID: "group-independent", Name: "independent", GroupType: "AIGC", Status: "Active", KeyFingerprint: key, AccountFingerprint: model.SeedanceAssetAccountFingerprint(channel, key)}
@@ -648,7 +826,7 @@ func TestSeedanceDeleteDuringSyncCleansLateUpstreamAssetMySQL(t *testing.T) {
 	service.InitHttpClient()
 	const modelName = "doubao-seedance-2-0-260128"
 	channel := &model.Channel{Id: 701, Type: constant.ChannelTypeTaskPlugin, Name: "late-delete", Key: "late-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
-	require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "late-delete"}))
+	setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "late-delete"})
 	require.NoError(t, channel.Insert())
 	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(channel.Key)))
 	group := &model.SeedanceAssetGroup{UserID: 1, ChannelID: channel.Id, GroupID: "group-late", Name: "late", GroupType: "AIGC", Status: "Active", KeyFingerprint: key, AccountFingerprint: model.SeedanceAssetAccountFingerprint(channel, key)}
@@ -713,7 +891,7 @@ func TestSeedancePrimaryReviewScopeMySQL(t *testing.T) {
 	origin := &model.Channel{Id: 801, Type: constant.ChannelTypeTaskPlugin, Name: "primary-origin", Key: "origin-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	foreign := &model.Channel{Id: 802, Type: constant.ChannelTypeTaskPlugin, Name: "primary-foreign", Key: "foreign-key", Status: common.ChannelStatusEnabled, Group: "aaa", Models: modelName, BaseURL: &upstream.URL}
 	for _, channel := range []*model.Channel{origin, foreign} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"})
 		require.NoError(t, channel.Insert())
 	}
 	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(origin.Key)))
@@ -739,7 +917,7 @@ func TestSeedancePrimaryReviewScopeMySQL(t *testing.T) {
 
 	priority := int64(100)
 	allowed := &model.Channel{Id: 803, Type: constant.ChannelTypeTaskPlugin, Name: "primary-allowed", Key: "allowed-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL, Priority: &priority}
-	require.NoError(t, allowed.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"}))
+	setSeedanceReadyChannelSetting(t, allowed, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"})
 	require.NoError(t, allowed.Insert())
 	require.NoError(t, fixture.db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).UpdateColumn("next_poll_at", common.GetTimestamp()).Error)
 	_, err = service.RunSeedanceAssetPollingOnce(t.Context(), nil)
@@ -809,7 +987,7 @@ func TestSeedancePrimaryReviewScopeMySQL(t *testing.T) {
 	independent := &model.Channel{Id: 804, Type: constant.ChannelTypeTaskPlugin, Name: "independent-origin", Key: "independent-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	sameAccount := &model.Channel{Id: 805, Type: constant.ChannelTypeTaskPlugin, Name: "independent-alternate", Key: "independent-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	for _, channel := range []*model.Channel{independent, sameAccount} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL})
 		require.NoError(t, channel.Insert())
 	}
 	independentKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(independent.Key)))
@@ -825,7 +1003,7 @@ func TestSeedancePrimaryReviewScopeMySQL(t *testing.T) {
 
 	multi := &model.Channel{Id: 806, Type: constant.ChannelTypeTaskPlugin, Name: "multi-primary", Key: "first-key\nbound-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL,
 		ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModeRandom}}
-	require.NoError(t, multi.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"}))
+	setSeedanceReadyChannelSetting(t, multi, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "primary-review"})
 	require.NoError(t, multi.Insert())
 	boundKey := fmt.Sprintf("%x", common.Sha256Raw([]byte("bound-key")))
 	for _, modelScoped := range []bool{false, true} {
@@ -879,7 +1057,7 @@ func TestSeedanceHumanReviewScopeMySQL(t *testing.T) {
 	foreign := &model.Channel{Id: 812, Type: constant.ChannelTypeTaskPlugin, Name: "human-foreign", Key: "human-foreign", Status: common.ChannelStatusEnabled, Group: "aaa", Models: modelName, BaseURL: &upstream.URL}
 	allowed := &model.Channel{Id: 813, Type: constant.ChannelTypeTaskPlugin, Name: "human-allowed", Key: "human-allowed", Status: common.ChannelStatusEnabled, Group: "vip", Models: modelName, BaseURL: &upstream.URL}
 	for _, channel := range []*model.Channel{origin, foreign, allowed} {
-		require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "human-review"}))
+		setSeedanceReadyChannelSetting(t, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: upstream.URL, SeedanceAssetShareGroup: "human-review"})
 		require.NoError(t, channel.Insert())
 	}
 	key := fmt.Sprintf("%x", common.Sha256Raw([]byte(origin.Key)))
@@ -1014,7 +1192,7 @@ func BenchmarkSeedanceAssetSyncTargetsMySQL(b *testing.B) {
 		{Id: 212, Type: constant.ChannelTypeTaskPlugin, Name: "benchmark-two", Key: "benchmark-fixture-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: strings.Join(modelNames, ","), BaseURL: &baseURL},
 	}
 	for _, channel := range channels {
-		require.NoError(b, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"}))
+		setSeedanceReadyChannelSetting(b, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test"})
 		require.NoError(b, channel.Insert())
 	}
 	serial := 0
@@ -1029,7 +1207,7 @@ func BenchmarkSeedanceAssetSyncTargetsMySQL(b *testing.B) {
 	} {
 		b.Run(scenario.name, func(b *testing.B) {
 			for _, channel := range channels {
-				require.NoError(b, channel.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test", SeedanceAssetShareGroup: scenario.shareGroup}))
+				setSeedanceReadyChannelSetting(b, channel, kitdto.ChannelSettings{TaskPluginKey: "doubao", SeedanceAssetURL: "https://assets.example.test", SeedanceAssetShareGroup: scenario.shareGroup})
 				require.NoError(b, channel.Update())
 			}
 			scopes, err := service.SeedanceAssetModelScopes(b.Context(), 1, []string{"vip"}, nil, 0)

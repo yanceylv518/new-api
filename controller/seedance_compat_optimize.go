@@ -72,8 +72,10 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 		err = model.PromoteLocalSeedanceAsset(c.Request.Context(), c.GetInt("id"), asset.ID, asset.GroupID, asset.UpdatedAt,
 			scopedClient.ChannelID, scopedClient.KeyFingerprint, scopedClient.AccountFingerprint, upstreamID, scope)
 		if err != nil {
-			if rollbackErr := service.RollbackSeedanceAsset(c.Request.Context(), client, upstreamID, ""); rollbackErr != nil {
-				common.SysError("seedance asset optimization rollback failed: " + rollbackErr.Error())
+			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+				if rollbackErr := service.RollbackSeedanceAsset(c.Request.Context(), client, upstreamID, ""); rollbackErr != nil {
+					common.SysError("seedance asset optimization rollback failed: " + rollbackErr.Error())
+				}
 			}
 			seedanceCompatError(c, http.StatusConflict, "asset changed while optimization was starting")
 			return

@@ -300,7 +300,7 @@ func TestRollbackSeedanceAssetQueuesFailedOSSCleanup(t *testing.T) {
 func TestSeedanceCleanupDeletesLocallyWhenUpstreamFails(t *testing.T) {
 	db := model.DB
 	require.NoError(t, db.AutoMigrate(&model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetCleanupJob{}))
-	for _, scenario := range []string{"removed", "primary-removed", "replaced-key", "enabled-alias", "disabled", "upstream-failure", "primary-upstream-failure", "unsupported-delete", "oss-failure", "database-failure", "single-asset", "single-upstream-failure"} {
+	for _, scenario := range []string{"removed", "primary-removed", "replaced-key", "enabled-alias", "disabled", "upstream-failure", "primary-upstream-failure", "unsupported-delete", "oss-failure", "database-failure", "single-asset", "single-upstream-failure", "shared-group"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +319,11 @@ func TestSeedanceCleanupDeletesLocallyWhenUpstreamFails(t *testing.T) {
 			defer upstream.Close()
 			ossClient := useFakePrivateAssetOSSStorage(t)
 			channel := seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-retired-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled})
+			if scenario == "shared-group" {
+				settings := channel.GetSetting()
+				settings.SeedanceAssetShareGroup = "fixture-shared"
+				channel.SetSetting(settings)
+			}
 			require.NoError(t, db.Create(channel).Error)
 			t.Cleanup(func() { require.NoError(t, db.Delete(channel).Error) })
 			client, err := NewSeedanceAssetClient(channel)
@@ -528,7 +533,9 @@ func TestSeedanceUpstreamCompensationStillRetriesMySQL(t *testing.T) {
 	defer server.Close()
 	channel := seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled})
 	require.NoError(t, db.Create(channel).Error)
-	job := &model.SeedanceAssetCleanupJob{Kind: model.SeedanceAssetCleanupKindUpstreamAsset, ChannelID: channel.Id, UpstreamID: "orphan", DedupKey: "mysql-slow-delete-compensation", Status: model.SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp()}
+	client, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	job := &model.SeedanceAssetCleanupJob{Kind: model.SeedanceAssetCleanupKindUpstreamAsset, ChannelID: channel.Id, KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, UpstreamID: "orphan", DedupKey: "mysql-slow-delete-compensation", Status: model.SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp()}
 	require.NoError(t, db.Create(job).Error)
 	t.Cleanup(func() {
 		require.NoError(t, db.Delete(job).Error)

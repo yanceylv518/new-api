@@ -59,7 +59,7 @@ func seedanceAssetStatusExpressions(c *gin.Context, alias string) (string, []any
 	value, exists := c.Get(seedanceStatusModelsKey)
 	models, _ := value.(map[string][]string)
 	if !exists {
-		models, err = service.SeedanceAssetModelScopes(c.Request.Context(), c.GetInt("id"), seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c))
+		models, err = service.SeedanceAssetRequestModelScopes(c.Request.Context(), c.GetInt("id"), seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c))
 		if err != nil {
 			return "", nil, "", nil, err
 		}
@@ -119,10 +119,15 @@ func scheduleMissingSeedanceAssetTargets(c *gin.Context) error {
 			}
 		}
 	}
-	if len(scopes) == 0 {
+	accounts, err := seedanceStatusAccounts(c)
+	if err != nil {
+		return err
+	}
+	accounts = slices.DeleteFunc(slices.Clone(accounts), func(account string) bool { return account == "" })
+	if len(scopes) == 0 && len(accounts) == 0 {
 		return nil
 	}
-	assets, err := model.ListMissingSeedanceAssetSyncTargets(c.Request.Context(), c.GetInt("id"), scopes, 0, nil)
+	assets, err := model.ListMissingSeedanceAssetSyncTargets(c.Request.Context(), c.GetInt("id"), scopes, 0, nil, accounts)
 	if err != nil {
 		return err
 	}
@@ -149,6 +154,20 @@ func projectSeedanceAssetStatuses(c *gin.Context, assets []model.SeedanceAsset, 
 	}
 	if err := service.EnsureSeedanceAssetSynchronization(c.Request.Context(), c.GetInt("id"), assets, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
 		return err
+	}
+	groups, models, channel := seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)
+	scope, err := service.EncodeSeedanceAssetSyncScope(groups, models, channel)
+	if err != nil {
+		return err
+	}
+	pending, err := service.EnsureSeedanceAssetPrimaryAuthorization(c.Request.Context(), c.GetInt("id"), assets, scope)
+	if err != nil {
+		return err
+	}
+	if pending {
+		if err := service.QueueSeedanceAssetDiscovery(c.Request.Context(), c.GetInt("id"), groups, models, channel); err != nil {
+			return err
+		}
 	}
 	expression, args, timeoutExpression, timeoutArgs, err := seedanceAssetStatusExpressions(c, "a")
 	if err != nil {

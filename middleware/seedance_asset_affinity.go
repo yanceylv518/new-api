@@ -281,8 +281,8 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 		modelName = modelNames[0]
 	}
 	if value, exists := c.Get(seedanceReadyScopeKey); exists {
-		if scope, ok := value.(*seedanceReadyScope); ok && scope.models[channel.Id] != "" {
-			modelName = scope.models[channel.Id]
+		if scope, ok := value.(*seedanceReadyScope); ok && scope.selectedModel != "" {
+			modelName = scope.selectedModel
 		}
 	}
 	var newMapping map[string]string

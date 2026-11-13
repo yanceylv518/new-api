@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -122,13 +123,18 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 		if err == nil {
 			break
 		}
+		if errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			break
+		}
 		var count int64
 		if checkErr := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAsset{}).Where("asset_id = ?", asset.AssetID).Count(&count).Error; checkErr != nil || count == 0 {
 			break
 		}
 	}
 	if err != nil {
-		cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+		}
 		seedanceCompatError(c, http.StatusBadGateway, "asset upload failed")
 		return
 	}

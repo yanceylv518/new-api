@@ -22,6 +22,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -62,6 +63,69 @@ type fakePrivateAssetOSSClient struct {
 	deletedKey string
 	putErr     error
 	deleteErr  error
+}
+
+func TestSeedanceAssetCommitOutcomeRecoveryMySQL(t *testing.T) {
+	requireBillingRefundMySQL(t)
+	const userID = 974302
+	primary := model.DB
+	models := []any{&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetSize{}}
+	require.NoError(t, primary.AutoMigrate(models...))
+	t.Cleanup(func() {
+		for _, value := range models {
+			assert.NoError(t, primary.Where("user_id = ?", userID).Delete(value).Error)
+		}
+	})
+	config, err := mysqldriver.ParseDSN(os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN"))
+	require.NoError(t, err)
+	connector, err := mysqldriver.NewConnector(config)
+	require.NoError(t, err)
+	fault := &commitFailureConnector{Connector: connector}
+	connection := sql.OpenDB(fault)
+	connection.SetMaxOpenConns(2)
+	db, err := gorm.Open(mysql.New(mysql.Config{Conn: connection, SkipInitializeWithVersion: true}), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = primary; assert.NoError(t, connection.Close()) })
+
+	group := &model.SeedanceAssetGroup{UserID: userID, ChannelID: 1, GroupID: "commit-group", Name: "commit", Status: "Active", KeyFingerprint: "key", AccountFingerprint: "account"}
+	fault.fail.Store(true)
+	require.NoError(t, model.CreateSeedanceAssetGroup(t.Context(), group))
+	assert.False(t, fault.fail.Load())
+	localOnly := true
+	asset := &model.SeedanceAsset{UserID: userID, ChannelID: 1, GroupID: group.GroupID, AssetID: "commit-asset", Name: "commit", AssetType: "Image", Status: "Active", KeyFingerprint: "key", AccountFingerprint: "account", LocalOnly: &localOnly, ObjectKey: "fixture/commit.jpg", UploadBytes: 123}
+	fault.fail.Store(true)
+	require.NoError(t, model.CreateSeedanceAssetInGroup(t.Context(), asset))
+	assert.False(t, fault.fail.Load())
+	var stored model.SeedanceAsset
+	require.NoError(t, db.First(&stored, asset.ID).Error)
+	assert.Equal(t, asset.ObjectKey, stored.ObjectKey)
+
+	fault.fail.Store(true)
+	require.NoError(t, model.PromoteLocalSeedanceAsset(t.Context(), userID, asset.ID, group.GroupID, stored.UpdatedAt, 1, "key", "account", "optimized-upstream", "scope"))
+	require.NoError(t, db.First(&stored, asset.ID).Error)
+	assert.Equal(t, "optimized-upstream", stored.UpstreamAssetID())
+
+	groupReplica := &model.SeedanceAssetGroupReplica{UserID: userID, LocalGroupID: group.ID, ChannelID: 2, AccountFingerprint: "replica-account", KeyFingerprint: "replica-key", Status: model.SeedanceAssetReplicaCreating, LeaseUntil: 100}
+	require.NoError(t, db.Create(groupReplica).Error)
+	fault.fail.Store(true)
+	won, err := model.CompleteSeedanceAssetGroupReplica(t.Context(), groupReplica.ID, 100, "upstream-group", "commit")
+	require.NoError(t, err)
+	require.True(t, won)
+	replica := &model.SeedanceAssetReplica{UserID: userID, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: 2, AccountFingerprint: "replica-account", KeyFingerprint: "replica-key", ProvisionStatus: model.SeedanceAssetReplicaCreating, PollLeaseUntil: 100}
+	require.NoError(t, db.Create(replica).Error)
+	fault.fail.Store(true)
+	won, err = model.CompleteSeedanceAssetReplica(t.Context(), replica.ID, 100, "upstream-group", "upstream-asset", time.Now().Unix())
+	require.NoError(t, err)
+	require.True(t, won)
+
+	fault.rollback = true
+	fault.fail.Store(true)
+	uncommitted := &model.SeedanceAssetGroup{UserID: userID, ChannelID: 1, GroupID: "rollback-group", Name: "rollback", KeyFingerprint: "key", AccountFingerprint: "account"}
+	require.ErrorIs(t, model.CreateSeedanceAssetGroup(t.Context(), uncommitted), model.ErrSeedanceAssetCommitUncertain)
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", userID, uncommitted.GroupID).Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func seedanceAssetTestChannel(t *testing.T, channel *model.Channel) *model.Channel {

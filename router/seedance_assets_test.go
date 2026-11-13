@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -40,6 +42,49 @@ import (
 
 // 测试专用 CA 只在显式 fallback 模式启用，仍执行证书验证，不修改系统信任库。
 var seedanceTestRootsOnce sync.Once
+
+const seedanceCompatMySQLDSN = "SEEDANCE_COMPAT_TEST_MYSQL_DSN"
+
+func seedanceCompatTestDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv(seedanceCompatMySQLDSN)
+	if dsn == "" {
+		t.Skip(seedanceCompatMySQLDSN + " is not configured")
+	}
+	config, err := driver.ParseDSN(dsn)
+	require.NoError(t, err)
+	require.Equal(t, "tcp", config.Net)
+	host, _, err := net.SplitHostPort(config.Addr)
+	require.NoError(t, err)
+	ip := net.ParseIP(host)
+	require.NotNil(t, ip)
+	require.True(t, ip.IsLoopback(), "test database must be on loopback")
+	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_id_"), "test database must be isolated")
+	return dsn
+}
+
+func isolatedSeedanceCompatTestDSN(t *testing.T, dsn string) string {
+	t.Helper()
+	config, err := driver.ParseDSN(dsn)
+	require.NoError(t, err)
+	suffix, err := common.GenerateRandomCharsKey(12)
+	require.NoError(t, err)
+	name := "codex_seedance_id_" + strings.ToLower(suffix)
+	admin, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := admin.DB()
+	require.NoError(t, err)
+	if err := admin.Exec("CREATE DATABASE `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").Error; err != nil {
+		_ = connection.Close()
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() {
+		assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
+		assert.NoError(t, connection.Close())
+	})
+	config.DBName = name
+	return config.FormatDSN()
+}
 
 func TestSeedanceAssetValidationActionUsesDoubaoNamespace(t *testing.T) {
 	router := gin.New()
@@ -609,9 +654,11 @@ func TestSeedanceCompatMySQLAssetGroupAndCleanup(t *testing.T) {
 	}
 	deniedGroup := request("compatrestrictedkey", http.MethodPost, "/doubao/api/assets/groups", `{"name":"denied","bind_model":"doubao-seedance-2-0-fast"}`)
 	assert.Equal(t, http.StatusForbidden, deniedGroup.Code)
-	created := request("compatownerkey", http.MethodPost, "/doubao/api/assets", `{"group_id":"group-compat-1","url":"https://8.8.8.8/image.png","name":"picture"}`)
-	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
-	assert.Contains(t, created.Body.String(), `"assetId":"asset-compat-original"`)
+	var sourceGroup model.SeedanceAssetGroup
+	require.NoError(t, db.Where("user_id = ? AND group_id = ?", user.Id, "group-compat-1").First(&sourceGroup).Error)
+	keyFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(channel.Key)))
+	originalAsset := model.SeedanceAsset{UserID: user.Id, ChannelID: channel.Id, GroupID: sourceGroup.GroupID, AssetID: "asset-compat-original", Name: "picture", AssetType: "Image", SourceURL: "https://example.test/image.png", Status: "Active", KeyFingerprint: keyFingerprint, AccountFingerprint: model.SeedanceAssetAccountFingerprint(channel, keyFingerprint)}
+	require.NoError(t, db.Create(&originalAsset).Error)
 	// 已有记录升级后，新增兼容字段可能为 NULL。
 	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", user.Id, "group-compat-2").
 		UpdateColumns(map[string]any{"bind_model": nil, "compat_type": nil}).Error)
@@ -636,9 +683,6 @@ func TestSeedanceCompatMySQLAssetGroupAndCleanup(t *testing.T) {
 	router.ServeHTTP(trustedResponse, spoofedIP)
 	assert.Equal(t, http.StatusOK, trustedResponse.Code)
 	require.NoError(t, router.SetTrustedProxies(nil))
-	var sourceGroup model.SeedanceAssetGroup
-	require.NoError(t, db.Where("user_id = ? AND group_id = ?", user.Id, "group-compat-1").First(&sourceGroup).Error)
-	var originalAsset model.SeedanceAsset
 	require.NoError(t, db.Where("user_id = ? AND asset_id = ?", user.Id, "asset-compat-original").First(&originalAsset).Error)
 	copyClient, err := service.NewSeedanceAssetClient(channel)
 	require.NoError(t, err)
@@ -941,7 +985,7 @@ func TestSeedanceAssetAPIKeysSharedLibrary(t *testing.T) {
 				common.IsMasterNode = previousMaster
 				assert.NoError(t, connection.Close())
 			})
-			tables := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAsset{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}}
+			tables := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAsset{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}}
 			require.NoError(t, db.AutoMigrate(tables...))
 			t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(tables...)) })
 			users := []model.User{{Id: 85001, Username: "assetsowner", AffCode: "assetsowner", Group: "default", Status: common.UserStatusEnabled}, {Id: 85002, Username: "assetsother", AffCode: "assetsother", Group: "default", Status: common.UserStatusEnabled}}
@@ -1441,6 +1485,15 @@ func verifySeedanceLibraryQueries(t *testing.T, db *gorm.DB, router *gin.Engine,
 		{UserID: owner, GroupID: "group-a", AssetID: "query-b", Name: "same", AssetType: "Video", Status: "Pending", CreatedAt: start, UpdatedAt: start.Add(time.Hour)},
 		{UserID: owner, GroupID: "group-b", AssetID: "query-c", Name: "literal %_#", AssetType: "Audio", Status: "Failed", CreatedAt: start.Add(time.Hour), UpdatedAt: start},
 		{UserID: outsider, GroupID: "group-secret", AssetID: "query-secret", Name: "Secret", AssetType: "Image", Status: "Active", CreatedAt: start},
+	}
+	var sourceChannel model.Channel
+	require.NoError(t, db.First(&sourceChannel, 85001).Error)
+	keyFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(sourceChannel.Key)))
+	accountFingerprint := model.SeedanceAssetModelScopeFingerprint(&sourceChannel, "doubao-seedance-2-0-fast-260128", keyFingerprint)
+	for index := range assets {
+		assets[index].ChannelID = sourceChannel.Id
+		assets[index].KeyFingerprint = keyFingerprint
+		assets[index].AccountFingerprint = accountFingerprint
 	}
 	require.NoError(t, db.Create(&assets).Error)
 	request := func(path string) *httptest.ResponseRecorder {

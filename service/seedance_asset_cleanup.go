@@ -99,13 +99,14 @@ func queueSeedanceAssetUpstreamCleanup(kind string, client *SeedanceAssetClient,
 		return errors.New("invalid Seedance upstream cleanup target")
 	}
 	job := &model.SeedanceAssetCleanupJob{
-		Kind:           kind,
-		ChannelID:      client.ChannelID,
-		KeyFingerprint: client.KeyFingerprint,
-		UpstreamID:     upstreamID,
-		DedupKey:       seedanceAssetCleanupDedupKey(kind, fmt.Sprintf("%d", client.ChannelID), client.KeyFingerprint, upstreamID),
-		Status:         model.SeedanceAssetCleanupStatusPending,
-		NextAttemptAt:  common.GetTimestamp(),
+		Kind:               kind,
+		ChannelID:          client.ChannelID,
+		KeyFingerprint:     client.KeyFingerprint,
+		AccountFingerprint: client.AccountFingerprint,
+		UpstreamID:         upstreamID,
+		DedupKey:           seedanceAssetCleanupDedupKey(kind, fmt.Sprintf("%d", client.ChannelID), client.KeyFingerprint, upstreamID),
+		Status:             model.SeedanceAssetCleanupStatusPending,
+		NextAttemptAt:      common.GetTimestamp(),
 	}
 	if err := model.CreateSeedanceAssetCleanupJob(job); err != nil {
 		return err
@@ -278,11 +279,11 @@ func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAs
 	}
 
 	if group.UpstreamDeletedAt == 0 && strings.TrimSpace(group.GroupID) != "" {
-		client, err := ResolveSeedanceAssetClient(ctx, group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
+		client, err := resolveSeedanceAssetClient(ctx, group.ChannelID, group.KeyFingerprint, group.AccountFingerprint, false)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err == nil {
+		if err == nil && group.AccountFingerprint != "" && !client.sharedAccount {
 			deleteSeedanceAssetUpstreamBestEffort(client, group.GroupID, true)
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroup{}).
@@ -301,11 +302,11 @@ func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAs
 		if strings.TrimSpace(replica.UpstreamGroupID) == "" || replica.UpstreamDeletedAt != 0 {
 			continue
 		}
-		client, err := ResolveSeedanceAssetClient(ctx, replica.ChannelID, replica.KeyFingerprint, replica.AccountFingerprint)
+		client, err := resolveSeedanceAssetClient(ctx, replica.ChannelID, replica.KeyFingerprint, replica.AccountFingerprint, false)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err == nil {
+		if err == nil && replica.AccountFingerprint != "" && !client.sharedAccount {
 			deleteSeedanceAssetUpstreamBestEffort(client, replica.UpstreamGroupID, true)
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroupReplica{}).
@@ -397,8 +398,8 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 		needsUpstreamDelete := strings.TrimSpace(job.UpstreamID) != "" &&
 			((job.Kind != model.SeedanceAssetCleanupKindAssetDelete && job.Kind != model.SeedanceAssetCleanupKindReplicaDelete) || job.UpstreamDoneAt == 0)
 		if needsUpstreamDelete {
-			accountFingerprint := ""
-			if job.Kind == model.SeedanceAssetCleanupKindAssetDelete {
+			accountFingerprint := job.AccountFingerprint
+			if accountFingerprint == "" && job.Kind == model.SeedanceAssetCleanupKindAssetDelete {
 				var asset model.SeedanceAsset
 				err := model.DB.WithContext(operationCtx).Select("account_fingerprint").
 					Where("id = ? AND user_id = ?", job.LocalAssetID, job.UserID).First(&asset).Error
@@ -407,7 +408,7 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 				} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
 				}
-			} else if job.Kind == model.SeedanceAssetCleanupKindReplicaDelete {
+			} else if accountFingerprint == "" && job.Kind == model.SeedanceAssetCleanupKindReplicaDelete {
 				var replica model.SeedanceAssetReplica
 				err := model.DB.WithContext(operationCtx).Select("account_fingerprint").
 					Where("id = ? AND user_id = ? AND local_asset_id = ?", job.LocalMappingID, job.UserID, job.LocalAssetID).
@@ -418,8 +419,14 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 					return err
 				}
 			}
-			client, err := ResolveSeedanceAssetClient(operationCtx, job.ChannelID, job.KeyFingerprint, accountFingerprint)
 			localDelete := job.Kind == model.SeedanceAssetCleanupKindAssetDelete || job.Kind == model.SeedanceAssetCleanupKindReplicaDelete
+			var client *SeedanceAssetClient
+			var err error
+			if accountFingerprint != "" {
+				client, err = resolveSeedanceAssetClient(operationCtx, job.ChannelID, job.KeyFingerprint, accountFingerprint, false)
+			} else {
+				err = errSeedanceAssetAccountMissing
+			}
 			if err == nil && !localDelete {
 				switch job.Kind {
 				case model.SeedanceAssetCleanupKindUpstreamGroup:
@@ -442,7 +449,7 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 				if !updated {
 					return errors.New("Seedance asset cleanup lease lost")
 				}
-				if err == nil && client != nil {
+				if err == nil && client != nil && !client.sharedAccount {
 					deleteSeedanceAssetUpstreamBestEffort(client, job.UpstreamID, false)
 				}
 			}

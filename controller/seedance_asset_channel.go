@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -37,6 +38,7 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matchFamily bool) ([]seedanceAssetChannelChoice, error) {
 	modelLimitsEnabled := c.GetBool("token_model_limit_enabled")
 	allowed := map[string]bool{}
+	var allowedModels []string
 	if modelLimitsEnabled {
 		limits, ok := c.Get("token_model_limit")
 		var valid bool
@@ -44,10 +46,11 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 		if !ok || !valid {
 			return nil, errors.New("API key model limits are invalid")
 		}
+		allowedModels = seedanceAssetSynchronizationModels(c)
 		if modelName != "" {
-			permitted := false
+			permitted := middleware.TokenModelLimitAllows(allowed, modelName)
 			for candidate, enabled := range allowed {
-				if enabled && (candidate == modelName || matchFamily && strings.HasPrefix(candidate, modelName+"-")) {
+				if enabled && matchFamily && strings.HasPrefix(ratio_setting.RoutingMatchModelName(candidate), modelName+"-") {
 					permitted = true
 					break
 				}
@@ -93,15 +96,17 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 	}
 	pin, pinned, _ := constraints.ResolvedPin()
 	filtered := make([]seedanceAssetChannelChoice, 0, len(channels))
+	fallback := make([]seedanceAssetChannelChoice, 0, len(channels))
 	for _, channel := range channels {
 		if pinned && channel.Id != pin.ChannelId {
 			continue
 		}
+		var selected seedanceAssetChannelChoice
 		for _, candidateModel := range channel.GetModels() {
-			if modelName != "" && candidateModel != modelName && !(matchFamily && strings.HasPrefix(candidateModel, modelName+"-")) {
+			if modelName != "" && candidateModel != modelName && candidateModel != ratio_setting.RoutingMatchModelName(modelName) && !(matchFamily && strings.HasPrefix(candidateModel, modelName+"-")) {
 				continue
 			}
-			if modelLimitsEnabled && !allowed[candidateModel] {
+			if modelLimitsEnabled && !service.SeedanceAssetModelAllowed(candidateModel, allowedModels) {
 				continue
 			}
 			if ok, _ := model.ChannelSatisfiesFilters(channel, candidateModel, constraints.Filters); !ok {
@@ -112,14 +117,26 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 					continue
 				}
 				if model.IsChannelEnabledForGroupModel(candidateGroup, candidateModel, channel.Id) {
-					filtered = append(filtered, seedanceAssetChannelChoice{channel: channel, model: candidateModel})
+					if selected.channel == nil || candidateModel == modelName {
+						selected = seedanceAssetChannelChoice{channel: channel, model: candidateModel}
+					}
 					break
 				}
 			}
-			if len(filtered) > 0 && filtered[len(filtered)-1].channel.Id == channel.Id {
+			if selected.channel != nil && (modelName == "" || candidateModel == modelName) {
 				break
 			}
 		}
+		if selected.channel != nil {
+			if modelName == "" || selected.model == modelName {
+				filtered = append(filtered, selected)
+			} else {
+				fallback = append(fallback, selected)
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = fallback
 	}
 	if len(filtered) == 0 {
 		return nil, errSeedanceAssetNoChannel
@@ -143,7 +160,7 @@ func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.C
 	if c.GetBool("token_model_limit_enabled") {
 		limits, ok := c.Get("token_model_limit")
 		allowed, valid := limits.(map[string]bool)
-		if !ok || !valid || !allowed[modelName] {
+		if !ok || !valid || !middleware.TokenModelLimitAllows(allowed, modelName) {
 			return nil, errors.New("API key does not allow this model")
 		}
 	}
@@ -171,6 +188,12 @@ func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.C
 		return nil, errors.New("selected asset channel does not serve this model in an allowed group")
 	}
 	channel, _, err := service.CacheGetRandomSatisfiedChannel(&service.RetryParam{Ctx: c, ModelName: modelName, TokenGroup: group})
+	if err == nil && channel == nil && ratio_setting.RoutingMatchModelName(modelName) != modelName {
+		choices, choiceErr := selectSeedanceAssetValidationChoices(c, modelName, false)
+		if choiceErr == nil && len(choices) > 0 {
+			return choices[0].channel, nil
+		}
+	}
 	if err != nil || channel == nil {
 		return nil, errors.New("no available Seedance asset channel for this model and group")
 	}

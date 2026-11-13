@@ -892,7 +892,34 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	}
 	if value, exists := c.Get(seedanceReadyScopeKey); exists {
 		if scope, valid := value.(*seedanceReadyScope); valid {
-			allowed := scope.keys[channel.Id]
+			selectedGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+			if selectedGroup == "auto" {
+				selectedGroup = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
+			}
+			models := []string{common.GetContextKeyString(c, constant.ContextKeySelectedAbility)}
+			if models[0] == "" {
+				models[0] = modelName
+				if normalized := ratio_setting.RoutingMatchModelName(modelName); normalized != modelName {
+					models = append(models, normalized)
+				}
+			}
+			var allowed map[string]struct{}
+			scope.selectedModel = ""
+			for _, candidate := range models {
+				if selectedGroup != "" {
+					if _, exists := scope.groups[channel.Id][candidate][selectedGroup]; !exists {
+						continue
+					}
+				}
+				if keys := scope.keys[channel.Id][candidate]; len(keys) > 0 {
+					allowed = keys
+					scope.selectedModel = candidate
+					break
+				}
+			}
+			if len(allowed) == 0 {
+				return newSeedanceAssetMappingError(c, service.ErrSeedanceAssetMappingPending)
+			}
 			fingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
 			if _, found := allowed[fingerprint]; !found {
 				key = ""
@@ -910,6 +937,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 				if key == "" {
 					return newSeedanceAssetMappingError(c, service.ErrSeedanceAssetMappingPending)
 				}
+			}
+			selectedFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+			expectedAccount := scope.accounts[seedanceReadyIdentity{channel.Id, scope.selectedModel, selectedFingerprint}]
+			if expectedAccount == "" || expectedAccount != model.SeedanceAssetModelScopeFingerprint(channel, scope.selectedModel, selectedFingerprint) {
+				return newSeedanceAssetMappingError(c, service.ErrSeedanceAssetMappingPending)
 			}
 		}
 	}

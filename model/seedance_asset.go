@@ -465,10 +465,36 @@ const SeedanceAssetReviewTimeoutCode = "review_timeout"
 // ErrSeedanceAssetUnavailable 表示素材不存在、已删除或不属于当前用户。
 var ErrSeedanceAssetUnavailable = errors.New("private asset is unavailable")
 
+var ErrSeedanceAssetCommitUncertain = errors.New("asset changes could not be confirmed; check the asset library before retrying")
+
+// CreateSeedanceAssetGroup 在提交确认丢失时保留已创建的上游组。
+func CreateSeedanceAssetGroup(ctx context.Context, group *SeedanceAssetGroup) error {
+	ready := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(group).Error; err != nil {
+			return err
+		}
+		ready = true
+		return nil
+	})
+	if err == nil || !ready {
+		return err
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stored SeedanceAssetGroup
+	if checkErr := DB.WithContext(checkCtx).Where("user_id = ? AND group_id = ? AND channel_id = ? AND account_fingerprint = ?", group.UserID, group.GroupID, group.ChannelID, group.AccountFingerprint).First(&stored).Error; checkErr == nil {
+		*group = stored
+		return nil
+	}
+	return ErrSeedanceAssetCommitUncertain
+}
+
 // CreateSeedanceAssetInGroup 与分组删除共享数据库锁，仅允许仍可用的分组接收最终素材。
 // 外部上传不持有锁，失败由调用方补偿；锁只覆盖状态校验与本地落库。
 func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset, syncTargets ...SeedanceAssetSyncTarget) error {
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	ready := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// SQLite 无行锁，先执行无值变化的更新取得写锁，避免读快照升级写锁的竞态。
 		if tx.Dialector.Name() == "sqlite" {
 			if err := tx.Model(&SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", asset.UserID, asset.GroupID).
@@ -521,13 +547,27 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset, syncT
 				return err
 			}
 		}
-		if group.AssetCount == nil {
-			return nil
+		if group.AssetCount != nil {
+			if err := tx.Model(&SeedanceAssetGroup{}).
+				Where("user_id = ? AND group_id = ? AND asset_count IS NOT NULL", asset.UserID, asset.GroupID).
+				UpdateColumn("asset_count", gorm.Expr("asset_count + ?", 1)).Error; err != nil {
+				return err
+			}
 		}
-		return tx.Model(&SeedanceAssetGroup{}).
-			Where("user_id = ? AND group_id = ? AND asset_count IS NOT NULL", asset.UserID, asset.GroupID).
-			UpdateColumn("asset_count", gorm.Expr("asset_count + ?", 1)).Error
+		ready = true
+		return nil
 	})
+	if err == nil || !ready {
+		return err
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stored SeedanceAsset
+	if checkErr := DB.WithContext(checkCtx).Where("user_id = ? AND group_id = ? AND asset_id = ? AND object_key = ?", asset.UserID, asset.GroupID, asset.AssetID, asset.ObjectKey).First(&stored).Error; checkErr == nil {
+		*asset = stored
+		return nil
+	}
+	return ErrSeedanceAssetCommitUncertain
 }
 
 // DeleteSeedanceAssetWithCount 删除指定用户的素材，并在同一事务内维护素材组计数。
@@ -877,6 +917,15 @@ func CompleteSeedanceAssetGroupReplica(ctx context.Context, id uint, leaseUntil 
 		updated = result.RowsAffected == 1
 		return nil
 	})
+	if err != nil && updated {
+		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var stored SeedanceAssetGroupReplica
+		if checkErr := DB.WithContext(checkCtx).Where("id = ? AND upstream_group_id = ? AND status = ?", id, upstreamGroupID, SeedanceAssetReplicaReady).First(&stored).Error; checkErr == nil {
+			return true, nil
+		}
+		return false, ErrSeedanceAssetCommitUncertain
+	}
 	return updated, err
 }
 
@@ -1073,6 +1122,15 @@ func CompleteSeedanceAssetReplica(ctx context.Context, id uint, leaseUntil int64
 		updated = result.RowsAffected == 1
 		return nil
 	})
+	if err != nil && updated {
+		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var stored SeedanceAssetReplica
+		if checkErr := DB.WithContext(checkCtx).Where("id = ? AND upstream_group_id = ? AND upstream_asset_id = ? AND provision_status = ?", id, upstreamGroupID, upstreamAssetID, SeedanceAssetReplicaReady).First(&stored).Error; checkErr == nil {
+			return true, nil
+		}
+		return false, ErrSeedanceAssetCommitUncertain
+	}
 	return updated, err
 }
 

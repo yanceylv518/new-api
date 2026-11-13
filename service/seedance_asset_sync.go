@@ -51,6 +51,8 @@ type seedanceAssetSyncScope struct {
 	PinnedChannel int      `json:"pinned_channel"`
 }
 
+const seedanceAssetSyncScopeVersion = 2
+
 // EncodeSeedanceAssetSyncScope 固定创建任务时的令牌范围，后台仍需重新校验用户权限。
 func EncodeSeedanceAssetSyncScope(groups, models []string, pinnedChannel int) (string, error) {
 	groups = slices.Clone(groups)
@@ -59,7 +61,7 @@ func EncodeSeedanceAssetSyncScope(groups, models []string, pinnedChannel int) (s
 	slices.Sort(models)
 	groups = slices.Compact(groups)
 	models = slices.Compact(models)
-	value, err := common.Marshal(seedanceAssetSyncScope{Version: 1, Groups: groups, Models: models, PinnedChannel: pinnedChannel})
+	value, err := common.Marshal(seedanceAssetSyncScope{Version: seedanceAssetSyncScopeVersion, Groups: groups, Models: models, PinnedChannel: pinnedChannel})
 	return string(value), err
 }
 
@@ -157,10 +159,18 @@ func seedanceAssetSyncGroupsForUser(ctx context.Context, userID int, requestedGr
 	return groups, nil
 }
 
-func seedanceAssetModelAllowed(name string, allowedModels []string) bool {
-	return allowedModels == nil || slices.Contains(allowedModels, name) ||
+func SeedanceAssetModelAllowed(name string, allowedModels []string) bool {
+	if allowedModels == nil || slices.Contains(allowedModels, name) ||
 		slices.Contains(allowedModels, ratio_setting.FormatMatchingModelName(name)) ||
-		slices.Contains(allowedModels, ratio_setting.RoutingMatchModelName(name))
+		slices.Contains(allowedModels, ratio_setting.RoutingMatchModelName(name)) {
+		return true
+	}
+	for _, allowed := range allowedModels {
+		if ratio_setting.RoutingMatchModelName(allowed) == name {
+			return true
+		}
+	}
+	return false
 }
 
 func seedanceAssetModelName(channel *model.Channel, name string) bool {
@@ -224,7 +234,7 @@ func seedanceAssetSyncClientsForUser(ctx context.Context, userID int, channels [
 	})
 	for _, ability := range abilities {
 		channel := byID[ability.ChannelId]
-		if channel == nil || !seedanceAssetModelAllowed(ability.Model, allowedModels) ||
+		if channel == nil || !SeedanceAssetModelAllowed(ability.Model, allowedModels) ||
 			!seedanceAssetModelName(channel, ability.Model) && (len(includeOtherModels) == 0 || !includeOtherModels[0]) {
 			continue
 		}
@@ -257,8 +267,8 @@ func seedanceAssetSyncClientsForUser(ctx context.Context, userID int, channels [
 	return clients, nil
 }
 
-// SeedanceAssetModelScopes 返回当前凭证可用模型及其独立同步目标。
-func SeedanceAssetModelScopes(ctx context.Context, userID int, requestedGroups, allowedModels []string, pinnedChannel int) (map[string][]string, error) {
+// seedanceAssetAbilityScopes 保留能力名称，避免精确模型与基础模型的副本混淆。
+func seedanceAssetAbilityScopes(ctx context.Context, userID int, requestedGroups, allowedModels []string, pinnedChannel int) (map[string][]string, error) {
 	groups, err := seedanceAssetSyncGroupsForUser(ctx, userID, requestedGroups)
 	if err != nil {
 		return nil, err
@@ -294,9 +304,10 @@ func SeedanceAssetModelScopes(ctx context.Context, userID int, requestedGroups, 
 	}
 	for _, ability := range abilities {
 		channel := byID[ability.ChannelId]
-		if channel != nil && seedanceAssetModelAllowed(ability.Model, allowedModels) && seedanceAssetModelName(channel, ability.Model) {
-			if _, exists := result[ability.Model]; !exists {
-				result[ability.Model] = nil
+		if channel != nil && SeedanceAssetModelAllowed(ability.Model, allowedModels) && seedanceAssetModelName(channel, ability.Model) {
+			name := ability.Model
+			if _, exists := result[name]; !exists {
+				result[name] = nil
 			}
 		}
 	}
@@ -316,7 +327,7 @@ func SeedanceAssetModelScopes(ctx context.Context, userID int, requestedGroups, 
 	}
 	for _, ability := range abilities {
 		channel := available[ability.ChannelId]
-		if channel == nil || !seedanceAssetModelAllowed(ability.Model, allowedModels) || !seedanceAssetModelName(channel, ability.Model) {
+		if channel == nil || !SeedanceAssetModelAllowed(ability.Model, allowedModels) || !seedanceAssetModelName(channel, ability.Model) {
 			continue
 		}
 		for index, key := range channel.GetKeys() {
@@ -331,12 +342,72 @@ func SeedanceAssetModelScopes(ctx context.Context, userID int, requestedGroups, 
 				continue
 			}
 			fingerprint := model.SeedanceAssetModelScopeFingerprint(channel, ability.Model, keyFingerprint)
-			if fingerprint != "" && !slices.Contains(result[ability.Model], fingerprint) {
-				result[ability.Model] = append(result[ability.Model], fingerprint)
+			name := ability.Model
+			if fingerprint != "" && !slices.Contains(result[name], fingerprint) {
+				result[name] = append(result[name], fingerprint)
 			}
 		}
 	}
 	for name := range result {
+		slices.Sort(result[name])
+	}
+	return result, nil
+}
+
+// SeedanceAssetModelScopes 返回按基础模型汇总的同步目标，供发现任务去重。
+func SeedanceAssetModelScopes(ctx context.Context, userID int, requestedGroups, allowedModels []string, pinnedChannel int) (map[string][]string, error) {
+	abilities, err := seedanceAssetAbilityScopes(ctx, userID, requestedGroups, allowedModels, pinnedChannel)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string)
+	for ability, fingerprints := range abilities {
+		name := ratio_setting.RoutingMatchModelName(ability)
+		if _, exists := result[name]; !exists {
+			result[name] = nil
+		}
+		for _, fingerprint := range fingerprints {
+			if !slices.Contains(result[name], fingerprint) {
+				result[name] = append(result[name], fingerprint)
+			}
+		}
+	}
+	for name := range result {
+		slices.Sort(result[name])
+	}
+	return result, nil
+}
+
+// SeedanceAssetRequestModelScopes 按可请求模型分别计算精确及基础能力的候选副本。
+func SeedanceAssetRequestModelScopes(ctx context.Context, userID int, requestedGroups, allowedModels []string, pinnedChannel int) (map[string][]string, error) {
+	abilities, err := seedanceAssetAbilityScopes(ctx, userID, requestedGroups, allowedModels, pinnedChannel)
+	if err != nil {
+		return nil, err
+	}
+	requests := make(map[string]struct{}, len(abilities)+len(allowedModels))
+	for name := range abilities {
+		if allowedModels == nil || slices.Contains(allowedModels, name) || slices.Contains(allowedModels, ratio_setting.FormatMatchingModelName(name)) || slices.Contains(allowedModels, ratio_setting.RoutingMatchModelName(name)) {
+			requests[name] = struct{}{}
+		}
+	}
+	for _, name := range allowedModels {
+		requests[name] = struct{}{}
+	}
+	result := make(map[string][]string, len(requests))
+	for name := range requests {
+		exact, exactExists := abilities[name]
+		fallback, fallbackExists := abilities[ratio_setting.RoutingMatchModelName(name)]
+		if !exactExists && !fallbackExists {
+			continue
+		}
+		result[name] = nil
+		for _, fingerprints := range [][]string{exact, fallback} {
+			for _, fingerprint := range fingerprints {
+				if !slices.Contains(result[name], fingerprint) {
+					result[name] = append(result[name], fingerprint)
+				}
+			}
+		}
 		slices.Sort(result[name])
 	}
 	return result, nil
@@ -405,8 +476,15 @@ func EnsureSeedanceAssetSynchronization(ctx context.Context, userID int, assets 
 		for _, client := range clients {
 			if replica := existing[asset.ID][client.AccountFingerprint]; replica != nil {
 				if replica.SyncScope != scope {
-					restart := replica.LastError == errSeedanceAssetSyncTargetUnavailable.Error()
-					updated, err := model.AuthorizeSeedanceAssetSyncScope(ctx, replica, scope, common.GetTimestamp(), restart)
+					legacy := SeedanceAssetScopeRequiresReauthorization(replica.SyncScope)
+					restart := replica.LastError == errSeedanceAssetSyncTargetUnavailable.Error() || legacy && replica.LastError == model.SeedanceAssetReviewTimeoutCode && replica.ProvisionStatus == model.SeedanceAssetReplicaReady
+					var updated bool
+					var err error
+					if legacy {
+						updated, err = model.ReauthorizeSeedanceAssetReplica(ctx, replica, scope, common.GetTimestamp(), restart)
+					} else {
+						updated, err = model.AuthorizeSeedanceAssetSyncScope(ctx, replica, scope, common.GetTimestamp(), restart)
+					}
 					if err != nil {
 						return err
 					}
@@ -584,7 +662,7 @@ func RunSeedanceAssetSynchronizationOnce(ctx context.Context, report func(proces
 // resolveSeedanceAssetSyncClient 每项任务执行前校验权限；原渠道失效时仅在同一共享范围内恢复。
 func resolveSeedanceAssetSyncClient(ctx context.Context, replica *model.SeedanceAssetReplica) (*SeedanceAssetClient, error) {
 	var scope seedanceAssetSyncScope
-	if replica.SyncScope == "" || common.UnmarshalJsonStr(replica.SyncScope, &scope) != nil || scope.Version != 1 || scope.PinnedChannel < 0 {
+	if replica.SyncScope == "" || common.UnmarshalJsonStr(replica.SyncScope, &scope) != nil || scope.Version != seedanceAssetSyncScopeVersion || scope.PinnedChannel < 0 {
 		return nil, errSeedanceAssetSyncTargetUnavailable
 	}
 	canonical, err := EncodeSeedanceAssetSyncScope(scope.Groups, scope.Models, scope.PinnedChannel)

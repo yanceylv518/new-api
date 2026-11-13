@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -145,6 +146,8 @@ func (p *RetryParam) ResetRetryNextTry() {
 func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
 	var channel *model.Channel
 	var err error
+	var matchedAbility string
+	common.SetContextKey(param.Ctx, constant.ContextKeySelectedAbility, "")
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
@@ -183,6 +186,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				param.ModelName,
 				priorityRetry,
 				filters,
+				&matchedAbility,
 			)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
@@ -226,10 +230,14 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			param.ModelName,
 			param.GetRetry(),
 			filters,
+			&matchedAbility,
 		)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}
+	}
+	if channel != nil {
+		common.SetContextKey(param.Ctx, constant.ContextKeySelectedAbility, matchedAbility)
 	}
 	return channel, selectGroup, nil
 }
@@ -344,6 +352,7 @@ func OriginTaskChannelGroup(c *gin.Context, modelName string, channelID int) (st
 // filters. The group the channel was chosen from is returned for auto-group
 // callers. The caller still applies SetupContextForSelectedChannel.
 func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Channel, string, *ChannelSelectError) {
+	common.SetContextKey(c, constant.ContextKeySelectedAbility, "")
 	constraints := GetChannelConstraints(c)
 	if pin, found, overridden := constraints.ResolvedPin(); found {
 		for _, lost := range overridden {
@@ -378,6 +387,38 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				FilterKind: kind, Channel: channel,
 			}
 		}
+		if pin.Source == dto.PinSourceOriginTask && c.GetInt("token_id") > 0 {
+			groups := []string{retry.TokenGroup}
+			if retry.TokenGroup == "auto" {
+				groups = GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+			}
+			for _, group := range groups {
+				if ability := model.MatchingChannelAbilityForGroup(channel, group, modelName, constraints.Filters); ability != "" {
+					common.SetContextKey(c, constant.ContextKeySelectedAbility, ability)
+					if retry.TokenGroup == "auto" {
+						common.SetContextKey(c, constant.ContextKeyAutoGroup, group)
+					}
+					return channel, group, nil
+				}
+			}
+			return nil, "", &ChannelSelectError{StatusCode: http.StatusForbidden, MessageID: i18n.MsgDistributorGroupAccessDenied}
+		}
+		if slices.ContainsFunc(constraints.Filters, func(filter dto.ChannelFilter) bool { return filter.Kind == dto.FilterSeedanceAssetReady }) {
+			groups := []string{retry.TokenGroup}
+			if retry.TokenGroup == "auto" {
+				groups = GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+			}
+			for _, group := range groups {
+				if ability := model.MatchingChannelAbilityForGroup(channel, group, modelName, constraints.Filters); ability != "" {
+					common.SetContextKey(c, constant.ContextKeySelectedAbility, ability)
+					if retry.TokenGroup == "auto" {
+						common.SetContextKey(c, constant.ContextKeyAutoGroup, group)
+					}
+					return channel, group, nil
+				}
+			}
+			return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, FilterKind: dto.FilterSeedanceAssetReady, NoAvailableChannel: true}
+		}
 		if selectedGroup != "" && common.GetContextKeyString(c, constant.ContextKeyUsingGroup) == "auto" {
 			common.SetContextKey(c, constant.ContextKeyAutoGroup, selectedGroup)
 		}
@@ -399,7 +440,8 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				if usingGroup == "auto" {
 					userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 					for _, g := range GetRequestAutoGroups(c, userGroup) {
-						if model.IsChannelEnabledForGroupModel(g, modelName, preferred.Id) {
+						if ability := model.MatchingChannelAbilityForGroup(preferred, g, modelName, constraints.Filters); ability != "" {
+							common.SetContextKey(c, constant.ContextKeySelectedAbility, ability)
 							selectGroup = g
 							common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
 							channel = preferred
@@ -408,7 +450,8 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 							break
 						}
 					}
-				} else if model.IsChannelEnabledForGroupModel(usingGroup, modelName, preferred.Id) {
+				} else if ability := model.MatchingChannelAbilityForGroup(preferred, usingGroup, modelName, constraints.Filters); ability != "" {
+					common.SetContextKey(c, constant.ContextKeySelectedAbility, ability)
 					channel = preferred
 					selectGroup = usingGroup
 					affinityUsable = true
@@ -444,7 +487,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			}
 		}
 	}
-	if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
+	if ok, kind := model.ChannelSatisfiesFiltersForGroup(channel, modelName, selectGroup, constraints.Filters); !ok {
 		return nil, selectGroup, &ChannelSelectError{
 			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
 			Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},

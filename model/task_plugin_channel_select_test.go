@@ -49,6 +49,40 @@ func TestTaskPluginChannelSelectionFiltersBothCachePaths(t *testing.T) {
 	assert.Contains(t, []string{"legacy-alpha", "legacy-beta"}, selected.Name)
 }
 
+func TestModelModifierChannelSelectionMatchesAcrossCacheModes(t *testing.T) {
+	truncateTables(t)
+	previousMemory := common.MemoryCacheEnabled
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemory; InitChannelCache() })
+	const base = "doubao-seedance-2-0-260128"
+	const modified = base + "@temperature:0.2"
+	high, low := int64(10), int64(0)
+	alpha, beta := `{"task_plugin_key":"alpha"}`, `{"task_plugin_key":"beta"}`
+	channels := []Channel{
+		{Id: 930001, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Name: "base-alpha", Models: base, Group: "default", Priority: &high, Setting: &alpha},
+		{Id: 930002, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Name: "exact-beta", Models: modified, Group: "default", Priority: &low, Setting: &beta},
+	}
+	for index := range channels {
+		require.NoError(t, channels[index].Insert())
+	}
+	for _, enabled := range []bool{false, true} {
+		common.MemoryCacheEnabled = enabled
+		if enabled {
+			InitChannelCache()
+		}
+		selected, err := GetRandomSatisfiedChannel("default", modified, 0, nil)
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "exact-beta", selected.Name)
+		selected, err = GetRandomSatisfiedChannel("default", modified, 0, identityFilters("alpha", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "base-alpha", selected.Name)
+		selected, err = GetRandomSatisfiedChannel("default", modified, 0, identityFilters("other", nil))
+		require.NoError(t, err)
+		assert.Nil(t, selected)
+	}
+}
+
 func identityFilters(key string, channelTypes []int) []dto.ChannelFilter {
 	return []dto.ChannelFilter{{
 		Kind:                   dto.FilterTaskPluginIdentity,

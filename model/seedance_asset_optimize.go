@@ -12,7 +12,8 @@ import (
 // PromoteLocalSeedanceAsset 在持有组锁时将通用素材切换为真实的上游审核任务。
 func PromoteLocalSeedanceAsset(ctx context.Context, userID int, assetID uint, groupID string, expectedUpdatedAt time.Time,
 	channelID int, keyFingerprint, accountFingerprint, upstreamID, syncScope string) error {
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	ready := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var group SeedanceAssetGroup
 		if err := lockForUpdate(tx).Where("user_id = ? AND group_id = ? AND status <> ?", userID, groupID, "Deleting").First(&group).Error; err != nil {
 			return err
@@ -24,11 +25,25 @@ func PromoteLocalSeedanceAsset(ctx context.Context, userID int, assetID uint, gr
 		if asset.LocalOnly == nil || !*asset.LocalOnly || asset.Status == "Deleting" || !asset.UpdatedAt.Equal(expectedUpdatedAt) {
 			return errors.New("asset changed while optimization was starting")
 		}
-		return tx.Model(&asset).Updates(map[string]any{
+		if err := tx.Model(&asset).Updates(map[string]any{
 			"local_only": false, "primary_upstream_id": upstreamID, "primary_sync_scope": syncScope,
 			"channel_id": channelID, "key_fingerprint": keyFingerprint, "account_fingerprint": accountFingerprint,
 			"status": "Processing", "status_key": SeedanceAssetStatusIndexKey("Processing"), "pending_status": true,
 			"poll_attempts": 0, "poll_lease_until": 0, "next_poll_at": common.GetTimestamp(), "compat_optimize_replica_id": 0,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		ready = true
+		return nil
 	})
+	if err == nil || !ready {
+		return err
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stored SeedanceAsset
+	if checkErr := DB.WithContext(checkCtx).Where("id = ? AND user_id = ? AND group_id = ? AND channel_id = ? AND account_fingerprint = ? AND primary_upstream_id = ? AND local_only = ?", assetID, userID, groupID, channelID, accountFingerprint, upstreamID, false).First(&stored).Error; checkErr == nil {
+		return nil
+	}
+	return ErrSeedanceAssetCommitUncertain
 }

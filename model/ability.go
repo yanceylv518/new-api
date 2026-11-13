@@ -111,12 +111,16 @@ func GetChannel(
 	retry int,
 	filters []dto.ChannelFilter,
 ) (*Channel, error) {
+	return getChannelForAbility(group, model, model, retry, filters)
+}
+
+func getChannelForAbility(group, abilityModel, requestModel string, retry int, filters []dto.ChannelFilter) (*Channel, error) {
 	var abilities []Ability
-	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
+	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, abilityModel, true).Order("priority DESC, weight DESC").Find(&abilities).Error
 	if err != nil {
 		return nil, err
 	}
-	abilities = filterAbilitiesByConstraints(abilities, model, filters)
+	abilities = filterAbilitiesByConstraintsForGroup(abilities, requestModel, group, filters)
 	if len(abilities) > 0 {
 		priorities := make([]int64, 0)
 		seen := make(map[int64]bool)
@@ -167,6 +171,10 @@ func GetChannel(
 // predicate used by the memory-cache path. A failed channel lookup fails
 // 账号或插件身份依赖渠道详情时，查询失败必须拒绝候选，不能跳过权限约束。
 func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
+	return filterAbilitiesByConstraintsForGroup(abilities, modelName, "", filters)
+}
+
+func filterAbilitiesByConstraintsForGroup(abilities []Ability, modelName, group string, filters []dto.ChannelFilter) []Ability {
 	if len(abilities) == 0 {
 		return nil
 	}
@@ -197,7 +205,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 	filtered := make([]Ability, 0, len(abilities))
 	for _, ability := range abilities {
 		channel := channelsByID[ability.ChannelId]
-		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
+		if ok, _ := channelSatisfiesFiltersForAbility(channel, modelName, ability.Model, group, filters); ok {
 			filtered = append(filtered, ability)
 		}
 	}

@@ -368,8 +368,10 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 	}
 	completed, err := model.CompleteSeedanceAssetGroupReplica(ctx, replica.ID, leaseUntil, response.Result.ID, group.Name)
 	if err != nil || !completed {
-		if rollbackErr := RollbackSeedanceAssetGroup(ctx, client, response.Result.ID); rollbackErr != nil {
-			common.SysError("failed to roll back an unrecorded Seedance asset group: " + rollbackErr.Error())
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			if rollbackErr := RollbackSeedanceAssetGroup(ctx, client, response.Result.ID); rollbackErr != nil {
+				common.SysError("failed to roll back an unrecorded Seedance asset group: " + rollbackErr.Error())
+			}
 		}
 		if err != nil {
 			return "", err
@@ -510,8 +512,10 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 	}
 	completed, err := model.CompleteSeedanceAssetReplica(ctx, replica.ID, leaseUntil, upstreamGroupID, upstreamAssetID, common.GetTimestamp())
 	if err != nil || !completed {
-		if rollbackErr := RollbackSeedanceAsset(ctx, client, upstreamAssetID, ""); rollbackErr != nil {
-			common.SysError("failed to roll back an unrecorded Seedance asset replica: " + rollbackErr.Error())
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			if rollbackErr := RollbackSeedanceAsset(ctx, client, upstreamAssetID, ""); rollbackErr != nil {
+				common.SysError("failed to roll back an unrecorded Seedance asset replica: " + rollbackErr.Error())
+			}
 		}
 		if err != nil {
 			return "", false, err

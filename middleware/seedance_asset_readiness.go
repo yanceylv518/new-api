@@ -21,10 +21,18 @@ var errSeedanceAssetChannelOutsideGroup = errors.New("selected channel is unavai
 var errSeedanceAssetSynchronizationFailed = errors.New("private asset synchronization failed; retry after the issue is resolved")
 
 type seedanceReadyScope struct {
-	keys    map[int]map[string]struct{}
-	models  map[int]string
-	pending bool
-	failed  bool
+	keys          map[int]map[string]map[string]struct{}
+	groups        map[int]map[string]map[string]struct{}
+	accounts      map[seedanceReadyIdentity]string
+	selectedModel string
+	pending       bool
+	failed        bool
+}
+
+type seedanceReadyIdentity struct {
+	channelID int
+	model     string
+	key       string
 }
 
 // prepareSeedanceReadyChannels 只在本次请求允许的分组和模型内选取素材已就绪的账号。
@@ -61,28 +69,33 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		requestGroups = service.GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
 	}
 	models := []string{modelName}
+	abilityModels := []string{modelName}
 	if normalized := ratio_setting.RoutingMatchModelName(modelName); normalized != modelName {
-		models = append(models, normalized)
+		abilityModels = append(abilityModels, normalized)
 	}
 	var abilities []model.Ability
-	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": requestGroups, "model": models, "enabled": true}).Find(&abilities).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": requestGroups, "model": abilityModels, "enabled": true}).Find(&abilities).Error; err != nil {
 		return err
 	}
-	channelModels := make(map[int]string, len(abilities))
+	channelModels := make(map[int][]string, len(abilities))
+	channelGroups := make(map[int]map[string]map[string]struct{}, len(abilities))
 	channelIDs := make([]int, 0, len(abilities))
 	for _, ability := range abilities {
 		if _, exists := channelModels[ability.ChannelId]; !exists {
 			channelIDs = append(channelIDs, ability.ChannelId)
+			channelGroups[ability.ChannelId] = make(map[string]map[string]struct{})
 		}
-		if channelModels[ability.ChannelId] == "" || ability.Model == modelName {
-			channelModels[ability.ChannelId] = ability.Model
+		if !slices.Contains(channelModels[ability.ChannelId], ability.Model) {
+			channelModels[ability.ChannelId] = append(channelModels[ability.ChannelId], ability.Model)
+			channelGroups[ability.ChannelId][ability.Model] = make(map[string]struct{})
 		}
+		channelGroups[ability.ChannelId][ability.Model][ability.Group] = struct{}{}
 	}
 	if len(channelIDs) == 0 {
 		if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned {
 			return errSeedanceAssetChannelOutsideGroup
 		}
-		return nil
+		return errSeedanceAssetSynchronizationFailed
 	}
 	var candidates []model.Channel
 	if err := model.DB.WithContext(ctx).Where("id IN ?", channelIDs).Find(&candidates).Error; err != nil {
@@ -102,7 +115,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		return errSeedanceAssetChannelOutsideGroup
 	}
 	if len(candidates) == 0 {
-		return nil
+		return errSeedanceAssetSynchronizationFailed
 	}
 	channelsByID := make(map[int]*model.Channel, len(candidates))
 	for index := range candidates {
@@ -140,7 +153,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		}
 		replicasByAsset[replica.LocalAssetID][replica.AccountFingerprint] = replica
 	}
-	scope := &seedanceReadyScope{keys: make(map[int]map[string]struct{}), models: channelModels}
+	scope := &seedanceReadyScope{keys: make(map[int]map[string]map[string]struct{}), groups: channelGroups, accounts: make(map[seedanceReadyIdentity]string)}
 	targets := make([]model.SeedanceAssetReplica, 0)
 	seenTargets := make(map[string]struct{})
 	candidateAccounts := 0
@@ -154,121 +167,127 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		if ok, _ := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 			continue
 		}
-		for index, key := range channel.GetKeys() {
-			if strings.TrimSpace(key) == "" {
-				continue
-			}
-			if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; channel.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
-				continue
-			}
-			keyFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
-			fingerprints := model.SeedanceAssetAccountFingerprints(channel, keyFingerprint)
-			if len(fingerprints) == 0 {
-				continue
-			}
-			candidateAccounts++
-			ready, pending, failed := true, false, false
-			for _, asset := range assets {
-				group := groupsByID[asset.GroupID]
-				assetFingerprints := fingerprints
-				if !strings.EqualFold(group.GroupType, "LivenessFace") {
-					assetFingerprints = []string{model.SeedanceAssetModelScopeFingerprint(channel, channelModels[channelID], keyFingerprint)}
-				}
-				if strings.EqualFold(group.GroupType, "LivenessFace") {
-					groupAccount := group.AccountFingerprint
-					if groupAccount == "" {
-						groupAccount = model.SeedanceAssetAccountFingerprint(channelsByID[group.ChannelID], group.KeyFingerprint)
-					}
-					if groupAccount != "" && !slices.Contains(fingerprints, groupAccount) ||
-						groupAccount == "" && (group.ChannelID != channelID || group.KeyFingerprint != keyFingerprint) {
-						ready, failed = false, true
-						continue
-					}
-				}
-				if asset.LocalOnly != nil && *asset.LocalOnly {
-					if !strings.EqualFold(asset.Status, "Active") {
-						ready, failed = false, true
-					}
+		for _, abilityModel := range channelModels[channelID] {
+			for index, key := range channel.GetKeys() {
+				if strings.TrimSpace(key) == "" {
 					continue
 				}
-				origin := asset.AccountFingerprint
-				if origin == "" {
-					origin = group.AccountFingerprint
-				}
-				if origin == "" {
-					origin = model.SeedanceAssetAccountFingerprint(channelsByID[asset.ChannelID], asset.KeyFingerprint)
-				}
-				originMatches := origin != "" && slices.Contains(assetFingerprints, origin) ||
-					origin == "" && asset.ChannelID == channelID && asset.KeyFingerprint == keyFingerprint &&
-						(strings.EqualFold(group.GroupType, "LivenessFace") || channel.GetSetting().SeedanceAssetShareGroup != "")
-				if originMatches && asset.UpstreamAssetID() != "" {
-					if asset.UpstreamDeletedAt != 0 {
-						ready, failed = false, true
-						continue
-					}
-					switch strings.ToLower(strings.TrimSpace(asset.Status)) {
-					case "active", "success", "succeeded":
-					case "failed":
-						ready, failed = false, true
-					default:
-						ready, pending = false, true
-					}
+				if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; channel.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
 					continue
 				}
-				var replica *model.SeedanceAssetReplica
-				for _, fingerprint := range assetFingerprints {
-					if replica = replicasByAsset[asset.ID][fingerprint]; replica != nil {
-						break
-					}
+				keyFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+				fingerprints := model.SeedanceAssetAccountFingerprints(channel, keyFingerprint)
+				if len(fingerprints) == 0 {
+					continue
 				}
-				if replica != nil && replica.ProvisionStatus == model.SeedanceAssetReplicaReady && replica.UpstreamAssetID != "" && replica.UpstreamDeletedAt == 0 {
-					switch strings.ToLower(strings.TrimSpace(replica.Status)) {
-					case "active", "success", "succeeded":
+				candidateAccounts++
+				ready, pending, failed := true, false, false
+				for _, asset := range assets {
+					group := groupsByID[asset.GroupID]
+					assetFingerprints := fingerprints
+					if !strings.EqualFold(group.GroupType, "LivenessFace") {
+						assetFingerprints = []string{model.SeedanceAssetModelScopeFingerprint(channel, abilityModel, keyFingerprint)}
+					}
+					if strings.EqualFold(group.GroupType, "LivenessFace") {
+						groupAccount := group.AccountFingerprint
+						if groupAccount == "" {
+							groupAccount = model.SeedanceAssetAccountFingerprint(channelsByID[group.ChannelID], group.KeyFingerprint)
+						}
+						if groupAccount != "" && !slices.Contains(fingerprints, groupAccount) ||
+							groupAccount == "" && (group.ChannelID != channelID || group.KeyFingerprint != keyFingerprint) {
+							ready, failed = false, true
+							continue
+						}
+					}
+					if asset.LocalOnly != nil && *asset.LocalOnly {
+						if !strings.EqualFold(asset.Status, "Active") {
+							ready, failed = false, true
+						}
 						continue
 					}
-				}
-				ready = false
-				if replica != nil {
-					if replica.SyncScope != syncScope {
-						needsAuthorization = true
+					origin := asset.AccountFingerprint
+					if origin == "" {
+						origin = group.AccountFingerprint
 					}
-					if replica.UpstreamDeletedAt != 0 || strings.EqualFold(replica.Status, "Failed") || replica.ProvisionStatus == model.SeedanceAssetReplicaFailed && (replica.NextPollAt == 0 || replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts) ||
-						replica.ProvisionStatus == model.SeedanceAssetReplicaReady && replica.LastError != "" && replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts {
+					if origin == "" {
+						origin = model.SeedanceAssetAccountFingerprint(channelsByID[asset.ChannelID], asset.KeyFingerprint)
+					}
+					originMatches := origin != "" && slices.Contains(assetFingerprints, origin) ||
+						origin == "" && asset.ChannelID == channelID && asset.KeyFingerprint == keyFingerprint &&
+							(strings.EqualFold(group.GroupType, "LivenessFace") || channel.GetSetting().SeedanceAssetShareGroup != "")
+					if originMatches && asset.UpstreamAssetID() != "" {
+						if asset.UpstreamDeletedAt != 0 {
+							ready, failed = false, true
+							continue
+						}
+						switch strings.ToLower(strings.TrimSpace(asset.Status)) {
+						case "active", "success", "succeeded":
+						case "failed":
+							ready, failed = false, true
+						default:
+							ready, pending = false, true
+						}
+						continue
+					}
+					var replica *model.SeedanceAssetReplica
+					for _, fingerprint := range assetFingerprints {
+						if replica = replicasByAsset[asset.ID][fingerprint]; replica != nil {
+							break
+						}
+					}
+					if replica != nil && replica.ProvisionStatus == model.SeedanceAssetReplicaReady && replica.UpstreamAssetID != "" && replica.UpstreamDeletedAt == 0 {
+						switch strings.ToLower(strings.TrimSpace(replica.Status)) {
+						case "active", "success", "succeeded":
+							continue
+						}
+					}
+					ready = false
+					if replica != nil {
+						if replica.SyncScope != syncScope {
+							needsAuthorization = true
+						}
+						if replica.UpstreamDeletedAt != 0 || strings.EqualFold(replica.Status, "Failed") || replica.ProvisionStatus == model.SeedanceAssetReplicaFailed && (replica.NextPollAt == 0 || replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts) ||
+							replica.ProvisionStatus == model.SeedanceAssetReplicaReady && replica.LastError != "" && replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts {
+							failed = true
+						} else {
+							pending = true
+						}
+						continue
+					}
+					if strings.EqualFold(group.GroupType, "LivenessFace") {
 						failed = true
-					} else {
-						pending = true
+						continue
 					}
-					continue
+					pending = true
+					identity := fmt.Sprintf("%d:%s", asset.ID, assetFingerprints[0])
+					if _, exists := seenTargets[identity]; !exists {
+						seenTargets[identity] = struct{}{}
+						targets = append(targets, model.SeedanceAssetReplica{
+							UserID: userID, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channelID,
+							AccountFingerprint: assetFingerprints[0], KeyFingerprint: keyFingerprint, SyncScope: syncScope,
+							ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp(),
+						})
+					}
 				}
-				if strings.EqualFold(group.GroupType, "LivenessFace") {
-					failed = true
-					continue
+				if ready {
+					if scope.keys[channelID] == nil {
+						scope.keys[channelID] = make(map[string]map[string]struct{})
+					}
+					if scope.keys[channelID][abilityModel] == nil {
+						scope.keys[channelID][abilityModel] = make(map[string]struct{})
+					}
+					scope.keys[channelID][abilityModel][keyFingerprint] = struct{}{}
+					scope.accounts[seedanceReadyIdentity{channelID, abilityModel, keyFingerprint}] = model.SeedanceAssetModelScopeFingerprint(channel, abilityModel, keyFingerprint)
+				} else if pending && !failed {
+					scope.pending = true
+				} else {
+					scope.failed = true
 				}
-				pending = true
-				identity := fmt.Sprintf("%d:%s", asset.ID, assetFingerprints[0])
-				if _, exists := seenTargets[identity]; !exists {
-					seenTargets[identity] = struct{}{}
-					targets = append(targets, model.SeedanceAssetReplica{
-						UserID: userID, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channelID,
-						AccountFingerprint: assetFingerprints[0], KeyFingerprint: keyFingerprint, SyncScope: syncScope,
-						ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp(),
-					})
-				}
-			}
-			if ready {
-				if scope.keys[channelID] == nil {
-					scope.keys[channelID] = make(map[string]struct{})
-				}
-				scope.keys[channelID][keyFingerprint] = struct{}{}
-			} else if pending && !failed {
-				scope.pending = true
-			} else {
-				scope.failed = true
 			}
 		}
 	}
 	if candidateAccounts == 0 {
-		return nil
+		return errSeedanceAssetSynchronizationFailed
 	}
 	if needsAuthorization {
 		if err := service.EnsureSeedanceAssetSynchronization(ctx, userID, assets, requestGroups, models, pinnedChannel); err != nil {
@@ -283,7 +302,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 			common.SysError("failed to wake Seedance asset synchronization: " + err.Error())
 		}
 	}
-	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterSeedanceAssetReady, SeedanceAssetReadyKeys: scope.keys})
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterSeedanceAssetReady, SeedanceAssetReadyKeys: scope.keys, SeedanceAssetReadyGroups: scope.groups})
 	c.Set(seedanceReadyScopeKey, scope)
 	return nil
 }

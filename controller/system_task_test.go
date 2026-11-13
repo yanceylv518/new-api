@@ -14,8 +14,10 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -34,12 +36,12 @@ func setupSeedanceSyncTestDB(t *testing.T) *gorm.DB {
 	}
 	config, err := driver.ParseDSN(dsn)
 	require.NoError(t, err)
-	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_sync_"), "test requires an isolated database")
+	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_sync_") || config.DBName == "codex_agent_assets", "test requires an isolated database")
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	connection, err := db.DB()
 	require.NoError(t, err)
-	models := []any{&model.User{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SystemTaskLock{}}
+	models := []any{&model.User{}, &model.Token{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SystemTaskLock{}}
 	for _, item := range models {
 		require.False(t, db.Migrator().HasTable(item), "isolated test database must be empty")
 	}
@@ -240,7 +242,7 @@ func TestSeedanceDiscoveryRejectsInvalidScopes(t *testing.T) {
 		`{"version":1,"models":null,"pinned_channel":1}`,
 		`{"version":1,"groups":["default"],"pinned_channel":1}`,
 		`{"groups":["default"],"models":null,"pinned_channel":1}`,
-		`{"version":2,"groups":["default"],"models":null,"pinned_channel":1}`,
+		`{"version":3,"groups":["default"],"models":null,"pinned_channel":1}`,
 		`{"version":1,"groups":["default"],"models":null,"pinned_channel":null}`,
 		`{"version":1,"groups":["default",null],"models":null,"pinned_channel":1}`,
 		`{"version":1,"groups":["default"],"models":{},"pinned_channel":1}`,
@@ -622,4 +624,265 @@ func TestSystemTaskInvalidFiltersAreRejected(t *testing.T) {
 			assert.JSONEq(t, `{"success":false,"message":"invalid system task filters"}`, recorder.Body.String())
 		})
 	}
+}
+
+const seedanceScopeTestBase = "doubao-seedance-scope-test"
+const seedanceScopeTestExact = seedanceScopeTestBase + "@temperature:0.2"
+const seedanceScopeTestOther = seedanceScopeTestBase + "@temperature:0.3"
+
+func setupSeedanceScopeRecoveryMySQL(t *testing.T, failing ...*atomic.Bool) (*gorm.DB, *gin.Engine, *model.Channel, *service.SeedanceAssetClient, *atomic.Int32) {
+	t.Helper()
+	db := setupSeedanceSyncTestDB(t)
+	t.Setenv("LOG_SQL_DSN", "")
+	wasMaster := common.IsMasterNode
+	common.IsMasterNode = false
+	err := model.InitLogDB()
+	common.IsMasterNode = wasMaster
+	require.NoError(t, err)
+	oldRatios, oldGroups := ratio_setting.GroupRatio2JSONString(), setting.UserUsableGroups2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
+	t.Cleanup(func() {
+		assert.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(oldRatios))
+		assert.NoError(t, setting.UpdateUserUsableGroupsByJSONString(oldGroups))
+	})
+	var upstreamCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("Action") != "GetAsset" {
+			t.Errorf("unexpected local upstream action: %s", r.URL.Query().Get("Action"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		upstreamCalls.Add(1)
+		if len(failing) > 0 && failing[0].Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"Result":{"Status":"Processing"}}`)
+	}))
+	t.Cleanup(server.Close)
+	service.InitHttpClient()
+	channel := &model.Channel{Id: 701, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-upstream", BaseURL: &server.URL, Group: "default", Models: strings.Join([]string{seedanceScopeTestBase, seedanceScopeTestExact, seedanceScopeTestOther}, ","), Status: common.ChannelStatusEnabled}
+	configureSeedanceTestAssetURL(t, channel)
+	require.NoError(t, channel.Insert())
+	client, err := service.NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.User{Id: 701, Username: "scopeowner", AffCode: "scopeowner", Group: "default", Status: common.UserStatusEnabled}).Error)
+	tokens := []model.Token{
+		{UserId: 701, Key: "scopevalid", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, Group: "default", ModelLimitsEnabled: true, ModelLimits: seedanceScopeTestExact},
+		{UserId: 701, Key: "scopebase", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, Group: "default", ModelLimitsEnabled: true, ModelLimits: seedanceScopeTestBase},
+		{UserId: 701, Key: "scopeother", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, Group: "default", ModelLimitsEnabled: true, ModelLimits: "doubao-seedance-unavailable"},
+		{UserId: 701, Key: "scopeempty", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, Group: "default", ModelLimitsEnabled: true},
+		{UserId: 701, Key: "scopeexpired", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: 1, Group: "default", ModelLimitsEnabled: true, ModelLimits: seedanceScopeTestExact},
+	}
+	require.NoError(t, db.Create(&tokens).Error)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/assets", middleware.TokenAuth(), ListSeedanceAssets)
+	router.GET("/assets/:id", middleware.TokenAuth(), GetSeedanceAsset)
+	router.POST("/assets/:id/refresh", middleware.TokenAuth(), RefreshSeedanceAsset)
+	return db, router, channel, client, &upstreamCalls
+}
+
+func seedanceScopeTestRequest(router *gin.Engine, method, path, token string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, nil)
+	request.Header.Set("Authorization", "Bearer sk-"+token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func seedanceScopeTestV1(t *testing.T) string {
+	t.Helper()
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{seedanceScopeTestBase, seedanceScopeTestExact}, 0)
+	require.NoError(t, err)
+	return strings.Replace(scope, `"version":2`, `"version":1`, 1)
+}
+
+func TestSeedanceVersionOnePrimaryRefreshMySQL(t *testing.T) {
+	var failing atomic.Bool
+	db, router, channel, client, calls := setupSeedanceScopeRecoveryMySQL(t, &failing)
+	group := &model.SeedanceAssetGroup{UserID: 701, ChannelID: channel.Id, GroupID: "human-scope", Name: "human", GroupType: "LivenessFace", Status: "Active", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint}
+	require.NoError(t, db.Create(group).Error)
+	asset := &model.SeedanceAsset{UserID: 701, ChannelID: channel.Id, GroupID: group.GroupID, AssetID: "human-scope-asset", Name: "human", AssetType: "Image", Status: "Processing", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, PrimarySyncScope: seedanceScopeTestV1(t), NextPollAt: common.GetTimestamp() - 1}
+	require.NoError(t, db.Create(asset).Error)
+	path := fmt.Sprintf("/assets/%d/refresh", asset.ID)
+	assert.Equal(t, http.StatusUnauthorized, seedanceScopeTestRequest(router, http.MethodPost, path, "scopeexpired").Code)
+	assert.Equal(t, http.StatusForbidden, seedanceScopeTestRequest(router, http.MethodPost, path, "scopeother").Code)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, seedanceScopeTestV1(t), asset.PrimarySyncScope)
+	assert.Zero(t, calls.Load())
+	failing.Store(true)
+	response := seedanceScopeTestRequest(router, http.MethodPost, path, "scopevalid")
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	want, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{seedanceScopeTestExact}, 0)
+	require.NoError(t, err)
+	assert.Equal(t, want, asset.PrimarySyncScope)
+	assert.Equal(t, "Processing", asset.Status)
+	failing.Store(false)
+	response = seedanceScopeTestRequest(router, http.MethodPost, path, "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, want, asset.PrimarySyncScope)
+	require.NoError(t, db.Model(asset).Update("next_poll_at", common.GetTimestamp()-1).Error)
+	summary, err := service.RunSeedanceAssetPollingOnce(t.Context(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Updated)
+	assert.EqualValues(t, 3, calls.Load())
+}
+
+func TestSeedanceVersionOneDiscoveryReauthorizationMySQL(t *testing.T) {
+	db, router, channel, client, _ := setupSeedanceScopeRecoveryMySQL(t)
+	group := model.SeedanceAssetGroup{UserID: 701, ChannelID: channel.Id, GroupID: "scope-discovery", Name: "scope", GroupType: "AIGC", Status: "Active"}
+	require.NoError(t, db.Create(&group).Error)
+	localOnly := false
+	assets := make([]model.SeedanceAsset, 101)
+	for index := range assets {
+		assets[index] = model.SeedanceAsset{UserID: 701, ChannelID: channel.Id, GroupID: group.GroupID, AssetID: fmt.Sprintf("scope-discovery-%d", index), Name: "asset", AssetType: "Image", Status: "Processing", LocalOnly: &localOnly}
+	}
+	require.NoError(t, db.CreateInBatches(&assets, 100).Error)
+	oldScope := seedanceScopeTestV1(t)
+	replicas := make([]model.SeedanceAssetReplica, 0, len(assets)*2)
+	for _, asset := range assets {
+		for _, name := range []string{seedanceScopeTestBase, seedanceScopeTestExact} {
+			replicas = append(replicas, model.SeedanceAssetReplica{UserID: 701, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(channel, name, client.KeyFingerprint), KeyFingerprint: client.KeyFingerprint, SyncScope: oldScope, ProvisionStatus: model.SeedanceAssetReplicaFailed, Status: "Pending", PollAttempts: model.SeedanceAssetSyncMaxAttempts, NextPollAt: common.GetTimestamp() + 900, LastError: "asset synchronization target is not currently available to this user"})
+		}
+	}
+	replicas[0].ProvisionStatus = model.SeedanceAssetReplicaReady
+	replicas[0].Status = "Processing"
+	replicas[0].UpstreamAssetID = "existing-upstream"
+	replicas[0].LastError = model.SeedanceAssetReviewTimeoutCode
+	replicas[0].PollLeaseUntil = common.GetTimestamp() + 60
+	replicas[1].PollLeaseUntil = common.GetTimestamp() - 1
+	require.NoError(t, db.CreateInBatches(&replicas, 100).Error)
+	require.NoError(t, model.QueueSeedanceAssetDiscovery(t.Context(), 701, oldScope))
+	found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.True(t, found)
+	require.Error(t, err)
+	var oldJob model.SeedanceAssetDiscovery
+	require.NoError(t, db.Where("user_id = ? AND scope = ?", 701, oldScope).First(&oldJob).Error)
+	assert.EqualValues(t, -1, oldJob.NextAttemptAt)
+	assert.Equal(t, "scope requires reauthorization", oldJob.LastError)
+	assert.Equal(t, http.StatusUnauthorized, seedanceScopeTestRequest(router, http.MethodGet, "/assets?status=active", "scopeexpired").Code)
+	assert.Equal(t, http.StatusOK, seedanceScopeTestRequest(router, http.MethodGet, "/assets?status=active", "scopeempty").Code)
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Where("user_id = ? AND next_attempt_at >= 0", 701).Count(&count).Error)
+	assert.Zero(t, count)
+	response := seedanceScopeTestRequest(router, http.MethodGet, "/assets?status=active", "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	want, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{seedanceScopeTestExact}, 0)
+	require.NoError(t, err)
+	var job model.SeedanceAssetDiscovery
+	require.NoError(t, db.Where("user_id = ? AND scope = ?", 701, want).First(&job).Error)
+	var expiredLease model.SeedanceAssetReplica
+	require.NoError(t, db.First(&expiredLease, replicas[1].ID).Error)
+	assert.Equal(t, want, expiredLease.SyncScope)
+	assert.Zero(t, expiredLease.PollLeaseUntil)
+	found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.True(t, found)
+	require.ErrorIs(t, err, service.ErrSeedanceAssetServiceTemporary)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	assert.Zero(t, job.Cursor)
+	assert.Greater(t, job.NextAttemptAt, common.GetTimestamp())
+	var leased model.SeedanceAssetReplica
+	require.NoError(t, db.First(&leased, replicas[0].ID).Error)
+	assert.Equal(t, oldScope, leased.SyncScope)
+	assert.Equal(t, "existing-upstream", leased.UpstreamAssetID)
+	assert.Greater(t, leased.PollLeaseUntil, common.GetTimestamp())
+	require.NoError(t, db.Model(&leased).Update("poll_lease_until", 0).Error)
+	require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+	for range 2 {
+		found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+		require.NoError(t, err)
+		require.True(t, found)
+	}
+	var updated, forbidden int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND sync_scope = ?", 701, want).Count(&updated).Error)
+	assert.EqualValues(t, len(replicas), updated)
+	require.NoError(t, db.First(&leased, replicas[0].ID).Error)
+	assert.Equal(t, "existing-upstream", leased.UpstreamAssetID)
+	assert.Equal(t, "Processing", leased.Status)
+	assert.Zero(t, leased.PollAttempts)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND account_fingerprint = ?", 701, model.SeedanceAssetModelScopeFingerprint(channel, seedanceScopeTestOther, client.KeyFingerprint)).Count(&forbidden).Error)
+	assert.Zero(t, forbidden)
+}
+
+func TestSeedanceRequestedModelStatusMySQL(t *testing.T) {
+	db, router, channel, client, _ := setupSeedanceScopeRecoveryMySQL(t)
+	group := &model.SeedanceAssetGroup{UserID: 701, ChannelID: channel.Id, GroupID: "scope-status", Name: "scope", GroupType: "AIGC", Status: "Active"}
+	require.NoError(t, db.Create(group).Error)
+	localOnly := false
+	asset := &model.SeedanceAsset{UserID: 701, ChannelID: channel.Id, GroupID: group.GroupID, AssetID: "scope-status-asset", Name: "asset", AssetType: "Image", Status: "Processing", LocalOnly: &localOnly}
+	require.NoError(t, db.Create(asset).Error)
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{seedanceScopeTestBase}, 0)
+	require.NoError(t, err)
+	base := &model.SeedanceAssetReplica{UserID: 701, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(channel, seedanceScopeTestBase, client.KeyFingerprint), KeyFingerprint: client.KeyFingerprint, SyncScope: scope, ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Failed", UpstreamAssetID: "base-asset"}
+	exact := &model.SeedanceAssetReplica{UserID: 701, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(channel, seedanceScopeTestExact, client.KeyFingerprint), KeyFingerprint: client.KeyFingerprint, SyncScope: scope, ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active", UpstreamAssetID: "exact-asset"}
+	require.NoError(t, db.Create(base).Error)
+	require.NoError(t, db.Create(exact).Error)
+	path := fmt.Sprintf("/assets/%d", asset.ID)
+	response := seedanceScopeTestRequest(router, http.MethodGet, path, "scopebase")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var payload struct {
+		Data model.SeedanceAsset `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, "Failed", payload.Data.Status)
+	response = seedanceScopeTestRequest(router, http.MethodGet, path, "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, "Active", payload.Data.Status)
+	require.NoError(t, db.Model(base).Update("status", "Active").Error)
+	require.NoError(t, db.Model(exact).Update("status", "Failed").Error)
+	response = seedanceScopeTestRequest(router, http.MethodGet, path, "scopebase")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, "Active", payload.Data.Status)
+	response = seedanceScopeTestRequest(router, http.MethodGet, path, "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, "Active", payload.Data.Status)
+	channel.Models = seedanceScopeTestBase
+	require.NoError(t, channel.Update())
+	response = seedanceScopeTestRequest(router, http.MethodGet, path, "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, "Active", payload.Data.Status)
+}
+
+func TestSeedanceVersionOneHumanDiscoveryMySQL(t *testing.T) {
+	db, router, channel, client, calls := setupSeedanceScopeRecoveryMySQL(t)
+	group := &model.SeedanceAssetGroup{UserID: 701, ChannelID: channel.Id, GroupID: "human-discovery", Name: "human", GroupType: "LivenessFace", Status: "Active", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint}
+	require.NoError(t, db.Create(group).Error)
+	asset := &model.SeedanceAsset{UserID: 701, ChannelID: channel.Id, GroupID: group.GroupID, AssetID: "human-discovery-asset", Name: "human", AssetType: "Image", Status: "Processing", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, PrimarySyncScope: seedanceScopeTestV1(t), NextPollAt: common.GetTimestamp() + 900, PollLeaseUntil: common.GetTimestamp() + 60}
+	require.NoError(t, db.Create(asset).Error)
+	require.NoError(t, db.Create(&model.User{Id: 702, Username: "scopeforeign", AffCode: "scopeforeign", Group: "default", Status: common.UserStatusEnabled}).Error)
+	foreignGroup := &model.SeedanceAssetGroup{UserID: 702, ChannelID: channel.Id, GroupID: "foreign-human", Name: "foreign", GroupType: "LivenessFace", Status: "Active", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint}
+	require.NoError(t, db.Create(foreignGroup).Error)
+	foreign := &model.SeedanceAsset{UserID: 702, ChannelID: channel.Id, GroupID: foreignGroup.GroupID, AssetID: "foreign-human-asset", Name: "foreign", AssetType: "Image", Status: "Processing", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, PrimarySyncScope: seedanceScopeTestV1(t)}
+	require.NoError(t, db.Create(foreign).Error)
+	response := seedanceScopeTestRequest(router, http.MethodGet, "/assets?status=active", "scopevalid")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.True(t, found)
+	require.ErrorIs(t, err, service.ErrSeedanceAssetServiceTemporary)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	assert.Equal(t, seedanceScopeTestV1(t), asset.PrimarySyncScope)
+	var job model.SeedanceAssetDiscovery
+	require.NoError(t, db.Where("user_id = ? AND next_attempt_at >= 0", 701).First(&job).Error)
+	assert.Zero(t, job.Cursor)
+	require.NoError(t, db.Model(asset).Update("poll_lease_until", 0).Error)
+	require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+	found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, db.First(asset, asset.ID).Error)
+	want, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{seedanceScopeTestExact}, 0)
+	require.NoError(t, err)
+	assert.Equal(t, want, asset.PrimarySyncScope)
+	assert.LessOrEqual(t, asset.NextPollAt, common.GetTimestamp())
+	require.NoError(t, db.First(foreign, foreign.ID).Error)
+	assert.Equal(t, seedanceScopeTestV1(t), foreign.PrimarySyncScope)
+	assert.Zero(t, calls.Load())
 }

@@ -22,6 +22,14 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 // ChannelSatisfiesFilters reports whether ch passes every filter.
 // 失败时按固定顺序返回首个未满足的约束，供调用方区分协议、身份和素材账号错误。
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
+	return channelSatisfiesFiltersForAbility(ch, modelName, "", "", filters)
+}
+
+func ChannelSatisfiesFiltersForGroup(ch *Channel, modelName, group string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
+	return channelSatisfiesFiltersForAbility(ch, modelName, "", group, filters)
+}
+
+func channelSatisfiesFiltersForAbility(ch *Channel, modelName, abilityModel, group string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
 	}
@@ -30,7 +38,7 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
 			if filter.Kind != kind {
 				continue
 			}
-			if !channelMatchesFilter(ch, modelName, filter) {
+			if !channelMatchesFilter(ch, modelName, abilityModel, group, filter) {
 				return false, kind
 			}
 		}
@@ -43,6 +51,10 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
 // A missing id in channelsIDM is kept for request_path (downstream consistency
 // error) and dropped for task_plugin_identity, matching the previous filters.
 func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter) (kept []int, emptiedBy dto.ChannelFilterKind) {
+	return filterCandidateIDsForAbility(ids, modelName, "", "", filters)
+}
+
+func filterCandidateIDsForAbility(ids []int, modelName, abilityModel, group string, filters []dto.ChannelFilter) (kept []int, emptiedBy dto.ChannelFilterKind) {
 	if len(ids) == 0 {
 		return ids, ""
 	}
@@ -55,7 +67,7 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
 		next := make([]int, 0, len(kept))
 		for _, id := range kept {
 			channel, exists := channelsIDM[id]
-			if candidatePassesKindFilters(channel, exists, modelName, kind, kindFilters) {
+			if candidatePassesKindFilters(channel, exists, modelName, abilityModel, group, kind, kindFilters) {
 				next = append(next, id)
 			}
 		}
@@ -77,7 +89,7 @@ func filtersByKind(filters []dto.ChannelFilter, kind dto.ChannelFilterKind) []dt
 	return matched
 }
 
-func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind dto.ChannelFilterKind, filters []dto.ChannelFilter) bool {
+func candidatePassesKindFilters(ch *Channel, exists bool, modelName, abilityModel, group string, kind dto.ChannelFilterKind, filters []dto.ChannelFilter) bool {
 	if kind == dto.FilterRequestPath && !exists {
 		return true
 	}
@@ -85,14 +97,14 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 		return false
 	}
 	for _, filter := range filters {
-		if !channelMatchesFilter(ch, modelName, filter) {
+		if !channelMatchesFilter(ch, modelName, abilityModel, group, filter) {
 			return false
 		}
 	}
 	return true
 }
 
-func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
+func channelMatchesFilter(ch *Channel, modelName, abilityModel, group string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
 	case dto.FilterVideoRouting:
 		return ch.matchesVideoRouting(modelName, filter)
@@ -172,17 +184,26 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		if ch.Status != common.ChannelStatusEnabled {
 			return false
 		}
-		allowed := filter.SeedanceAssetReadyKeys[ch.Id]
-		for index, key := range ch.GetKeys() {
-			if strings.TrimSpace(key) == "" {
+		for candidate, allowed := range filter.SeedanceAssetReadyKeys[ch.Id] {
+			if abilityModel != "" && candidate != abilityModel {
 				continue
 			}
-			if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; ch.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
-				continue
+			if group != "" {
+				if _, exists := filter.SeedanceAssetReadyGroups[ch.Id][candidate][group]; !exists {
+					continue
+				}
 			}
-			fingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
-			if _, ready := allowed[fingerprint]; ready {
-				return true
+			for index, key := range ch.GetKeys() {
+				if strings.TrimSpace(key) == "" {
+					continue
+				}
+				if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; ch.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
+					continue
+				}
+				fingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+				if _, ready := allowed[fingerprint]; ready {
+					return true
+				}
 			}
 		}
 		return false

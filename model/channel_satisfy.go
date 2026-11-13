@@ -4,8 +4,38 @@ import (
 	"slices"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
+
+// MatchingChannelAbilityForGroup 返回与就绪副本一致的实际模型能力。
+func MatchingChannelAbilityForGroup(channel *Channel, group, modelName string, filters []dto.ChannelFilter) string {
+	if channel == nil || group == "" || modelName == "" {
+		return ""
+	}
+	models := []string{modelName}
+	if normalized := ratio_setting.RoutingMatchModelName(modelName); normalized != "" && normalized != modelName {
+		models = append(models, normalized)
+	}
+	for _, candidate := range models {
+		var enabled bool
+		if common.MemoryCacheEnabled {
+			channelSyncLock.RLock()
+			enabled = isChannelIDInList(group2model2channels[group][candidate], channel.Id)
+			channelSyncLock.RUnlock()
+		} else {
+			var count int64
+			err := DB.Model(&Ability{}).Where(commonGroupCol+" = ? and model = ? and channel_id = ? and enabled = ?", group, candidate, channel.Id, true).Count(&count).Error
+			enabled = err == nil && count > 0
+		}
+		if enabled {
+			if ok, _ := channelSatisfiesFiltersForAbility(channel, modelName, candidate, group, filters); ok {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
 
 func IsChannelEnabledForGroupModel(group string, modelName string, channelID int) bool {
 	if group == "" || modelName == "" || channelID <= 0 {

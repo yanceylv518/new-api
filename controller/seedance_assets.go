@@ -360,8 +360,10 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
-	if err := model.DB.Create(group).Error; err != nil {
-		cleanupSeedanceAssetGroupAfterFailure(c.Request.Context(), client, group.GroupID)
+	if err := model.CreateSeedanceAssetGroup(c.Request.Context(), group); err != nil {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			cleanupSeedanceAssetGroupAfterFailure(c.Request.Context(), client, group.GroupID)
+		}
 		seedanceAssetAPIError(c, err)
 		return
 	}
@@ -587,6 +589,24 @@ func RefreshSeedanceAsset(c *gin.Context) {
 		}
 		seedanceAssetRequestScopeError(c, err)
 		return
+	}
+	if service.SeedanceAssetScopeRequiresReauthorization(asset.PrimarySyncScope) {
+		pending, err := service.EnsureSeedanceAssetPrimaryAuthorization(c.Request.Context(), asset.UserID, []model.SeedanceAsset{asset}, requestScope)
+		if err != nil {
+			seedanceAssetAPIError(c, err)
+			return
+		}
+		if pending {
+			if err := service.QueueSeedanceAssetDiscovery(c.Request.Context(), asset.UserID, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
+				seedanceAssetAPIError(c, err)
+				return
+			}
+		}
+		if err := model.DB.WithContext(c.Request.Context()).Where("user_id = ? AND id = ? AND status <> ?", asset.UserID, asset.ID, "Deleting").First(&asset).Error; err != nil {
+			seedanceAssetAPIError(c, err)
+			return
+		}
+		loadedUpdatedAt = asset.UpdatedAt
 	}
 	var details service.SeedanceAssetDetails
 	if asset.LocalOnly != nil && !*asset.LocalOnly {
@@ -825,7 +845,9 @@ func UploadSeedanceAsset(c *gin.Context) {
 	if client == nil {
 		asset, err := createStoredSeedanceAsset(c, &group, upload, name, "")
 		if err != nil {
-			cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+				cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+			}
 			common.ApiError(c, err)
 			return
 		}
@@ -861,7 +883,9 @@ func UploadSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if err := service.CreateSeedanceAssetWithSynchronization(c.Request.Context(), asset, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
-		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -917,7 +941,9 @@ func CreateSeedanceAsset(c *gin.Context) {
 	if client == nil {
 		asset, err := createStoredSeedanceAsset(c, &group, upload, strings.TrimSpace(req.Name), strings.TrimSpace(req.SourceURL))
 		if err != nil {
-			cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+				cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
+			}
 			seedanceAssetAPIError(c, err)
 			return
 		}
@@ -943,7 +969,9 @@ func CreateSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if err := service.CreateSeedanceAssetWithSynchronization(c.Request.Context(), asset, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
-		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+		}
 		seedanceAssetAPIError(c, err)
 		return
 	}

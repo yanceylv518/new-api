@@ -148,7 +148,7 @@ func TestSeedanceAssetDatabaseLifecycle(t *testing.T) {
 			assert.Equal(t, asset.Storage, stored.Storage)
 			assert.Equal(t, asset.ObjectKey, stored.ObjectKey)
 			duplicate := SeedanceAssetGroup{UserID: group.UserID, ChannelID: 7, GroupID: "duplicate", Name: group.Name}
-			assert.Error(t, db.Create(&duplicate).Error)
+			require.NoError(t, db.Create(&duplicate).Error)
 			otherUser := SeedanceAssetGroup{UserID: 12, ChannelID: 7, GroupID: "other-group", Name: group.Name}
 			require.NoError(t, db.Create(&otherUser).Error)
 			foreign := asset

@@ -80,6 +80,40 @@ func TestSeedanceAssetURLSettingOnlyAppliesToAssetPlugins(t *testing.T) {
 	}
 }
 
+func TestSeedanceModelModifierScopeAndExactPriority(t *testing.T) {
+	db := setupSeedancePriorityRegression(t)
+	const baseModel = "doubao-seedance-2-0-260128"
+	const permitted = baseModel + "@temperature:0.2"
+	baseURL := "https://assets.example.test"
+	high, low := int64(10), int64(0)
+	base := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Name: "base", Status: common.ChannelStatusEnabled, Key: "base-fixture", Group: "default", Models: baseModel, BaseURL: &baseURL, Priority: &high}
+	exact := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Name: "exact", Status: common.ChannelStatusEnabled, Key: "exact-fixture", Group: "default", Models: permitted, BaseURL: &baseURL, Priority: &low}
+	for _, channel := range []*model.Channel{base, exact} {
+		configureSeedanceTestAssetURL(t, channel)
+		require.NoError(t, channel.Insert())
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	c.Set("token_id", 1)
+	c.Set("token_model_limit_enabled", true)
+	c.Set("token_model_limit", map[string]bool{permitted: true})
+	c.Set("group", "default")
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	choices, err := selectSeedanceAssetValidationChoices(c, permitted, true)
+	require.NoError(t, err)
+	require.Len(t, choices, 1)
+	assert.Equal(t, exact.Id, choices[0].channel.Id)
+	_, err = selectSeedanceAssetValidationChoices(c, baseModel, false)
+	require.ErrorIs(t, err, errSeedanceAssetModelNotPermitted)
+	_, err = selectSeedanceAssetValidationChoices(c, baseModel+"@temperature:0.3", false)
+	require.ErrorIs(t, err, errSeedanceAssetModelNotPermitted)
+	require.NoError(t, db.Model(exact).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	choices, err = selectSeedanceAssetValidationChoices(c, permitted, true)
+	require.NoError(t, err)
+	require.Len(t, choices, 1)
+	assert.Equal(t, base.Id, choices[0].channel.Id)
+}
+
 func TestSeedanceValidationNotFoundWaitsWithoutErrorAndExpiresLocally(t *testing.T) {
 	db := setupSeedancePriorityRegression(t)
 	var creates, queries atomic.Int32

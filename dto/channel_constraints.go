@@ -56,7 +56,8 @@ type ChannelFilter struct {
 	TaskPluginChannelIDs            map[int]struct{}
 	SeedanceAssetAccountFingerprint string
 	SeedanceAssetKeyFingerprint     string
-	SeedanceAssetReadyKeys          map[int]map[string]struct{}
+	SeedanceAssetReadyKeys          map[int]map[string]map[string]struct{}
+	SeedanceAssetReadyGroups        map[int]map[string]map[string]struct{}
 }
 
 type ChannelConstraints struct {

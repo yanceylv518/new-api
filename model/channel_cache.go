@@ -120,27 +120,52 @@ func GetRandomSatisfiedChannel(
 	model string,
 	retry int,
 	filters []dto.ChannelFilter,
+	matchedAbility ...*string,
 ) (*Channel, error) {
+	setAbility := func(name string) {
+		if len(matchedAbility) > 0 && matchedAbility[0] != nil {
+			*matchedAbility[0] = name
+		}
+	}
+	setAbility("")
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, filters)
+		channel, err := GetChannel(group, model, retry, filters)
+		if err != nil || channel != nil {
+			if channel != nil {
+				setAbility(model)
+			}
+			return channel, err
+		}
+		normalized := ratio_setting.RoutingMatchModelName(model)
+		if normalized == model {
+			return nil, nil
+		}
+		channel, err = getChannelForAbility(group, normalized, model, retry, filters)
+		if channel != nil {
+			setAbility(normalized)
+		}
+		return channel, err
 	}
 
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
-	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
+	abilityModel := model
+	channels, _ := filterCandidateIDsForAbility(group2model2channels[group][model], model, model, group, filters)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
-		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		abilityModel = normalizedModel
+		channels, _ = filterCandidateIDsForAbility(group2model2channels[group][normalizedModel], model, normalizedModel, group, filters)
 	}
 
 	if len(channels) == 0 {
 		return nil, nil
 	}
+	setAbility(abilityModel)
 
 	if len(channels) == 1 {
 		if channel, ok := channelsIDM[channels[0]]; ok {

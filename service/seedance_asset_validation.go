@@ -610,8 +610,14 @@ func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 			}
 		}
 		current, readErr := model.GetSeedanceAssetValidationSession(ctx, userID, id)
-		if readErr == nil && current.Status == model.SeedanceAssetValidationStatusSucceeded && current.UpstreamGroupID == groupID {
+		if readErr != nil {
+			return nil, errors.Join(err, readErr)
+		}
+		if current.Status == model.SeedanceAssetValidationStatusSucceeded && current.UpstreamGroupID == groupID {
 			return current, nil
+		}
+		if current.Status == model.SeedanceAssetValidationStatusPending {
+			return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, current, errors.Join(ErrSeedanceAssetServiceTemporary, err), groupID)
 		}
 		cleanupErr := RollbackSeedanceAssetGroup(ctx, client, groupID)
 		_, updateErr := model.UpdateSeedanceAssetValidationSession(id, userID, leaseUntil, map[string]any{

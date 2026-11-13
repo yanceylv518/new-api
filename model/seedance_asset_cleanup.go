@@ -31,26 +31,27 @@ const (
 // SeedanceAssetCleanupJob 持久化上游素材、素材组和 OSS 对象的补偿清理。
 // 外部 API 与本地数据库无法共享事务，因此失败的清理必须拥有独立的重试记录。
 type SeedanceAssetCleanupJob struct {
-	ID             uint                 `gorm:"primaryKey;index:idx_seedance_asset_cleanup_due,priority:4"`
-	Kind           string               `gorm:"size:32;not null;index"`
-	UserID         int                  `gorm:"index"`
-	LocalGroupID   uint                 `gorm:"index"`
-	LocalAssetID   uint                 `gorm:"index"`
-	LocalMappingID uint                 `gorm:"index"`
-	ChannelID      int                  `gorm:"index"`
-	KeyFingerprint string               `gorm:"size:64"`
-	UpstreamID     string               `gorm:"size:128"`
-	UpstreamDoneAt int64                `gorm:"not null"`
-	ObjectKey      string               `gorm:"size:1023"`
-	Storage        SeedanceAssetStorage `gorm:"embedded;embeddedPrefix:oss_"`
-	DedupKey       string               `gorm:"size:64;not null;uniqueIndex"`
-	Status         string               `gorm:"size:16;not null;index;index:idx_seedance_asset_cleanup_due,priority:1"`
-	Attempts       int                  `gorm:"not null"`
-	NextAttemptAt  int64                `gorm:"not null;index;index:idx_seedance_asset_cleanup_due,priority:2"`
-	LeaseUntil     int64                `gorm:"not null;index;index:idx_seedance_asset_cleanup_due,priority:3"`
-	LastError      string               `gorm:"type:text"`
-	CreatedAt      time.Time            `json:"created_at"`
-	UpdatedAt      time.Time            `json:"updated_at"`
+	ID                 uint                 `gorm:"primaryKey;index:idx_seedance_asset_cleanup_due,priority:4"`
+	Kind               string               `gorm:"size:32;not null;index"`
+	UserID             int                  `gorm:"index"`
+	LocalGroupID       uint                 `gorm:"index"`
+	LocalAssetID       uint                 `gorm:"index"`
+	LocalMappingID     uint                 `gorm:"index"`
+	ChannelID          int                  `gorm:"index"`
+	KeyFingerprint     string               `gorm:"size:64"`
+	AccountFingerprint string               `gorm:"size:64"`
+	UpstreamID         string               `gorm:"size:128"`
+	UpstreamDoneAt     int64                `gorm:"not null"`
+	ObjectKey          string               `gorm:"size:1023"`
+	Storage            SeedanceAssetStorage `gorm:"embedded;embeddedPrefix:oss_"`
+	DedupKey           string               `gorm:"size:64;not null;uniqueIndex"`
+	Status             string               `gorm:"size:16;not null;index;index:idx_seedance_asset_cleanup_due,priority:1"`
+	Attempts           int                  `gorm:"not null"`
+	NextAttemptAt      int64                `gorm:"not null;index;index:idx_seedance_asset_cleanup_due,priority:2"`
+	LeaseUntil         int64                `gorm:"not null;index;index:idx_seedance_asset_cleanup_due,priority:3"`
+	LastError          string               `gorm:"type:text"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
 }
 
 // CreateSeedanceAssetCleanupJob 按资源摘要去重创建清理任务，避免同一孤儿资源重复积压。
@@ -94,7 +95,7 @@ func NewSeedanceAssetDeleteCleanupJobs(asset *SeedanceAsset, replicas []Seedance
 	jobs := make([]SeedanceAssetCleanupJob, 0, len(replicas)+1)
 	jobs = append(jobs, SeedanceAssetCleanupJob{
 		Kind: SeedanceAssetCleanupKindAssetDelete, UserID: asset.UserID, LocalAssetID: asset.ID,
-		ChannelID: asset.ChannelID, KeyFingerprint: asset.KeyFingerprint,
+		ChannelID: asset.ChannelID, KeyFingerprint: asset.KeyFingerprint, AccountFingerprint: asset.AccountFingerprint,
 		UpstreamID: asset.UpstreamAssetID(), UpstreamDoneAt: asset.UpstreamDeletedAt,
 		ObjectKey: asset.ObjectKey, Storage: asset.Storage,
 		Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp(),
@@ -103,7 +104,7 @@ func NewSeedanceAssetDeleteCleanupJobs(asset *SeedanceAsset, replicas []Seedance
 		jobs = append(jobs, SeedanceAssetCleanupJob{
 			Kind: SeedanceAssetCleanupKindReplicaDelete, UserID: replica.UserID,
 			LocalAssetID: replica.LocalAssetID, LocalMappingID: replica.ID,
-			ChannelID: replica.ChannelID, KeyFingerprint: replica.KeyFingerprint,
+			ChannelID: replica.ChannelID, KeyFingerprint: replica.KeyFingerprint, AccountFingerprint: replica.AccountFingerprint,
 			UpstreamID: replica.UpstreamAssetID, UpstreamDoneAt: replica.UpstreamDeletedAt,
 			Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp(),
 		})
@@ -218,7 +219,7 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 					continue
 				}
 				updates := map[string]any{
-					"channel_id": job.ChannelID, "key_fingerprint": job.KeyFingerprint,
+					"channel_id": job.ChannelID, "key_fingerprint": job.KeyFingerprint, "account_fingerprint": job.AccountFingerprint,
 					"upstream_id": job.UpstreamID, "upstream_done_at": job.UpstreamDoneAt,
 					"object_key": job.ObjectKey, "next_attempt_at": common.GetTimestamp(), "lease_until": int64(0),
 				}
