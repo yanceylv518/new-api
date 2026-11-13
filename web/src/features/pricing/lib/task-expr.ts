@@ -123,9 +123,12 @@ export function getTaskEnumFields(
   if (!schema) return []
   return Object.entries(schema)
     .flatMap(([name, field]): [string, BillingUsageFieldSchema][] => {
-      if (!field.enum?.length) return []
       const applicable = getTaskUsageField(field, sample)
-      return applicable ? [[name, applicable]] : []
+      if (!applicable) return []
+      if (applicable.type === 'boolean') {
+        return [[name, { ...applicable, enum: ['false', 'true'] }]]
+      }
+      return applicable.enum?.length ? [[name, applicable]] : []
     })
     .sort(([left], [right]) => left.localeCompare(right))
 }
@@ -161,7 +164,13 @@ export function normalizeTaskUsageSample(
   schema: BillingUsageSchema,
   sample: Record<string, string | number>
 ): Record<string, string | number> {
-  if (!Object.values(schema).some((field) => field.when)) return sample
+  if (
+    !Object.values(schema).some(
+      (field) => field.when || field.type === 'boolean'
+    )
+  ) {
+    return sample
+  }
   const normalized = { ...sample }
   const fields = Object.entries(schema).sort(
     (left, right) =>
@@ -172,6 +181,9 @@ export function normalizeTaskUsageSample(
     if (!applicable) {
       if (definition.type === 'number') normalized[name] = 0
       else delete normalized[name]
+    } else if (applicable.type === 'boolean') {
+      // 表格和选择器使用字符串，表达式生成时再还原布尔常量。
+      normalized[name] = String(normalized[name] ?? false)
     } else if (
       applicable.enum?.length &&
       !applicable.enum.includes(String(normalized[name] ?? ''))
@@ -300,7 +312,7 @@ export function tryParseTaskMatrixConfig(
   schema: BillingUsageSchema
 ): TaskMatrixConfig | null {
   if (!expression) return null
-  const tiers = parseTaskTiersFromExpr(expression, schema)
+  const tiers = parseTaskTiersFromExpr(expression, schema, true)
   if (tiers.length === 0) return null
 
   const numberFields = getTaskNumberFields(schema)
@@ -506,12 +518,18 @@ function generateTaskTierCall(
   return `tier(${JSON.stringify(tier.label)}, ${generateTaskTierBody(tier, numberFields)})`
 }
 
-function generateTaskCondition(conditions: TaskVisualCondition[]): string {
+function generateTaskCondition(
+  conditions: TaskVisualCondition[],
+  schema: BillingUsageSchema
+): string {
   return conditions
-    .map(
-      (condition) =>
-        `u(${JSON.stringify(condition.field)}) == ${JSON.stringify(condition.value)}`
-    )
+    .map((condition) => {
+      const value =
+        schema[condition.field]?.type === 'boolean'
+          ? condition.value
+          : JSON.stringify(condition.value)
+      return `u(${JSON.stringify(condition.field)}) == ${value}`
+    })
     .join(' && ')
 }
 
@@ -534,7 +552,7 @@ export function generateTaskExprFromConfig(
       parts.push(call)
       continue
     }
-    const condition = generateTaskCondition(tier.conditions)
+    const condition = generateTaskCondition(tier.conditions, schema)
     if (!condition) return ''
     parts.push(`${condition} ? ${call}`)
   }
@@ -546,7 +564,7 @@ export function tryParseTaskVisualConfig(
   schema: BillingUsageSchema
 ): TaskVisualConfig | null {
   if (!expression) return null
-  const tiers = parseTaskTiersFromExpr(expression, schema)
+  const tiers = parseTaskTiersFromExpr(expression, schema, true)
   if (tiers.length === 0) return null
   return normalizeTaskVisualConfig(
     {

@@ -297,6 +297,36 @@ func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	return processHeaderOverride(info, c)
 }
 
+// ApplyTaskHeaderOverrides 后台查询只应用静态规则，不持久化或重放客户端请求头。
+func ApplyTaskHeaderOverrides(req *http.Request, info *common.RelayInfo, c *gin.Context, allowHost bool) error {
+	if info == nil {
+		return nil
+	}
+	copyInfo := *info
+	if c == nil || c.Request == nil {
+		copyInfo.RuntimeHeadersOverride = make(map[string]any)
+		copyInfo.UseRuntimeHeadersOverride = true
+		for name, value := range common.GetEffectiveHeaderOverride(info) {
+			if IsHeaderPassthroughRuleKey(name) {
+				continue
+			}
+			if text, ok := value.(string); ok && strings.HasPrefix(strings.TrimSpace(text), clientHeaderPlaceholderPrefix) {
+				continue
+			}
+			copyInfo.RuntimeHeadersOverride[name] = value
+		}
+	}
+	override, err := ResolveHeaderOverride(&copyInfo, c)
+	if err != nil {
+		return err
+	}
+	if !allowHost {
+		delete(override, "host")
+	}
+	applyHeaderOverrideToRequest(req, override)
+	return nil
+}
+
 func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]string) {
 	if req == nil {
 		return
@@ -610,6 +640,9 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
+	}
+	if err := ApplyTaskHeaderOverrides(req, info, c, true); err != nil {
+		return nil, err
 	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {

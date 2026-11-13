@@ -21,6 +21,7 @@ const (
 	privateAssetOSSCleanupTimeout = 30 * time.Second
 	privateAssetOSSPreviewTTL     = time.Hour
 	privateAssetOSSUpstreamTTL    = 24 * time.Hour
+	privateAssetOSSVideoInputTTL  = 73 * time.Hour
 )
 
 type privateAssetOSSClient interface {
@@ -131,6 +132,11 @@ func (storage *PrivateAssetOSSStorage) PrivateAssetPreviewURL(ctx context.Contex
 // PrivateAssetUpstreamURL 为上游审核生成足够覆盖异步拉取过程的签名地址。
 func (storage *PrivateAssetOSSStorage) PrivateAssetUpstreamURL(ctx context.Context, objectKey string) (string, error) {
 	return storage.presignGet(ctx, objectKey, privateAssetOSSUpstreamTTL)
+}
+
+// PrivateAssetVideoInputURL 覆盖视频任务最长排队期限并留出拉取余量。
+func (storage *PrivateAssetOSSStorage) PrivateAssetVideoInputURL(ctx context.Context, objectKey string) (string, error) {
+	return storage.presignGet(ctx, objectKey, privateAssetOSSVideoInputTTL)
 }
 
 func (storage *PrivateAssetOSSStorage) presignGet(ctx context.Context, objectKey string, ttl time.Duration) (string, error) {

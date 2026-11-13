@@ -7,7 +7,7 @@ export const meta = {
     en: "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   author: { name: "QuantumNous" },
   channelTypes: [24],
   models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],
@@ -144,6 +144,7 @@ function converted(ctx) {
   const req = ctx.requestBody || {};
   const metadata = Object.assign({}, req.metadata || {});
   const params = Object.assign({}, metadata);
+  if (req.resolution) params.resolution = req.resolution;
   if (Number(req.duration) > 0) params.durationSeconds = Number(req.duration);
   if (!params.resolution && req.size) params.resolution = resolutionForSize(req.size);
   if (!params.aspectRatio && req.size) params.aspectRatio = aspectForSize(req.size);
@@ -188,7 +189,7 @@ export function extractUsage(ctx) {
   const metadata = req.metadata || {};
   let seconds = Number(req.duration);
   if (!Number.isFinite(seconds) || seconds <= 0) seconds = 8;
-  const resolution = String(metadata.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
+  const resolution = String(req.resolution || metadata.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
   return { seconds: seconds, resolution: resolution };
 }
 
@@ -205,7 +206,10 @@ export function buildQueryRequest(ctx) {
 }
 
 export function parseTaskResult(ctx, body) {
-  if (body.error && body.error.message) return { status: "FAILURE", progress: "100%", reason: body.error.message };
+  if (body.error && body.error.message) {
+    if (body.done === true && trimmed(body.name)) return { status: "FAILURE", progress: "100%", reason: body.error.message };
+    throw new Error(body.error.message);
+  }
   // Google long-running operations omit `done` (proto3 default) while still
   // running, so a missing key means in-progress; only a non-operation shape is
   // unrecognized.
@@ -368,6 +372,10 @@ protocols.openai_video = {
     }
     if (hasInputReferenceFile) {
       req.images = [{ __fileRef: "request_file:input_reference", encoding: "base64", maxBytes: 20971520 }];
+    } else if (req.input_reference !== undefined || req.image !== undefined) {
+      const reference = req.input_reference !== undefined ? req.input_reference : req.image;
+      if (typeof reference !== "string" || !imageInput(reference)) throw new Error("input reference must be an image data URL or base64 value");
+      req.images = [reference];
     }
     return {
       kind: "submit",

@@ -2,17 +2,39 @@ package controller
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 )
 
+type seedanceAssetChannelChoice struct {
+	channel *model.Channel
+	model   string
+}
+
+var errSeedanceAssetModelNotPermitted = errors.New("API key does not allow this model")
+var errSeedanceAssetNoChannel = errors.New("no available Seedance asset channel for the current group and model permissions")
+
 // selectSeedanceAssetValidationChannels 按优先级降序筛选允许访问的素材渠道，供认证回退和官方建组共用。
 func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]*model.Channel, error) {
+	choices, err := selectSeedanceAssetValidationChoices(c, modelName, false)
+	if err != nil {
+		return nil, err
+	}
+	channels := make([]*model.Channel, 0, len(choices))
+	for _, choice := range choices {
+		channels = append(channels, choice.channel)
+	}
+	return channels, nil
+}
+
+func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matchFamily bool) ([]seedanceAssetChannelChoice, error) {
 	modelLimitsEnabled := c.GetBool("token_model_limit_enabled")
 	allowed := map[string]bool{}
 	if modelLimitsEnabled {
@@ -22,9 +44,21 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 		if !ok || !valid {
 			return nil, errors.New("API key model limits are invalid")
 		}
+		if modelName != "" {
+			permitted := false
+			for candidate, enabled := range allowed {
+				if enabled && (candidate == modelName || matchFamily && strings.HasPrefix(candidate, modelName+"-")) {
+					permitted = true
+					break
+				}
+			}
+			if !permitted {
+				return nil, errSeedanceAssetModelNotPermitted
+			}
+		}
 	}
 	constraints := service.GetChannelConstraints(c)
-	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	if group == "" {
 		group = c.GetString("group")
@@ -38,44 +72,57 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 	groups := []string{group}
 	if group == "auto" {
 		groups = service.GetRequestAutoGroups(c, c.GetString("user_group"))
+	} else if c.GetInt("token_id") == 0 {
+		userGroup := c.GetString("user_group")
+		if userGroup == "" {
+			userGroup = c.GetString("group")
+		}
+		for candidate := range service.GetUserUsableGroups(userGroup) {
+			if candidate == "" || candidate == "auto" || candidate == group || !ratio_setting.ContainsGroupRatio(candidate) {
+				continue
+			}
+			groups = append(groups, candidate)
+		}
 	}
 	channels, err := service.FindSeedanceAssetChannels()
 	if err != nil {
+		if errors.Is(err, service.ErrSeedanceAssetChannelUnavailable) {
+			return nil, errSeedanceAssetNoChannel
+		}
 		return nil, err
 	}
-	if c.GetInt("token_id") == 0 && modelName == "" {
-		return channels, nil
-	}
 	pin, pinned, _ := constraints.ResolvedPin()
-	filtered := make([]*model.Channel, 0, len(channels))
+	filtered := make([]seedanceAssetChannelChoice, 0, len(channels))
 	for _, channel := range channels {
 		if pinned && channel.Id != pin.ChannelId {
 			continue
 		}
 		for _, candidateModel := range channel.GetModels() {
-			if modelName != "" && candidateModel != modelName {
+			if modelName != "" && candidateModel != modelName && !(matchFamily && strings.HasPrefix(candidateModel, modelName+"-")) {
 				continue
 			}
 			if modelLimitsEnabled && !allowed[candidateModel] {
+				continue
+			}
+			if ok, _ := model.ChannelSatisfiesFilters(channel, candidateModel, constraints.Filters); !ok {
 				continue
 			}
 			for _, candidateGroup := range groups {
 				if candidateGroup == "" || candidateGroup == "auto" {
 					continue
 				}
-				if ok, _ := model.ChannelSatisfiesFilters(channel, candidateModel, constraints.Filters); ok &&
-					model.IsChannelEnabledForGroupModel(candidateGroup, candidateModel, channel.Id) {
-					filtered = append(filtered, channel)
+				if model.IsChannelEnabledForGroupModel(candidateGroup, candidateModel, channel.Id) {
+					filtered = append(filtered, seedanceAssetChannelChoice{channel: channel, model: candidateModel})
 					break
 				}
 			}
-			if len(filtered) > 0 && filtered[len(filtered)-1].Id == channel.Id {
+			if len(filtered) > 0 && filtered[len(filtered)-1].channel.Id == channel.Id {
 				break
 			}
 		}
 	}
 	if len(filtered) == 0 {
-		return nil, errors.New("no available Seedance asset channel is allowed for this API key")
+		return nil, errSeedanceAssetNoChannel
 	}
 	return filtered, nil
 }
@@ -84,17 +131,14 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 // 绑定。API Key 的资源读取按用户共享，但建组不能绕过模型或分组访问限制。
 func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.Channel, error) {
 	if modelName == "" {
-		if c.GetString(seedanceAssetActionContextKey) == "CreateAssetGroup" {
-			channels, err := selectSeedanceAssetValidationChannels(c, "")
-			if err != nil {
-				return nil, err
-			}
-			return channels[0], nil
-		}
-		if c.GetInt("token_id") > 0 {
+		if c.GetInt("token_id") > 0 && c.GetString(seedanceAssetActionContextKey) != "CreateAssetGroup" {
 			return nil, errors.New("model is required when creating an asset group with an API key")
 		}
-		return service.FindSeedanceAssetChannel()
+		channels, err := selectSeedanceAssetValidationChannels(c, "")
+		if err != nil {
+			return nil, err
+		}
+		return channels[0], nil
 	}
 	if c.GetBool("token_model_limit_enabled") {
 		limits, ok := c.Get("token_model_limit")
@@ -104,8 +148,8 @@ func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.C
 		}
 	}
 	constraints := service.GetChannelConstraints(c)
-	// 用渠道的 Doubao 身份约束模型，允许管理员配置的模型别名。
-	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
+	// 用素材插件身份约束模型，允许管理员配置的模型别名。
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	if group == "" {
 		group = c.GetString("group")

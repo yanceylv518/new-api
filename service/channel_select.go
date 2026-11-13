@@ -38,7 +38,38 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 		TaskPluginKey:          pluginKey,
 		TaskPluginChannelTypes: channelTypes,
 		TaskPluginKeys:         pluginKeys,
+		TaskPluginChannelIDs:   pinnedTaskPluginChannelIDs(c),
 	})
+}
+
+func pinnedTaskPluginChannelIDs(c *gin.Context) map[int]struct{} {
+	result := make(map[int]struct{})
+	if value, exists := c.Get(jsplugin.ContextKeyPinnedRoute); exists {
+		if pinned, ok := value.(jsplugin.PinnedRoute); ok && len(pinned.Candidates) > 0 {
+			for _, candidate := range pinned.Candidates {
+				if len(candidate.ChannelIDs) == 0 {
+					return nil
+				}
+				for _, id := range candidate.ChannelIDs {
+					result[id] = struct{}{}
+				}
+			}
+			return result
+		}
+	}
+	if value, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
+		if pinned, ok := value.(jsplugin.PinnedEndpoint); ok && len(pinned.Candidates) > 0 {
+			for _, candidate := range pinned.Candidates {
+				if len(candidate.ChannelIDs) == 0 {
+					return nil
+				}
+				for _, id := range candidate.ChannelIDs {
+					result[id] = struct{}{}
+				}
+			}
+		}
+	}
+	return result
 }
 
 type RetryParam struct {
@@ -207,6 +238,23 @@ func pinnedTaskPluginIdentities(c *gin.Context, expected string) ([]int, []strin
 	if c == nil || expected == "" {
 		return nil, nil
 	}
+	if value, exists := c.Get(jsplugin.ContextKeyPinnedRoute); exists {
+		if pinned, ok := value.(jsplugin.PinnedRoute); ok && len(pinned.Candidates) > 1 {
+			var channelTypes []int
+			var keys []string
+			expectedFound := false
+			for _, binding := range pinned.Candidates {
+				if binding.Plugin != nil {
+					expectedFound = expectedFound || binding.Plugin.Meta.Key == expected
+					keys = append(keys, binding.Plugin.Meta.Key)
+					channelTypes = append(channelTypes, binding.Plugin.Meta.ChannelTypes...)
+				}
+			}
+			if expectedFound {
+				return channelTypes, keys
+			}
+		}
+	}
 	if value, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
 		pinned, ok := value.(jsplugin.PinnedEndpoint)
 		if ok && pinned.Generation != nil && len(pinned.Candidates) > 1 {
@@ -274,6 +322,21 @@ type ChannelSelectError struct {
 	NoAvailableChannel bool
 }
 
+// OriginTaskChannelGroup 校验源任务渠道是否在当前令牌可用的分组和模型中。
+func OriginTaskChannelGroup(c *gin.Context, modelName string, channelID int) (string, bool) {
+	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	groups := []string{usingGroup}
+	if usingGroup == "auto" {
+		groups = GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+	}
+	for _, group := range groups {
+		if model.IsChannelEnabledForGroupModel(group, modelName, channelID) {
+			return group, true
+		}
+	}
+	return "", false
+}
+
 // SelectChannelForRequest resolves the channel for one attempt with the rules
 // shared by the HTTP distributor and the Responses WebSocket relay: a pinned
 // channel wins, then session affinity (first attempt only), then a random
@@ -296,6 +359,18 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		if channel.Status != common.ChannelStatusEnabled {
 			return nil, "", pinnedChannelUnavailable(pin, http.StatusForbidden, i18n.MsgDistributorChannelDisabled)
 		}
+		selectedGroup := ""
+		if pin.Source == dto.PinSourceOriginTask {
+			var allowed bool
+			selectedGroup, allowed = OriginTaskChannelGroup(c, modelName, channel.Id)
+			if !allowed {
+				return nil, "", &ChannelSelectError{
+					StatusCode: http.StatusForbidden,
+					Code:       "origin_task_channel_not_allowed",
+					MessageID:  i18n.MsgDistributorOriginTaskChannelNotAllowed,
+				}
+			}
+		}
 		if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 			return nil, "", &ChannelSelectError{
 				StatusCode: http.StatusBadRequest, Code: types.ErrorCode(kind), MessageID: i18n.MsgDistributorNoAvailableChannel,
@@ -303,7 +378,10 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				FilterKind: kind, Channel: channel,
 			}
 		}
-		return channel, "", nil
+		if selectedGroup != "" && common.GetContextKeyString(c, constant.ContextKeyUsingGroup) == "auto" {
+			common.SetContextKey(c, constant.ContextKeyAutoGroup, selectedGroup)
+		}
+		return channel, selectedGroup, nil
 	}
 
 	usingGroup := retry.TokenGroup

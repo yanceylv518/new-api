@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -96,9 +97,9 @@ func TestUserModelPricingSummaryAndRulePages(t *testing.T) {
 	require.Len(t, result.Items, 1)
 	assert.Empty(t, result.Items[0].Rules)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "match-00", DiscountBPS: 5000},
-		{ModelName: "match-01", DiscountBPS: 5001},
-		{ModelName: "match-02", DiscountBPS: 5002},
+		{ModelName: "match-00", DiscountBPS: 5000, Mode: types.UserModelPricingSingle},
+		{ModelName: "match-01", DiscountBPS: 5001, Mode: types.UserModelPricingSingle},
+		{ModelName: "match-02", DiscountBPS: 5002, Mode: types.UserModelPricingSingle},
 	}, result.Items[0].PreviewRules)
 	assert.Equal(t, 25, result.Items[0].RuleCount)
 	assert.Equal(t, 5000, result.Items[0].MinDiscountBPS)
@@ -212,8 +213,8 @@ func TestGetUserModelPricingOverviewGroupsRulesAndAppliesRoleBoundary(t *testing
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, visibleUser.Id, result.Items[0].User.Id)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "doubao-video", DiscountBPS: 6500},
-		{ModelName: "gpt-4o", DiscountBPS: 8000},
+		{ModelName: "doubao-video", DiscountBPS: 6500, Mode: types.UserModelPricingSingle},
+		{ModelName: "gpt-4o", DiscountBPS: 8000, Mode: types.UserModelPricingSingle},
 	}, result.Items[0].Rules)
 	assert.Equal(t, 2, result.Items[0].RuleCount)
 }
@@ -247,7 +248,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, "alpha-user", result.Items[0].User.Username)
 	assert.Equal(t, []UserModelPricingOverviewRule{
-		{ModelName: "claude-3-7", DiscountBPS: 9000},
+		{ModelName: "claude-3-7", DiscountBPS: 9000, Mode: types.UserModelPricingSingle},
 	}, result.Items[0].Rules)
 
 	// 同名模型属于不同用户时不能跨用户去重，且分页统计只计算匹配规则。
@@ -259,7 +260,7 @@ func TestGetUserModelPricingOverviewSearchesUsersAndModels(t *testing.T) {
 	require.Len(t, result.Items, 2)
 	for i, discount := range []int{8000, 7000} {
 		assert.Equal(t, users[i].Id, result.Items[i].User.Id)
-		assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "gpt-4o", DiscountBPS: discount}}, result.Items[i].Rules)
+		assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "gpt-4o", DiscountBPS: discount, Mode: types.UserModelPricingSingle}}, result.Items[i].Rules)
 		assert.Equal(t, 1, result.Items[i].RuleCount)
 	}
 	page, err := GetUserModelPricingOverview(t.Context(), "gpt-4o", common.RoleRootUser, 1, 1, UserModelPricingOverviewFilters{})
@@ -360,13 +361,13 @@ func TestUserModelPricingOverviewHidesStaleAndFullPriceRules(t *testing.T) {
 	assert.Equal(t, int64(2), result.TotalRules)
 	assert.Equal(t, int64(2), result.TotalModels)
 	require.Len(t, result.Items, 2)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, result.Items[0].PreviewRules)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000, Mode: types.UserModelPricingSingle}}, result.Items[0].PreviewRules)
 	assert.Equal(t, 1, result.Items[0].RuleCount)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "other-model", DiscountBPS: 6000}}, result.Items[1].PreviewRules)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "other-model", DiscountBPS: 6000, Mode: types.UserModelPricingSingle}}, result.Items[1].PreviewRules)
 	assert.Equal(t, 1, result.Items[1].RuleCount)
 
 	items, total, err := GetUserModelPricingRulePage(t.Context(), users[0].Id, common.RoleRootUser, "", 1)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), total)
-	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000}}, items)
+	assert.Equal(t, []UserModelPricingOverviewRule{{ModelName: "active-model", DiscountBPS: 8000, Mode: types.UserModelPricingSingle}}, items)
 }

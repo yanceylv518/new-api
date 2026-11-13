@@ -958,6 +958,70 @@ func DeleteUserForSession(identity AuthSessionIdentity) (int64, error) {
 	return user.delete(&identity)
 }
 
+var ErrUserTaskBillingPending = errors.New("账户仍有未完成的任务或待处理账务，请处理完成后再删除")
+
+// 删除与任务交接共用用户锁；检查必须先于身份撤销，拒绝删除不能使会话失效。
+func ensureUserDeletionAllowed(tx *gorm.DB, userID int, identity *AuthSessionIdentity) error {
+	if tx.Dialector.Name() == "sqlite" {
+		if err := tx.Unscoped().Model(&User{}).Where("id = ?", userID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+			return err
+		}
+	}
+	var user User
+	if err := lockForUpdate(tx.Unscoped()).Select("id", "role").Where("id = ?", userID).First(&user).Error; err != nil {
+		return err
+	}
+	if identity != nil {
+		if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
+			return err
+		}
+		if user.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
+	}
+	var pendingTaskID int64
+	if err := tx.Model(&Task{}).Where("user_id = ? AND status IN ?", userID, unfinishedTaskStatuses()).Limit(1).Pluck("id", &pendingTaskID).Error; err != nil {
+		return err
+	}
+	if pendingTaskID != 0 {
+		return ErrUserTaskBillingPending
+	}
+	ownedTasks := tx.Model(&Task{}).Select("-id").Where("user_id = ?", userID)
+	if err := tx.Model(&VideoTaskPendingLog{}).Where("kind = ? AND task_id IN (?)", videoLogKindAccounting, ownedTasks).Limit(1).Pluck("task_id", &pendingTaskID).Error; err != nil {
+		return err
+	}
+	if pendingTaskID != 0 {
+		return ErrUserTaskBillingPending
+	}
+	var pendingRefundID int64
+	if err := tx.Model(&BillingRefund{}).Where("user_id = ? AND (completed = ? OR cache_pending = ?)", userID, false, true).Limit(1).Pluck("id", &pendingRefundID).Error; err != nil {
+		return err
+	}
+	if pendingRefundID != 0 {
+		return ErrUserTaskBillingPending
+	}
+	// 终态资金确认前尚无记账队列项，只查询当前用户的终态快照以覆盖交接窗口。
+	terminal := tx.Model(&Task{}).Where("user_id = ? AND status IN ?", userID, []TaskStatus{TaskStatusSuccess, TaskStatusFailure})
+	privateData := terminal.Statement.Quote("private_data")
+	switch tx.Dialector.Name() {
+	case "mysql":
+		terminal = terminal.Where("CASE WHEN JSON_VALID("+privateData+") THEN JSON_UNQUOTE(JSON_EXTRACT("+privateData+", '$.initial_accounting_pending')) END = ?", "true")
+	case "postgres":
+		terminal = terminal.Where(privateData+"::jsonb ->> 'initial_accounting_pending' = ?", "true")
+	case "sqlite":
+		terminal = terminal.Where("CASE WHEN json_valid("+privateData+") THEN json_extract("+privateData+", '$.initial_accounting_pending') END = ?", 1)
+	default:
+		return errors.New("unsupported task database dialect")
+	}
+	if err := terminal.Limit(1).Pluck("id", &pendingTaskID).Error; err != nil {
+		return err
+	}
+	if pendingTaskID != 0 {
+		return ErrUserTaskBillingPending
+	}
+	return nil
+}
+
 func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	if user.Id == 0 {
 		return 0, errors.New("id 为空！")
@@ -965,17 +1029,8 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	var nextAuthVersion int64
 	var revokedAccessTokens int64
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		if identity != nil {
-			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
-				return err
-			}
-			var role int
-			if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role").Scan(&role).Error; err != nil {
-				return err
-			}
-			if role == common.RoleRootUser {
-				return ErrCannotDeleteRootUser
-			}
+		if err := ensureUserDeletionAllowed(tx, user.Id, identity); err != nil {
+			return err
 		}
 		var err error
 		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
@@ -1012,6 +1067,9 @@ func (user *User) HardDeleteWithActor(actorID int) (int64, error) {
 	var deletedAuthVersion int64
 	var revokedAccessTokens int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := ensureUserDeletionAllowed(tx, user.Id, nil); err != nil {
+			return err
+		}
 		var err error
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
@@ -1056,6 +1114,15 @@ func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
 	// 硬删除在用户锁内清理独立规则及版本，避免并发改价留下孤儿数据。
 	for _, row := range []any{&UserModelPricing{}, &UserModelPricingRevision{}} {
 		if err := tx.Where("user_id = ?", userId).Delete(row).Error; err != nil {
+			return err
+		}
+	}
+	var tokenIDs []int
+	if err := lockForUpdate(tx.Unscoped()).Model(&Token{}).Where("user_id = ?", userId).Order("id").Pluck("id", &tokenIDs).Error; err != nil {
+		return err
+	}
+	if len(tokenIDs) > 0 {
+		if err := tx.Where("token_id IN ?", tokenIDs).Delete(&TokenSignatureCredential{}).Error; err != nil {
 			return err
 		}
 	}

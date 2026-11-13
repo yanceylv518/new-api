@@ -34,6 +34,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Textarea } from '@/components/ui/textarea'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import {
   uploadSeedanceAsset,
@@ -44,6 +45,7 @@ import {
   SEEDANCE_PORTRAIT_ACCEPT,
   formatSeedanceFileSize,
   validateSeedancePortraitFile,
+  type SeedanceAssetUploadLimits,
 } from '../lib/upload'
 
 const validationStatusCopy: Record<string, string> = {
@@ -63,6 +65,7 @@ export type HumanAssetGroupDetails = {
 
 export function CreateHumanValidationDialog(props: {
   open: boolean
+  getUploadLimits: () => Promise<SeedanceAssetUploadLimits | null>
   isPending: boolean
   isChecking: boolean
   session: SeedanceAssetValidationSession | null
@@ -74,23 +77,48 @@ export function CreateHumanValidationDialog(props: {
 }) {
   const { t } = useTranslation()
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const portraitSelectionRef = useRef(0)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [tags, setTags] = useState('')
   const [portrait, setPortrait] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
+  const [imageLimitMiB, setImageLimitMiB] = useState<number | null>(null)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
   const session = props.session
+  useEffect(() => {
+    if (!props.open) portraitSelectionRef.current++
+  }, [props.open])
+  useEffect(
+    () => () => {
+      portraitSelectionRef.current++
+    },
+    []
+  )
   const trimmedName = name.trim()
   const isSessionFailed =
     session?.status === 'Failed' ||
     session?.status === 'Expired' ||
     session?.status === 'Cancelled'
   const isVerified = session?.status === 'Succeeded'
-  const status = session
+  const getUploadLimits = props.getUploadLimits
+  useEffect(() => {
+    if (!props.open || !isVerified) return
+    let active = true
+    void getUploadLimits().then((limits) => {
+      if (active) setImageLimitMiB(limits?.Image ?? null)
+    })
+    return () => {
+      active = false
+    }
+  }, [isVerified, props.open, getUploadLimits])
+  const isGroupPreparing =
+    session?.status === 'Pending' && Boolean(session.group_id)
+  let status = session
     ? t(validationStatusCopy[session.status] ?? session.status)
     : ''
+  if (isGroupPreparing) status = t('Processing')
 
   const uploadMutation = useMutation({
     mutationFn: async (file: File) => {
@@ -126,6 +154,7 @@ export function CreateHumanValidationDialog(props: {
 
   const handleOpenChange = (open: boolean) => {
     if (!open && uploadMutation.isPending) return
+    if (!open) portraitSelectionRef.current++
     if (!open && !session) {
       setName('')
       setDescription('')
@@ -135,11 +164,13 @@ export function CreateHumanValidationDialog(props: {
   }
 
   const handleStartOver = () => {
+    portraitSelectionRef.current++
     setName('')
     setDescription('')
     setTags('')
     setPortrait(null)
     setFileError('')
+    setImageLimitMiB(null)
     setUploadProgress(0)
     uploadMutation.reset()
     props.onStartOver()
@@ -154,11 +185,17 @@ export function CreateHumanValidationDialog(props: {
     })
   }
 
-  const handlePortraitChange = (file: File | undefined) => {
+  const handlePortraitChange = async (file: File | undefined) => {
     if (!file) return
+    const selection = ++portraitSelectionRef.current
+    setPortrait(null)
+    setFileError('')
     uploadMutation.reset()
     setUploadProgress(0)
-    const validation = validateSeedancePortraitFile(file)
+    const limits = await props.getUploadLimits()
+    if (selection !== portraitSelectionRef.current) return
+    setImageLimitMiB(limits?.Image ?? null)
+    const validation = validateSeedancePortraitFile(file, limits)
     if (!validation.valid) {
       setPortrait(null)
       setFileError(
@@ -187,13 +224,16 @@ export function CreateHumanValidationDialog(props: {
   if (!session) {
     title = t('Create a verified human asset group')
     dialogDescription = t(
-      'Start a 30-minute H5 identity check. After it succeeds, upload a portrait for review.'
+      'Start an H5 identity check. After it succeeds, upload a portrait for review.'
     )
   } else if (isVerified) {
     title = t('Step 2 of 2: Upload portrait')
     dialogDescription = t(
       'Identity verification is complete. Upload a matching portrait to finish setup.'
     )
+  } else if (isGroupPreparing) {
+    title = t('Human verification')
+    dialogDescription = t('The verified group is not ready yet')
   } else if (statusFailedOrExpired) {
     title = t('Human verification')
     dialogDescription = t(
@@ -356,7 +396,7 @@ export function CreateHumanValidationDialog(props: {
       {session && !isVerified && !statusFailedOrExpired ? (
         <div className='space-y-4'>
           <div className='flex flex-col items-center gap-4 rounded-lg border p-4'>
-            {session.launch_url ? (
+            {session.launch_url && !isGroupPreparing ? (
               <div className='rounded-lg bg-white p-3'>
                 <QRCodeSVG
                   value={session.launch_url}
@@ -373,14 +413,18 @@ export function CreateHumanValidationDialog(props: {
             <div className='w-full space-y-2'>
               <div className='flex items-center justify-between gap-3 text-sm'>
                 <span className='font-medium'>{status}</span>
-                <span className='text-muted-foreground tabular-nums'>
-                  {t('Time remaining')}: {minutes}:{seconds}
-                </span>
+                {!isGroupPreparing ? (
+                  <span className='text-muted-foreground tabular-nums'>
+                    {t('Time remaining')}: {minutes}:{seconds}
+                  </span>
+                ) : null}
               </div>
-              <Progress value={verificationProgress} />
+              {!isGroupPreparing ? (
+                <Progress value={verificationProgress} />
+              ) : null}
             </div>
             <div className='flex flex-wrap justify-center gap-2'>
-              {session.launch_url ? (
+              {session.launch_url && !isGroupPreparing ? (
                 <Button
                   type='button'
                   render={
@@ -411,6 +455,13 @@ export function CreateHumanValidationDialog(props: {
             </div>
           </div>
           <p className='text-muted-foreground text-sm'>{session.name}</p>
+          {session.status_check_retrying ? (
+            <p role='status' className='text-muted-foreground text-sm'>
+              {t(
+                'Status check temporarily unavailable. Retrying automatically.'
+              )}
+            </p>
+          ) : null}
           {session.last_error ? (
             <p className='text-destructive text-sm break-words'>
               {session.last_error}
@@ -444,7 +495,7 @@ export function CreateHumanValidationDialog(props: {
               className='sr-only'
               disabled={uploadMutation.isPending}
               onChange={(event) => {
-                handlePortraitChange(event.currentTarget.files?.[0])
+                void handlePortraitChange(event.currentTarget.files?.[0])
                 event.currentTarget.value = ''
               }}
             />
@@ -463,7 +514,16 @@ export function CreateHumanValidationDialog(props: {
               </span>
             </div>
             <p className='text-muted-foreground text-sm'>
-              {t('Supports JPG, PNG, WebP, GIF, or HEIC, up to 30 MB.')}
+              {imageLimitMiB === null
+                ? t('Supported formats: JPG, PNG, WebP, GIF, HEIC.')
+                : t(
+                    'Supported formats: JPG, PNG, WebP, GIF, HEIC. Maximum {{limit}}.',
+                    {
+                      limit: formatSeedanceFileSize(
+                        imageLimitMiB * 1024 * 1024
+                      ),
+                    }
+                  )}
             </p>
             {portrait ? (
               <p className='text-muted-foreground text-xs'>
@@ -477,7 +537,12 @@ export function CreateHumanValidationDialog(props: {
             ) : null}
             {uploadMutation.error ? (
               <p role='alert' className='text-destructive text-sm break-words'>
-                {uploadMutation.error.message || t('Upload failed')}
+                {t(
+                  getServerErrorMessage(
+                    uploadMutation.error,
+                    t('Upload failed')
+                  )
+                )}
               </p>
             ) : null}
             {uploadMutation.isPending ? (

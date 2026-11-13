@@ -236,6 +236,28 @@ func TestSecurityAccountDeletionConcurrentRequestsHaveOneWinner(t *testing.T) {
 	assert.Equal(t, identity.UserAuthVersion+1, deleted.AuthVersion)
 }
 
+func TestSecurityAccountDeletionPreservesSessionWhileTaskPending(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	task := &model.Task{TaskID: "account-pending-task", UserId: user.Id, Status: model.TaskStatusQueued}
+	require.NoError(t, model.DB.Create(task).Error)
+	operation := service.VerificationOperation{Scope: service.VerificationScopeAccountDelete}
+	proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+	response := securityEnrollmentRequest(http.MethodDelete, "/api/user/self", "", proof, identity, DeleteSelf)
+	assert.Contains(t, response.Body.String(), model.ErrUserTaskBillingPending.Error())
+	_, _, err := service.ValidateLoginSession(identity)
+	require.NoError(t, err)
+	var stored model.User
+	require.NoError(t, model.DB.First(&stored, user.Id).Error)
+	assert.Equal(t, identity.UserAuthVersion, stored.AuthVersion)
+
+	require.NoError(t, model.DB.Model(task).UpdateColumn("status", model.TaskStatusSuccess).Error)
+	proof = issueSecurityEnrollmentProof(t, identity, operation, "password")
+	response = securityEnrollmentRequest(http.MethodDelete, "/api/user/self", "", proof, identity, DeleteSelf)
+	var result securityEnrollmentResponse
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	assert.True(t, result.Success, response.Body.String())
+}
+
 type securityMailbox struct {
 	mutex sync.Mutex
 	mail  map[string][]string

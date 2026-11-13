@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func TestSeedanceAssetValidationSessionSchemaMatrix(t *testing.T) {
@@ -189,38 +191,109 @@ func TestListDueSeedanceAssetsHonorsBackoff(t *testing.T) {
 	require.Len(t, due, 1)
 }
 
-// TestSeedanceAssetGroupNameIsUniquePerUser 验证同一用户不能创建重复或仅大小写不同的素材组名称。
-func TestSeedanceAssetGroupNameIsUniquePerUser(t *testing.T) {
-	previousDB := DB
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+type legacySeedanceAssetGroupName struct {
+	ID        uint    `gorm:"primaryKey"`
+	UserID    int     `gorm:"not null;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:1"`
+	ChannelID int     `gorm:"not null"`
+	GroupID   string  `gorm:"size:128;not null"`
+	Name      string  `gorm:"size:64;not null"`
+	NameKey   *string `gorm:"size:64;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:2"`
+}
+
+func (legacySeedanceAssetGroupName) TableName() string { return "seedance_asset_groups" }
+
+func TestSeedanceAssetGroupNamesCanRepeat(t *testing.T) {
+	var dialector gorm.Dialector = sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name()))
+	if dsn := os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN"); dsn != "" {
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("TASK_PLUGIN_TEST_POSTGRES_DSN"); dsn != "" {
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("sg%d_", time.Now().UnixNano())}})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}))
-	DB = db
+	connection, err := db.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
 	t.Cleanup(func() {
-		DB = previousDB
-		sqlDB, dbErr := db.DB()
-		if dbErr == nil {
-			_ = sqlDB.Close()
-		}
+		require.NoError(t, db.Migrator().DropTable(&SeedanceAssetGroup{}))
+		require.NoError(t, connection.Close())
 	})
 
-	first := &SeedanceAssetGroup{UserID: 7, ChannelID: 1, GroupID: "group-1", Name: "Drafts"}
-	require.NoError(t, db.Create(first).Error)
+	legacyDB := db.Table(db.NamingStrategy.TableName("SeedanceAssetGroup"))
+	require.NoError(t, legacyDB.AutoMigrate(&legacySeedanceAssetGroupName{}))
+	nameKey := "drafts"
+	legacy := &legacySeedanceAssetGroupName{UserID: 7, ChannelID: 1, GroupID: "group-1", Name: "Drafts", NameKey: &nameKey}
+	require.NoError(t, legacyDB.Create(legacy).Error)
+	require.True(t, db.Migrator().HasIndex(&SeedanceAssetGroup{}, "idx_seedance_asset_group_user_name_key"))
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}))
+	for range 2 {
+		require.NoError(t, migrateSeedanceAssetGroupNameUniqueness(db))
+	}
+	require.False(t, db.Migrator().HasIndex(&SeedanceAssetGroup{}, "idx_seedance_asset_group_user_name_key"))
+	var existing SeedanceAssetGroup
+	require.NoError(t, db.First(&existing, legacy.ID).Error)
+	require.Equal(t, "group-1", existing.GroupID)
+	require.Equal(t, "Drafts", existing.Name)
+	duplicate := &SeedanceAssetGroup{UserID: 7, ChannelID: 1, GroupID: "group-2", Name: " Drafts "}
+	require.NoError(t, db.Create(duplicate).Error)
+	require.NotEqual(t, existing.ID, duplicate.ID)
+	require.Equal(t, "Drafts", duplicate.Name)
+	require.NoError(t, db.Model(duplicate).Update("name", existing.Name).Error)
+	var count int64
+	require.NoError(t, db.Model(&SeedanceAssetGroup{}).Where("user_id = ? AND name = ?", 7, "Drafts").Count(&count).Error)
+	require.EqualValues(t, 2, count)
 
-	duplicated, err := IsSeedanceAssetGroupNameDuplicated(0, first.UserID, " drafts ")
+	require.NoError(t, db.Migrator().DropTable(&SeedanceAssetGroup{}))
+	require.NoError(t, db.AutoMigrate(&SeedanceAssetGroup{}))
+	for range 2 {
+		require.NoError(t, migrateSeedanceAssetGroupNameUniqueness(db))
+	}
+	for _, groupID := range []string{"fresh-1", "fresh-2"} {
+		require.NoError(t, db.Create(&SeedanceAssetGroup{UserID: 7, ChannelID: 1, GroupID: groupID, Name: "Drafts"}).Error)
+	}
+}
+
+func TestSeedanceAssetGroupNamesUpgradeOnMySQLStartup(t *testing.T) {
+	dsn := os.Getenv("SEEDANCE_GROUP_STARTUP_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("SEEDANCE_GROUP_STARTUP_TEST_MYSQL_DSN is unset")
+	}
+	config, err := driver.ParseDSN(dsn)
 	require.NoError(t, err)
-	require.True(t, duplicated)
-
-	duplicated, err = IsSeedanceAssetGroupNameDuplicated(first.ID, first.UserID, first.Name)
+	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_names_"))
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
-	require.False(t, duplicated)
+	tables, err := db.Migrator().GetTables()
+	require.NoError(t, err)
+	require.Empty(t, tables, "startup migration requires an empty database")
+	connection, err := db.DB()
+	require.NoError(t, err)
+	previousDB, previousLog := DB, LOG_DB
+	DB, LOG_DB = db, db
+	t.Cleanup(func() {
+		DB, LOG_DB = previousDB, previousLog
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, DB.AutoMigrate(&legacySeedanceAssetGroupName{}, &SeedanceAsset{}))
+	nameKey := "existing"
+	group := &legacySeedanceAssetGroupName{UserID: 7, ChannelID: 1, GroupID: "existing-group", Name: "existing", NameKey: &nameKey}
+	require.NoError(t, DB.Create(group).Error)
+	asset := &SeedanceAsset{UserID: 7, ChannelID: 1, GroupID: group.GroupID, AssetID: "existing-asset", Name: "image", AssetType: "Image", Status: "Active"}
+	require.NoError(t, DB.Create(asset).Error)
+	require.True(t, DB.Migrator().HasIndex(&SeedanceAssetGroup{}, "idx_seedance_asset_group_user_name_key"))
 
-	duplicate := &SeedanceAssetGroup{UserID: first.UserID, ChannelID: 1, GroupID: "group-2", Name: "drafts"}
-	require.Error(t, db.Create(duplicate).Error)
-
-	differentUser := &SeedanceAssetGroup{UserID: 8, ChannelID: 1, GroupID: "group-3", Name: first.Name}
-	require.NoError(t, db.Create(differentUser).Error)
+	require.NoError(t, migrateDB())
+	require.False(t, DB.Migrator().HasIndex(&SeedanceAssetGroup{}, "idx_seedance_asset_group_user_name_key"))
+	require.NoError(t, DB.Create(&SeedanceAssetGroup{UserID: 7, ChannelID: 1, GroupID: "new-group", Name: group.Name}).Error)
+	require.NoError(t, migrateDB())
+	var groups []SeedanceAssetGroup
+	require.NoError(t, DB.Where("user_id = ? AND name = ?", 7, group.Name).Order("id").Find(&groups).Error)
+	require.Len(t, groups, 2)
+	require.Equal(t, group.GroupID, groups[0].GroupID)
+	require.Equal(t, "new-group", groups[1].GroupID)
+	var stored SeedanceAsset
+	require.NoError(t, DB.Where("asset_id = ?", asset.AssetID).First(&stored).Error)
+	require.Equal(t, group.GroupID, stored.GroupID)
 }
 
 // TestSeedanceAssetValidationSessionPublishesOneGroup 验证认证结果只能发布一次真人素材组，

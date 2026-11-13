@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -146,6 +147,181 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	}
 	_, err = GetUserModelDiscountSnapshotContext(t.Context(), user.Id)
 	assert.Error(t, err)
+}
+
+func TestUserDeletionRejectsPendingTaskAccounting(t *testing.T) {
+	for _, scenario := range []string{"task", "initial accounting", "terminal success", "terminal failure", "refund", "refund cache"} {
+		t.Run(scenario, func(t *testing.T) {
+			truncateTables(t)
+			user := User{Username: "pending-owner", AffCode: "pending-owner", Status: common.UserStatusEnabled, AuthVersion: 1, Quota: 900}
+			require.NoError(t, DB.Create(&user).Error)
+			access := UserAccessToken{UserId: user.Id, TokenHash: AccessTokenFingerprint("pending-owner-test")}
+			require.NoError(t, DB.Create(&access).Error)
+			var task Task
+			var refund BillingRefund
+			switch scenario {
+			case "task":
+				task = Task{TaskID: "pending-task", UserId: user.Id, Status: TaskStatusQueued}
+				require.NoError(t, StageBillingTask(t.Context(), &task, 0))
+			case "initial accounting":
+				task = Task{TaskID: "pending-accounting", UserId: user.Id, Status: TaskStatusSuccess}
+				require.NoError(t, DB.Create(&task).Error)
+				require.NoError(t, DB.Create(&VideoTaskPendingLog{TaskID: -task.ID}).Error)
+			case "terminal success", "terminal failure":
+				task = Task{TaskID: "terminal-accounting", UserId: user.Id, Status: TaskStatusUnknown,
+					PrivateData: TaskPrivateData{SubmissionPending: true, InitialAccountingPending: true}}
+				require.NoError(t, StageBillingTask(t.Context(), &task, 0))
+				task.Status = TaskStatusSuccess
+				if scenario == "terminal failure" {
+					task.Status = TaskStatusFailure
+				}
+				task.PrivateData.SubmissionPending = false
+				won, err := PersistTaskSubmission(t.Context(), &task, true)
+				require.NoError(t, err)
+				require.True(t, won)
+			case "refund", "refund cache":
+				refund = BillingRefund{RequestID: "pending-refund", UserID: user.Id, Amount: 100, Completed: scenario == "refund cache", CachePending: scenario == "refund cache"}
+				require.NoError(t, QueueBillingRefund(t.Context(), &refund))
+			}
+
+			_, err := user.Delete()
+			require.ErrorIs(t, err, ErrUserTaskBillingPending)
+			_, err = user.HardDelete()
+			require.ErrorIs(t, err, ErrUserTaskBillingPending)
+			var stored User
+			require.NoError(t, DB.First(&stored, user.Id).Error)
+			assert.EqualValues(t, 1, stored.AuthVersion)
+			assert.Equal(t, 900, stored.Quota)
+			var accessCount int64
+			require.NoError(t, DB.Model(&UserAccessToken{}).Where("id = ?", access.Id).Count(&accessCount).Error)
+			assert.EqualValues(t, 1, accessCount)
+			other := User{Username: "unrelated-owner", AffCode: "unrelated-owner", Status: common.UserStatusEnabled, AuthVersion: 1}
+			require.NoError(t, DB.Create(&other).Error)
+			_, err = other.Delete()
+			require.NoError(t, err)
+			_, err = other.HardDelete()
+			require.NoError(t, err)
+
+			switch scenario {
+			case "task":
+				require.NoError(t, DB.Model(&task).UpdateColumn("status", TaskStatusSuccess).Error)
+			case "initial accounting":
+				require.NoError(t, DB.Where("task_id = ?", -task.ID).Delete(&VideoTaskPendingLog{}).Error)
+			case "terminal success", "terminal failure":
+				task.PrivateData.InitialAccountingPending = false
+				require.NoError(t, DB.Model(&task).Update("private_data", task.PrivateData).Error)
+			case "refund", "refund cache":
+				require.NoError(t, DB.Model(&refund).Updates(map[string]any{"completed": true, "cache_pending": false}).Error)
+			}
+			_, err = user.Delete()
+			require.NoError(t, err)
+			_, err = user.HardDelete()
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestTaskSubmissionAndUserDeletionSerialize(t *testing.T) {
+	if !common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		t.Skip("requires MySQL row locking")
+	}
+	for _, submissionFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("submission_first=%t", submissionFirst), func(t *testing.T) {
+			truncateTables(t)
+			connection, err := DB.DB()
+			require.NoError(t, err)
+			connection.SetMaxOpenConns(4)
+			t.Cleanup(func() { connection.SetMaxOpenConns(1) })
+			user := User{Username: "concurrent-owner", AffCode: "concurrent-owner", Status: common.UserStatusEnabled, AuthVersion: 1}
+			require.NoError(t, DB.Create(&user).Error)
+			task := Task{TaskID: "concurrent-submission", UserId: user.Id, Status: TaskStatusQueued}
+			locked, release, attempted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce, lockedOnce, attemptedOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+			callback := "test:user-task-lock"
+			if submissionFirst {
+				require.NoError(t, DB.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+					if tx.Statement.Table == "tasks" {
+						lockedOnce.Do(func() { close(locked) })
+						<-release
+					}
+				}))
+				t.Cleanup(func() {
+					releaseOnce.Do(func() { close(release) })
+					assert.NoError(t, DB.Callback().Create().Remove(callback))
+				})
+			} else {
+				require.NoError(t, DB.Callback().Delete().Before("gorm:delete").Register(callback, func(tx *gorm.DB) {
+					if tx.Statement.Table == "users" {
+						lockedOnce.Do(func() { close(locked) })
+						<-release
+					}
+				}))
+				t.Cleanup(func() {
+					releaseOnce.Do(func() { close(release) })
+					assert.NoError(t, DB.Callback().Delete().Remove(callback))
+				})
+			}
+			submissionResult, deletionResult := make(chan error, 1), make(chan error, 1)
+			submit := func() { submissionResult <- StageBillingTask(t.Context(), &task, 0) }
+			deleteUser := func() { _, deleteErr := user.Delete(); deletionResult <- deleteErr }
+			if submissionFirst {
+				go submit()
+			} else {
+				go deleteUser()
+			}
+			select {
+			case <-locked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first transaction did not reach its locked write")
+			}
+			require.NoError(t, DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" {
+					attemptedOnce.Do(func() { close(attempted) })
+				}
+			}))
+			t.Cleanup(func() { assert.NoError(t, DB.Callback().Query().Remove(callback)) })
+			if submissionFirst {
+				go deleteUser()
+			} else {
+				go submit()
+			}
+			select {
+			case <-attempted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("second transaction did not attempt the user lock")
+			}
+			select {
+			case err := <-submissionResult:
+				t.Fatalf("submission completed before the first transaction released its lock: %v", err)
+			case err := <-deletionResult:
+				t.Fatalf("deletion completed before the first transaction released its lock: %v", err)
+			case <-time.After(200 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(release) })
+			var submissionErr, deletionErr error
+			select {
+			case submissionErr = <-submissionResult:
+			case <-time.After(5 * time.Second):
+				t.Fatal("submission did not finish after releasing the lock")
+			}
+			select {
+			case deletionErr = <-deletionResult:
+			case <-time.After(5 * time.Second):
+				t.Fatal("deletion did not finish after releasing the lock")
+			}
+			if submissionFirst {
+				assert.NoError(t, submissionErr)
+				assert.ErrorIs(t, deletionErr, ErrUserTaskBillingPending)
+			} else {
+				assert.NoError(t, deletionErr)
+				assert.ErrorIs(t, submissionErr, gorm.ErrRecordNotFound)
+				var count int64
+				require.NoError(t, DB.Model(&Task{}).Where("user_id = ?", user.Id).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+		})
+	}
 }
 
 func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {

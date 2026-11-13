@@ -2,7 +2,9 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -17,6 +19,79 @@ import (
 )
 
 // 恢复必须保留尚未批量落库的预扣；同时覆盖普通退款与结算影子的合并。
+func TestBillingRefundCacheRecoveryUsesRefundCommit(t *testing.T) {
+	address := os.Getenv("TASK_PLUGIN_TEST_REDIS_ADDR")
+	if address == "" {
+		t.Skip("TASK_PLUGIN_TEST_REDIS_ADDR is unset")
+	}
+	require.Equal(t, "127.0.0.1:26379", address)
+	require.NoError(t, DB.AutoMigrate(&BillingRefund{}))
+	require.NoError(t, DB.AutoMigrate(&BillingRefund{}))
+	for _, rollback := range []bool{false, true} {
+		t.Run(fmt.Sprint(rollback), func(t *testing.T) {
+			truncateTables(t)
+			require.NoError(t, DB.Where("1 = 1").Delete(&BillingRefund{}).Error)
+			client := redis.NewClient(&redis.Options{Addr: address, DB: 4, MaxRetries: -1})
+			previousClient, previousRedis := common.RDB, common.RedisEnabled
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() {
+				common.RDB, common.RedisEnabled = previousClient, previousRedis
+				require.NoError(t, client.Close())
+			})
+			require.NoError(t, client.FlushDB(t.Context()).Err())
+			require.NoError(t, DB.Create(&User{Id: 941010, Username: "refund-cache", AffCode: "refund-cache", Quota: 900}).Error)
+			token := &Token{Id: 941010, UserId: 941010, Key: "refund-cache-token", RemainQuota: 900, UsedQuota: 100}
+			require.NoError(t, DB.Create(token).Error)
+			_, err := GetUserCache(941010)
+			require.NoError(t, err)
+			_, err = GetTokenByKey(token.Key, false)
+			require.NoError(t, err)
+			refund := &BillingRefund{RequestID: "refund-cache-request", UserID: 941010, TokenID: token.Id, Amount: 100, TokenAmount: 100}
+			require.NoError(t, QueueBillingRefund(t.Context(), refund))
+			// 两种业务记录的数值ID相同，恢复仍必须读取正确的提交标记。
+			require.NoError(t, DB.Create(&Task{ID: refund.ID, TaskID: "unrelated-task", UserId: 941010, Quota: 100, Status: TaskStatusQueued}).Error)
+			injected := false
+			client.AddHook(videoAuditRedisHook{before: func(_ context.Context, cmd redis.Cmder) error {
+				if !rollback && !injected && isVideoFinishCommand(cmd) {
+					injected = true
+					return errors.New("injected cache finish failure")
+				}
+				return nil
+			}})
+			const callback = "regression:refund-commit"
+			if rollback {
+				require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+					if tx.Statement.Table == "billing_refunds" {
+						tx.AddError(errors.New("injected refund commit failure"))
+					}
+				}))
+			}
+			err = CompleteBillingRefund(t.Context(), refund.ID)
+			if rollback {
+				require.Error(t, err)
+				require.NoError(t, DB.Callback().Update().Remove(callback))
+			} else {
+				require.NoError(t, err)
+				require.True(t, injected)
+			}
+			user, err := GetUserCache(941010)
+			require.NoError(t, err)
+			cachedToken, err := GetTokenByKey(token.Key, false)
+			require.NoError(t, err)
+			want := 1000
+			if rollback {
+				want = 900
+			}
+			assert.Equal(t, want, user.Quota)
+			assert.Equal(t, want, cachedToken.RemainQuota)
+			require.NoError(t, CompleteBillingRefund(t.Context(), refund.ID))
+			user, err = GetUserCache(941010)
+			require.NoError(t, err)
+			assert.Equal(t, 1000, user.Quota)
+		})
+	}
+}
+
 func TestVideoCacheRecoveryPreservesPendingBatch(t *testing.T) {
 	for _, actual := range []int{60, 125} {
 		t.Run(fmt.Sprint(actual), func(t *testing.T) {

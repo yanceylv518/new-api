@@ -252,6 +252,56 @@ func TestPluginResponsesMachineUsesVerbatimStringOutput(t *testing.T) {
 	require.NotNil(t, events[6].Response.Usage)
 }
 
+func TestPluginResponsesMachineExposesMeasuredTaskUsageAcrossModes(t *testing.T) {
+	for _, mode := range []string{"sync", "stream", "retrieve-events"} {
+		t.Run(mode, func(t *testing.T) {
+			machine := NewPluginResponsesMachine("task_usage", "video-model", 1, PluginProtocolLimits{})
+			machine.SetTaskUsage([]byte(`{"usage":{"total_tokens":40594,"completion_tokens":0,"input_tokens":-1,"output_tokens":true,"prompt_tokens":9007199254740991.1,"provider":"private-provider"}}`))
+			var metadataValue any
+			if mode == "sync" {
+				response, err := machine.FinalResponse(map[string]any{
+					"output":   []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "video", "annotations": []any{}, "logprobs": []any{}}}}},
+					"metadata": map[string]string{"task_usage": "plugin-controlled"},
+				}, "SUCCESS")
+				require.NoError(t, err)
+				metadataValue = response["metadata"]
+			} else {
+				result, err := DecodePluginProtocolEventResult(map[string]any{"events": []any{map[string]any{"type": "output", "data": "video"}}, "done": true}, PluginProtocolLimits{})
+				require.NoError(t, err)
+				if mode == "stream" {
+					_, err = machine.CreatedEvent()
+					require.NoError(t, err)
+					events, applyErr := machine.ApplyTick(result, "SUCCESS")
+					require.NoError(t, applyErr)
+					completed := events[len(events)-1].Response
+					require.NotNil(t, completed)
+					assert.Zero(t, completed.Usage.TotalTokens)
+					metadataValue = completed.Metadata
+				} else {
+					response, finalErr := machine.FinalFromEvents(result, "SUCCESS")
+					require.NoError(t, finalErr)
+					metadataValue = response["metadata"]
+				}
+			}
+			encoded, err := common.Marshal(metadataValue)
+			require.NoError(t, err)
+			var metadata map[string]string
+			require.NoError(t, common.Unmarshal(encoded, &metadata))
+			assert.JSONEq(t, `{"total_tokens":40594,"completion_tokens":0}`, metadata["task_usage"])
+			assert.NotContains(t, metadata["task_usage"], "private-provider")
+		})
+	}
+	t.Run("invalid counters cannot be replaced by plugin metadata", func(t *testing.T) {
+		machine := NewPluginResponsesMachine("task_invalid_usage", "video-model", 1, PluginProtocolLimits{})
+		machine.SetTaskUsage([]byte(`{"usage":{"total_tokens":"40594","input_tokens":-1}}`))
+		response, err := machine.FinalResponse(map[string]any{"output": []any{}, "metadata": map[string]string{"task_usage": "plugin-controlled"}}, "SUCCESS")
+		require.NoError(t, err)
+		metadata, ok := response["metadata"].(map[string]string)
+		require.True(t, ok)
+		assert.NotContains(t, metadata, "task_usage")
+	})
+}
+
 func TestPluginResponsesMachineSanitizesFailure(t *testing.T) {
 	t.Run("plugin semantic error", func(t *testing.T) {
 		machine := NewPluginResponsesMachine("task_error", "model", 1, PluginProtocolLimits{})

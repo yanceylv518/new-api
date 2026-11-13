@@ -1,35 +1,61 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image/jpeg"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	mysqldriver "github.com/go-sql-driver/mysql"
+	"gorm.io/gorm"
 )
 
 // SeedanceAssetClient 调用兼容火山方舟的 Seedance 素材 Action 接口。
 type SeedanceAssetClient struct {
-	ChannelID          int
-	baseURL            string
-	apiKey             string
-	path               string
-	proxy              string
-	KeyFingerprint     string
-	AccountFingerprint string
+	ChannelID           int
+	baseURL             string
+	apiKey              string
+	proxy               string
+	KeyFingerprint      string
+	AccountFingerprint  string
+	syncAccount         string
+	accountFingerprints []string
+	sharedAccount       bool
+	jsonAction          bool
+	originREST          bool
+}
+
+// ForSeedanceModel 对未配置共享组的渠道区分模型及密钥。
+func (client *SeedanceAssetClient) ForSeedanceModel(channel *model.Channel, modelName string) *SeedanceAssetClient {
+	if client == nil {
+		return nil
+	}
+	copy := *client
+	copy.AccountFingerprint = model.SeedanceAssetModelScopeFingerprint(channel, modelName, client.KeyFingerprint)
+	copy.syncAccount = copy.AccountFingerprint
+	if !copy.sharedAccount {
+		copy.accountFingerprints = []string{copy.AccountFingerprint}
+	}
+	return &copy
 }
 
 var seedanceAssetHTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -37,17 +63,26 @@ var seedanceAssetHTTPClient = &http.Client{Timeout: 30 * time.Second}
 // 仅明确的资源不存在允许删除重试继续，路由 404 和鉴权错误不能视作删除成功。
 var ErrSeedanceAssetNotFound = errors.New("seedance asset resource not found")
 
+var errSeedanceAssetAccountMissing = errors.New("bound Seedance account no longer exists")
+
+var ErrSeedanceAssetGroupPending = errors.New("the verified asset group is still processing")
+
+var ErrSeedanceAssetServiceTemporary = errors.New("Asset service is temporarily unavailable. Please try again.")
+
+var ErrSeedanceAssetChannelUnavailable = errors.New("no enabled Seedance channel available")
+
+var errSeedanceAssetResponse = errors.New("invalid Seedance asset response")
+
 const (
-	seedanceAssetImageMaxSize      int64 = 30 << 20
-	seedanceAssetVideoMaxSize      int64 = 50 << 20
-	seedanceAssetAudioMaxSize      int64 = 15 << 20
-	seedanceAssetMultipartOverhead       = 1 << 20
-	seedanceAssetImageMaxDimension       = 6000
-	seedanceAssetJPEGQuality             = 95
-	seedanceAssetRequestTimeout          = 30 * time.Second
-	seedanceAssetResponseBodyLimit       = 1 << 20
-	seedanceAssetErrorPreviewLimit       = 4096
-	seedanceAssetNativeActionPath        = "/v2/assets"
+	seedanceAssetImageMaxDimension  = 6000
+	seedanceAssetJPEGQuality        = 95
+	seedanceAssetRequestTimeout     = 30 * time.Second
+	seedanceAssetJSONImportTimeout  = 10 * time.Minute
+	seedanceAssetURLDownloadTimeout = 10 * time.Minute
+	seedanceAssetURLStoreTimeout    = 20 * time.Minute
+	seedanceAssetResponseBodyLimit  = 1 << 20
+	seedanceAssetErrorPreviewLimit  = 4096
+	seedanceNativeGroupIDPrefix     = "group-"
 )
 
 // privateAssetOSSStorageFactory 为素材流程提供统一的存储客户端创建入口。
@@ -66,18 +101,23 @@ type SeedanceAssetUpload struct {
 
 // SeedanceAssetMaxMultipartBodySize 返回上传请求体上限，额外空间用于 multipart 边界和表单字段。
 func SeedanceAssetMaxMultipartBodySize() int64 {
-	return seedanceAssetVideoMaxSize + seedanceAssetMultipartOverhead
+	return common.PrivateAssetMultipartBodyLimit(false)
 }
 
-// SeedanceAssetMaxUploadSize 返回各类素材对应的上游文件大小上限。
+func SeedanceCompatMaxMultipartBodySize() int64 {
+	return common.PrivateAssetMultipartBodyLimit(true)
+}
+
+// SeedanceAssetMaxUploadSize 返回管理员配置的各类素材文件大小上限。
 func SeedanceAssetMaxUploadSize(assetType string) int64 {
+	limits := common.GetManagementRateLimits().AssetLimits
 	switch assetType {
 	case "Image":
-		return seedanceAssetImageMaxSize
+		return limits.ImageMiB << 20
 	case "Video":
-		return seedanceAssetVideoMaxSize
+		return limits.VideoMiB << 20
 	case "Audio":
-		return seedanceAssetAudioMaxSize
+		return limits.AudioMiB << 20
 	default:
 		return 0
 	}
@@ -135,22 +175,41 @@ func inferSeedanceAssetType(filename, contentType, declaredType string) (string,
 }
 
 // isProgressiveJPEG 按 JPEG 段结构查找 SOF2，避免把扫描数据中的字节误判为标记。
-func isProgressiveJPEG(data []byte) (bool, error) {
-	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
+func isProgressiveJPEG(source io.Reader) (bool, error) {
+	reader := bufio.NewReader(source)
+	var signature [2]byte
+	if _, err := io.ReadFull(reader, signature[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	if signature[0] != 0xff || signature[1] != 0xd8 {
 		return false, nil
 	}
-	for offset := 2; offset < len(data); {
-		if data[offset] != 0xff {
+	for offset := int64(2); ; {
+		prefix, err := reader.ReadByte()
+		if errors.Is(err, io.EOF) {
+			return false, fmt.Errorf("truncated JPEG data")
+		}
+		if err != nil {
+			return false, err
+		}
+		if prefix != 0xff {
 			return false, fmt.Errorf("invalid JPEG marker at offset %d", offset)
 		}
-		for offset < len(data) && data[offset] == 0xff {
+		offset++
+		marker := byte(0xff)
+		for marker == 0xff {
+			marker, err = reader.ReadByte()
+			if errors.Is(err, io.EOF) {
+				return false, fmt.Errorf("truncated JPEG marker")
+			}
+			if err != nil {
+				return false, err
+			}
 			offset++
 		}
-		if offset >= len(data) {
-			return false, fmt.Errorf("truncated JPEG marker")
-		}
-		marker := data[offset]
-		offset++
 		if marker == 0xc2 {
 			return true, nil
 		}
@@ -160,79 +219,157 @@ func isProgressiveJPEG(data []byte) (bool, error) {
 		if marker == 0x01 || marker == 0xd8 || (marker >= 0xd0 && marker <= 0xd7) {
 			continue
 		}
-		if offset+2 > len(data) {
+		var lengthBytes [2]byte
+		if _, err := io.ReadFull(reader, lengthBytes[:]); err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				return false, err
+			}
 			return false, fmt.Errorf("truncated JPEG segment length")
 		}
-		segmentLength := int(data[offset])<<8 | int(data[offset+1])
-		if segmentLength < 2 || offset+segmentLength > len(data) {
+		segmentLength := int(lengthBytes[0])<<8 | int(lengthBytes[1])
+		if segmentLength < 2 {
 			return false, fmt.Errorf("invalid JPEG segment length")
 		}
-		offset += segmentLength
+		if _, err := io.CopyN(io.Discard, reader, int64(segmentLength-2)); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return false, fmt.Errorf("invalid JPEG segment length")
+			}
+			return false, err
+		}
+		offset += int64(segmentLength)
 	}
-	return false, fmt.Errorf("truncated JPEG data")
 }
 
 // normalizeSeedanceProgressiveJPEG 将上游实际无法处理的 progressive JPEG 规范化为 baseline JPEG。
-func normalizeSeedanceProgressiveJPEG(path string, maxSize int64) (int64, error) {
-	data, err := os.ReadFile(path)
+func normalizeSeedanceProgressiveJPEG(ctx context.Context, path string, maxSize int64) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
-	progressive, err := isProgressiveJPEG(data)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	progressive, err := isProgressiveJPEG(file)
 	if err != nil {
 		return 0, err
 	}
 	if !progressive {
-		return int64(len(data)), nil
+		return info.Size(), nil
 	}
-
-	config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	config, err := jpeg.DecodeConfig(file)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read progressive JPEG dimensions: %w", err)
 	}
 	if config.Width > seedanceAssetImageMaxDimension || config.Height > seedanceAssetImageMaxDimension {
 		return 0, fmt.Errorf("JPEG dimensions exceed the %d px limit", seedanceAssetImageMaxDimension)
 	}
-	decoded, err := jpeg.Decode(bytes.NewReader(data))
+	release, err := acquireSeedanceImageDecode(ctx, config)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	decoded, err := jpeg.Decode(file)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decode progressive JPEG: %w", err)
 	}
-	var normalized bytes.Buffer
-	if err := jpeg.Encode(&normalized, decoded, &jpeg.Options{Quality: seedanceAssetJPEGQuality}); err != nil {
-		return 0, fmt.Errorf("failed to encode baseline JPEG: %w", err)
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	if int64(normalized.Len()) > maxSize {
-		return 0, fmt.Errorf("normalized Image asset exceeds the %s upload limit", SeedanceAssetUploadMaxSizeLabel("Image"))
+	if err := file.Close(); err != nil {
+		return 0, err
 	}
-
 	normalizedFile, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return 0, err
 	}
-	written, writeErr := normalizedFile.Write(normalized.Bytes())
+	encodeErr := jpeg.Encode(normalizedFile, decoded, &jpeg.Options{Quality: seedanceAssetJPEGQuality})
+	info, statErr := normalizedFile.Stat()
 	closeErr := normalizedFile.Close()
-	if writeErr != nil {
-		return 0, writeErr
+	if encodeErr != nil {
+		return 0, fmt.Errorf("failed to encode baseline JPEG: %w", encodeErr)
 	}
-	if written != normalized.Len() {
-		return 0, io.ErrShortWrite
+	if statErr != nil {
+		return 0, statErr
 	}
 	if closeErr != nil {
 		return 0, closeErr
 	}
-	return int64(written), nil
+	if info.Size() > maxSize {
+		return 0, fmt.Errorf("normalized Image asset exceeds the %d MB upload limit", maxSize>>20)
+	}
+	return info.Size(), nil
 }
 
 // StoreSeedanceAssetUpload 校验并规范化用户文件，再持久写入 OSS。
 // 本地文件只承担有界缓冲和图片转码，OSS 对象由用户手动删除素材时回收。
 func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, contentType, declaredType string, size int64, userID int) (*SeedanceAssetUpload, error) {
+	return storeSeedanceAssetUpload(ctx, reader, filename, contentType, declaredType, size, userID, 0)
+}
+
+// StoreSeedanceAssetURL 固化外部素材，避免账号同步依赖临时地址。
+func StoreSeedanceAssetURL(ctx context.Context, sourceURL, assetType string, userID int) (*SeedanceAssetUpload, error) {
+	if err := ValidateSeedanceAssetSourceURL(sourceURL); err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, seedanceAssetURLStoreTimeout)
+	defer cancel()
+	downloadCtx, cancelDownload := context.WithTimeout(ctx, seedanceAssetURLDownloadTimeout)
+	defer cancelDownload()
+	request, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := *GetSSRFProtectedHTTPClient()
+	client.Timeout = 0
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, errors.New("unable to fetch asset source")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("asset source returned status %d", response.StatusCode)
+	}
+	size := max(response.ContentLength, 0)
+	if size > SeedanceAssetMaxUploadSize(assetType) {
+		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+	}
+	if err := model.CheckSeedanceAssetCapacity(ctx, userID, size); err != nil {
+		return nil, err
+	}
+	return StoreSeedanceAssetUpload(ctx, response.Body, filepath.Base(parsed.Path), response.Header.Get("Content-Type"), assetType, size, userID)
+}
+
+// StoreSeedanceCompatImageUpload 使用兼容接口的独立图片上限。
+func StoreSeedanceCompatImageUpload(ctx context.Context, reader io.Reader, filename, contentType string, size int64, userID int) (*SeedanceAssetUpload, error) {
+	return storeSeedanceAssetUpload(ctx, reader, filename, contentType, "Image", size, userID, common.GetManagementRateLimits().AssetLimits.CompatImageMiB<<20)
+}
+
+func storeSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, contentType, declaredType string, size int64, userID int, imageLimit int64) (*SeedanceAssetUpload, error) {
 	assetType, err := inferSeedanceAssetType(filename, contentType, declaredType)
 	if err != nil {
 		return nil, err
 	}
 	maxSize := SeedanceAssetMaxUploadSize(assetType)
+	if assetType == "Image" && imageLimit > 0 {
+		maxSize = imageLimit
+	}
 	if size < 0 || size > maxSize {
-		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+		return nil, fmt.Errorf("%s asset exceeds the %d MB upload limit", assetType, maxSize>>20)
 	}
 	storage, err := privateAssetOSSStorageFactory()
 	if err != nil {
@@ -271,10 +408,10 @@ func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 		return nil, fmt.Errorf("seedance asset file is empty")
 	}
 	if written > maxSize {
-		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+		return nil, fmt.Errorf("%s asset exceeds the %d MB upload limit", assetType, maxSize>>20)
 	}
 	if assetType == "Image" {
-		written, err = normalizeSeedanceProgressiveJPEG(path, maxSize)
+		written, err = normalizeSeedanceProgressiveJPEG(ctx, path, maxSize)
 		if err != nil {
 			return nil, fmt.Errorf("failed to normalize Seedance image: %w", err)
 		}
@@ -525,6 +662,13 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 	if !isSeedanceAssetChannel(channel) {
 		return nil, fmt.Errorf("channel does not support Seedance assets")
 	}
+	settings := channel.GetSetting()
+	if err := settings.ValidateSeedanceAssetURL(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(settings.SeedanceAssetURL) == "" {
+		return nil, errors.New("configure the channel's complete Seedance asset service URL before using private assets")
+	}
 	var key string
 	if len(binding) == 0 {
 		selected, _, err := channel.GetNextEnabledKey()
@@ -559,16 +703,21 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 	if strings.TrimSpace(key) == "" {
 		return nil, fmt.Errorf("bound Seedance account is unavailable")
 	}
-	baseURL, assetPath := seedanceAssetEndpoint(channel)
+	baseURL := strings.TrimSpace(settings.SeedanceAssetURL)
 	keyFingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	account := SeedanceAssetAccountFingerprint(channel, keyFingerprint)
 	return &SeedanceAssetClient{
-		ChannelID:          channel.Id,
-		baseURL:            baseURL,
-		apiKey:             key,
-		path:               assetPath,
-		proxy:              channel.GetSetting().Proxy,
-		KeyFingerprint:     keyFingerprint,
-		AccountFingerprint: seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint),
+		ChannelID:           channel.Id,
+		baseURL:             baseURL,
+		apiKey:              key,
+		proxy:               channel.GetSetting().Proxy,
+		KeyFingerprint:      keyFingerprint,
+		AccountFingerprint:  account,
+		syncAccount:         account,
+		accountFingerprints: model.SeedanceAssetAccountFingerprints(channel, keyFingerprint),
+		sharedAccount:       settings.SeedanceAssetShareGroup != "",
+		jsonAction:          settings.TaskPluginKey == "anyllm",
+		originREST:          settings.TaskPluginKey == "originocean",
 	}, nil
 }
 
@@ -583,6 +732,10 @@ func NewSeedanceAssetClientForSelectedKey(channel *model.Channel, key string) (*
 
 // ResolveSeedanceAssetClient 使用仍启用且指向同一上游账号的渠道恢复旧素材绑定。
 func ResolveSeedanceAssetClient(ctx context.Context, channelID int, keyFingerprint, accountFingerprint string) (*SeedanceAssetClient, error) {
+	return resolveSeedanceAssetClient(ctx, channelID, keyFingerprint, accountFingerprint, true)
+}
+
+func resolveSeedanceAssetClient(ctx context.Context, channelID int, keyFingerprint, accountFingerprint string, allowSharedKey bool) (*SeedanceAssetClient, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -593,17 +746,30 @@ func ResolveSeedanceAssetClient(ctx context.Context, channelID int, keyFingerpri
 	expectedAccountFingerprint := strings.TrimSpace(accountFingerprint)
 	var originalChannel model.Channel
 	originalChannelErr := model.DB.WithContext(ctx).First(&originalChannel, "id = ?", channelID).Error
+	if originalChannelErr != nil && !errors.Is(originalChannelErr, gorm.ErrRecordNotFound) {
+		return nil, originalChannelErr
+	}
+	var unavailableErr error
 	if originalChannelErr == nil {
 		if expectedAccountFingerprint == "" {
 			expectedAccountFingerprint = SeedanceAssetAccountFingerprint(&originalChannel, keyFingerprint)
 		}
-		if client, err := NewSeedanceAssetClient(&originalChannel, keyFingerprint); err == nil &&
-			(expectedAccountFingerprint == "" || client.AccountFingerprint == expectedAccountFingerprint) {
+		client, err := NewSeedanceAssetClient(&originalChannel, keyFingerprint)
+		if err == nil &&
+			(expectedAccountFingerprint == "" || client.matchesAccountFingerprint(expectedAccountFingerprint) ||
+				model.SeedanceAssetModelScopeMatches(&originalChannel, keyFingerprint, expectedAccountFingerprint)) {
 			return client, nil
+		}
+		if seedanceAssetChannelHasBinding(&originalChannel, keyFingerprint, expectedAccountFingerprint) ||
+			(originalChannel.GetSetting().SeedanceAssetURL == "" && seedanceAssetChannelHasBinding(&originalChannel, keyFingerprint, "")) {
+			unavailableErr = err
 		}
 	}
 	if expectedAccountFingerprint == "" {
-		return nil, errors.New("bound Seedance account is unavailable")
+		if unavailableErr != nil {
+			return nil, unavailableErr
+		}
+		return nil, errSeedanceAssetAccountMissing
 	}
 
 	const batchSize = 100
@@ -611,78 +777,149 @@ func ResolveSeedanceAssetClient(ctx context.Context, channelID int, keyFingerpri
 	for {
 		var channels []*model.Channel
 		if err := model.DB.WithContext(ctx).
-			Where("id > ? AND status = ? AND type IN ?", lastID, common.ChannelStatusEnabled,
+			Where("id > ? AND type IN ?", lastID,
 				[]int{constant.ChannelTypeDoubaoVideo, constant.ChannelTypeTaskPlugin}).
 			Order("id asc").Limit(batchSize).Find(&channels).Error; err != nil {
 			return nil, err
 		}
 		for _, channel := range channels {
 			lastID = channel.Id
+			if allowSharedKey && model.SeedanceAssetSharedAccountMatches(channel, expectedAccountFingerprint) {
+				client, err := NewSeedanceAssetClient(channel)
+				if err == nil && client.matchesAccountFingerprint(expectedAccountFingerprint) {
+					return client, nil
+				}
+				if err != nil {
+					unavailableErr = err
+				}
+				continue
+			}
+			if !seedanceAssetChannelHasBinding(channel, keyFingerprint, expectedAccountFingerprint) {
+				continue
+			}
 			client, err := NewSeedanceAssetClient(channel, keyFingerprint)
-			if err == nil && client.AccountFingerprint == expectedAccountFingerprint {
+			if err == nil && client.matchesAccountFingerprint(expectedAccountFingerprint) {
 				return client, nil
+			}
+			if err != nil {
+				unavailableErr = err
 			}
 		}
 		if len(channels) < batchSize {
 			break
 		}
 	}
-	return nil, errors.New("no enabled Seedance channel matches the bound account")
+	if unavailableErr != nil {
+		return nil, unavailableErr
+	}
+	return nil, errSeedanceAssetAccountMissing
+}
+
+// 停用账号仍保留绑定，不能与已经移除的渠道或密钥混为一谈。
+func seedanceAssetChannelHasBinding(channel *model.Channel, keyFingerprint, accountFingerprint string) bool {
+	if !isSeedanceAssetChannel(channel) {
+		return false
+	}
+	for _, key := range channel.GetKeys() {
+		fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+		if (keyFingerprint == "" || fingerprint == keyFingerprint) &&
+			(accountFingerprint == "" || model.SeedanceAssetAccountFingerprintMatches(channel, fingerprint, accountFingerprint) ||
+				model.SeedanceAssetModelScopeMatches(channel, fingerprint, accountFingerprint)) {
+			return true
+		}
+	}
+	return false
 }
 
 // SeedanceAssetAccountFingerprint 生成不包含密钥明文、可跨同账号渠道复用的命名空间。
 func SeedanceAssetAccountFingerprint(channel *model.Channel, keyFingerprint string) string {
-	if channel == nil || strings.TrimSpace(keyFingerprint) == "" {
-		return ""
-	}
-	baseURL, assetPath := seedanceAssetEndpoint(channel)
-	return seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint)
+	return model.SeedanceAssetAccountFingerprint(channel, keyFingerprint)
 }
 
-func seedanceAssetEndpoint(channel *model.Channel) (string, string) {
-	baseURL := strings.TrimRight(channel.GetBaseURL(), "/")
-	parsed, err := url.Parse(baseURL)
-	// ShuYan 的素材 Action 挂在 /seedance 本身，其他上游按 /v2/assets 调用。
-	if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/seedance") {
-		return baseURL, ""
-	}
-	return baseURL, seedanceAssetNativeActionPath
+func (client *SeedanceAssetClient) matchesAccountFingerprint(fingerprint string) bool {
+	return fingerprint != "" && (client.AccountFingerprint == fingerprint || slices.Contains(client.accountFingerprints, fingerprint))
 }
 
 func seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(baseURL+"\x00"+assetPath+"\x00"+keyFingerprint)))
 }
 
-func (client *SeedanceAssetClient) call(ctx context.Context, action string, request any, response any) error {
-	return client.callAtPath(ctx, client.path, action, request, response)
-}
-
-func (client *SeedanceAssetClient) callAtPath(ctx context.Context, path, action string, request any, response any) error {
+func (client *SeedanceAssetClient) call(ctx context.Context, action string, request any, response any) (callErr error) {
+	defer func() {
+		if callErr == nil {
+			return
+		}
+		if client.jsonAction {
+			common.SysError("private asset action " + action + " failed: " + strings.ReplaceAll(callErr.Error(), client.apiKey, "[redacted]"))
+		}
+		if errors.Is(callErr, context.Canceled) {
+			return
+		}
+		if isSeedanceAssetServiceTemporary(callErr) {
+			callErr = &seedanceAssetTemporaryError{cause: callErr}
+			return
+		}
+		if !client.jsonAction {
+			return
+		}
+		if errors.Is(callErr, errSeedanceAssetResponse) {
+			callErr = fmt.Errorf("%w: Asset service returned an invalid response for %s", errSeedanceAssetResponse, action)
+			return
+		}
+		var upstream *seedanceAssetUpstreamError
+		if errors.As(callErr, &upstream) {
+			clean := *upstream
+			clean.message = "Asset service rejected " + action
+			if errors.Is(callErr, ErrSeedanceAssetNotFound) {
+				callErr = errors.Join(ErrSeedanceAssetNotFound, &clean)
+			} else {
+				callErr = &clean
+			}
+			return
+		}
+		callErr = errors.New("Asset service request failed for " + action)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	requestTimeout := seedanceAssetRequestTimeout
+	if client.jsonAction && action == "CreateAsset" {
+		// JSON Action 素材协议的导入同步等待处理，客户端期限按协议保留十分钟。
+		requestTimeout = seedanceAssetJSONImportTimeout
+	}
 	// 请求级截止时间覆盖直连、代理、响应头及响应体读取，不依赖通用 Relay 超时。
-	ctx, cancel := context.WithTimeout(ctx, seedanceAssetRequestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	requestURL := client.baseURL
-	var err error
-	if path != "" {
-		requestURL, err = url.JoinPath(client.baseURL, strings.TrimLeft(path, "/"))
-		if err != nil {
-			return err
-		}
-	}
 	parsedURL, err := url.Parse(requestURL)
 	if err != nil {
 		return err
 	}
-	query := parsedURL.Query()
-	query.Set("Action", action)
-	query.Set("Version", "2024-01-01")
-	parsedURL.RawQuery = query.Encode()
 	body, err := common.Marshal(request)
 	if err != nil {
 		return err
+	}
+	if client.jsonAction {
+		var fields map[string]json.RawMessage
+		if err := common.Unmarshal(body, &fields); err != nil {
+			return err
+		}
+		if fields == nil {
+			return errors.New("asset Action request must be a JSON object")
+		}
+		fields["Action"], err = common.Marshal(action)
+		if err != nil {
+			return err
+		}
+		body, err = common.Marshal(fields)
+		if err != nil {
+			return err
+		}
+	} else {
+		query := parsedURL.Query()
+		query.Set("Action", action)
+		query.Set("Version", "2024-01-01")
+		parsedURL.RawQuery = query.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parsedURL.String(), bytes.NewReader(body))
 	if err != nil {
@@ -699,6 +936,7 @@ func (client *SeedanceAssetClient) callAtPath(ctx context.Context, path, action 
 	}
 	// Action 请求禁止重定向，防止携带账号凭证跨目标发送或被导向私网。
 	requestClient := *httpClient
+	requestClient.Timeout = requestTimeout
 	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := requestClient.Do(req)
 	if err != nil {
@@ -717,28 +955,48 @@ func (client *SeedanceAssetClient) callAtPath(ctx context.Context, path, action 
 	if len(raw) > seedanceAssetResponseBodyLimit {
 		return fmt.Errorf("seedance asset API response body exceeds %d bytes", seedanceAssetResponseBodyLimit)
 	}
-	var envelope seedanceAssetResponse
+	var envelope seedanceAssetResponseEnvelope
 	decodeErr := common.Unmarshal(raw, &envelope)
 	if decodeErr == nil {
 		if err := envelope.businessError(); err != nil {
-			// 上游可能回显凭证，保持资源不存在语义但过滤实际账号密钥。
-			message := strings.ReplaceAll(err.Error(), client.apiKey, "[redacted]")
-			if errors.Is(err, ErrSeedanceAssetNotFound) {
-				return fmt.Errorf("%w: %s", ErrSeedanceAssetNotFound, message)
+			var upstream *seedanceAssetUpstreamError
+			if !errors.As(err, &upstream) {
+				return errors.New(strings.ReplaceAll(err.Error(), client.apiKey, "[redacted]"))
 			}
-			return errors.New(message)
+			clean := *upstream
+			clean.action = action
+			clean.httpStatus = resp.StatusCode
+			clean.message = strings.ReplaceAll(clean.message, client.apiKey, "[redacted]")
+			// 兼容旧代理把稳定错误码嵌入消息、但留空 code 的返回。
+			if action == "GetVisualValidateResult" && clean.code == "" {
+				for word := range strings.FieldsSeq(clean.message) {
+					candidate := strings.Trim(word, "()[]{}:;,\"")
+					code, _, _ := strings.Cut(candidate, ".")
+					if strings.EqualFold(code, "NotFound") {
+						clean.code = candidate
+						break
+					}
+				}
+			}
+			if errors.Is(err, ErrSeedanceAssetNotFound) {
+				return errors.Join(ErrSeedanceAssetNotFound, &clean)
+			}
+			return &clean
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return seedanceAssetHTTPError(resp.StatusCode, raw, client.apiKey)
 	}
 	if decodeErr != nil {
-		return seedanceAssetInvalidJSONError(resp.StatusCode, resp.Header.Get("Content-Type"), raw, client.apiKey, decodeErr)
+		return errors.Join(errSeedanceAssetResponse, seedanceAssetInvalidJSONError(resp.StatusCode, resp.Header.Get("Content-Type"), raw, client.apiKey, decodeErr))
 	}
-	return common.Unmarshal(raw, response)
+	if err := common.Unmarshal(raw, response); err != nil {
+		return fmt.Errorf("%w: %w", errSeedanceAssetResponse, err)
+	}
+	return nil
 }
 
-type seedanceAssetResponse struct {
+type seedanceAssetResponseEnvelope struct {
 	Code             string              `json:"code"`
 	Message          string              `json:"message"`
 	Success          *bool               `json:"success"`
@@ -746,13 +1004,20 @@ type seedanceAssetResponse struct {
 	ResponseMetadata struct {
 		Error *seedanceAssetError `json:"Error"`
 	} `json:"ResponseMetadata"`
+}
+
+type seedanceAssetResponse struct {
+	seedanceAssetResponseEnvelope
 	Result struct {
-		ID         string `json:"Id"`
-		Status     string `json:"Status"`
-		URL        string `json:"URL"`
-		BytedToken string `json:"BytedToken"`
-		H5Link     string `json:"H5Link"`
-		GroupID    string `json:"GroupId"`
+		ID         string          `json:"Id"`
+		AssetID    string          `json:"AssetId"`
+		Status     string          `json:"Status"`
+		URL        string          `json:"URL"`
+		AssetType  json.RawMessage `json:"AssetType"`
+		BytedToken string          `json:"BytedToken"`
+		H5Link     string          `json:"H5Link"`
+		GroupID    string          `json:"GroupId"`
+		GroupType  string          `json:"GroupType"`
 	} `json:"Result"`
 	Data *seedanceAssetResponseData `json:"data"`
 }
@@ -773,9 +1038,13 @@ type seedanceAssetContent struct {
 
 // seedanceAssetResponseData 兼容素材接口和兼容代理返回的多层 data 结构。
 type seedanceAssetResponseData struct {
+	ID        string                     `json:"id"`
+	AssetID   string                     `json:"assetId"`
+	AssetIDV1 string                     `json:"asset_id"`
 	Status    string                     `json:"status"`
 	URL       string                     `json:"url"`
 	ResultURL string                     `json:"result_url"`
+	AssetType json.RawMessage            `json:"asset_type"`
 	Content   seedanceAssetContent       `json:"content"`
 	Data      *seedanceAssetResponseData `json:"data"`
 }
@@ -817,12 +1086,12 @@ func (response seedanceAssetResponse) previewURL() string {
 }
 
 // seedanceAssetBusinessError 提取不同 HTTP 状态下的业务失败，保留上游可操作的错误信息。
-func (response seedanceAssetResponse) businessError() error {
+func (response seedanceAssetResponseEnvelope) businessError() error {
 	if response.Error != nil {
 		return newSeedanceAssetBusinessError(response.Error.Code, response.Error.Message)
 	}
 	if response.ResponseMetadata.Error != nil {
-		response.Code, response.Message = response.ResponseMetadata.Error.Code, response.ResponseMetadata.Error.Message
+		return newSeedanceAssetBusinessError(response.ResponseMetadata.Error.Code, response.ResponseMetadata.Error.Message)
 	}
 	switch strings.ToLower(strings.TrimSpace(response.Code)) {
 	case "", "0", "ok", "success":
@@ -833,7 +1102,82 @@ func (response seedanceAssetResponse) businessError() error {
 	return newSeedanceAssetBusinessError(response.Code, response.Message)
 }
 
-// newSeedanceAssetBusinessError 将上游错误码映射为本地可识别的错误，同时保留原始消息。
+type seedanceAssetUpstreamError struct {
+	code       string
+	message    string
+	action     string
+	httpStatus int
+}
+
+func (err *seedanceAssetUpstreamError) Error() string {
+	return "seedance asset API request failed: " + err.message
+}
+
+type seedanceAssetTemporaryError struct{ cause error }
+
+func (err *seedanceAssetTemporaryError) Error() string {
+	return ErrSeedanceAssetServiceTemporary.Error()
+}
+func (err *seedanceAssetTemporaryError) Unwrap() error { return err.cause }
+func (err *seedanceAssetTemporaryError) Is(target error) bool {
+	return target == ErrSeedanceAssetServiceTemporary
+}
+
+func isSeedanceAssetServiceTemporary(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	var mysqlError *mysqldriver.MySQLError
+	if errors.As(err, &mysqlError) && (mysqlError.Number == 1205 || mysqlError.Number == 1213 || mysqlError.Number == 2006 || mysqlError.Number == 2013) {
+		return true
+	}
+	var databaseError interface{ SQLState() string }
+	if errors.As(err, &databaseError) {
+		state := databaseError.SQLState()
+		if state == "40001" || state == "40P01" || strings.HasPrefix(state, "08") {
+			return true
+		}
+	}
+	if errors.Is(err, ErrSeedanceAssetServiceTemporary) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return true
+	}
+	var connectionError *net.OpError
+	if errors.As(err, &connectionError) {
+		var dnsError *net.DNSError
+		if errors.As(err, &dnsError) && dnsError.IsNotFound {
+			return false
+		}
+		return true
+	}
+	var upstream *seedanceAssetUpstreamError
+	if !errors.As(err, &upstream) {
+		return false
+	}
+	if upstream.httpStatus == http.StatusUnauthorized || upstream.httpStatus == http.StatusForbidden {
+		return false
+	}
+	code, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(upstream.code)), ".")
+	switch code {
+	case "notfound", "assetnotfound", "assetgroupnotfound", "resourcenotfound", "not_found", "invalidparameter", "invalidargument", "invalidrequest", "invalid_request_error", "validationerror", "unauthorized", "forbidden", "accessdenied", "permissiondenied", "permission_error", "authenticationerror", "invalid_api_key", "unsupportedaction", "unsupported_action", "unsupportedoperation", "unsupported_operation", "notimplemented":
+		return false
+	case "internalservicetimeout", "requesttimeout", "serviceunavailable", "temporarilyunavailable", "toomanyrequests", "throttling", "throttlingexception", "serveroverloaded", "600502":
+		return true
+	}
+	switch upstream.httpStatus {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// newSeedanceAssetBusinessError 保留业务错误码，避免调用方依赖可变的显示文案。
 func newSeedanceAssetBusinessError(code, message string) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -842,7 +1186,7 @@ func newSeedanceAssetBusinessError(code, message string) error {
 	if message == "" {
 		message = "upstream rejected operation"
 	}
-	err := fmt.Errorf("seedance asset API request failed: %s", message)
+	err := &seedanceAssetUpstreamError{code: strings.TrimSpace(code), message: message}
 	switch strings.ToLower(strings.TrimSpace(code)) {
 	case "assetnotfound", "assetgroupnotfound", "resourcenotfound", "resourcenotfound.asset", "resourcenotfound.assetgroup", "not_found":
 		return errors.Join(ErrSeedanceAssetNotFound, err)
@@ -858,12 +1202,15 @@ func seedanceAssetHTTPError(status int, body []byte, apiKey string) error {
 		message = message[:seedanceAssetErrorPreviewLimit] + "..."
 	}
 	if message == "" {
-		return fmt.Errorf("seedance asset API returned status %d", status)
+		return &seedanceAssetUpstreamError{httpStatus: status, message: fmt.Sprintf("seedance asset API returned status %d", status)}
 	}
-	return fmt.Errorf("seedance asset API returned status %d: %s", status, message)
+	return &seedanceAssetUpstreamError{httpStatus: status, message: fmt.Sprintf("seedance asset API returned status %d: %s", status, message)}
 }
 
 func seedanceAssetInvalidJSONError(status int, contentType string, body []byte, apiKey string, decodeErr error) error {
+	if strings.Contains(strings.ToLower(contentType), "text/html") {
+		return fmt.Errorf("seedance asset API returned invalid JSON (status %d, content-type %s): the configured asset service URL returned an HTML page; check the complete asset endpoint", status, contentType)
+	}
 	message := strings.TrimSpace(string(body))
 	message = strings.ReplaceAll(message, apiKey, "[redacted]")
 	if len(message) > seedanceAssetErrorPreviewLimit {
@@ -894,8 +1241,61 @@ func ValidateSeedanceAssetSourceURL(sourceURL string) error {
 	return ValidateSSRFProtectedFetchURL(sourceURL)
 }
 
+// DetectSeedanceAssetURLType 为省略类型的兼容请求确定上游必填的媒体类型。
+func DetectSeedanceAssetURLType(ctx context.Context, sourceURL string) (string, error) {
+	if err := ValidateSeedanceAssetSourceURL(sourceURL); err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(sourceURL)
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(filepath.Ext(parsed.Path)) {
+	case ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".gif", ".heic", ".heif", ".bmp":
+		return "Image", nil
+	case ".mp4", ".mov":
+		return "Video", nil
+	case ".wav", ".mp3":
+		return "Audio", nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Range", "bytes=0-511")
+	response, err := GetSSRFProtectedHTTPClient().Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		return "", fmt.Errorf("asset source returned status %d", response.StatusCode)
+	}
+	content, err := io.ReadAll(io.LimitReader(response.Body, 512))
+	if err != nil {
+		return "", err
+	}
+	for _, contentType := range []string{http.DetectContentType(content), response.Header.Get("Content-Type")} {
+		mediaType, _, _ := mime.ParseMediaType(contentType)
+		switch {
+		case strings.HasPrefix(mediaType, "image/"):
+			return "Image", nil
+		case strings.HasPrefix(mediaType, "video/"):
+			return "Video", nil
+		case strings.HasPrefix(mediaType, "audio/"):
+			return "Audio", nil
+		}
+	}
+	return "", errors.New("asset media type could not be determined")
+}
+
 // CreateSeedanceAsset 将公网资源提交给上游托管。
 func (client *SeedanceAssetClient) CreateSeedanceAsset(ctx context.Context, groupID, sourceURL, assetType, name string) (string, error) {
+	if client.originREST {
+		return client.createOriginAsset(ctx, sourceURL, assetType, name)
+	}
 	var response seedanceAssetResponse
 	err := client.call(ctx, "CreateAsset", map[string]string{"GroupId": groupID, "URL": sourceURL, "AssetType": assetType, "Name": name}, &response)
 	if err == nil {
@@ -907,8 +1307,87 @@ func (client *SeedanceAssetClient) CreateSeedanceAsset(ctx context.Context, grou
 	return response.Result.ID, err
 }
 
+func (client *SeedanceAssetClient) getSeedanceHumanGroupStatus(ctx context.Context, groupID string) (string, error) {
+	var response struct {
+		Result struct {
+			ID        string          `json:"Id"`
+			GroupType string          `json:"GroupType"`
+			Status    json.RawMessage `json:"Status"`
+		} `json:"Result"`
+	}
+	if err := client.call(ctx, "GetAssetGroup", map[string]string{"Id": groupID}, &response); err != nil {
+		return "", err
+	}
+	if response.Result.ID != groupID || !strings.EqualFold(response.Result.GroupType, "LivenessFace") {
+		return "", fmt.Errorf("%w: asset service returned an invalid verified group", errSeedanceAssetResponse)
+	}
+	// 原生组由认证结果确认，组详情不含审核状态；包装组仍必须显式返回状态。
+	if len(response.Result.Status) == 0 && strings.HasPrefix(groupID, seedanceNativeGroupIDPrefix) {
+		return "Active", nil
+	}
+	var status string
+	if len(response.Result.Status) == 0 || common.Unmarshal(response.Result.Status, &status) != nil {
+		return "", fmt.Errorf("%w: asset service returned no valid group status", errSeedanceAssetResponse)
+	}
+	status = strings.TrimSpace(status)
+	if status == "" || len(status) > 32 {
+		return "", fmt.Errorf("%w: asset service returned no valid group status", errSeedanceAssetResponse)
+	}
+	return status, nil
+}
+
+func seedanceHumanGroupStatusError(status string) error {
+	switch strings.ToLower(status) {
+	case "active":
+		return nil
+	case "failed", "rejected", "disabled", "deleted":
+		return ErrSeedanceAssetValidationFailed
+	default:
+		return ErrSeedanceAssetGroupPending
+	}
+}
+
+// EnsureSeedanceAssetGroupReady 在接收原件前核实真人组，防止旧的 Active 记录绕过上游就绪检查。
+func EnsureSeedanceAssetGroupReady(ctx context.Context, client *SeedanceAssetClient, group *model.SeedanceAssetGroup) error {
+	if !client.jsonAction || !strings.EqualFold(group.GroupType, "LivenessFace") {
+		return nil
+	}
+	status, err := client.getSeedanceHumanGroupStatus(ctx, group.GroupID)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(status, "Active") {
+		status = "Active"
+	}
+	if status != group.Status {
+		result := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroup{}).
+			Where("id = ? AND user_id = ? AND status <> ?", group.ID, group.UserID, "Deleting").Update("status", status)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			// MySQL 的同值更新可返回零行；并发检查已写入相同状态时仍视为成功。
+			var current model.SeedanceAssetGroup
+			readErr := model.DB.WithContext(ctx).Select("status").Where("id = ? AND user_id = ?", group.ID, group.UserID).First(&current).Error
+			if errors.Is(readErr, gorm.ErrRecordNotFound) || current.Status == "Deleting" {
+				return model.ErrSeedanceAssetUnavailable
+			}
+			if readErr != nil {
+				return readErr
+			}
+			group.Status = current.Status
+			return seedanceHumanGroupStatusError(current.Status)
+		}
+		group.Status = status
+	}
+	return seedanceHumanGroupStatusError(status)
+}
+
 // CreateSeedanceAssetGroup 创建上游素材组并返回组 ID；GroupType 由上游决定是否支持。
 func (client *SeedanceAssetClient) CreateSeedanceAssetGroup(ctx context.Context, name, groupType string, response any) error {
+	if client.originREST {
+		return createOriginLocalAssetGroup(groupType, response)
+	}
 	request := map[string]string{"Name": name}
 	// GroupType 不做本地枚举校验，避免把上游新增或渠道自定义类型拦截在网关内。
 	if groupType != "" {
@@ -917,26 +1396,102 @@ func (client *SeedanceAssetClient) CreateSeedanceAssetGroup(ctx context.Context,
 	return client.call(ctx, "CreateAssetGroup", request, response)
 }
 
-// GetSeedanceAsset 查询上游素材审核状态及审核通过后的临时预览地址。
-func (client *SeedanceAssetClient) GetSeedanceAsset(ctx context.Context, assetID string) (string, string, error) {
+type SeedanceAssetDetails struct {
+	ID         string
+	Status     string
+	PreviewURL string
+	AssetType  string
+}
+
+// 上游可选类型的格式异常不改变素材状态。
+func seedanceAssetOptionalType(assetType json.RawMessage) string {
+	var kind string
+	if common.Unmarshal(assetType, &kind) != nil {
+		return ""
+	}
+	kind = strings.TrimSpace(kind)
+	if kind != "Image" && kind != "Video" && kind != "Audio" {
+		return ""
+	}
+	return kind
+}
+
+// UpdateValues 只保存上游实际返回的素材详情。
+func (details SeedanceAssetDetails) UpdateValues(primary bool) map[string]any {
+	values := map[string]any{"status": details.Status}
+	if details.PreviewURL != "" {
+		values["preview_url"] = details.PreviewURL
+	}
+	if primary && details.AssetType != "" {
+		values["asset_type"] = details.AssetType
+	}
+	return values
+}
+
+// GetSeedanceAssetDetails 查询素材状态、预览及类型。
+func (client *SeedanceAssetClient) GetSeedanceAssetDetails(ctx context.Context, assetID string) (SeedanceAssetDetails, error) {
+	if client.originREST {
+		return client.getOriginAsset(ctx, assetID)
+	}
 	var response seedanceAssetResponse
 	err := client.call(ctx, "GetAsset", map[string]string{"Id": assetID}, &response)
 	if err != nil {
-		return "", "", err
+		return SeedanceAssetDetails{}, err
 	}
 	if err := response.businessError(); err != nil {
-		return "", "", err
+		return SeedanceAssetDetails{}, err
 	}
 	// 查询错误或空响应不是审核结论，禁止用空状态覆盖已保存的状态。
 	status := response.status()
 	if status == "" {
-		return "", "", fmt.Errorf("seedance asset API returned no asset status")
+		return SeedanceAssetDetails{}, fmt.Errorf("seedance asset API returned no asset status")
 	}
-	return status, response.previewURL(), nil
+	details := SeedanceAssetDetails{ID: strings.TrimSpace(response.Result.ID), Status: status, PreviewURL: response.previewURL(), AssetType: seedanceAssetOptionalType(response.Result.AssetType)}
+	if details.ID == "" {
+		details.ID = strings.TrimSpace(response.Result.AssetID)
+	}
+	statusFound := strings.TrimSpace(response.Result.Status) != ""
+	for data := response.Data; data != nil; data = data.Data {
+		if !statusFound && strings.TrimSpace(data.Status) != "" {
+			statusFound = true
+			if details.ID == "" {
+				for _, id := range []string{data.ID, data.AssetID, data.AssetIDV1} {
+					if details.ID = strings.TrimSpace(id); details.ID != "" {
+						break
+					}
+				}
+			}
+		}
+		if details.AssetType == "" {
+			details.AssetType = seedanceAssetOptionalType(data.AssetType)
+		}
+	}
+	return details, nil
+}
+
+// GetCheckedSeedanceAssetDetails 拒绝与请求素材 ID 不一致的审核结果。
+func (client *SeedanceAssetClient) GetCheckedSeedanceAssetDetails(ctx context.Context, assetID string) (SeedanceAssetDetails, error) {
+	details, err := client.GetSeedanceAssetDetails(ctx, assetID)
+	if err != nil {
+		return SeedanceAssetDetails{}, err
+	}
+	if details.ID != "" && details.ID != assetID {
+		return SeedanceAssetDetails{}, fmt.Errorf("%w: asset service returned a different asset", errSeedanceAssetResponse)
+	}
+	return details, nil
+}
+
+// GetSeedanceAsset 保留既有调用方的状态和预览接口。
+func (client *SeedanceAssetClient) GetSeedanceAsset(ctx context.Context, assetID string) (string, string, error) {
+	details, err := client.GetSeedanceAssetDetails(ctx, assetID)
+	return details.Status, details.PreviewURL, err
 }
 
 // DeleteSeedanceAsset 删除上游素材。
 func (client *SeedanceAssetClient) DeleteSeedanceAsset(ctx context.Context, assetID string) error {
+	if client.originREST {
+		return client.deleteOriginAsset(ctx, assetID)
+	}
 	err := client.call(ctx, "DeleteAsset", map[string]string{"Id": assetID}, &struct{}{})
 	if isSeedanceAssetDeleteNotFoundError(err) {
 		return nil
@@ -946,6 +1501,9 @@ func (client *SeedanceAssetClient) DeleteSeedanceAsset(ctx context.Context, asse
 
 // DeleteSeedanceAssetGroup 删除上游素材组。
 func (client *SeedanceAssetClient) DeleteSeedanceAssetGroup(ctx context.Context, groupID string) error {
+	if client.originREST {
+		return nil
+	}
 	err := client.call(ctx, "DeleteAssetGroup", map[string]string{"Id": groupID}, &struct{}{})
 	if isSeedanceAssetDeleteNotFoundError(err) {
 		return nil
@@ -980,16 +1538,25 @@ func isSeedanceAssetDeleteNotFoundError(err error) bool {
 
 // UpdateSeedanceAssetGroup 更新上游素材组名称。
 func (client *SeedanceAssetClient) UpdateSeedanceAssetGroup(ctx context.Context, groupID, name string, response any) error {
+	if client.jsonAction {
+		return errors.New("upstream does not support renaming asset groups")
+	}
 	return client.call(ctx, "UpdateAssetGroup", map[string]string{"Id": groupID, "Name": name}, response)
 }
 
-// isSeedanceAssetChannel 同时识别旧渠道类型和目标架构的显式 Doubao 插件渠道。
+// SupportsGroupRename 区分远端改名与仅保存站内名称，避免调用上游未提供的 Action。
+func (client *SeedanceAssetClient) SupportsGroupRename() bool {
+	return !client.jsonAction && !client.originREST
+}
+
+// isSeedanceAssetChannel 识别支持站内 Seedance 素材映射的渠道。
 func isSeedanceAssetChannel(channel *model.Channel) bool {
 	switch channel.Type {
 	case constant.ChannelTypeDoubaoVideo:
 		return true
 	case constant.ChannelTypeTaskPlugin:
-		return channel.GetSetting().TaskPluginKey == "doubao"
+		key := channel.GetSetting().TaskPluginKey
+		return key == "doubao" || key == "anyllm" || key == "originocean"
 	default:
 		return false
 	}
@@ -1020,7 +1587,7 @@ func FindSeedanceAssetChannels() ([]*model.Channel, error) {
 		for _, channel := range channels {
 			lastID = channel.Id
 			lastPriority = channel.GetPriority()
-			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
+			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" || strings.TrimSpace(channel.GetSetting().SeedanceAssetURL) == "" {
 				continue
 			}
 			// 只检查可用密钥，不提前推进轮询索引；实际账号选择由客户端完成。
@@ -1039,7 +1606,7 @@ func FindSeedanceAssetChannels() ([]*model.Channel, error) {
 		}
 		if len(channels) < batchSize {
 			if len(result) == 0 {
-				return nil, fmt.Errorf("no enabled Seedance channel available")
+				return nil, ErrSeedanceAssetChannelUnavailable
 			}
 			return result, nil
 		}
@@ -1065,7 +1632,7 @@ func FindSeedanceAssetChannel() (*model.Channel, error) {
 		for _, channel := range channels {
 			lastID = channel.Id
 			lastPriority = channel.GetPriority()
-			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" {
+			if !isSeedanceAssetChannel(channel) || channel.GetBaseURL() == "" || strings.TrimSpace(channel.GetSetting().SeedanceAssetURL) == "" {
 				continue
 			}
 			for index, key := range channel.GetKeys() {

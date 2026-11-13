@@ -3,6 +3,7 @@ package dto
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -719,6 +720,22 @@ func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
 	err = (&ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
+}
+
+func TestChannelSettingsValidateSeedanceAssetURL(t *testing.T) {
+	for _, value := range []string{"", "https://provider.example/", "https://provider.example/api/ark/assets", "http://127.0.0.1:3000/action"} {
+		assert.NoError(t, (&ChannelSettings{SeedanceAssetURL: value}).ValidateSeedanceAssetURL(), value)
+	}
+	for _, value := range []string{"/v2/assets", "https://user:secret@example.com/", "https://example.com/?Action=x", "https://example.com/#x", "file:///tmp/x", "https://example.com/?", " https://example.com/"} {
+		assert.Error(t, (&ChannelSettings{SeedanceAssetURL: value}).ValidateSeedanceAssetURL())
+	}
+	for _, value := range []string{"account-a", "共享组", strings.Repeat("a", 64)} {
+		assert.NoError(t, (&ChannelSettings{SeedanceAssetURL: "https://provider.example/", SeedanceAssetShareGroup: value}).ValidateSeedanceAssetURL())
+	}
+	for _, value := range []string{strings.Repeat("a", 65), " leading", "trailing ", "control\ncharacter"} {
+		assert.Error(t, (&ChannelSettings{SeedanceAssetURL: "https://provider.example/", SeedanceAssetShareGroup: value}).ValidateSeedanceAssetURL())
+	}
+	assert.Error(t, (&ChannelSettings{SeedanceAssetShareGroup: "account-a"}).ValidateSeedanceAssetURL())
 }
 
 func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {

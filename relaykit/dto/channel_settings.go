@@ -7,12 +7,16 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 type ChannelSettings struct {
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
+	SeedanceAssetURL          string `json:"seedance_asset_url,omitempty"`
+	SeedanceAssetShareGroup   string `json:"seedance_asset_share_group,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
 	Proxy                     string `json:"proxy"`
@@ -25,13 +29,48 @@ type ChannelSettings struct {
 	// channel serves every listed plugin's models while the request still pins
 	// the executing plugin. TaskPluginKey remains the single type-61 binding
 	// and stays valid on a New API channel as well.
-	TaskExtendPluginKeys []string `json:"task_extend_plugin_keys,omitempty"`
+	TaskExtendPluginKeys []string           `json:"task_extend_plugin_keys,omitempty"`
+	VideoRoutingRules    []VideoRoutingRule `json:"video_routing_rules,omitempty"`
 	// HTTPProtocol controls outbound HTTP version negotiation for this channel.
 	// Accepted values: "", "auto" (default), "http1".
 	HTTPProtocol string `json:"http_protocol,omitempty"`
 	// HTTP2ConnectionShards spreads HTTP/2 traffic across N independent transports
 	// (1-8). Zero/unset means 1. Ignored when HTTPProtocol is "http1".
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
+}
+
+type VideoRoutingRule struct {
+	Model       string   `json:"model"`
+	Mode        string   `json:"mode"`
+	Resolutions []string `json:"resolutions"`
+}
+
+func (s ChannelSettings) ValidateVideoRoutingRules() error {
+	if len(s.VideoRoutingRules) > 32 {
+		return fmt.Errorf("video routing accepts at most 32 model rules")
+	}
+	seen := make(map[string]bool)
+	for _, rule := range s.VideoRoutingRules {
+		name := strings.ToLower(strings.TrimSpace(rule.Model))
+		if name == "" || len(rule.Model) > 256 || rule.Model != strings.TrimSpace(rule.Model) || seen[name] {
+			return fmt.Errorf("video routing requires unique non-empty models")
+		}
+		seen[name] = true
+		if rule.Mode != "allow" && rule.Mode != "deny" {
+			return fmt.Errorf("video routing mode must be allow or deny")
+		}
+		if len(rule.Resolutions) == 0 || len(rule.Resolutions) > 4 {
+			return fmt.Errorf("video routing requires one or more resolutions")
+		}
+		resolutions := make(map[string]bool)
+		for _, resolution := range rule.Resolutions {
+			if !slices.Contains([]string{"480p", "720p", "1080p", "4k"}, resolution) || resolutions[resolution] {
+				return fmt.Errorf("video routing contains an invalid or repeated resolution")
+			}
+			resolutions[resolution] = true
+		}
+	}
+	return nil
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,
@@ -64,6 +103,29 @@ const (
 	HTTPProtocolHTTP1        = "http1"
 	MaxHTTP2ConnectionShards = 8
 )
+
+// ValidateSeedanceAssetURL 校验完整素材入口；操作参数由服务端追加，地址不携带凭证。
+func (s *ChannelSettings) ValidateSeedanceAssetURL() error {
+	group := s.SeedanceAssetShareGroup
+	if group != "" {
+		if utf8.RuneCountInString(group) > 64 || strings.TrimSpace(group) != group || s.SeedanceAssetURL == "" {
+			return fmt.Errorf("seedance_asset_share_group requires an asset service URL and at most 64 characters")
+		}
+		for _, character := range group {
+			if unicode.IsControl(character) {
+				return fmt.Errorf("seedance_asset_share_group must not contain control characters")
+			}
+		}
+	}
+	if s.SeedanceAssetURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(s.SeedanceAssetURL)
+	if err != nil || len(s.SeedanceAssetURL) > 2048 || strings.TrimSpace(s.SeedanceAssetURL) != s.SeedanceAssetURL || parsed == nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return fmt.Errorf("seedance_asset_url must be a complete HTTP(S) URL without credentials, query, or fragment")
+	}
+	return nil
+}
 
 // ValidateHTTPTransport validates save-time HTTP transport channel settings.
 func (s *ChannelSettings) ValidateHTTPTransport() error {

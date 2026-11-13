@@ -36,6 +36,15 @@ export const LEGACY_TASK_PLUGIN_KEYS: Readonly<
   55: 'sora',
 }
 
+export function supportsSeedanceAssetURL(
+  channelType: number,
+  pluginKey?: string
+): boolean {
+  return channelType === CHANNEL_TYPE_TASK_PLUGIN
+    ? pluginKey === 'doubao' || pluginKey === 'anyllm' || pluginKey === 'originocean'
+    : LEGACY_TASK_PLUGIN_KEYS[channelType] === 'doubao'
+}
+
 export function supportsChannelPluginExtensions(channelType: number): boolean {
   return (
     channelType !== CHANNEL_TYPE_TASK_PLUGIN &&

@@ -1,11 +1,13 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +49,51 @@ func TestTaskPluginUserTaskListFiltersAndCounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	assert.Equal(t, "h3-queued", tasks[0].TaskID)
+}
+
+func TestTaskResourceIndexIncludesPathsAddedDuringFlight(t *testing.T) {
+	truncateTables(t)
+	registry := jsplugin.NewRegistry()
+	plugin, err := registry.Register(`
+export const meta = {apiVersion:1,key:"resource-index-test",name:"Resource index",version:"2.0.0",author:{name:"Test"},models:["resource-model"],fetchMode:"per_task",resourcePaths:["old.id","new.id"]};
+export function buildSubmitRequest(){return {}} export function parseSubmitResponse(){return {taskId:"upstream"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`, jsplugin.Options{})
+	require.NoError(t, err)
+	previous := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = registry
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previous })
+	task := Task{TaskID: "resource-in-flight", UserId: 7, Platform: "resource-index-test", Action: "create", Status: TaskStatusQueued,
+		PrivateData: TaskPrivateData{Execution: &TaskExecutionSnapshot{ResourcePaths: []string{"old.id"}}}}
+	task.SetData(map[string]any{"old": map[string]any{"id": "old-resource"}, "new": map[string]any{"id": "new-resource"}})
+	require.NoError(t, DB.Create(&task).Error)
+	// 补建先越过未完成任务；任务终态必须自行写入新增路径。
+	require.NoError(t, BackfillTaskResourceIndexes(context.Background()))
+	assert.False(t, HasPendingTaskResourceIndexes())
+	task.Status = TaskStatusSuccess
+	won, err := task.UpdateWithStatus(TaskStatusQueued)
+	require.NoError(t, err)
+	require.True(t, won)
+	for _, reference := range []TaskPluginResourceReference{
+		{ID: "old-resource", Action: "create", Paths: []string{"old.id"}},
+		{ID: "new-resource", Action: "create", Paths: []string{"new.id"}},
+	} {
+		found, err := FindTaskPluginUserResource(t.Context(), 7, []constant.TaskPlatform{task.Platform}, reference, plugin.Meta)
+		require.NoError(t, err)
+		require.NotNil(t, found)
+		assert.Equal(t, task.ID, found.ID)
+		other, err := FindTaskPluginUserResource(t.Context(), 8, []constant.TaskPlatform{task.Platform}, reference, plugin.Meta)
+		require.NoError(t, err)
+		assert.Nil(t, other)
+	}
+
+	require.NoError(t, registry.Unregister(plugin.Meta.Key))
+	detached := Task{TaskID: "resource-detached", UserId: 7, Platform: "resource-index-test", Action: "create", Status: TaskStatusSuccess,
+		PrivateData: TaskPrivateData{Execution: &TaskExecutionSnapshot{ResourcePaths: []string{"old.id"}}}}
+	detached.SetData(map[string]any{"old": map[string]any{"id": "detached-resource"}})
+	require.NoError(t, DB.Create(&detached).Error)
+	var count int64
+	require.NoError(t, DB.Model(&TaskResource{}).Where("task_id = ? AND resource_key = ?", detached.ID, taskResourceKey("old.id", "detached-resource")).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
 }
 
 // 使用隔离表验证三种实际数据库的 JSON 服务等级、别名、时间边界和分页总数。

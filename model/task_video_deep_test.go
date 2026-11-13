@@ -23,7 +23,11 @@ func openVideoDeepDatabase(t *testing.T, prefix string) *gorm.DB {
 	if os.Getenv("VIDEO_DEEP_AUDIT") != "1" {
 		t.Skip("set VIDEO_DEEP_AUDIT=1 to use the isolated audit database")
 	}
-	db, err := gorm.Open(postgres.Open("host=127.0.0.1 port=25446 user=postgres dbname=doubao_native_test sslmode=disable"), &gorm.Config{
+	dsn := os.Getenv("TASK_PLUGIN_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = "host=127.0.0.1 port=25446 user=postgres dbname=doubao_native_test sslmode=disable"
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{TablePrefix: prefix}, Logger: logger.Default.LogMode(logger.Error),
 	})
 	require.NoError(t, err)
@@ -40,7 +44,7 @@ func openVideoDeepDatabase(t *testing.T, prefix string) *gorm.DB {
 	DB, common.RedisEnabled = db, false
 	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
 	initCol()
-	models := []any{&User{}, &Token{}, &Channel{}, &Task{}, &UserSubscription{}}
+	models := []any{&User{}, &Token{}, &Channel{}, &Task{}, &UserSubscription{}, &AccountingBatchReceipt{}}
 	require.NoError(t, db.AutoMigrate(models...))
 	t.Cleanup(func() {
 		assert.NoError(t, db.Migrator().DropTable(models...))

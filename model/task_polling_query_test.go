@@ -68,7 +68,7 @@ func TestTaskLegacyCredentialsEncryptOnWriteback(t *testing.T) {
 	assert.Equal(t, 8, task.PrivateData.TokenId)
 }
 
-// 状态索引优化不得遗漏可重试任务，也不能重新领取终态或进度已完成的任务。
+// 状态索引优化不得遗漏可重试任务，也不能重新领取终态任务。
 func TestVideoPollingQueryStatusBoundaries(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func TestVideoPollingQueryStatusBoundaries(t *testing.T) {
 		for _, progress := range []string{"0%", "100%"} {
 			task := Task{TaskID: fmt.Sprintf("%d-%s", i, progress), Status: status, Progress: progress, SubmitTime: 100}
 			require.NoError(t, db.Create(&task).Error)
-			if i < 6 && progress == "0%" {
+			if i < 6 {
 				pending = append(pending, task.ID)
 				expired = append(expired, task.ID)
 			}

@@ -20,6 +20,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestVideoQueryErrorsRemainUnconfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		body map[string]any
+	}{
+		{"vidu", map[string]any{"error": map[string]any{"code": "InvalidParameter", "message": "invalid query"}}},
+		{"alibaba", map[string]any{"code": "InvalidParameter", "message": "invalid query"}},
+		{"jimeng", map[string]any{"code": 10001, "message": "invalid query"}},
+		{"hailuo", map[string]any{"base_resp": map[string]any{"status_code": 1004, "status_msg": "invalid query"}}},
+		{"google", map[string]any{"error": map[string]any{"code": 400, "message": "invalid query"}}},
+		{"vertex-ai", map[string]any{"error": map[string]any{"code": 400, "message": "invalid query"}}},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			source, err := builtinplugins.Source(tc.key)
+			require.NoError(t, err)
+			plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: tc.key})
+			require.NoError(t, err)
+			_, err = plugin.Engine.Call(t.Context(), "parseTaskResult", map[string]any{"taskId": "upstream"}, tc.body)
+			require.Error(t, err)
+		})
+	}
+}
+
 // 保留可视化编辑器生成的零价项，复现线上 nil * 0，不能改用仅含有效字段的简化表达式。
 const h3VisualBillingExpression = `u("operation") == "generation" && u("resolution") == "768P" ? tier("generation:768P", u("seconds") * 0.5 + u("prompt_tokens") * 0 / 1000000 + u("completion_tokens") * 0 / 1000000 + max(u("input_images") - 5, 0) * 0.2 + u("input_video_seconds") * 0) : u("operation") == "generation" && u("resolution") == "2K" ? tier("generation:2K", u("seconds") * 0.8 + u("prompt_tokens") * 0 / 1000000 + u("completion_tokens") * 0 / 1000000 + max(u("input_images") - 5, 0) * 0.2 + u("input_video_seconds") * 0) : u("operation") == "regeneration" && u("resolution") == "2K" ? tier("regeneration:2K", u("seconds") * 0.3 + u("prompt_tokens") * 0 / 1000000 + u("completion_tokens") * 0 / 1000000 + max(u("input_images") - 5, 0) * 0.15 + u("input_video_seconds") * 0) : tier("context_ir", u("seconds") * 0 + u("prompt_tokens") * 23 / 1000000 + u("completion_tokens") * 5.8 / 1000000 + u("input_images") * 0 + u("input_video_seconds") * 0)`
 

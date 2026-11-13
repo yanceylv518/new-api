@@ -21,6 +21,7 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 	var delta int
 	var tokenKey string
 	var wallet bool
+	var final Task
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var stored Task
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
@@ -58,18 +59,11 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 					return fmt.Errorf("video task wallet unavailable or quota limit exceeded")
 				}
 			} else {
-				var subscription UserSubscription
-				if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", stored.PrivateData.SubscriptionId, stored.UserId).First(&subscription).Error; err != nil {
-					return err
+				periodStart := stored.PrivateData.SubscriptionPeriodStart
+				if periodStart == 0 {
+					periodStart = stored.SubmitTime
 				}
-				if delta > 0 && subscription.AmountUsed > math.MaxInt64-int64(delta) {
-					return fmt.Errorf("subscription quota overflow")
-				}
-				used := max(subscription.AmountUsed+int64(delta), 0)
-				if subscription.AmountTotal > 0 && used > subscription.AmountTotal {
-					return fmt.Errorf("subscription quota exceeded")
-				}
-				if err := tx.Model(&subscription).Update("amount_used", used).Error; err != nil {
+				if err := postConsumeUserSubscriptionDeltaTx(tx, stored.PrivateData.SubscriptionId, int64(delta), periodStart, stored.UserId); err != nil {
 					return err
 				}
 				result := tx.Model(&User{}).Where("id = ?", stored.UserId).Update("used_quota", gorm.Expr("used_quota + ?", delta))
@@ -106,8 +100,11 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			}
 		}
 		// 复制后更新，回滚不能把调用方预扣快照误改成已结算额度。
-		final := *task
+		final = *task
 		final.Quota = actualQuota
+		final.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
+		final.PrivateData.SubmissionFundsCommitted = stored.PrivateData.SubmissionFundsCommitted
+		final.PrivateData.ResponsesBackground = stored.PrivateData.ResponsesBackground || final.PrivateData.ResponsesBackground
 		result := tx.Model(&final).Where("status = ? AND quota = ?", fromStatus, stored.Quota).Select("*").Updates(&final)
 		if result.Error != nil {
 			return result.Error
@@ -138,7 +135,7 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 	if err != nil || !won {
 		return false, err
 	}
-	task.Quota = actualQuota
+	*task = final
 	// 单次Lua同时更新两个缓存；失败保留标记，下次读取/预扣会先恢复而不是使用旧余额。
 	if delta != 0 && common.RedisEnabled {
 		flag := "0"
@@ -157,11 +154,29 @@ func FinalizeVideoTask(ctx context.Context, task *Task, fromStatus TaskStatus, a
 }
 
 // CommitTaskInitialAccounting 将初始统计和待入账标记一起提交，恢复或重放不会重复增加用量。
-func CommitTaskInitialAccounting(ctx context.Context, task *Task) (bool, error) {
+func CommitTaskInitialAccounting(ctx context.Context, task *Task, initialLogs ...*Log) (bool, error) {
 	var stored Task
 	updated := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if stored.PrivateData.InitialAccountingPending && (stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure) && !stored.PrivateData.SubmissionFundsCommitted {
+			return fmt.Errorf("terminal task submission funding is unconfirmed")
+		}
+		if stored.PrivateData.SubmissionFunding != nil {
+			return fmt.Errorf("task submission funding handoff is pending")
+		}
+		if stored.PrivateData.InitialAccountingPending {
+			if task.Quota != stored.Quota || task.ChannelId != stored.ChannelId || !sameTaskAmounts(task.PrivateData.DiscountAmounts, stored.PrivateData.DiscountAmounts) {
+				return fmt.Errorf("task initial accounting snapshot changed; retry with current task")
+			}
+			if len(initialLogs) > 0 && initialLogs[0] != nil && (initialLogs[0].UserId != stored.UserId || initialLogs[0].Quota != stored.Quota) {
+				return fmt.Errorf("task initial accounting log does not match current task")
+			}
+		}
+		// 同事务消费恢复标记；失败回滚保留入口，独立日志库随后写入完整日志。
+		if err := tx.Where("task_id = ? AND kind = ?", -stored.ID, videoLogKindAccounting).Delete(&VideoTaskPendingLog{}).Error; err != nil {
 			return err
 		}
 		if !stored.PrivateData.InitialAccountingPending {
@@ -181,6 +196,22 @@ func CommitTaskInitialAccounting(ctx context.Context, task *Task) (bool, error) 
 		if err := tx.Model(&Channel{}).Where("id = ?", stored.ChannelId).Update("used_quota", gorm.Expr("used_quota + ?", before)).Error; err != nil {
 			return err
 		}
+		if len(initialLogs) > 0 && initialLogs[0] != nil {
+			log := initialLogs[0]
+			if LOG_DB == DB {
+				if err := tx.Create(log).Error; err != nil {
+					return err
+				}
+			} else {
+				payload, err := common.Marshal(log)
+				if err != nil {
+					return err
+				}
+				if err := tx.Create(&VideoTaskPendingLog{TaskID: -stored.ID, Payload: string(payload)}).Error; err != nil {
+					return err
+				}
+			}
+		}
 		stored.PrivateData.InitialAccountingPending = false
 		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error; err != nil {
 			return err
@@ -194,10 +225,41 @@ func CommitTaskInitialAccounting(ctx context.Context, task *Task) (bool, error) 
 	return updated, err
 }
 
+// TaskSubmissionFunding 指定提交交接时已预扣的额度和令牌调整范围。
+type TaskSubmissionFunding struct {
+	ReservedQuota int  `json:"reserved_quota"`
+	UpdateToken   bool `json:"update_token"`
+}
+
+// ImmediateTaskFunding 保持已有调用兼容。
+type ImmediateTaskFunding = TaskSubmissionFunding
+
+// ReplaceTaskSubmissionIntent 在重试渠道前原子替换已拒绝的意图，不能先删除唯一的预扣恢复记录。
+func ReplaceTaskSubmissionIntent(ctx context.Context, previous, next *Task) error {
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", previous.ID, previous.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if stored.Status != TaskStatusUnknown || !stored.PrivateData.SubmissionPending || stored.TaskID != next.TaskID || stored.UserId != next.UserId {
+			return fmt.Errorf("task submission intent is no longer replaceable")
+		}
+		next.ID, next.CreatedAt = stored.ID, stored.CreatedAt
+		next.PrivateData.SubmissionFunding = stored.PrivateData.SubmissionFunding
+		if err := tx.Delete(&stored).Error; err != nil {
+			return err
+		}
+		return tx.Create(next).Error
+	})
+}
+
 // PersistTaskSubmission 交接提交结果时保留数据库中的入账标记，旧请求快照不能重新打开已完成的初始入账。
-func PersistTaskSubmission(ctx context.Context, task *Task, complete bool) (bool, error) {
+func PersistTaskSubmission(ctx context.Context, task *Task, complete bool, funding ...TaskSubmissionFunding) (bool, error) {
 	var final Task
 	won := false
+	var delta int
+	var tokenKey string
+	var wallet bool
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var stored Task
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
@@ -213,6 +275,34 @@ func PersistTaskSubmission(ctx context.Context, task *Task, complete bool) (bool
 			final = *task
 			final.CreatedAt, final.TaskID = stored.CreatedAt, stored.TaskID
 			final.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
+			submissionFunding := stored.PrivateData.SubmissionFunding
+			if len(funding) > 0 {
+				if submissionFunding != nil && *submissionFunding != funding[0] {
+					return fmt.Errorf("task submission reservation changed")
+				}
+				submissionFunding = &funding[0]
+			}
+			if submissionFunding != nil {
+				reserved := submissionFunding.ReservedQuota
+				if reserved < final.Quota || reserved > common.MaxQuota {
+					return fmt.Errorf("invalid task submission reservation")
+				}
+				delta = final.Quota - reserved
+				if delta != 0 {
+					var err error
+					wallet, tokenKey, err = refundTaskSubmissionFunding(ctx, tx, &stored, reserved, final.Quota, submissionFunding.UpdateToken)
+					if err != nil {
+						return err
+					}
+				}
+				final.PrivateData.SubmissionFundsCommitted = true
+			}
+			final.PrivateData.SubmissionFunding = nil
+			if final.PrivateData.InitialAccountingPending && final.PrivateData.SubmissionFundsCommitted && (final.Status == TaskStatusSuccess || final.Status == TaskStatusFailure) {
+				if err := queueTaskInitialAccounting(tx, final.ID); err != nil {
+					return err
+				}
+			}
 			if !stored.PrivateData.InitialAccountingPending {
 				delta := final.Quota - stored.Quota
 				if delta != 0 {
@@ -229,10 +319,28 @@ func PersistTaskSubmission(ctx context.Context, task *Task, complete bool) (bool
 			}
 		} else {
 			final = stored
+			if funding := stored.PrivateData.SubmissionFunding; funding != nil {
+				if funding.ReservedQuota < stored.Quota || funding.ReservedQuota > common.MaxQuota || stored.Quota < 0 {
+					return fmt.Errorf("invalid task submission reservation")
+				}
+				delta = stored.Quota - funding.ReservedQuota
+				if delta != 0 {
+					var err error
+					wallet, tokenKey, err = refundTaskSubmissionFunding(ctx, tx, &stored, funding.ReservedQuota, stored.Quota, funding.UpdateToken)
+					if err != nil {
+						return err
+					}
+				}
+				final.PrivateData.SubmissionFunding = nil
+				final.PrivateData.SubmissionFundsCommitted = true
+			}
 			final.PrivateData.SubmissionResponse, final.PrivateData.SubmissionContext = task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext
 			final.PrivateData.ReconciliationRequired, final.PrivateData.ReconciliationReason, final.PrivateData.NextPollAt = true, task.PrivateData.ReconciliationReason, 0
 		}
 		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Select("*").Updates(&final).Error; err != nil {
+			return err
+		}
+		if err := saveTaskResourceIndex(tx, &final); err != nil {
 			return err
 		}
 		won = true
@@ -240,6 +348,96 @@ func PersistTaskSubmission(ctx context.Context, task *Task, complete bool) (bool
 	})
 	if err == nil && won {
 		*task = final
+		if delta != 0 && common.RedisEnabled {
+			flag, cacheKey := "0", ""
+			if wallet {
+				flag = "1"
+			}
+			if tokenKey != "" {
+				cacheKey = getTokenCacheKey(tokenKey)
+			}
+			if cacheErr := applyVideoQuotaCache(ctx, task.UserId, task.ID, -delta, flag, cacheKey); cacheErr != nil {
+				common.SysError("task submission cache synchronization pending: " + cacheErr.Error())
+			}
+		}
 	}
 	return won, err
+}
+
+// refundTaskSubmissionFunding 与提交交接同事务退还预扣差额，统计仍由初始记账负责。
+func refundTaskSubmissionFunding(ctx context.Context, tx *gorm.DB, task *Task, reserved, actual int, updateToken bool) (bool, string, error) {
+	delta := actual - reserved
+	wallet := task.PrivateData.BillingSource != "subscription" || task.PrivateData.SubscriptionId <= 0
+	if wallet {
+		result := tx.Model(&User{}).Where("id = ? AND quota <= ?", task.UserId, common.MaxWalletQuota+int64(delta)).
+			Update("quota", gorm.Expr("quota - ?", delta))
+		if result.Error != nil {
+			return false, "", result.Error
+		}
+		if result.RowsAffected != 1 {
+			return false, "", fmt.Errorf("immediate task wallet unavailable or quota limit exceeded")
+		}
+	} else {
+		periodStart := task.PrivateData.SubscriptionPeriodStart
+		if periodStart == 0 {
+			periodStart = task.SubmitTime
+		}
+		if err := postConsumeUserSubscriptionDeltaTx(tx, task.PrivateData.SubscriptionId, int64(delta), periodStart, task.UserId); err != nil {
+			return false, "", err
+		}
+		var user User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", task.UserId).First(&user).Error; err != nil {
+			return false, "", err
+		}
+	}
+	var tokenKey string
+	if updateToken && task.PrivateData.TokenId > 0 {
+		var token Token
+		err := tx.Where("id = ? AND user_id = ?", task.PrivateData.TokenId, task.UserId).First(&token).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, "", err
+		}
+		if err == nil {
+			tokenKey = token.Key
+			if err := tx.Model(&token).Updates(map[string]any{"remain_quota": gorm.Expr("remain_quota - ?", delta), "used_quota": gorm.Expr("used_quota + ?", delta), "accessed_time": common.GetTimestamp()}).Error; err != nil {
+				return false, "", err
+			}
+		}
+	}
+	cacheTask := *task
+	cacheTask.Quota = reserved
+	if err := prepareVideoQuotaCache(ctx, tx, &cacheTask, actual, wallet, tokenKey); err != nil {
+		return false, "", err
+	}
+	return wallet, tokenKey, nil
+}
+
+// ConfirmTaskSubmissionFunds 在既有结算成功后开放终态任务的初始记账重试。
+func ConfirmTaskSubmissionFunds(ctx context.Context, task *Task) error {
+	var confirmed bool
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if !stored.PrivateData.InitialAccountingPending {
+			return nil
+		}
+		if stored.Status != TaskStatusSuccess && stored.Status != TaskStatusFailure {
+			return fmt.Errorf("task submission is not terminal")
+		}
+		stored.PrivateData.SubmissionFundsCommitted = true
+		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error; err != nil {
+			return err
+		}
+		if err := queueTaskInitialAccounting(tx, stored.ID); err != nil {
+			return err
+		}
+		confirmed = true
+		return nil
+	})
+	if err == nil && confirmed {
+		task.PrivateData.SubmissionFundsCommitted = true
+	}
+	return err
 }

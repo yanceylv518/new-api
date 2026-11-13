@@ -186,7 +186,8 @@ func TestNewAPIChannelNativeActionRequiresCurrentPluginBinding(t *testing.T) {
 			user := &model.User{Id: 7, Username: "native-gateway-owner", Quota: 927, UsedQuota: 73}
 			require.NoError(t, model.DB.Create(user).Error)
 			setting := `{"task_extend_plugin_keys":["doubao"]}`
-			channel := &model.Channel{Type: constant.ChannelTypeNewAPI, Key: "sk-fixture-native", Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL, Setting: &setting, UsedQuota: 73}
+			baseURL := upstream.URL + "/doubao"
+			channel := &model.Channel{Type: constant.ChannelTypeNewAPI, Key: "sk-fixture-native", Status: common.ChannelStatusEnabled, BaseURL: &baseURL, Setting: &setting, UsedQuota: 73}
 			require.NoError(t, model.DB.Create(channel).Error)
 			task := &model.Task{TaskID: "gateway-public", UserId: 7, Platform: "doubao", ChannelId: channel.Id, Status: status, Progress: "0%", Quota: 73, Properties: model.Properties{OriginModelName: "doubao-seedance-2-0-260128"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-private"}}
 			require.NoError(t, model.DB.Create(task).Error)
@@ -245,13 +246,15 @@ func setupNativeActionTestDB(t *testing.T) {
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	t.Cleanup(func() {
+		defer func() {
+			model.DB = previousDB
+			model.LOG_DB = previousLogDB
+			common.MemoryCacheEnabled = previousMemoryCache
+			common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
+			common.SetDatabaseTypes(previousMain, previousLog)
+		}()
 		// 异步指标仍会读取全局缓存配置，结束后才能还原测试环境。
 		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
-		model.DB = previousDB
-		model.LOG_DB = previousLogDB
-		common.MemoryCacheEnabled = previousMemoryCache
-		common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
-		common.SetDatabaseTypes(previousMain, previousLog)
 	})
 }
 
@@ -320,8 +323,15 @@ func TestRelayTaskPluginNativeActionCancellationRefundFailure(t *testing.T) {
 
 func nativeActionTestPlugin(t *testing.T, source string) *pluginruntime.LoadedPlugin {
 	t.Helper()
-	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	registry := pluginruntime.NewRegistry()
+	plugin, err := registry.Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
+	if len(plugin.Meta.ResourcePaths) > 0 {
+		previous := pluginruntime.DefaultRegistry
+		pluginruntime.DefaultRegistry = registry
+		t.Cleanup(func() { pluginruntime.DefaultRegistry = previous })
+		require.NoError(t, model.BackfillTaskResourceIndexes(t.Context()))
+	}
 	return plugin
 }
 
@@ -514,7 +524,7 @@ func TestRelayTaskPluginNativeActionPreservesUpstreamErrors(t *testing.T) {
 
 // 方舟的空成功响应必须通过二次查询区分取消和删除，404 不能触发失败退款。
 func TestDoubaoNativeDeletionConfirmation(t *testing.T) {
-	for _, scenario := range []string{"cancelled", "completed", "deleted_during_completion", "confirmation_unavailable", "running_rejected"} {
+	for _, scenario := range []string{"cancelled", "completed", "completed_missing", "deleted_during_completion", "confirmation_unavailable", "running_rejected"} {
 		t.Run(scenario, func(t *testing.T) {
 			setupNativeActionTestDB(t)
 			service.InitHttpClient()
@@ -526,6 +536,10 @@ func TestDoubaoNativeDeletionConfirmation(t *testing.T) {
 				assert.Equal(t, "/api/v3/contents/generations/tasks/upstream-id", r.URL.Path)
 				if r.Method == http.MethodDelete {
 					deletes++
+					if scenario == "completed_missing" {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
 					if scenario == "running_rejected" {
 						w.WriteHeader(400)
 						_, _ = w.Write([]byte(`{"error":{"code":"InvalidTaskState","message":"Running tasks cannot be cancelled"}}`))
@@ -554,7 +568,7 @@ func TestDoubaoNativeDeletionConfirmation(t *testing.T) {
 			require.NoError(t, model.DB.Create(channel).Error)
 			task := &model.Task{TaskID: "public-id", UserId: user.Id, ChannelId: channel.Id, Platform: "doubao", Status: model.TaskStatusQueued, Quota: 100,
 				Properties: model.Properties{OriginModelName: "doubao-seedance-2-0-260128"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-id"}}
-			if scenario == "completed" {
+			if scenario == "completed" || scenario == "completed_missing" {
 				task.Status = model.TaskStatusSuccess
 			}
 			require.NoError(t, model.DB.Create(task).Error)
@@ -582,10 +596,34 @@ func TestDoubaoNativeDeletionConfirmation(t *testing.T) {
 				assert.Equal(t, 900, user.Quota)
 				assert.Equal(t, 100, task.Quota)
 				switch scenario {
-				case "completed":
+				case "completed", "completed_missing":
 					assert.Equal(t, 200, recorder.Code)
 					assert.JSONEq(t, `{}`, recorder.Body.String())
 					assert.Zero(t, queries)
+					assert.True(t, task.PrivateData.NativeDeleted)
+					assert.True(t, task.ResultRetrievable(), "本地通用结果及账务历史继续保留")
+					count, err := model.CountTaskPluginUserTasks(user.Id, model.TaskPluginTaskFilter{ExcludeNativeDeleted: true})
+					require.NoError(t, err)
+					assert.Zero(t, count)
+					listed, err := model.ListTaskPluginUserTasks(user.Id, model.TaskPluginTaskFilter{ExcludeNativeDeleted: true}, 0, 20)
+					require.NoError(t, err)
+					assert.Empty(t, listed)
+					var queryRoute pluginruntime.Route
+					for _, route := range plugin.Meta.Routes {
+						if route.Method == http.MethodGet && strings.Contains(route.Path, ":task_id") {
+							queryRoute = route
+						}
+					}
+					require.NotEmpty(t, queryRoute.Path)
+					router := gin.New()
+					router.GET(queryRoute.Path, func(c *gin.Context) {
+						common.SetContextKey(c, constant.ContextKeyUserId, user.Id)
+						c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: &pluginruntime.RoutingGeneration{}, Plugin: plugin, Route: queryRoute})
+					}, middleware.PrepareTaskPluginRoute())
+					queryWriter := httptest.NewRecorder()
+					router.ServeHTTP(queryWriter, httptest.NewRequest(http.MethodGet, "/doubao/api/v3/contents/generations/tasks/"+task.TaskID, nil))
+					assert.Equal(t, http.StatusNotFound, queryWriter.Code, queryWriter.Body.String())
+					assert.JSONEq(t, `{"code":"task_not_exist","message":"task_not_exist","data":null}`, queryWriter.Body.String())
 				case "running_rejected":
 					assert.Equal(t, 400, recorder.Code)
 					assert.Contains(t, recorder.Body.String(), "InvalidTaskState")
@@ -595,6 +633,59 @@ func TestDoubaoNativeDeletionConfirmation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDoubaoNativeDeletionPersistsAfterLocalFailure(t *testing.T) {
+	setupNativeActionTestDB(t)
+	service.InitHttpClient()
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin := nativeActionTestPlugin(t, source)
+	deletes := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodDelete, r.Method)
+		deletes++
+		if deletes > 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(upstream.Close)
+	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL}
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := &model.Task{TaskID: "delete-persist", UserId: 9, ChannelId: channel.Id, Platform: "doubao", Status: model.TaskStatusSuccess, Quota: 100,
+		Properties: model.Properties{OriginModelName: "doubao-seedance-2-5-260628"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "cgt-upstream", Key: "stored-credential", PluginState: []byte(`{"preserve":"state"}`)}}
+	require.NoError(t, model.DB.Create(task).Error)
+	const callback = "test:reject-native-delete"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == model.DB.NamingStrategy.TableName("tasks") {
+			tx.AddError(errors.New("private data unavailable"))
+		}
+	}))
+	for attempt := range 2 {
+		writer := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(writer)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/doubao/api/v3/contents/generations/tasks/"+task.TaskID, nil)
+		common.SetContextKey(c, constant.ContextKeyUserId, task.UserId)
+		c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: &pluginruntime.RoutingGeneration{}, Plugin: plugin, Route: pluginruntime.Route{Action: "delete", Render: "taskDeleted"}})
+		c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{Method: http.MethodDelete, Path: c.Request.URL.Path, Params: map[string]string{"task_id": task.TaskID}})
+		c.Set(pluginruntime.ContextKeyNativeRouteIntent, map[string]any{"kind": "delete", "taskId": task.TaskID})
+		RelayTaskPluginNativeAction(c)
+		if attempt == 0 {
+			assert.Equal(t, http.StatusServiceUnavailable, writer.Code, writer.Body.String())
+			require.NoError(t, model.DB.Callback().Update().Remove(callback))
+		} else {
+			assert.Equal(t, http.StatusOK, writer.Code, writer.Body.String())
+		}
+		require.NoError(t, model.DB.First(task, task.ID).Error)
+		assert.Equal(t, attempt == 1, task.PrivateData.NativeDeleted)
+		assert.Equal(t, 100, task.Quota)
+		assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+		assert.Equal(t, "stored-credential", task.PrivateData.Key)
+		assert.JSONEq(t, `{"preserve":"state"}`, string(task.PrivateData.PluginState))
+	}
+	assert.Equal(t, 2, deletes)
 }
 
 // 上游已成功但本地仍排队时，删除前必须按实际用量结算；查询失败则禁止删除。

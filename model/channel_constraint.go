@@ -1,8 +1,11 @@
 package model
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 )
@@ -10,12 +13,14 @@ import (
 var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
+	dto.FilterVideoRouting,
 	dto.FilterResponsesWebSocket,
+	dto.FilterSeedanceAssetAccount,
+	dto.FilterSeedanceAssetReady,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
-// On false, it returns the kind of the first violated filter (request_path
-// then task_plugin_identity) for error attribution.
+// 失败时按固定顺序返回首个未满足的约束，供调用方区分协议、身份和素材账号错误。
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
@@ -89,6 +94,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterVideoRouting:
+		return ch.matchesVideoRouting(modelName, filter)
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true
@@ -99,6 +106,11 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		config := ch.GetOtherSettings().AdvancedCustom
 		return config != nil && config.SupportsPathForModel(filter.RequestPath, modelName)
 	case dto.FilterTaskPluginIdentity:
+		if len(filter.TaskPluginChannelIDs) > 0 {
+			if _, allowed := filter.TaskPluginChannelIDs[ch.Id]; !allowed {
+				return false
+			}
+		}
 		if filter.TaskPluginKey == "" {
 			return ch.Type != constant.ChannelTypeTaskPlugin
 		}
@@ -124,6 +136,56 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		default:
 			return false
 		}
+	case dto.FilterSeedanceAssetAccount:
+		if ch.Status != common.ChannelStatusEnabled || filter.SeedanceAssetAccountFingerprint == "" || filter.SeedanceAssetKeyFingerprint == "" {
+			return false
+		}
+		if SeedanceAssetSharedAccountMatches(ch, filter.SeedanceAssetAccountFingerprint) {
+			if !ch.ChannelInfo.IsMultiKey {
+				return strings.TrimSpace(ch.Key) != ""
+			}
+			for index, key := range ch.GetKeys() {
+				if strings.TrimSpace(key) == "" {
+					continue
+				}
+				if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; !exists || status == common.ChannelStatusEnabled {
+					return true
+				}
+			}
+			return false
+		}
+		if !ch.ChannelInfo.IsMultiKey {
+			return ch.Key != "" && fmt.Sprintf("%x", common.Sha256Raw([]byte(ch.Key))) == filter.SeedanceAssetKeyFingerprint &&
+				SeedanceAssetAccountFingerprintMatches(ch, filter.SeedanceAssetKeyFingerprint, filter.SeedanceAssetAccountFingerprint)
+		}
+		for index, key := range ch.GetKeys() {
+			if strings.TrimSpace(key) == "" || fmt.Sprintf("%x", common.Sha256Raw([]byte(key))) != filter.SeedanceAssetKeyFingerprint {
+				continue
+			}
+			if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+				continue
+			}
+			return SeedanceAssetAccountFingerprintMatches(ch, filter.SeedanceAssetKeyFingerprint, filter.SeedanceAssetAccountFingerprint)
+		}
+		return false
+	case dto.FilterSeedanceAssetReady:
+		if ch.Status != common.ChannelStatusEnabled {
+			return false
+		}
+		allowed := filter.SeedanceAssetReadyKeys[ch.Id]
+		for index, key := range ch.GetKeys() {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; ch.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
+				continue
+			}
+			fingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+			if _, ready := allowed[fingerprint]; ready {
+				return true
+			}
+		}
+		return false
 	default:
 		return true
 	}

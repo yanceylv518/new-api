@@ -11,6 +11,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestChannelVideoRouting(t *testing.T) {
+	const original = "doubao-seedance-2-0-260128"
+	for _, plugin := range []string{"doubao", "anyllm"} {
+		t.Run(plugin, func(t *testing.T) {
+			channel := &Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin}
+			settings := kitdto.ChannelSettings{TaskPluginKey: plugin, VideoRoutingRules: []kitdto.VideoRoutingRule{{Model: original, Mode: "deny", Resolutions: []string{"4k"}}}}
+			require.NoError(t, channel.SetSetting(settings))
+			for _, tc := range []struct {
+				model, resolution string
+				allow             bool
+			}{
+				{original, "4k", false}, {original, "720p", true}, {original, "", true},
+				{"doubao-seedream-5-0-pro-260628", "4k", true},
+			} {
+				ok, _ := ChannelSatisfiesFilters(channel, tc.model, []dto.ChannelFilter{{Kind: dto.FilterVideoRouting, VideoRoutingModel: tc.model, VideoRoutingResolution: tc.resolution}})
+				assert.Equal(t, tc.allow, ok)
+			}
+			filter := dto.ChannelFilter{Kind: dto.FilterVideoRouting, VideoRoutingChannelModels: map[int]string{1: original}, VideoRoutingResolution: "4k"}
+			ok, _ := ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{filter})
+			assert.False(t, ok, "aliases inherit the canonical model rule")
+			settings.VideoRoutingRules = append(settings.VideoRoutingRules, kitdto.VideoRoutingRule{Model: "alias", Mode: "allow", Resolutions: []string{"4k"}})
+			require.NoError(t, channel.SetSetting(settings))
+			ok, _ = ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{filter})
+			assert.True(t, ok, "explicit alias rules override canonical rules")
+			filter.VideoRoutingResolution = ""
+			ok, _ = ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{filter})
+			assert.False(t, ok, "allow rules require an explicit resolution")
+			settings.TaskPluginKey = "kling"
+			require.NoError(t, channel.SetSetting(settings))
+			ok, _ = ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{filter})
+			assert.True(t, ok, "other plugins are unaffected")
+		})
+	}
+}
+
 func TestFilterCandidateIDs(t *testing.T) {
 	alphaSetting := `{"task_plugin_key":"alpha"}`
 	betaSetting := `{"task_plugin_key":"beta"}`
@@ -49,6 +84,16 @@ func TestFilterCandidateIDs(t *testing.T) {
 		wantKept  []int
 		wantEmpty dto.ChannelFilterKind
 	}{
+		{
+			name:      "identity restricts mapped alias to validated channels",
+			ids:       []int{900001, 900002},
+			modelName: "alias",
+			filters: []dto.ChannelFilter{{
+				Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "alpha", TaskPluginKeys: []string{"beta"},
+				TaskPluginChannelIDs: map[int]struct{}{900002: {}},
+			}},
+			wantKept: []int{900002},
+		},
 		{
 			name:      "identity keeps matching type-59 key",
 			ids:       []int{900001, 900002},

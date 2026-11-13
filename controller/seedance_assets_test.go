@@ -26,8 +26,11 @@ import (
 	"errors"
 	"fmt"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -39,8 +42,10 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -79,6 +84,8 @@ func TestSeedanceAssetValidationSessionCreatesAndPublishesLocalGroup(t *testing.
 			_, _ = w.Write([]byte(`{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`))
 		case "GetVisualValidateResult":
 			_, _ = w.Write([]byte(`{"Result":{"GroupId":"group-liveness"}}`))
+		case "GetAssetGroup":
+			_, _ = w.Write([]byte(`{"Result":{"Id":"group-liveness","GroupType":"LivenessFace","Status":"Active"}}`))
 		default:
 			_, _ = w.Write([]byte(`{"Result":{"Status":"Active"}}`))
 		}
@@ -94,9 +101,10 @@ func TestSeedanceAssetValidationSessionCreatesAndPublishesLocalGroup(t *testing.
 	common.CryptoSecret = "validation-controller-test-secret"
 	t.Setenv("CRYPTO_SECRET", "validation-controller-test-secret")
 	system_setting.ServerAddress = "http://localhost:3000"
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
-	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled, Models: "doubao-seedance-2-0-fast-260128", Group: "default"}
+	configureSeedanceTestAssetURL(t, channel)
+	require.NoError(t, channel.Insert())
 
 	createWriter := httptest.NewRecorder()
 	createContext, _ := gin.CreateTestContext(createWriter)
@@ -172,12 +180,17 @@ func TestSeedanceAssetValidationFallsBackWhenActionIsUnsupported(t *testing.T) {
 	common.CryptoSecret = "validation-fallback-test-secret"
 	t.Setenv("CRYPTO_SECRET", "validation-fallback-test-secret")
 	system_setting.ServerAddress = "http://localhost:3000"
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
 	firstURL, secondURL := unsupportedServer.URL, successServer.URL
-	require.NoError(t, db.Create([]*model.Channel{
+	channels := []*model.Channel{
 		{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &firstURL, Status: common.ChannelStatusEnabled},
 		{Id: 2, Type: constant.ChannelTypeDoubaoVideo, Key: "supported-key", BaseURL: &secondURL, Status: common.ChannelStatusEnabled},
-	}).Error)
+	}
+	for _, channel := range channels {
+		channel.Models, channel.Group = "doubao-seedance-2-0-fast-260128", "default"
+		configureSeedanceTestAssetURL(t, channel)
+		require.NoError(t, channel.Insert())
+	}
 
 	writer := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(writer)
@@ -239,12 +252,14 @@ func TestCreateSeedanceAssetGroupCreatesAIGCType(t *testing.T) {
 		_ = sqlDB.Close()
 	})
 	model.DB = db
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}))
 	channel := &model.Channel{
 		Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key",
 		BaseURL: &server.URL, Status: common.ChannelStatusEnabled,
+		Models: "doubao-seedance-2-0-fast-260128", Group: "default",
 	}
-	require.NoError(t, db.Create(channel).Error)
+	configureSeedanceTestAssetURL(t, channel)
+	require.NoError(t, channel.Insert())
 
 	writer := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(writer)
@@ -285,6 +300,8 @@ func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
 				return
 			}
 			_, _ = w.Write([]byte(`{"Result":{"GroupId":"group-liveness"}}`))
+		case "GetAssetGroup":
+			_, _ = w.Write([]byte(`{"Result":{"Id":"group-liveness","GroupType":"LivenessFace","Status":"Active"}}`))
 		default:
 			t.Fatalf("unexpected action %q", r.URL.Query().Get("Action"))
 		}
@@ -298,9 +315,10 @@ func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
 	model.DB = db
 	common.CryptoSecret = "validation-official-contract-test-secret"
 	t.Setenv("CRYPTO_SECRET", "validation-official-contract-test-secret")
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
-	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled, Models: "doubao-seedance-2-0-fast-260128", Group: "default"}
+	configureSeedanceTestAssetURL(t, channel)
+	require.NoError(t, channel.Insert())
 
 	request := func(userID int, query, body string) *httptest.ResponseRecorder {
 		writer := httptest.NewRecorder()
@@ -332,10 +350,14 @@ func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
 	require.Equal(t, "validation-token", createdBody.Result.BytedToken)
 	require.Equal(t, "https://example.com/validate", createdBody.Result.H5Link)
 	require.Len(t, received, 1)
-	assert.Equal(t, map[string]string{"CallbackURL": "https://example.com/callback", "ProjectName": "project-a"}, received[0])
+	callback, err := url.Parse(received[0]["CallbackURL"])
+	require.NoError(t, err)
+	assert.Equal(t, "/v1/seedance/validation-sessions/1/callback", callback.Path)
+	assert.NotEmpty(t, callback.Query().Get("state"))
+	assert.Equal(t, "project-a", received[0]["ProjectName"])
 
 	pending := request(9, "Action=GetVisualValidateResult&Version=2024-01-01", `{"BytedToken":"validation-token","ProjectName":"project-a"}`)
-	assert.Equal(t, http.StatusBadGateway, pending.Code)
+	assert.Equal(t, http.StatusConflict, pending.Code)
 	var pendingBody struct {
 		ResponseMetadata struct {
 			Error struct {
@@ -344,7 +366,7 @@ func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
 		} `json:"ResponseMetadata"`
 	}
 	require.NoError(t, common.Unmarshal(pending.Body.Bytes(), &pendingBody))
-	assert.Equal(t, "UpstreamError", pendingBody.ResponseMetadata.Error.Code)
+	assert.Equal(t, "ValidationPending", pendingBody.ResponseMetadata.Error.Code)
 	require.Len(t, received, 2)
 
 	result := request(9, "Action=GetVisualValidateResult&Version=2024-01-01", `{"BytedToken":"validation-token","ProjectName":"project-a"}`)
@@ -375,15 +397,18 @@ func setupSeedanceControllerRegression(t *testing.T, upstream http.HandlerFunc) 
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, db.AutoMigrate(
 		&model.Channel{Type: constant.ChannelTypeDoubaoVideo},
+		&model.User{}, &model.Ability{},
 		&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{},
-		&model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{},
+		&model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SeedanceAssetValidationSession{},
 	))
 	model.DB = db
 	t.Cleanup(func() { model.DB = previousDB; _ = sqlDB.Close() })
 	server := httptest.NewServer(upstream)
 	t.Cleanup(server.Close)
-	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Id: 1, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(&model.User{Id: 9, Username: "seedance-owner", AffCode: "seedance-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
+	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Id: 1, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled, Models: "doubao-seedance-2-0-fast-260128", Group: "default"}
+	configureSeedanceTestAssetURL(t, channel)
+	require.NoError(t, channel.Insert())
 	group := &model.SeedanceAssetGroup{UserID: 9, ChannelID: 1, GroupID: "group-test", Name: "Before"}
 	require.NoError(t, db.Create(group).Error)
 	asset := &model.SeedanceAsset{UserID: 9, ChannelID: 1, GroupID: group.GroupID, AssetID: "asset-test", Name: "preview", AssetType: "Video", Status: "Processing"}
@@ -497,8 +522,8 @@ func TestSeedanceControllerRejectsForeignOwnership(t *testing.T) {
 	require.NoError(t, db.First(asset, asset.ID).Error)
 }
 
-// 同步写操作必须返回上游业务错误；异步删除则保留记录并调度失败重试。
-func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
+// 改名失败保留本地原值；用户删除以本站为准，上游拒绝不阻止本地清理。
+func TestSeedanceControllerHandlesUpstreamBusinessFailure(t *testing.T) {
 	for _, operation := range []struct {
 		name, method string
 		handler      gin.HandlerFunc
@@ -517,13 +542,13 @@ func TestSeedanceControllerRejectsUpstreamBusinessFailure(t *testing.T) {
 				require.True(t, payload.Success, payload.Message)
 				summary, err := service.RunSeedanceAssetCleanupOnce(context.Background(), nil)
 				require.NoError(t, err)
-				assert.Equal(t, 1, summary.RetryScheduled)
+				assert.Equal(t, 1, summary.Completed)
+				assert.Zero(t, summary.RetryScheduled)
 				if operation.name == "delete asset" {
-					require.NoError(t, db.First(asset, asset.ID).Error)
-					assert.Equal(t, "Deleting", asset.Status)
+					require.ErrorIs(t, db.First(asset, asset.ID).Error, gorm.ErrRecordNotFound)
 				} else {
-					require.NoError(t, db.First(group, group.ID).Error)
-					assert.Equal(t, "Deleting", group.Status)
+					require.ErrorIs(t, db.First(group, group.ID).Error, gorm.ErrRecordNotFound)
+					require.ErrorIs(t, db.First(asset, asset.ID).Error, gorm.ErrRecordNotFound)
 				}
 				return
 			}
@@ -651,6 +676,166 @@ func TestSeedanceRefreshReturnsPersistedStatus(t *testing.T) {
 	assert.WithinDuration(t, asset.UpdatedAt, returned.UpdatedAt, 0)
 }
 
+func setupSeedanceScopedRegression(t *testing.T, handlers ...http.HandlerFunc) (*gorm.DB, *model.SeedanceAssetGroup, []*model.Channel, []*service.SeedanceAssetClient) {
+	t.Helper()
+	db, dialect := openTaskDialectDatabase(t, &model.Channel{}, &model.User{}, &model.Ability{},
+		&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{},
+		&model.SeedanceAssetReplica{}, &model.SystemTask{})
+	previousDB, previousMain, previousLog := model.DB, common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB = db
+	common.SetDatabaseTypes(dialect, dialect)
+	t.Cleanup(func() { model.DB = previousDB; common.SetDatabaseTypes(previousMain, previousLog) })
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("unexpected upstream request")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	if len(handlers) > 0 {
+		handler = handlers[0]
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	require.NoError(t, db.Create(&model.User{Id: 9, Username: "seedance-owner", AffCode: "seedance-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
+	channels := make([]*model.Channel, 0, 2)
+	clients := make([]*service.SeedanceAssetClient, 0, 2)
+	for index := range 2 {
+		name := fmt.Sprintf("doubao-seedance-model-%d", index)
+		channel := &model.Channel{Id: index + 1, Type: constant.ChannelTypeDoubaoVideo, Key: fmt.Sprintf("fixture-key-%d", index), BaseURL: &server.URL, Status: common.ChannelStatusEnabled, Models: name, Group: "default"}
+		configureSeedanceTestAssetURL(t, channel)
+		require.NoError(t, channel.Insert())
+		client, err := service.NewSeedanceAssetClient(channel)
+		require.NoError(t, err)
+		channels = append(channels, channel)
+		clients = append(clients, client.ForSeedanceModel(channel, name))
+	}
+	group := &model.SeedanceAssetGroup{UserID: 9, ChannelID: 1, GroupID: "group-scoped", Name: "group", GroupType: "AIGC"}
+	require.NoError(t, db.Create(group).Error)
+	return db, group, channels, clients
+}
+
+func TestSeedanceProjectionPreservesScopedReviewTimeout(t *testing.T) {
+	db, group, _, clients := setupSeedanceScopedRegression(t)
+	localOnly := false
+	asset := model.SeedanceAsset{UserID: 9, ChannelID: 1, GroupID: group.GroupID, AssetID: "asset-timeout", Name: "asset", AssetType: "Image", LocalOnly: &localOnly, Status: "Active"}
+	require.NoError(t, db.Create(&asset).Error)
+	for index, client := range clients {
+		replica := model.SeedanceAssetReplica{UserID: 9, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: client.ChannelID, AccountFingerprint: client.AccountFingerprint, KeyFingerprint: client.KeyFingerprint, UpstreamAssetID: "upstream", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active"}
+		if index == 1 {
+			replica.Status, replica.LastError, replica.PollAttempts = "Processing", model.SeedanceAssetReviewTimeoutCode, model.SeedanceAssetSyncMaxAttempts
+		}
+		require.NoError(t, db.Create(&replica).Error)
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Set("id", 9)
+	assets := []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Failed", assets[0].Status)
+	assert.Equal(t, model.SeedanceAssetReviewTimeoutCode, assets[0].FailureCode)
+
+	c.Set(seedanceStatusModelsKey, map[string][]string{"doubao-seedance-model-0": {clients[0].AccountFingerprint}})
+	assets = []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Active", assets[0].Status)
+	assert.Empty(t, assets[0].FailureCode)
+
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ? AND account_fingerprint = ?", asset.ID, clients[1].AccountFingerprint).
+		Updates(map[string]any{"status": "Failed", "last_error": "", "poll_attempts": 0}).Error)
+	c.Set(seedanceStatusModelsKey, map[string][]string{"doubao-seedance-model-0": {clients[0].AccountFingerprint}, "doubao-seedance-model-1": {clients[1].AccountFingerprint}})
+	asset.FailureCode = model.SeedanceAssetReviewTimeoutCode
+	assets = []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Failed", assets[0].Status)
+	assert.Equal(t, "Asset unavailable for this group or model", assets[0].FailureCode)
+
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ? AND account_fingerprint = ?", asset.ID, clients[1].AccountFingerprint).
+		Updates(map[string]any{"status": "Processing", "last_error": model.SeedanceAssetReviewTimeoutCode, "poll_attempts": model.SeedanceAssetSyncMaxAttempts}).Error)
+	rejected := model.SeedanceAssetReplica{UserID: 9, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: 3, AccountFingerprint: strings.Repeat("a", 64), KeyFingerprint: strings.Repeat("b", 64), UpstreamAssetID: "rejected", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Failed"}
+	require.NoError(t, db.Create(&rejected).Error)
+	c.Set(seedanceStatusModelsKey, map[string][]string{"model-with-alternative": {clients[0].AccountFingerprint, clients[1].AccountFingerprint}, "model-rejected": {rejected.AccountFingerprint}})
+	assets = []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Failed", assets[0].Status)
+	assert.Equal(t, "Asset unavailable for this group or model", assets[0].FailureCode)
+
+	require.NoError(t, db.Model(group).Update("group_type", "LivenessFace").Error)
+	assets = []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Active", assets[0].Status)
+
+	localOnly = true
+	asset.Status, asset.FailureCode = "Failed", model.SeedanceAssetReviewTimeoutCode
+	assets = []model.SeedanceAsset{asset}
+	require.NoError(t, projectSeedanceAssetStatuses(c, assets, false))
+	assert.Equal(t, "Failed", assets[0].Status)
+	assert.Equal(t, model.SeedanceAssetReviewTimeoutCode, assets[0].FailureCode)
+}
+
+func TestSeedanceRefreshRetriesReplicaWhenPrimaryChannelDisabled(t *testing.T) {
+	db, group, channels, clients := setupSeedanceScopedRegression(t)
+	localOnly := false
+	asset := model.SeedanceAsset{UserID: 9, ChannelID: channels[0].Id, GroupID: group.GroupID, AssetID: "asset-optimized", PrimaryUpstreamID: "primary", Name: "asset", AssetType: "Image", LocalOnly: &localOnly, Status: "Failed", AccountFingerprint: clients[0].AccountFingerprint, KeyFingerprint: clients[0].KeyFingerprint}
+	require.NoError(t, db.Create(&asset).Error)
+	replica := model.SeedanceAssetReplica{UserID: 9, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channels[1].Id, AccountFingerprint: clients[1].AccountFingerprint, KeyFingerprint: clients[1].KeyFingerprint, ProvisionStatus: model.SeedanceAssetReplicaFailed, Status: "Pending", LastError: "temporary failure", PollAttempts: model.SeedanceAssetSyncMaxAttempts}
+	require.NoError(t, db.Create(&replica).Error)
+	require.NoError(t, db.Model(channels[0]).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	payload := invokeSeedanceRegression(t, RefreshSeedanceAsset, http.MethodPost, "/", fmt.Sprint(asset.ID), "")
+	require.True(t, payload.Success, payload.Message)
+	require.NoError(t, db.First(&replica, replica.ID).Error)
+	assert.Zero(t, replica.PollAttempts)
+	assert.Empty(t, replica.LastError)
+	assert.Positive(t, replica.NextPollAt)
+
+	require.NoError(t, db.Model(&replica).Updates(map[string]any{"last_error": "temporary failure", "poll_attempts": model.SeedanceAssetSyncMaxAttempts, "next_poll_at": 0}).Error)
+	require.NoError(t, db.Model(group).Update("group_type", "LivenessFace").Error)
+	payload = invokeSeedanceRegression(t, RefreshSeedanceAsset, http.MethodPost, "/", fmt.Sprint(asset.ID), "")
+	assert.False(t, payload.Success)
+	require.NoError(t, db.First(&replica, replica.ID).Error)
+	assert.Equal(t, model.SeedanceAssetSyncMaxAttempts, replica.PollAttempts)
+
+	require.NoError(t, db.Model(&asset).Update("local_only", true).Error)
+	payload = invokeSeedanceRegression(t, RefreshSeedanceAsset, http.MethodPost, "/", fmt.Sprint(asset.ID), "")
+	assert.True(t, payload.Success, payload.Message)
+	require.NoError(t, db.First(&replica, replica.ID).Error)
+	assert.Equal(t, model.SeedanceAssetSyncMaxAttempts, replica.PollAttempts)
+
+	require.NoError(t, db.Model(group).Update("group_type", "AIGC").Error)
+	require.NoError(t, db.Model(&asset).Update("local_only", false).Error)
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Set("id", 9)
+	c.Set("token_id", 1)
+	c.Set("token_model_limit_enabled", true)
+	c.Set("token_model_limit", map[string]bool{"doubao-seedance-denied": true})
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprint(asset.ID)}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	RefreshSeedanceAsset(c)
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.False(t, payload.Success)
+	require.NoError(t, db.First(&replica, replica.ID).Error)
+	assert.Equal(t, model.SeedanceAssetSyncMaxAttempts, replica.PollAttempts)
+}
+
+func TestSeedanceRefreshRetriesReplicaWhenPrimaryRequestFails(t *testing.T) {
+	var calls atomic.Int32
+	db, group, channels, clients := setupSeedanceScopedRegression(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	localOnly := false
+	asset := model.SeedanceAsset{UserID: 9, ChannelID: channels[0].Id, GroupID: group.GroupID, AssetID: "asset-primary-error", PrimaryUpstreamID: "primary", Name: "asset", AssetType: "Image", LocalOnly: &localOnly, Status: "Failed", AccountFingerprint: clients[0].AccountFingerprint, KeyFingerprint: clients[0].KeyFingerprint}
+	require.NoError(t, db.Create(&asset).Error)
+	replica := model.SeedanceAssetReplica{UserID: 9, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channels[1].Id, AccountFingerprint: clients[1].AccountFingerprint, KeyFingerprint: clients[1].KeyFingerprint, ProvisionStatus: model.SeedanceAssetReplicaFailed, Status: "Pending", LastError: "temporary failure", PollAttempts: model.SeedanceAssetSyncMaxAttempts}
+	require.NoError(t, db.Create(&replica).Error)
+	payload := invokeSeedanceRegression(t, RefreshSeedanceAsset, http.MethodPost, "/", fmt.Sprint(asset.ID), "")
+	require.True(t, payload.Success, payload.Message)
+	require.Positive(t, calls.Load())
+	require.NoError(t, db.First(&replica, replica.ID).Error)
+	assert.Zero(t, replica.PollAttempts)
+	assert.Empty(t, replica.LastError)
+	assert.Positive(t, replica.NextPollAt)
+}
+
 // 明确同步上游创建和分组删除的先后顺序，证明过期创建会被拒绝并清理上游资源。
 func TestSeedanceCreateCannotOutliveDeletedGroup(t *testing.T) {
 	var cleanupCalls atomic.Int32
@@ -705,14 +890,11 @@ func TestSeedanceDeleteResumesAfterLocalFailure(t *testing.T) {
 	assert.EqualValues(t, 1, calls.Load())
 }
 
-// 批量删除先原子入队；后台单条上游失败不会阻断其他素材，失败项保留供重试。
+// 批量删除先原子入队；单条本地删除失败不会阻断其他素材，失败项保留供重试。
 func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
 	var calls atomic.Int32
 	db, group, first := setupSeedanceControllerRegression(t, func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 2 {
-			_, _ = w.Write([]byte(`{"code":"operation_failed","message":"rejected"}`))
-			return
-		}
+		calls.Add(1)
 		_, _ = w.Write([]byte(`{}`))
 	})
 	second := &model.SeedanceAsset{
@@ -720,6 +902,13 @@ func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
 		Name: "second", AssetType: "Image", Status: "Active",
 	}
 	require.NoError(t, db.Create(second).Error)
+	const callback = "test:batch-local-delete-failure"
+	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(callback, func(tx *gorm.DB) {
+		if asset, ok := tx.Statement.Dest.(*model.SeedanceAsset); ok && asset.ID == second.ID {
+			tx.AddError(errors.New("local deletion failed"))
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Delete().Remove(callback)) })
 
 	body := fmt.Sprintf(`{"ids":[%d,%d,%d,999999]}`, first.ID, second.ID, first.ID)
 	payload := invokeSeedanceRegression(t, DeleteSeedanceAssetBatch, http.MethodPost, "/", "", body)
@@ -755,6 +944,7 @@ func TestSeedanceDeleteAssetBatchReturnsPerAssetResults(t *testing.T) {
 	remaining = nil
 	require.NoError(t, db.Where("id IN ?", []uint{first.ID, second.ID}).Find(&remaining).Error)
 	require.Len(t, remaining, 1)
+	assert.Equal(t, second.ID, remaining[0].ID)
 	assert.Equal(t, "Deleting", remaining[0].Status)
 	require.NotNil(t, remaining[0].StatusKey)
 	require.NotNil(t, remaining[0].PendingStatus)
@@ -820,6 +1010,7 @@ func TestUpdateSeedanceAssetGroupUpdatesMetadataWithoutDeletingStoredAssets(t *t
 	t.Cleanup(server.Close)
 
 	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Id: 71, Key: "test-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	configureSeedanceTestAssetURL(t, channel)
 	require.NoError(t, db.Create(channel).Error)
 	group := &model.SeedanceAssetGroup{UserID: 9, ChannelID: channel.Id, GroupID: "group-1", Name: "Before"}
 	require.NoError(t, db.Create(group).Error)
@@ -851,4 +1042,79 @@ func TestUpdateSeedanceAssetGroupUpdatesMetadataWithoutDeletingStoredAssets(t *t
 	var storedAssetCount int64
 	require.NoError(t, db.Model(&model.SeedanceAsset{}).Where("id = ?", asset.ID).Count(&storedAssetCount).Error)
 	assert.EqualValues(t, 1, storedAssetCount)
+}
+
+func BenchmarkSeedanceAssetModelStatusMySQL(b *testing.B) {
+	dsn := os.Getenv("SEEDANCE_STATUS_BENCH_MYSQL_DSN")
+	if dsn == "" {
+		b.Skip("SEEDANCE_STATUS_BENCH_MYSQL_DSN is not configured")
+	}
+	config, err := mysqldriver.ParseDSN(dsn)
+	require.NoError(b, err)
+	require.Equal(b, "tcp", config.Net)
+	host, _, err := net.SplitHostPort(config.Addr)
+	require.NoError(b, err)
+	require.True(b, net.ParseIP(host).IsLoopback())
+	require.True(b, strings.HasPrefix(config.DBName, "codex_seedance_status_"))
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(b, err)
+	connection, err := db.DB()
+	require.NoError(b, err)
+	previousDB := model.DB
+	model.DB = db
+	b.Cleanup(func() {
+		model.DB = previousDB
+		assert.NoError(b, connection.Close())
+	})
+	require.NoError(b, db.AutoMigrate(&model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}))
+	group := model.SeedanceAssetGroup{UserID: 1, ChannelID: 1, GroupID: "benchmark-group", Name: "benchmark", GroupType: "AIGC", Status: "Active"}
+	require.NoError(b, db.Create(&group).Error)
+	localOnly := false
+	asset := model.SeedanceAsset{UserID: 1, ChannelID: 1, GroupID: group.GroupID, AssetID: "benchmark-asset", Name: "benchmark", AssetType: "Image", LocalOnly: &localOnly, Status: "Processing"}
+	require.NoError(b, db.Create(&asset).Error)
+	models := make(map[string][]string, 4)
+	var last model.SeedanceAssetReplica
+	for index := range 4 {
+		fingerprint := fmt.Sprintf("%064x", index+1)
+		models[fmt.Sprintf("model-%d", index+1)] = []string{fingerprint}
+		replica := model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: index + 1,
+			AccountFingerprint: fingerprint, KeyFingerprint: fingerprint, UpstreamGroupID: "group", UpstreamAssetID: "asset", ProvisionStatus: model.SeedanceAssetReplicaReady, Status: "Active"}
+		require.NoError(b, db.Create(&replica).Error)
+		last = replica
+	}
+	for _, scenario := range []struct {
+		name   string
+		count  int
+		state  string
+		status string
+	}{
+		{"one_model_active", 1, "Active", "active"},
+		{"four_models_active", 4, "Active", "active"},
+		{"four_models_processing", 4, "Processing", "processing"},
+		{"four_models_failed", 4, "Failed", "failed"},
+	} {
+		b.Run(scenario.name, func(b *testing.B) {
+			require.NoError(b, db.Model(&last).Updates(map[string]any{"status": scenario.state, "provision_status": model.SeedanceAssetReplicaReady, "last_error": "", "poll_attempts": 0}).Error)
+			context, _ := gin.CreateTestContext(httptest.NewRecorder())
+			context.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+			context.Set("id", 1)
+			context.Set(seedanceStatusAccountsKey, []string{""})
+			activeModels := make(map[string][]string, scenario.count)
+			for index := range scenario.count {
+				name := fmt.Sprintf("model-%d", index+1)
+				activeModels[name] = models[name]
+			}
+			context.Set(seedanceStatusModelsKey, activeModels)
+			expression, args, err := seedanceAssetStatusExpression(context, "a", false)
+			require.NoError(b, err)
+			b.ResetTimer()
+			for range b.N {
+				require.NoError(b, scheduleMissingSeedanceAssetTargets(context))
+				var result struct{ Status string }
+				require.NoError(b, db.Table(db.NamingStrategy.TableName("SeedanceAsset")+" AS a").
+					Select(expression+" AS status", args...).Where("a.id = ?", asset.ID).Scan(&result).Error)
+				require.Equal(b, scenario.status, result.Status)
+			}
+		})
+	}
 }

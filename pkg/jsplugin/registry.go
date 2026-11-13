@@ -39,6 +39,7 @@ var websiteHostLabelPattern = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,
 var pluginKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 var pluginVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 var localeTagPattern = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$`)
+var resourcePathPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|#))*$`)
 
 // ValidPluginKey checks the canonical identifier accepted by plugin manifests.
 func ValidPluginKey(key string) bool {
@@ -85,6 +86,7 @@ func (t *LocalizedText) UnmarshalJSON(data []byte) error {
 
 type Meta struct {
 	RequiredCapabilities []string                    `json:"requiredCapabilities,omitempty"`
+	ResourcePaths        []string                    `json:"resourcePaths,omitempty"`
 	SubmitResponseTypes  []string                    `json:"submitResponseTypes,omitempty"`
 	SortPriority         int                         `json:"sortPriority,omitempty"`
 	Website              string                      `json:"website,omitempty"`
@@ -879,6 +881,7 @@ func (r *Registry) Snapshot() RegistrySnapshot {
 func cloneMeta(meta Meta) Meta {
 	meta.SubmitResponseTypes = slices.Clone(meta.SubmitResponseTypes)
 	meta.RequiredCapabilities = slices.Clone(meta.RequiredCapabilities)
+	meta.ResourcePaths = slices.Clone(meta.ResourcePaths)
 	meta.ChannelTypes = append([]int(nil), meta.ChannelTypes...)
 	meta.Models = append([]string(nil), meta.Models...)
 	meta.AllowedHosts = append([]string(nil), meta.AllowedHosts...)
@@ -1032,7 +1035,7 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	for field := range object {
 		switch field {
-		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "upstreams", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions":
+		case "requiredCapabilities", "resourcePaths", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "upstreams", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions":
 		default:
 			return Meta{}, &UnknownMetaFieldError{Field: field}
 		}
@@ -1117,6 +1120,10 @@ func decodeMeta(value any) (Meta, error) {
 		}
 	}
 	meta.RequiredCapabilities, err = strictStringSlice(object, "requiredCapabilities")
+	if err != nil {
+		return Meta{}, err
+	}
+	meta.ResourcePaths, err = strictStringSlice(object, "resourcePaths")
 	if err != nil {
 		return Meta{}, err
 	}
@@ -1210,6 +1217,16 @@ func ValidateV1Meta(meta Meta) error {
 }
 
 func normalizeV1Meta(meta *Meta) error {
+	if len(meta.ResourcePaths) > 32 {
+		return fmt.Errorf("resourcePaths must contain at most 32 paths")
+	}
+	seenPaths := make(map[string]bool, len(meta.ResourcePaths))
+	for _, path := range meta.ResourcePaths {
+		if len(path) > 128 || !resourcePathPattern.MatchString(path) || seenPaths[path] {
+			return fmt.Errorf("invalid or duplicate resourcePaths entry %q", path)
+		}
+		seenPaths[path] = true
+	}
 	seenCapabilities := make(map[string]bool, len(meta.RequiredCapabilities))
 	for _, name := range meta.RequiredCapabilities {
 		if !HasCapability(name) || seenCapabilities[name] {
@@ -1860,13 +1877,19 @@ func decodeRoutes(value any) ([]Route, error) {
 		}
 		for key := range object {
 			switch key {
-			case "method", "path", "type", "action", "decode", "render", "taskIdParam", "models", "retainResult":
+			case "method", "path", "type", "protocol", "action", "decode", "render", "taskIdParam", "models", "retainResult":
 			default:
 				return nil, fmt.Errorf("plugin meta route %d has unknown field %q", index, key)
 			}
 		}
 		route := Route{}
 		var err error
+		if route.Protocol, err = stringMetaField(object, "protocol"); err != nil {
+			return nil, err
+		}
+		if route.Protocol != "" && (len(route.Protocol) > 64 || !pluginKeyPattern.MatchString(route.Protocol)) {
+			return nil, fmt.Errorf("plugin meta route %d has invalid protocol", index)
+		}
 		if route.Method, err = stringMetaField(object, "method"); err != nil {
 			return nil, err
 		}

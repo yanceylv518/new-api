@@ -75,6 +75,7 @@ import { getTaskEnumFields, getTaskNumberFields } from '../lib/task-expr'
 import { getTaskPricingDisplayTiers } from '../lib/task-matrix-display'
 import {
   hasSimpleTaskPricing,
+  taskEnumLabel,
   taskPriceLabel,
   taskUsageUnitLabel,
   pricingDisplayFallbackKey,
@@ -158,7 +159,11 @@ function UnconfiguredTaskPricingNotice(props: { model: PricingModel }) {
                 <code>{field}</code>
               </dt>
               <dd className='text-muted-foreground text-right text-xs'>
-                {(definition.enum ?? []).join(', ')}
+                {(definition.enum ?? [])
+                  .map((value) =>
+                    taskEnumLabel(definition, value, i18n.language)
+                  )
+                  .join(', ')}
               </dd>
             </div>
           ))}

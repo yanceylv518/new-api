@@ -828,6 +828,59 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	assert.Zero(t, countLogs(t))
 }
 
+func TestOverduePollingRetainsReconciliationUntilTerminal(t *testing.T) {
+	for _, mode := range []struct {
+		name  string
+		batch bool
+	}{{"single", false}, {"batch", true}} {
+		for _, status := range []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusInProgress} {
+			t.Run(mode.name+"/"+string(status), func(t *testing.T) {
+				truncate(t)
+				seedUser(t, 781, 10_000)
+				seedToken(t, 781, 781, "overdue-poll-token", 5_000)
+				seedTaskPollingChannel(t, 781, true)
+				seedChargedAccounting(t, 781, 781, 781, 1_000, 1)
+				task := makeTask(781, 781, 1_000, 781, BillingSourceWallet, 0)
+				task.TaskID = "overdue-poll-" + mode.name
+				task.PrivateData.UpstreamTaskID = "overdue-job"
+				task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+				require.NoError(t, model.DB.Create(task).Error)
+				previous := constant.TaskTimeoutMinutes
+				constant.TaskTimeoutMinutes = 1
+				t.Cleanup(func() { constant.TaskTimeoutMinutes = previous })
+				sweepTimedOutTasks(t.Context())
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				require.True(t, task.PrivateData.ReconciliationRequired)
+				reason := task.PrivateData.ReconciliationReason
+				for _, next := range []model.TaskStatus{status, model.TaskStatusFailure} {
+					info := &relaycommon.TaskInfo{Status: string(next), Reason: "confirmed failure"}
+					if mode.batch {
+						adaptor := &scriptedBatchPollingAdaptor{results: map[string]*BatchTaskResult{"overdue-job": {TaskInfo: *info}}}
+						require.NoError(t, updateBatchTasks(t.Context(), adaptor, 781, []string{"overdue-job"}, map[string]*model.Task{"overdue-job": task}))
+					} else {
+						channel, err := model.GetChannelById(781, true)
+						require.NoError(t, err)
+						require.NoError(t, updateVideoSingleTask(t.Context(), &scriptedPollingAdaptor{parse: info}, channel, "overdue-job", map[string]*model.Task{"overdue-job": task}))
+					}
+					require.NoError(t, model.DB.First(task, task.ID).Error)
+					assert.Equal(t, next, task.Status)
+					if next == model.TaskStatusFailure {
+						assert.False(t, task.PrivateData.ReconciliationRequired)
+						assert.Empty(t, task.PrivateData.ReconciliationReason)
+						assert.Zero(t, task.Quota)
+					} else {
+						assert.True(t, task.PrivateData.ReconciliationRequired)
+						assert.Equal(t, reason, task.PrivateData.ReconciliationReason)
+						assert.Equal(t, 1_000, task.Quota)
+					}
+				}
+				assert.Equal(t, 11_000, getUserQuota(t, 781))
+				assert.Equal(t, 6_000, getTokenRemainQuota(t, 781))
+			})
+		}
+	}
+}
+
 type scriptedPollingAdaptor struct {
 	statusCode int
 	body       []byte
@@ -959,6 +1012,14 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			name:          "other 4xx non-terminal is unrecognized",
 			statusCode:    http.StatusBadRequest,
 			parse:         &relaycommon.TaskInfo{Status: model.TaskStatusInProgress},
+			wantStatus:    model.TaskStatusInProgress,
+			wantFailures:  1,
+			wantUnchanged: true,
+		},
+		{
+			name:          "400 query failure cannot refund even when parsed as failed",
+			statusCode:    http.StatusBadRequest,
+			parse:         &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "invalid query"},
 			wantStatus:    model.TaskStatusInProgress,
 			wantFailures:  1,
 			wantUnchanged: true,

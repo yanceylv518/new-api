@@ -134,6 +134,23 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	refreshed := pricingByModel(GetPricing())
 	assert.Equal(t, `u("seconds") * 2`, refreshed["alias-own-expr"].BillingExpr)
 	assert.Equal(t, "second", refreshed["alias-own-expr"].BillingUsageSchema["seconds"].Unit)
+
+	previousPrice := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrice)) })
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"alias-model":0.25}`))
+	InvalidatePricingCache()
+	independent := pricingByModel(GetPricing())["alias-model"]
+	assert.Equal(t, 1, independent.QuotaType)
+	assert.Equal(t, 0.25, independent.ModelPrice)
+	assert.Empty(t, independent.BillingMode)
+	assert.Empty(t, independent.BillingExpr)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		billing_setting.PluginBillingExprOption: `{"pricing-usage-probe::alias-model":"tier(\"alias\", u(\"seconds\") * 7)"}`,
+	}))
+	InvalidatePricingCache()
+	variants := pricingByModel(GetPricing())["alias-model"].BillingPluginVariants
+	require.Len(t, variants, 1)
+	assert.Equal(t, `tier("alias", u("seconds") * 7)`, variants[0].BillingExpr)
 }
 
 func pricingByModel(pricings []Pricing) map[string]Pricing {
@@ -183,6 +200,8 @@ export function parseTaskResult(){return {};}
 	InitChannelCache()
 	pricing := pricingByModel(GetPricing())
 	names := []string{"profile-image", "profile-video", "image-alias", "video-alias", "ambiguous-alias"}
+	assert.Zero(t, pricing["ambiguous-alias"].ModelRatio)
+	assert.Empty(t, pricing["ambiguous-alias"].BillingExpr)
 	snapshot, err := GetModelPricingSnapshot(names)
 	require.NoError(t, err)
 	entries := make(map[string]ModelPricingEntry, len(snapshot.Entries))

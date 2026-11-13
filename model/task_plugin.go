@@ -54,7 +54,9 @@ func UnbindTaskPlugin(channelID int, key string) (bool, error) {
 		setting.TaskPluginKey = ""
 	}
 	setting.TaskExtendPluginKeys = slices.DeleteFunc(setting.TaskExtendPluginKeys, func(bound string) bool { return bound == key })
-	channel.SetSetting(setting)
+	if err := channel.SetSetting(setting); err != nil {
+		return false, err
+	}
 	return true, DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
 }
 

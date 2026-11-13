@@ -810,8 +810,7 @@ test.each(['create', 'edit'])(
           expect.anything()
         )
       )
-      const payload = put.mock.calls[0]?.[1] as { setting: string }
-      expect(JSON.parse(payload.setting)).not.toHaveProperty('task_plugin_key')
+      expect(put.mock.calls[0]?.[1]).not.toHaveProperty('setting_patch')
     }
   }
 )
@@ -1218,18 +1217,14 @@ test('quick options and detailed settings share changes across tabs and save the
   await waitFor(() => expect(put).toHaveBeenCalled())
   const payload = put.mock.calls[0]?.[1] as {
     auto_ban: number
-    setting: string
-    settings: string
+    setting_patch?: Record<string, unknown>
+    settings_patch?: Record<string, unknown>
   }
   expect(payload.auto_ban).toBe(0)
-  expect(JSON.parse(payload.setting)).toMatchObject({
-    pass_through_body_enabled: true,
+  expect(payload.setting_patch).toEqual({
     responses_websocket_enabled: false,
   })
-  expect(JSON.parse(payload.settings)).toMatchObject({
-    upstream_model_update_check_enabled: true,
-    upstream_model_update_auto_sync_enabled: true,
-  })
+  expect(payload.settings_patch).toBeUndefined()
 })
 
 test('quick options show only applicable shortcuts when the provider changes', async () => {
@@ -1361,8 +1356,7 @@ test('editing legacy channels retains the full provider list and saves the origi
       expect.anything()
     )
   )
-  const payload = put.mock.calls[0]?.[1] as { setting: string }
-  expect(JSON.parse(payload.setting)).not.toHaveProperty('task_plugin_key')
+  expect(put.mock.calls[0]?.[1]).not.toHaveProperty('setting_patch')
 })
 
 test('opening and reselecting an existing plugin preserves its saved configuration', async () => {
@@ -1415,8 +1409,8 @@ test('an unavailable plugin keeps its identifier and binding when other fields a
   })
   await userEvent.click(screen.getByRole('button', { name: 'Update Channel' }))
   await waitFor(() => expect(put).toHaveBeenCalled())
-  const payload = put.mock.calls[0]?.[1] as { setting: string }
-  expect(JSON.parse(payload.setting).task_plugin_key).toBe('removed-plugin')
+  expect(put.mock.calls[0]?.[1]).not.toHaveProperty('setting_patch')
+  expect(editingChannel.setting).toBe('{"task_plugin_key":"removed-plugin"}')
 })
 
 test('a failed detail request blocks updating until retry loads the saved channel', async () => {
@@ -1605,8 +1599,10 @@ test('an Ollama channel marks a saved OpenAI-compatible chat setting in Request 
   expect(requestTab).not.toHaveAccessibleName(/Configured/)
   await user.click(screen.getByRole('button', { name: 'Update Channel' }))
   await waitFor(() => expect(put).toHaveBeenCalled())
-  const payload = put.mock.calls[0]?.[1] as { settings: string }
-  expect(JSON.parse(payload.settings)).toMatchObject({
+  const payload = put.mock.calls[0]?.[1] as {
+    settings_patch?: Record<string, unknown>
+  }
+  expect(payload.settings_patch).toMatchObject({
     ollama_openai_chat: false,
   })
 })
@@ -2086,6 +2082,38 @@ test.each(['append', 'replace'])(
     })
   }
 )
+
+test('a background detail refetch retains the configuration baseline of a dirty form', async () => {
+  const originalSetting =
+    '{"responses_websocket_enabled":false,"future":{"revision":1}}'
+  editingChannel = { ...editingChannel, setting: originalSetting }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: false, message: 'Update failed' } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Request & Response/ }))
+  await user.click(
+    screen.getByRole('switch', { name: 'Enable Responses WebSocket' })
+  )
+  editingChannel = {
+    ...editingChannel,
+    setting: '{"responses_websocket_enabled":false,"future":{"revision":2}}',
+  }
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ['channels'] })
+  })
+  expect(
+    screen.getByRole('switch', { name: 'Enable Responses WebSocket' })
+  ).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  expect(put.mock.calls[0]?.[1]).toMatchObject({
+    setting_base: originalSetting,
+    setting_patch: { responses_websocket_enabled: true },
+  })
+})
 
 test('a failed update retains the draft through a background detail refetch', async () => {
   vi.spyOn(api, 'put').mockResolvedValue({
@@ -2804,11 +2832,11 @@ test('a New API channel binds upstream task plugins and publishes their models',
   await user.click(screen.getByRole('button', { name: 'Update Channel' }))
   await waitFor(() => expect(put).toHaveBeenCalled())
   const payload = put.mock.calls[0]?.[1] as {
-    setting?: string
+    setting_patch?: Record<string, unknown>
     models?: string
   }
-  const setting = JSON.parse(payload.setting ?? '{}')
-  expect(setting).toMatchObject({ task_extend_plugin_keys: ['video-b'] })
-  expect(setting).not.toHaveProperty('task_plugin_key')
+  expect(payload.setting_patch).toEqual({
+    task_extend_plugin_keys: ['video-b'],
+  })
   expect(payload.models?.split(',').sort()).toEqual(['gpt-5', 'video-b-1'])
 })

@@ -853,6 +853,7 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	model.InitChannelCache()
 	createAudit := map[string]any{
 		"name":  addChannelRequest.Channel.Name,
 		"type":  addChannelRequest.Channel.Type,
@@ -1102,6 +1103,7 @@ func DeleteChannelBatch(c *gin.Context) {
 
 type PatchChannel struct {
 	model.Channel
+	model.ChannelConfigurationPatch
 	MultiKeyMode *string `json:"multi_key_mode"`
 	KeyMode      *string `json:"key_mode"` // 多key模式下密钥覆盖或者追加
 }
@@ -1136,6 +1138,39 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
+	originChannel, err := model.GetChannelById(channel.Id, true)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	_, settingProvided := requestData["setting"]
+	_, settingsProvided := requestData["settings"]
+	if (settingProvided && channel.SettingPatch != nil) || (settingsProvided && channel.SettingsPatch != nil) {
+		common.ApiError(c, errors.New("settings replacement and patch cannot be submitted together"))
+		return
+	}
+	if !settingProvided {
+		channel.Setting = originChannel.Setting
+	}
+	if !settingsProvided {
+		channel.OtherSettings = originChannel.OtherSettings
+	}
+	if err := channel.ChannelConfigurationPatch.Apply(&channel.Channel, originChannel); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, model.ErrChannelConfigurationConflict) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if channel.SettingPatch != nil {
+		settingProvided = true
+		requestData["setting"] = channel.Setting
+	}
+	if channel.SettingsPatch != nil {
+		settingsProvided = true
+		requestData["settings"] = channel.OtherSettings
+	}
 
 	if channel.Type == constant.ChannelTypeTaskPlugin &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
@@ -1146,28 +1181,32 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	baseURLFromPluginDefault := channel.Type == constant.ChannelTypeTaskPlugin &&
-		(channel.BaseURL == nil || strings.TrimSpace(*channel.BaseURL) == "")
+	// 局部更新只提交被编辑的字段；校验时补齐原渠道上下文，不将补齐字段写回。
+	validationChannel := channel.Channel
+	if _, provided := requestData["type"]; !provided {
+		validationChannel.Type = originChannel.Type
+	}
+	if _, provided := requestData["base_url"]; !provided {
+		validationChannel.BaseURL = originChannel.BaseURL
+	}
+	if _, provided := requestData["other"]; !provided {
+		validationChannel.Other = originChannel.Other
+	}
+	baseURLFromPluginDefault := validationChannel.Type == constant.ChannelTypeTaskPlugin &&
+		(validationChannel.BaseURL == nil || strings.TrimSpace(*validationChannel.BaseURL) == "")
 	// 使用统一的校验函数
-	if err := validateChannel(&channel.Channel, false); err != nil {
+	if err := validateChannel(&validationChannel, false); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),
 		})
 		return
 	}
-	// Preserve existing ChannelInfo to ensure multi-key channels keep correct state even if the client does not send ChannelInfo in the request.
-	originChannel, err := model.GetChannelById(channel.Id, true)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
+	if _, provided := requestData["base_url"]; provided {
+		channel.BaseURL = validationChannel.BaseURL
 	}
 	originProxy := originChannel.GetSetting().Proxy
 	proxyChanged := false
-	_, settingProvided := requestData["setting"]
 	if settingProvided {
 		newProxy, _ := service.NormalizeProxyURL(channel.GetSetting().Proxy)
 		normalizedOriginProxy, originProxyErr := service.NormalizeProxyURL(originProxy)
@@ -1280,8 +1319,19 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	err = channel.Update()
+	// 未编辑的配置不写回，避免普通字段保存覆盖其他管理员刚更新的设置。
+	if !settingProvided {
+		channel.Setting = nil
+	}
+	if !settingsProvided {
+		channel.OtherSettings = ""
+	}
+	err = channel.UpdateWithConfigurationPatch(channel.ChannelConfigurationPatch)
 	if err != nil {
+		if errors.Is(err, model.ErrChannelConfigurationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -1458,7 +1508,9 @@ func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Chan
 	} else if req.ChannelID <= 0 {
 		return nil, fmt.Errorf("advanced_custom is required")
 	}
-	channel.SetOtherSettings(settings)
+	if err := channel.SetOtherSettings(settings); err != nil {
+		return nil, err
+	}
 
 	if req.HeaderOverride != nil {
 		rawHeaderOverride := strings.TrimSpace(*req.HeaderOverride)
@@ -1473,7 +1525,9 @@ func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Chan
 	if req.Proxy != nil {
 		channelSettings := channel.GetSetting()
 		channelSettings.Proxy = strings.TrimSpace(*req.Proxy)
-		channel.SetSetting(channelSettings)
+		if err := channel.SetSetting(channelSettings); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := validateChannel(channel, false); err != nil {

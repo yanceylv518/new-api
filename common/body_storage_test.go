@@ -3,8 +3,11 @@ package common
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,4 +37,19 @@ func TestNewReplayableBodyReaderKeepsStorageLifecycleWithCaller(t *testing.T) {
 	require.NoError(t, storage.Close())
 	_, err = body.NewReader()
 	require.ErrorIs(t, err, ErrStorageClosed)
+}
+
+func TestPrivateAssetUploadRequestUsesDiskForReplay(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/assets/upload", strings.NewReader("upload"))
+	storage, err := GetBodyStorage(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, storage.Close()) })
+	assert.True(t, storage.IsDisk())
+	reader, err := storage.NewReader()
+	require.NoError(t, err)
+	payload, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	assert.Equal(t, "upload", string(payload))
 }

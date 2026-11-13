@@ -193,6 +193,20 @@ func TestVertexAIResponsesProtocol(t *testing.T) {
 	})
 }
 
+func TestVertexAIResponsesExposeOnlyTheHostArtifactURL(t *testing.T) {
+	source, err := builtinplugins.Source("vertex-ai")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "vertex-ai"})
+	require.NoError(t, err)
+	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_responses", "renderFinal"}, map[string]any{"artifacts": map[string]any{"video": map[string]any{"url": "/v1/tasks/task_public/artifacts/video/content"}}}, map[string]any{"status": "SUCCESS", "data": map[string]any{"response": map[string]any{"bytesBase64Encoded": "MUST_NOT_LEAK"}}})
+	require.NoError(t, err)
+	encoded, err := common.Marshal(value)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "/v1/tasks/task_public/artifacts/video/content")
+	assert.Contains(t, string(encoded), "video controls")
+	assert.NotContains(t, string(encoded), "MUST_NOT_LEAK")
+}
+
 func decodePluginValue(t *testing.T, value any) map[string]any {
 	t.Helper()
 	encoded, err := common.Marshal(value)

@@ -38,6 +38,28 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 	return filtered
 }
 
+func pricingForViewer(pricing []model.Pricing, admin bool) []model.Pricing {
+	if admin {
+		return pricing
+	}
+	// 全局缓存仍保留管理员需要的供应商信息，用户响应只复制并匿名化展示身份。
+	pricing = append([]model.Pricing(nil), pricing...)
+	for i := range pricing {
+		if len(pricing[i].BillingPluginVariants) == 0 {
+			continue
+		}
+		variants := append([]model.PricingPluginVariant(nil), pricing[i].BillingPluginVariants...)
+		for j := range variants {
+			if variants[j].PluginKey == "anyllm" || variants[j].PluginKey == "originocean" {
+				variants[j].PluginKey = fmt.Sprintf("video-%d", j+1)
+				variants[j].PluginName, variants[j].Icon = "Doubao Video", "text:SD"
+			}
+		}
+		pricing[i].BillingPluginVariants = variants
+	}
+	return pricing
+}
+
 func GetPricing(c *gin.Context) {
 	// 定价响应可能包含用户专属折扣，统一禁止浏览器和中间代理复用响应。
 	c.Header("Cache-Control", "private, no-store")
@@ -79,6 +101,7 @@ func GetPricing(c *gin.Context) {
 
 	usableGroup = service.GetUserUsableGroups(group)
 	pricing = filterPricingByUsableGroups(pricing, usableGroup)
+	pricing = pricingForViewer(pricing, c.GetInt("role") >= common.RoleAdminUser && c.GetInt("token_id") == 0)
 	if exists {
 		for i := range pricing {
 			name := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(pricing[i].ModelName))

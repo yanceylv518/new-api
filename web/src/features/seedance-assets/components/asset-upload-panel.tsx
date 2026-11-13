@@ -41,6 +41,7 @@ import {
   SEEDANCE_ASSET_ACCEPT,
   formatSeedanceFileSize,
   validateSeedanceAssetFile,
+  type SeedanceAssetUploadLimits,
 } from '../lib/upload'
 import type { SeedanceUploadItem } from '../types'
 
@@ -51,6 +52,7 @@ const MAX_UPLOAD_QUEUE_ITEMS = 100
 export function AssetUploadPanel(props: {
   groupId: string
   groupName?: string
+  getUploadLimits: () => Promise<SeedanceAssetUploadLimits | null>
   onUploaded: (asset: SeedanceAsset) => void
   children: (browse: () => void) => ReactNode
 }) {
@@ -127,11 +129,14 @@ export function AssetUploadPanel(props: {
     }
   }
 
-  const enqueueFiles = (files: File[]) => {
+  const enqueueFiles = async (files: File[]) => {
+    if (files.length === 0) return
     if (!props.groupId) {
       toast.error(t('Select an asset group first'))
       return
     }
+    const limits = await props.getUploadLimits()
+    if (!mountedRef.current) return
     const validItems: SeedanceUploadItem[] = []
     for (const file of files) {
       if (queueSizeRef.current + validItems.length >= MAX_UPLOAD_QUEUE_ITEMS) {
@@ -142,7 +147,7 @@ export function AssetUploadPanel(props: {
         )
         break
       }
-      const validation = validateSeedanceAssetFile(file)
+      const validation = validateSeedanceAssetFile(file, limits)
       if (!validation.valid) {
         toast.error(
           `${file.name}: ${t(validation.errorKey, { limit: validation.limit })}`
@@ -171,15 +176,18 @@ export function AssetUploadPanel(props: {
     if (item.status !== 'error' || pendingIdsRef.current.has(item.id)) return
     pendingIdsRef.current.add(item.id)
     pendingRef.current.push(item)
-    updateQueueItem(item.id, { status: 'queued', progress: 0, error: undefined })
+    updateQueueItem(item.id, {
+      status: 'queued',
+      progress: 0,
+      error: undefined,
+    })
     void processQueue()
   }
 
   // 批量重试只重新入队失败项，保留正在上传和已完成的条目状态。
   const retryFailedUploads = () => {
     const failedItems = queue.filter(
-      (item) =>
-        item.status === 'error' && !pendingIdsRef.current.has(item.id)
+      (item) => item.status === 'error' && !pendingIdsRef.current.has(item.id)
     )
     if (failedItems.length === 0) return
     const failedIds = new Set(failedItems.map((item) => item.id))
@@ -235,7 +243,7 @@ export function AssetUploadPanel(props: {
       onDrop={(event) => {
         event.preventDefault()
         setDragActive(false)
-        enqueueFiles([...event.dataTransfer.files])
+        void enqueueFiles([...event.dataTransfer.files])
       }}
     >
       {props.children(() => inputRef.current?.click())}
@@ -248,7 +256,7 @@ export function AssetUploadPanel(props: {
         accept={SEEDANCE_ASSET_ACCEPT}
         multiple
         onChange={(event) => {
-          enqueueFiles([...(event.target.files ?? [])])
+          void enqueueFiles([...(event.target.files ?? [])])
           event.target.value = ''
         }}
       />

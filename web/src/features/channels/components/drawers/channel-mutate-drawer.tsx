@@ -195,6 +195,7 @@ import {
   getChannelPluginExtensions,
   supportsChannelPluginExtensions,
   supportsNewAPIUpstream,
+  supportsSeedanceAssetURL,
 } from '../../lib/channel-plugin-extensions'
 import { getChannelTypeConfig } from '../../lib/channel-type-config'
 import {
@@ -205,6 +206,7 @@ import {
   assessBaseUrlTrust,
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
+import { videoRoutingModels } from '../../lib/video-routing'
 import type { Channel } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelQuickOptions } from '../channel-quick-options'
@@ -222,6 +224,7 @@ import {
   type PassthroughKind,
 } from '../dialogs/passthrough-warning-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
+import { VideoRoutingEditorDialog } from '../dialogs/video-routing-editor-dialog'
 import {
   ModelMappingBatchDialog,
   type ModelMappingBatchResult,
@@ -281,6 +284,9 @@ const UPSTREAM_DETECTED_MODEL_PREVIEW_LIMIT = 8
 const SENSITIVE_FORM_FIELDS = [
   'type',
   'base_url',
+  'seedance_asset_url',
+  'seedance_asset_share_group',
+  'video_routing_rules',
   'key',
   'openai_organization',
   'other',
@@ -451,6 +457,9 @@ export function ChannelMutateDrawer({
     pluginKey?: string
   } | null>(null)
   const [paramOverrideEditorOpen, setParamOverrideEditorOpen] = useState(false)
+  const [videoRoutingEditorOpen, setVideoRoutingEditorOpen] = useState(false)
+  const [configurationBaseline, setConfigurationBaseline] =
+    useState<Channel | null>(null)
   const [advancedCustomEditorOpen, setAdvancedCustomEditorOpen] =
     useState(false)
   const [clipboardConnectionInfo, setClipboardConnectionInfo] =
@@ -1028,6 +1037,7 @@ export function ChannelMutateDrawer({
       setModelConfiguration(null)
       form.reset(CHANNEL_FORM_DEFAULT_VALUES)
       loadedForm.current = null
+      setConfigurationBaseline(null)
       setProviderTarget(null)
       setChoosingProvider(true)
       setConfigurationSection('connection')
@@ -1046,6 +1056,7 @@ export function ChannelMutateDrawer({
       }
       const defaults = transformChannelToFormDefaults(channelData.data)
       form.reset(defaults)
+      setConfigurationBaseline(channelData.data)
       loadedForm.current = {
         channelId: channelData.data.id,
         snapshot: JSON.stringify(form.getValues()),
@@ -1592,7 +1603,10 @@ export function ChannelMutateDrawer({
   }, [])
 
   const channelMutation = useChannelMutateForm({
-    currentRow,
+    currentRow:
+      configurationBaseline?.id === channelId
+        ? configurationBaseline
+        : currentRow,
     isEditing,
     isMultiKeyChannel,
     onSuccess: handleSuccess,
@@ -2217,6 +2231,43 @@ export function ChannelMutateDrawer({
           )}
         />
       </div>
+
+      {(supportsSeedanceAssetURL(currentType, currentTaskPluginKey) ||
+        (currentType === CHANNEL_TYPE_NEW_API &&
+          currentTaskExtendPluginKeys?.some(
+            (key) => key === 'doubao' || key === 'anyllm' || key === 'originocean'
+          )) ||
+        Boolean(formValues.video_routing_rules?.length)) && (
+        <FormField
+          control={form.control}
+          name='video_routing_rules'
+          render={({ field }) => (
+            <FormItem>
+              <div className='flex flex-wrap items-center justify-between gap-3'>
+                <FormLabel>{t('Video routing rules')}</FormLabel>
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  disabled={sensitiveLocked || isSubmitting}
+                  onClick={() => setVideoRoutingEditorOpen(true)}
+                >
+                  <Wand2 className='mr-2 size-4' />
+                  {t('Visual edit')}
+                </Button>
+              </div>
+              <FormDescription>
+                {field.value?.length
+                  ? t('{{count}} video routing rules configured', {
+                      count: field.value.length,
+                    })
+                  : t('No video routing rules configured.')}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      )}
 
       <FormField
         control={form.control}
@@ -4104,10 +4155,21 @@ export function ChannelMutateDrawer({
                     <FormControl>
                       <Input placeholder={baseUrlPlaceholder} {...field} />
                     </FormControl>
-                    {currentType !== CHANNEL_TYPE_TASK_PLUGIN && (
+                    {currentType !== CHANNEL_TYPE_TASK_PLUGIN &&
+                      currentType !== CHANNEL_TYPE_NEW_API && (
+                        <FormDescription>
+                          {t(
+                            'Custom API base URL. For official channels, New API has built-in addresses. Only fill this for third-party proxy sites or special endpoints. Do not add /v1 or trailing slash.'
+                          )}
+                        </FormDescription>
+                      )}
+                    {currentType === CHANNEL_TYPE_NEW_API && (
                       <FormDescription>
                         {t(
-                          'Custom API base URL. For official channels, New API has built-in addresses. Only fill this for third-party proxy sites or special endpoints. Do not add /v1 or trailing slash.'
+                          'Enter the complete service URL, including any required prefix.'
+                        )}{' '}
+                        {t(
+                          'Use separate channels when plugins require different service prefixes.'
                         )}
                       </FormDescription>
                     )}
@@ -4115,13 +4177,18 @@ export function ChannelMutateDrawer({
                       !boundTaskPlugin?.baseUrl && (
                         <FormDescription>
                           {t(
-                            'The upstream address this plugin sends requests to. The plugin declares no default, so it must be filled in.'
+                            'Enter the complete service URL, including any required prefix.'
                           )}
                         </FormDescription>
                       )}
                     {currentType === CHANNEL_TYPE_TASK_PLUGIN &&
                       boundTaskPlugin?.baseUrl && (
                         <FormDescription className='flex flex-wrap items-center gap-x-1'>
+                          <span>
+                            {t(
+                              'Enter the complete service URL, including any required prefix.'
+                            )}
+                          </span>
                           <span>{t('Plugin default')}:</span>
                           <span className='font-mono break-all'>
                             {boundTaskPlugin.baseUrl}
@@ -4172,6 +4239,58 @@ export function ChannelMutateDrawer({
                   </FormItem>
                 )}
               />
+            )}
+
+            {supportsSeedanceAssetURL(currentType, currentTaskPluginKey) && (
+              <>
+                <FormField
+                  control={form.control}
+                  name='seedance_asset_url'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Asset service URL')}</FormLabel>
+                      <FormControl>
+                        <Input
+                          type='url'
+                          placeholder={
+                            currentTaskPluginKey === 'originocean'
+                              ? 'https://api.example.com/v1/assets'
+                              : 'https://api.example.com/'
+                          }
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name='seedance_asset_share_group'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Asset sharing group')}</FormLabel>
+                      <FormControl>
+                        <Input placeholder='main-account' {...field} />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Use the same group only for channels that can share private assets. Leave blank to bind by key.'
+                        )}{' '}
+                        {t(
+                          'Changing this group does not migrate existing assets.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </>
             )}
 
             {currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && (
@@ -5016,6 +5135,23 @@ export function ChannelMutateDrawer({
               shouldValidate: true,
             })
           }}
+        />
+      )}
+
+      {videoRoutingEditorOpen && !sensitiveLocked && (
+        <VideoRoutingEditorDialog
+          models={videoRoutingModels(
+            parseModelsString(formValues.models || ''),
+            formValues.model_mapping
+          )}
+          value={formValues.video_routing_rules || []}
+          onOpenChange={setVideoRoutingEditorOpen}
+          onChange={(rules) =>
+            form.setValue('video_routing_rules', rules, {
+              shouldDirty: true,
+              shouldValidate: true,
+            })
+          }
         />
       )}
 

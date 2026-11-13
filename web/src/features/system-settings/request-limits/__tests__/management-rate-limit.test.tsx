@@ -43,6 +43,17 @@ const defaults = {
   session_refresh: { enabled: true, requests: 60, window_seconds: 60 },
   token_query: { enabled: true, requests: 60, window_seconds: 60 },
   sensitive: { enabled: true, requests: 20, window_seconds: 1200 },
+  seedance_asset: { enabled: true, requests: 60, window_seconds: 60 },
+  asset_upload: { enabled: true, requests: 10, window_seconds: 60 },
+  asset_download: { enabled: true, requests: 10, window_seconds: 60 },
+  asset_limits: {
+    image_mib: 30,
+    video_mib: 50,
+    audio_mib: 15,
+    compat_image_mib: 50,
+    user_max_count: 1000,
+    user_storage_mib: 1024,
+  },
 }
 
 function Fixture({ value = JSON.stringify(defaults) }: { value?: string }) {
@@ -80,7 +91,7 @@ describe('management rate limit settings', () => {
       .spyOn(api, 'put')
       .mockResolvedValue({ data: { success: true } })
     render(<Fixture />)
-    expect(screen.getAllByRole('switch')).toHaveLength(6)
+    expect(screen.getAllByRole('switch')).toHaveLength(9)
     const save = screen.getByRole('button', { name: 'Save Changes' })
     expect(save).toBeDisabled()
     const query = within(
@@ -102,6 +113,81 @@ describe('management rate limit settings', () => {
       }),
     })
     await waitFor(() => expect(save).toBeDisabled())
+  })
+
+  test('asset limits can be changed independently and saved together', async () => {
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    render(<Fixture />)
+    const assets = within(
+      screen.getByRole('group', {
+        name: 'Asset library requests (per account)',
+      })
+    )
+    const uploads = within(
+      screen.getByRole('group', { name: 'Asset uploads (per IP)' })
+    )
+    const downloads = within(
+      screen.getByRole('group', { name: 'Public asset downloads (per IP)' })
+    )
+    fireEvent.change(
+      assets.getByRole('spinbutton', { name: 'Max requests per period' }),
+      { target: { value: '120' } }
+    )
+    fireEvent.change(
+      uploads.getByRole('spinbutton', { name: 'Window (seconds)' }),
+      { target: { value: '30' } }
+    )
+    await userEvent.click(downloads.getByRole('switch'))
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+    expect(put.mock.calls[0][1]).toEqual({
+      key: 'ManagementRateLimits',
+      expected_value: JSON.stringify(defaults),
+      value: JSON.stringify({
+        ...defaults,
+        seedance_asset: { ...defaults.seedance_asset, requests: 120 },
+        asset_upload: { ...defaults.asset_upload, window_seconds: 30 },
+        asset_download: { ...defaults.asset_download, enabled: false },
+      }),
+    })
+  })
+
+  test('saves file sizes and account quotas including an unlimited quota', async () => {
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    render(<Fixture />)
+    const limits = within(
+      screen.getByRole('group', { name: 'Private asset limits' })
+    )
+    fireEvent.change(
+      limits.getByRole('spinbutton', { name: 'Image file size (MiB)' }),
+      {
+        target: { value: '60' },
+      }
+    )
+    fireEvent.change(
+      limits.getByRole('spinbutton', { name: 'Asset count per account' }),
+      {
+        target: { value: '0' },
+      }
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+    expect(put.mock.calls[0][1]).toEqual({
+      key: 'ManagementRateLimits',
+      expected_value: JSON.stringify(defaults),
+      value: JSON.stringify({
+        ...defaults,
+        asset_limits: {
+          ...defaults.asset_limits,
+          image_mib: 60,
+          user_max_count: 0,
+        },
+      }),
+    })
   })
 
   test.each(['0', '2147483648', '1.5', ''])(

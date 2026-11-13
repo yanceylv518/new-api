@@ -2,6 +2,9 @@ package plugins_test
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -10,6 +13,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMarketLatestViduUsesTheBilledDuration(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "marketplace", "catalog.json"))
+	require.NoError(t, err)
+	var catalog struct {
+		Plugins []struct {
+			Key, Latest string
+			Versions    []struct{ Version, Path string }
+		}
+	}
+	require.NoError(t, common.Unmarshal(data, &catalog))
+	var source []byte
+	for _, plugin := range catalog.Plugins {
+		if plugin.Key != "vidu" {
+			continue
+		}
+		for _, version := range plugin.Versions {
+			if version.Version != plugin.Latest {
+				continue
+			}
+			source, err = os.ReadFile(filepath.Join("..", "marketplace", "releases", filepath.FromSlash(strings.TrimPrefix(version.Path, "/"))))
+			require.NoError(t, err)
+			t.Logf("market latest vidu: %s", version.Version)
+		}
+	}
+	require.NotEmpty(t, source)
+	plugin, err := jsplugin.NewRegistry().Register(string(source), jsplugin.Options{Key: "vidu"})
+	require.NoError(t, err)
+	ctx := map[string]any{"baseUrl": "https://provider.example", "apiKey": "fixture", "upstreamModel": "viduq3", "action": "text_to_video", "usagePurpose": "facts", "requestBody": map[string]any{"model": "viduq3", "prompt": "test", "duration": 1, "resolution": "720p", "metadata": map[string]any{"duration": 16}}}
+	value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+	require.NoError(t, err)
+	request := decodePluginValue(t, value)
+	value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+	require.NoError(t, err)
+	assert.Equal(t, decodePluginValue(t, value)["duration"], request["body"].(map[string]any)["duration"])
+}
 
 func TestViduResponsesProtocol(t *testing.T) {
 	testVideoResponsesProtocol(t, videoResponsesTestCase{
@@ -59,6 +98,21 @@ func loadViduPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "vidu"})
 	require.NoError(t, err)
 	return plugin
+}
+
+func TestViduMetadataUsesTheBilledDurationAndResolution(t *testing.T) {
+	plugin := loadViduPlugin(t)
+	for _, request := range []map[string]any{
+		{"model": "viduq3-turbo", "duration": 1, "resolution": "720p", "metadata": map[string]any{"model": "viduq3-pro", "duration": 16, "resolution": "1080p"}},
+		{"model": "viduq3-turbo", "metadata": map[string]any{"duration": 8, "resolution": "1080p"}},
+	} {
+		ctx := map[string]any{"baseUrl": "https://provider.example", "upstreamModel": "viduq3-turbo", "action": "text_to_video", "requestBody": request, "usagePurpose": "facts"}
+		body := callViduHook(t, plugin, "buildSubmitRequest", ctx)["body"].(map[string]any)
+		facts := callViduHook(t, plugin, "extractUsage", ctx)
+		assert.Equal(t, "viduq3-turbo", body["model"])
+		assert.Equal(t, facts["duration"], body["duration"])
+		assert.Equal(t, facts["resolution"], body["resolution"])
+	}
 }
 
 func callViduNative(t *testing.T, plugin *jsplugin.LoadedPlugin, name string, ctx map[string]any, args ...any) any {
@@ -283,7 +337,7 @@ func TestViduNativeQueryUsesTaskListAndPreservesResults(t *testing.T) {
 
 	gatewayQueryValue, err := plugin.Engine.Call(t.Context(), "buildQueryRequest", map[string]any{
 		"taskId":   "upstream-task",
-		"baseUrl":  "https://example.com",
+		"baseUrl":  "https://example.com/vidu",
 		"apiKey":   "provider-key",
 		"upstream": map[string]any{"kind": "new_api"},
 	})

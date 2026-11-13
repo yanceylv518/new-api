@@ -342,6 +342,7 @@ func migrateDB() error {
 	err := DB.AutoMigrate(
 		&Channel{},
 		&Token{},
+		&TokenSignatureCredential{},
 		&User{},
 		&UserModelPricing{},
 		&UserModelPricingRevision{},
@@ -360,8 +361,12 @@ func migrateDB() error {
 		&TopUp{},
 		&QuotaData{},
 		&Task{},
+		&SeedanceCompatTaskIDSequence{},
+		&TaskResource{},
+		&TaskResourceIndexState{},
 		&TaskRequestSnapshot{},
 		&VideoTaskPendingLog{},
+		&BillingRefund{},
 		&SeedanceAssetSize{},
 		&TaskPlugin{},
 		&Model{},
@@ -387,6 +392,7 @@ func migrateDB() error {
 		&SeedanceAsset{},
 		&SeedanceAssetSchemaMigration{},
 		&SeedanceAssetReplica{},
+		&SeedanceAssetDiscovery{},
 		&SeedanceAssetCleanupJob{},
 		&CasbinRule{},
 		&AuthzRole{},
@@ -395,10 +401,16 @@ func migrateDB() error {
 	if err != nil {
 		return err
 	}
+	if err := migrateSeedanceAssetGroupNameUniqueness(DB); err != nil {
+		return err
+	}
 	if err := migrateSeedanceAssetListPerformance(DB); err != nil {
 		return err
 	}
 	if err := migrateUserModelPricingScheduleIndex(DB); err != nil {
+		return err
+	}
+	if err := migrateVideoTaskLogKinds(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

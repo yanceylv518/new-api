@@ -61,17 +61,23 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 	if maxMB <= 0 {
 		maxMB = 128 // 默认 128MB
 	}
-	maxBytes := int64(maxMB) << 20
+	maxBytes := RequestBodyLimitForPath(c.Request.Method, c.Request.URL.Path, int64(maxMB)<<20)
 
 	contentLength := c.Request.ContentLength
 
-	// 使用新的存储系统
-	storage, err := CreateBodyStorageFromReader(c.Request.Body, contentLength, maxBytes)
+	// 签名素材上传必须重读正文；始终使用磁盘，避免管理员调大上限后将整份文件载入内存。
+	var storage BodyStorage
+	var err error
+	if IsPrivateAssetUploadPath(c.Request.Method, c.Request.URL.Path) {
+		storage, err = newDiskStorageFromReader(c.Request.Body, maxBytes, GetDiskCachePath())
+	} else {
+		storage, err = CreateBodyStorageFromReader(c.Request.Body, contentLength, maxBytes)
+	}
 	_ = c.Request.Body.Close()
 
 	if err != nil {
 		if IsRequestBodyTooLargeError(err) {
-			return nil, errors.Wrap(ErrRequestBodyTooLarge, fmt.Sprintf("request body exceeds %d MB", maxMB))
+			return nil, errors.Wrap(ErrRequestBodyTooLarge, fmt.Sprintf("request body exceeds %d MB", maxBytes>>20))
 		}
 		return nil, err
 	}

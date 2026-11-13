@@ -165,7 +165,7 @@ func GetChannel(
 
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
-// closed when a task-plugin identity is required and fails open otherwise.
+// 账号或插件身份依赖渠道详情时，查询失败必须拒绝候选，不能跳过权限约束。
 func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
 	if len(abilities) == 0 {
 		return nil
@@ -206,6 +206,9 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 
 func identityFilterRequiresKey(filters []dto.ChannelFilter) bool {
 	for _, filter := range filters {
+		if filter.Kind == dto.FilterSeedanceAssetAccount || filter.Kind == dto.FilterSeedanceAssetReady || filter.Kind == dto.FilterVideoRouting {
+			return true
+		}
 		if filter.Kind == dto.FilterTaskPluginIdentity && filter.TaskPluginKey != "" {
 			return true
 		}

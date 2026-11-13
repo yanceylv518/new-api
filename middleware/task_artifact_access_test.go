@@ -150,6 +150,22 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), request)
 
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
+	router.GET("/v1/seedance/validation-sessions/:id/callback", func(c *gin.Context) {
+		assert.Equal(t, "callback-state", c.Query("state"))
+		assert.Equal(t, "callback-token", c.Query("bytedToken"))
+		c.Status(http.StatusNoContent)
+	})
+	callback := httptest.NewRequest(http.MethodGet, "/v1/seedance/validation-sessions/1/callback?state=callback-state&bytedToken=callback-token", nil)
+	router.ServeHTTP(httptest.NewRecorder(), callback)
+	assert.NotContains(t, output.String(), "callback-state")
+	assert.NotContains(t, output.String(), "callback-token")
+	router.GET("/doubao/api/a/:id", func(c *gin.Context) {
+		assert.Equal(t, "download-signature", c.Query("s"))
+		c.Status(http.StatusNoContent)
+	})
+	public := httptest.NewRequest(http.MethodGet, "/doubao/api/a/asset-1?e=1&s=download-signature", nil)
+	router.ServeHTTP(httptest.NewRecorder(), public)
+	assert.NotContains(t, output.String(), "download-signature")
 }
 
 func urlQueryEscape(value string) string {

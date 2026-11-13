@@ -7,7 +7,8 @@ export const meta = {
     en: "Google Veo video generation on Vertex AI (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Vertex AI 版本",
   },
-  version: "1.0.2",
+  version: "1.1.1",
+  requiredCapabilities: ["artifact-base64@1"],
   channelTypes: [41],
   author: { name: "QuantumNous" },
   models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],
@@ -150,6 +151,7 @@ export function buildSubmitRequest(ctx) {
     metadata = Object.assign({}, req.metadata || {}),
     model = ctx.upstreamModel || "veo-3.0-generate-001";
   if (Number(req.duration) > 0) metadata.durationSeconds = Number(req.duration);
+  if (req.resolution) metadata.resolution = req.resolution;
   if (!metadata.resolution && req.size) metadata.resolution = resolution(req.size);
   if (!metadata.aspectRatio && req.size) metadata.aspectRatio = aspect(req.size);
   if (metadata.resolution) metadata.resolution = String(metadata.resolution).toLowerCase();
@@ -201,7 +203,7 @@ export function extractUsage(ctx) {
   const metadata = req.metadata || {};
   return {
     seconds: duration(req),
-    resolution: String(metadata.resolution || resolution(req.size) || "720p").toLowerCase(),
+    resolution: String(req.resolution || metadata.resolution || resolution(req.size) || "720p").toLowerCase(),
     generate_audio: metadata.generateAudio !== false,
   };
 }
@@ -217,12 +219,20 @@ export function buildQueryRequest(ctx) {
   return {
     url: modelURL(ctx, project, location || "us-central1", model, "fetchPredictOperation"),
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: ctx.authHeader, "x-goog-user-project": ctx.auth.projectId },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: ctx.authHeader,
+      "x-goog-user-project": ctx.auth.projectId || project,
+    },
     body: { operationName: name },
   };
 }
 export function parseTaskResult(ctx, body) {
-  if (body.error && body.error.message) return { status: "FAILURE", progress: "100%", reason: body.error.message };
+  if (body.error && body.error.message) {
+    if (body.done === true && trimmed(body.name)) return { status: "FAILURE", progress: "100%", reason: body.error.message };
+    throw new Error(body.error.message);
+  }
   // Google long-running operations omit `done` (proto3 default) while still
   // running, so a missing key means in-progress; only a non-operation shape is
   // unrecognized.
@@ -231,13 +241,26 @@ export function parseTaskResult(ctx, body) {
   const url = dataVideo(body.response || {});
   return { status: "SUCCESS", progress: "100%", url: url, remoteUrl: url };
 }
-export function listArtifacts() {
-  return [];
+export function listArtifacts(task) {
+  const data = task.data || {};
+  return task.status === "SUCCESS" && data.done === true && data.response ? [{ key: "video", type: "video", mimeType: "video/mp4" }] : [];
 }
-export function buildContentRequest() {
-  throw new Error("artifact_not_found");
+export function buildContentRequest(ctx) {
+  if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
+  const query = buildQueryRequest(Object.assign({}, ctx, { taskId: ctx.upstreamTaskId }));
+  query.base64ContentPaths = ["response.videos.0.bytesBase64Encoded", "response.bytesBase64Encoded", "response.video"];
+  const response = (ctx.data || {}).response || {};
+  const first = (response.videos || [])[0] || {};
+  const encoding = first.mimeType || first.encoding || response.encoding || "video/mp4";
+  query.contentType = String(encoding).includes("/") ? encoding : "video/" + encoding;
+  return query;
 }
 function completionMessage(ctx, task) {
+  const artifact = ctx && ctx.artifacts && ctx.artifacts.video;
+  if (artifact && trimmed(artifact.url)) {
+    const url = trimmed(artifact.url).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return '<video controls src="' + url + '"></video>';
+  }
   const request = (ctx && ctx.requestBody) || {};
   const model = trimmed(request.model) || trimmed((task.properties || {}).origin_model_name) || "veo-3.0-generate-001";
   const status = String(task.status || "SUCCESS").toUpperCase();
@@ -382,6 +405,11 @@ protocols.openai_video = {
     }
     if (hasInputReferenceFile) {
       req.images = [{ __fileRef: "request_file:input_reference", encoding: "base64", maxBytes: 20971520 }];
+    } else if (req.input_reference !== undefined || req.image !== undefined) {
+      const reference = req.input_reference !== undefined ? req.input_reference : req.image;
+      if (typeof reference !== "string" || !/^(data:image\/(png|jpeg);base64,|iVBORw0KGgo|\/9j\/)/i.test(reference))
+        throw new Error("input reference must be a PNG or JPEG data URL or base64 value");
+      req.images = [reference];
     }
     return {
       kind: "submit",

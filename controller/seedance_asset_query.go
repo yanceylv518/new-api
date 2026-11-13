@@ -20,6 +20,9 @@ type seedanceLibraryQuery struct {
 	groups, ids, assetIDs, statuses, assetTypes []string
 	search, order                               string
 	groupType                                   string
+	statusExpression                            string
+	statusArguments                             []any
+	userID                                      int
 	nameOnly                                    bool
 	after, before                               *time.Time
 	page                                        *common.PageInfo
@@ -29,7 +32,7 @@ type seedanceLibraryQuery struct {
 // parseSeedanceLibraryQuery 先完成全部校验再访问数据库。批量参数支持逗号或重复键，
 // 单复数互斥，限制原始元素数以防去重前的无界输入；排序只能来自固定白名单。
 func parseSeedanceLibraryQuery(c *gin.Context, groups bool) (*seedanceLibraryQuery, error) {
-	q := &seedanceLibraryQuery{page: common.GetPageQuery(c)}
+	q := &seedanceLibraryQuery{page: common.GetPageQuery(c), userID: c.GetInt("id")}
 	q.nameOnly = c.GetString(seedanceAssetActionContextKey) != ""
 	q.groupType = c.GetString("seedance_asset_action_group_type")
 	// URL.Query 会静默丢弃格式错误的参数，必须显式拒绝，避免意外退回全量查询。
@@ -183,6 +186,10 @@ func parseSeedanceLibraryQuery(c *gin.Context, groups bool) (*seedanceLibraryQue
 	case "":
 		column = "id"
 	case "id", "created_at", "updated_at", "name":
+	case "group_id":
+		if groups || !c.GetBool("seedance_compat_ark_action") {
+			return nil, fmt.Errorf("unsupported sort_by")
+		}
 	default:
 		return nil, fmt.Errorf("unsupported sort_by")
 	}
@@ -195,7 +202,11 @@ func parseSeedanceLibraryQuery(c *gin.Context, groups bool) (*seedanceLibraryQue
 	}
 	q.order = column + " " + direction
 	if column != "id" {
-		q.order += ", id " + direction
+		if c.GetBool("seedance_compat_ark_action") {
+			q.order += ", id asc"
+		} else {
+			q.order += ", id " + direction
+		}
 	}
 	return q, nil
 }
@@ -212,6 +223,10 @@ func (q *seedanceLibraryQuery) scope(db *gorm.DB) *gorm.DB {
 func (q *seedanceLibraryQuery) filter(db *gorm.DB, groups bool) *gorm.DB {
 	if groups && q.groupType != "" {
 		db = db.Where("group_type = ?", q.groupType)
+	} else if !groups && q.groupType != "" {
+		groupsQuery := model.DB.WithContext(db.Statement.Context).Model(&model.SeedanceAssetGroup{}).
+			Select("group_id").Where("user_id = ? AND group_type = ?", q.userID, q.groupType)
+		db = db.Where("group_id IN (?)", groupsQuery)
 	}
 	if len(q.ids) > 0 {
 		db = db.Where("id IN ?", q.ids)
@@ -220,7 +235,12 @@ func (q *seedanceLibraryQuery) filter(db *gorm.DB, groups bool) *gorm.DB {
 		db = db.Where("asset_id IN ?", q.assetIDs)
 	}
 	if len(q.statuses) > 0 {
-		db = db.Where("LOWER(status) IN ?", q.statuses)
+		if !groups && q.statusExpression != "" {
+			args := append(append([]any{}, q.statusArguments...), q.statuses)
+			db = db.Where("("+q.statusExpression+") IN ?", args...)
+		} else {
+			db = db.Where("LOWER(status) IN ?", q.statuses)
+		}
 	}
 	if len(q.assetTypes) > 0 {
 		db = db.Where("LOWER(asset_type) IN ?", q.assetTypes)
@@ -261,7 +281,12 @@ func GetSeedanceAssetGroup(c *gin.Context) {
 		seedanceAssetAPIError(c, err)
 		return
 	}
-	seedanceAssetAPISuccess(c, group)
+	groups := []model.SeedanceAssetGroup{group}
+	if err := model.LoadSeedanceAssetGroupDeletionStates(c.Request.Context(), c.GetInt("id"), groups); err != nil {
+		seedanceAssetAPIError(c, err)
+		return
+	}
+	seedanceAssetAPISuccess(c, groups[0])
 }
 
 // GetSeedanceAsset 返回同步到本地的状态及临时预览，不隐式刷新或调用上游。
@@ -280,6 +305,14 @@ func GetSeedanceAsset(c *gin.Context) {
 	if err != nil {
 		seedanceAssetAPIError(c, err)
 		return
+	}
+	if asset.LocalOnly == nil || !*asset.LocalOnly {
+		assets := []model.SeedanceAsset{asset}
+		if err := projectSeedanceAssetStatuses(c, assets, false); err != nil {
+			seedanceAssetAPIError(c, err)
+			return
+		}
+		asset = assets[0]
 	}
 	asset.PreviewURL, err = seedanceAssetPreviewURL(c.Request.Context(), &asset)
 	if err != nil {

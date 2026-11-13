@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Archive } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -39,6 +39,7 @@ import {
   batchDeleteSeedanceAssets,
   deleteSeedanceAsset,
   deleteSeedanceAssetGroup,
+  getSeedanceAssetUploadLimits,
   getSeedanceAssetValidationSession,
   listSeedanceAssetGroups,
   listSeedanceAssets,
@@ -125,11 +126,26 @@ export function SeedanceAssets() {
   const groups = useQuery({
     queryKey: ['seedance-asset-groups', userId],
     queryFn: ({ signal }) => listSeedanceAssetGroups(signal),
-    refetchInterval: (query) =>
-      query.state.data?.data.some((group) => group.status === 'Deleting')
-        ? 5000
-        : false,
+    refetchOnWindowFocus: true,
+    refetchInterval: (query) => {
+      if (query.state.data?.data.some((group) => group.status === 'Deleting')) {
+        return 5000
+      }
+      return groupCategory === 'LivenessFace' ? 30000 : false
+    },
   })
+  const getUploadLimits = useCallback(async () => {
+    try {
+      return await queryClient.fetchQuery({
+        queryKey: ['seedance-asset-upload-limits', userId],
+        queryFn: ({ signal }) => getSeedanceAssetUploadLimits(signal),
+        staleTime: 0,
+        retry: false,
+      })
+    } catch {
+      return null
+    }
+  }, [queryClient, userId])
   const validationSession = useQuery({
     queryKey: [
       'seedance-asset-validation-session',
@@ -165,8 +181,18 @@ export function SeedanceAssets() {
     queryKey: ['seedance-assets', userId, selectedId, filters],
     queryFn: ({ signal }) => listSeedanceAssets(selectedId, signal, filters),
     enabled: Boolean(selectedId),
-    // React Query 管理计时器与卸载取消；全部进入终态后停止轮询。
-    refetchInterval: (query) => (query.state.data?.has_pending ? 5000 : false),
+    // 超时素材仍会在后台恢复，页面低频刷新以显示后续结果。
+    refetchInterval: (query) => {
+      if (query.state.data?.has_pending) return 5000
+      if (
+        query.state.data?.data.some(
+          (asset) => asset.failure_code === 'review_timeout'
+        )
+      ) {
+        return 60000
+      }
+      return false
+    },
   })
 
   // 分组和筛选改变后清空选择；分页切换保留已选 ID，支持跨页批量操作。
@@ -267,7 +293,7 @@ export function SeedanceAssets() {
       setPage(1)
       setDeleteGroup(null)
       void invalidate()
-      toast.success(t('Deleted successfully'))
+      toast.success(t('Deletion request submitted'))
     },
     onError: (error) => {
       void invalidate()
@@ -512,6 +538,7 @@ export function SeedanceAssets() {
             <AssetUploadPanel
               groupId={canUpload ? selectedId : ''}
               groupName={selectedGroup?.name}
+              getUploadLimits={getUploadLimits}
               onUploaded={(asset) => {
                 clearAssetSelection()
                 setPage(1)
@@ -609,6 +636,7 @@ export function SeedanceAssets() {
 
       <CreateHumanValidationDialog
         open={createValidationDialogOpen}
+        getUploadLimits={getUploadLimits}
         isPending={createValidationMutation.isPending}
         isChecking={validationSession.isFetching}
         session={validationSession.data?.data ?? null}

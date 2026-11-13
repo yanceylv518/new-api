@@ -348,45 +348,52 @@ func updatePricing() {
 			pricing.Tags = meta.Tags
 			pricing.VendorID = meta.VendorID
 		}
-		modelPrice, findPrice := ratio_setting.GetModelPrice(model, false)
+		declared := ""
+		aliasTarget, isAlias := ResolveTaskModelAlias(pluginGeneration, model)
+		if isAlias {
+			declared = aliasTarget.Declared
+		}
+		priceModel := ResolveTaskPriceModel("", model, declared)
+		modelPrice, findPrice := ratio_setting.GetModelPrice(priceModel, false)
+		if !findPrice && priceModel != model {
+			modelPrice, findPrice = ratio_setting.GetDefaultModelPriceMap()[priceModel]
+		}
 		if findPrice {
 			pricing.ModelPrice = modelPrice
 			pricing.QuotaType = 1
 		} else {
-			modelRatio, _, _ := ratio_setting.GetModelRatio(model)
+			modelRatio, _, _ := ratio_setting.GetModelRatio(priceModel)
 			pricing.ModelRatio = modelRatio
-			pricing.CompletionRatio = ratio_setting.GetCompletionRatio(model)
+			pricing.CompletionRatio = ratio_setting.GetCompletionRatio(priceModel)
 			pricing.QuotaType = 0
 		}
-		if cacheRatio, ok := ratio_setting.GetCacheRatio(model); ok {
+		if cacheRatio, ok := ratio_setting.GetCacheRatio(priceModel); ok {
 			pricing.CacheRatio = &cacheRatio
 		}
-		if createCacheRatio, ok := ratio_setting.GetCreateCacheRatio(model); ok {
+		if createCacheRatio, ok := ratio_setting.GetCreateCacheRatio(priceModel); ok {
 			pricing.CreateCacheRatio = &createCacheRatio
 		}
-		if imageRatio, ok := ratio_setting.GetImageRatio(model); ok {
+		if imageRatio, ok := ratio_setting.GetImageRatio(priceModel); ok {
 			pricing.ImageRatio = &imageRatio
 		}
-		if ratio_setting.ContainsAudioRatio(model) {
-			audioRatio := ratio_setting.GetAudioRatio(model)
+		if ratio_setting.ContainsAudioRatio(priceModel) {
+			audioRatio := ratio_setting.GetAudioRatio(priceModel)
 			pricing.AudioRatio = &audioRatio
 		}
-		if ratio_setting.ContainsAudioCompletionRatio(model) {
-			audioCompletionRatio := ratio_setting.GetAudioCompletionRatio(model)
+		if ratio_setting.ContainsAudioCompletionRatio(priceModel) {
+			audioCompletionRatio := ratio_setting.GetAudioCompletionRatio(priceModel)
 			pricing.AudioCompletionRatio = &audioCompletionRatio
 		}
-		if billingMode := billing_setting.GetBillingMode(model); billingMode == "tiered_expr" {
-			if expr, ok := billing_setting.GetBillingExpr(model); ok && strings.TrimSpace(expr) != "" {
+		if billingMode := billing_setting.GetBillingMode(priceModel); billingMode == billing_setting.BillingModeTieredExpr {
+			if expr, ok := billing_setting.GetBillingExpr(priceModel); ok && strings.TrimSpace(expr) != "" {
 				pricing.BillingMode = billingMode
 				pricing.BillingExpr = expr
 			}
-		} else if target, resolved := ResolveTaskModelAlias(pluginGeneration, model); resolved && target.Declared != "" {
-			if tailMode := billing_setting.GetBillingMode(target.Declared); tailMode == "tiered_expr" {
-				if expr, ok := billing_setting.GetBillingExpr(target.Declared); ok && strings.TrimSpace(expr) != "" {
-					pricing.BillingMode = tailMode
-					pricing.BillingExpr = expr
-				}
-			}
+		}
+		if isAlias && declared == "" && !HasPriceOrRatioEntry(model) {
+			// 多个原模型的价格无法合并成单一报价，不能展示自用模式的默认倍率。
+			pricing.ModelRatio, pricing.CompletionRatio = 0, 0
+			pricing.BillingMode = billing_setting.BillingModeTieredExpr
 		}
 		usageModel := model
 		plugin, ok := pluginGeneration.GetByModel(model)
@@ -402,22 +409,30 @@ func updatePricing() {
 			pricing.BillingUsageExamples = jsplugin.CloneUsageExamples(usageExamples)
 		}
 		providers := pluginGeneration.PluginsByModel(model)
+		if len(providers) == 0 && usageModel != model {
+			providers = pluginGeneration.PluginsByModel(usageModel)
+			if len(providers) == 0 && ok && plugin != nil {
+				providers = []*jsplugin.LoadedPlugin{plugin}
+			}
+		}
 		hasProviderOverride := false
 		for _, provider := range providers {
-			if _, configured := billing_setting.GetPluginBillingExpr(provider.Meta.Key, model); configured {
+			providerPriceModel := ResolveTaskPriceModel(provider.Meta.Key, model, declared)
+			if _, configured := billing_setting.GetPluginBillingExpr(provider.Meta.Key, providerPriceModel); configured {
 				hasProviderOverride = true
 				break
 			}
 		}
 		if hasProviderOverride || (len(providers) >= 2 && pricing.BillingMode == billing_setting.BillingModeTieredExpr) {
 			for _, provider := range providers {
-				schema, examples := provider.Meta.UsageForModel(model)
+				schema, examples := provider.Meta.UsageForModel(usageModel)
 				if schema == nil {
 					schema = map[string]jsplugin.UsageFieldSchema{}
 				}
-				expression, hasExpression := billing_setting.ResolveTaskBillingExpr(provider.Meta.Key, model, "")
+				providerPriceModel := ResolveTaskPriceModel(provider.Meta.Key, model, declared)
+				expression, hasExpression := billing_setting.ResolveTaskBillingExpr(provider.Meta.Key, providerPriceModel, "")
 				mode := billing_setting.BillingModeRatio
-				if hasExpression || billing_setting.GetBillingMode(model) == billing_setting.BillingModeTieredExpr {
+				if hasExpression || billing_setting.GetBillingMode(providerPriceModel) == billing_setting.BillingModeTieredExpr {
 					mode = billing_setting.BillingModeTieredExpr
 				}
 				if mode == billing_setting.BillingModeTieredExpr && !billing_setting.TaskExprCompatible(expression, schema) {

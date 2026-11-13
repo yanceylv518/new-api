@@ -2,27 +2,160 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
+// SeedanceAssetAccountFingerprint 按素材入口和管理员声明的共享范围区分账号。
+func SeedanceAssetAccountFingerprint(channel *Channel, keyFingerprint string) string {
+	if channel == nil || strings.TrimSpace(keyFingerprint) == "" {
+		return ""
+	}
+	settings := channel.GetSetting()
+	baseURL := strings.TrimRight(strings.TrimSpace(settings.SeedanceAssetURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	identity := keyFingerprint
+	if settings.SeedanceAssetShareGroup != "" {
+		identity = "shared:" + settings.SeedanceAssetShareGroup
+	}
+	if channel.Type == constant.ChannelTypeTaskPlugin && settings.TaskPluginKey == "anyllm" {
+		return seedanceAssetAccountFingerprint(baseURL, "json-action", identity)
+	}
+	if channel.Type == constant.ChannelTypeTaskPlugin && settings.TaskPluginKey == "originocean" {
+		return seedanceAssetAccountFingerprint(baseURL, "origin-rest", identity)
+	}
+	if legacyBase, found := strings.CutSuffix(baseURL, "/v2/assets"); found {
+		return seedanceAssetAccountFingerprint(legacyBase, "/v2/assets", identity)
+	}
+	return seedanceAssetAccountFingerprint(baseURL, "", identity)
+}
+
+// SeedanceAssetAccountFingerprints 兼容旧入口分支和尾斜杠摘要，不回填素材或副本大表。
+func SeedanceAssetAccountFingerprints(channel *Channel, keyFingerprint string) []string {
+	canonical := SeedanceAssetAccountFingerprint(channel, keyFingerprint)
+	if canonical == "" {
+		return nil
+	}
+	result := []string{canonical}
+	if channel.GetSetting().SeedanceAssetShareGroup != "" {
+		return result
+	}
+	baseURL := strings.TrimSpace(channel.GetSetting().SeedanceAssetURL)
+	protocol := ""
+	if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "anyllm" {
+		protocol = "json-action"
+	} else if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "originocean" {
+		protocol = "origin-rest"
+	}
+	for _, endpoint := range []string{baseURL, strings.TrimRight(baseURL, "/")} {
+		fingerprint := seedanceAssetAccountFingerprint(endpoint, protocol, keyFingerprint)
+		if !slices.Contains(result, fingerprint) {
+			result = append(result, fingerprint)
+		}
+	}
+	return result
+}
+
+// SeedanceAssetSharedAccountMatches 不将未配置共享组的渠道扩展到其他密钥。
+func SeedanceAssetSharedAccountMatches(channel *Channel, accountFingerprint string) bool {
+	return channel != nil && channel.GetSetting().SeedanceAssetShareGroup != "" &&
+		SeedanceAssetAccountFingerprintMatches(channel, "shared", accountFingerprint)
+}
+
+func SeedanceAssetAccountFingerprintMatches(channel *Channel, keyFingerprint, accountFingerprint string) bool {
+	if accountFingerprint == "" {
+		return false
+	}
+	if SeedanceAssetAccountFingerprint(channel, keyFingerprint) == accountFingerprint {
+		return true
+	}
+	return slices.Contains(SeedanceAssetAccountFingerprints(channel, keyFingerprint), accountFingerprint)
+}
+
+func seedanceAssetAccountFingerprint(baseURL, assetPath, keyFingerprint string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(baseURL+"\x00"+assetPath+"\x00"+keyFingerprint)))
+}
+
+// SeedanceAssetModelScopeFingerprint 保留明确配置的共享组，否则按模型、渠道和密钥区分。
+func SeedanceAssetModelScopeFingerprint(channel *Channel, modelName, keyFingerprint string) string {
+	if channel == nil || channel.Id <= 0 || strings.TrimSpace(modelName) == "" || strings.TrimSpace(keyFingerprint) == "" {
+		return ""
+	}
+	settings := channel.GetSetting()
+	if settings.SeedanceAssetShareGroup != "" {
+		return SeedanceAssetAccountFingerprint(channel, keyFingerprint)
+	}
+	assetURL := strings.TrimRight(strings.TrimSpace(settings.SeedanceAssetURL), "/")
+	if assetURL == "" {
+		return ""
+	}
+	mappedModel := modelName
+	mapping := make(map[string]string)
+	if raw := channel.GetModelMapping(); raw != "" {
+		if err := common.UnmarshalJsonStr(raw, &mapping); err != nil {
+			mappedModel = "invalid:" + raw
+		} else {
+			visited := map[string]bool{mappedModel: true}
+			for {
+				next := mapping[mappedModel]
+				if next == "" {
+					next = mapping[reasoning.BaseModelName(mappedModel)]
+				}
+				if next == "" || next == mappedModel {
+					break
+				}
+				if visited[next] {
+					mappedModel = "cycle:" + next
+					break
+				}
+				visited[next] = true
+				mappedModel = next
+			}
+		}
+	}
+	identity := fmt.Sprintf("seedance-model-v1\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		channel.Id, modelName, keyFingerprint, assetURL, strings.TrimRight(channel.GetBaseURL(), "/"), settings.TaskPluginKey, mappedModel)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
+}
+
+// SeedanceAssetModelScopeMatches 仅恢复原渠道及原密钥的逐模型映射。
+func SeedanceAssetModelScopeMatches(channel *Channel, keyFingerprint, fingerprint string) bool {
+	if channel == nil || keyFingerprint == "" || fingerprint == "" {
+		return false
+	}
+	for _, modelName := range channel.GetModels() {
+		if SeedanceAssetModelScopeFingerprint(channel, modelName, keyFingerprint) == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
 // SeedanceAssetGroup 保存用户在火山方舟 Seedance 素材库中的本地授权映射。
 type SeedanceAssetGroup struct {
-	ID          uint    `gorm:"primaryKey" json:"id"`
-	UserID      int     `gorm:"index;not null;index:idx_seedance_asset_group_user_group,priority:1;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:1" json:"user_id"`
-	ChannelID   int     `gorm:"index;not null" json:"channel_id"`
-	GroupID     string  `gorm:"size:128;not null;index:idx_seedance_asset_group_user_group,priority:2" json:"group_id"`
-	AssetCount  *int64  `gorm:"column:asset_count" json:"-"`
-	Name        string  `gorm:"size:64;not null" json:"name"`
-	Description string  `gorm:"type:text" json:"description,omitempty"`
-	Tags        string  `gorm:"size:512" json:"tags,omitempty"`
-	GroupType   string  `gorm:"size:128" json:"group_type,omitempty"`
-	NameKey     *string `gorm:"size:64;uniqueIndex:idx_seedance_asset_group_user_name_key,priority:2" json:"-"`
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	UserID      int    `gorm:"index;not null;index:idx_seedance_asset_group_user_group,priority:1" json:"user_id"`
+	ChannelID   int    `gorm:"index;not null" json:"channel_id"`
+	GroupID     string `gorm:"size:128;not null;index:idx_seedance_asset_group_user_group,priority:2" json:"group_id"`
+	AssetCount  *int64 `gorm:"column:asset_count" json:"-"`
+	Name        string `gorm:"size:64;not null" json:"name"`
+	Description string `gorm:"type:text" json:"description,omitempty"`
+	Tags        string `gorm:"size:512" json:"tags,omitempty"`
+	GroupType   string `gorm:"size:128" json:"group_type,omitempty"`
+	BindModel   string `gorm:"size:191" json:"-"`
+	CompatType  string `gorm:"size:128" json:"-"`
 	// 删除状态先持久化，阻止在途上传在分组清理后重新入库。
 	Status             string    `gorm:"size:16;not null;default:Active" json:"status"`
 	UpstreamDeletedAt  int64     `gorm:"not null;default:0" json:"-"`
@@ -30,6 +163,41 @@ type SeedanceAssetGroup struct {
 	AccountFingerprint string    `gorm:"size:64" json:"-"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
+	DeletionError      string    `gorm:"-" json:"deletion_error,omitempty"`
+	DeletionRetryAt    int64     `gorm:"-" json:"deletion_retry_at,omitempty"`
+}
+
+// LoadSeedanceAssetGroupDeletionStates 批量补充当前用户删除任务的阻塞原因，不增加表列。
+func LoadSeedanceAssetGroupDeletionStates(ctx context.Context, userID int, groups []SeedanceAssetGroup) error {
+	ids := make([]uint, 0)
+	for _, group := range groups {
+		if group.Status == "Deleting" {
+			ids = append(ids, group.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var jobs []SeedanceAssetCleanupJob
+	if err := DB.WithContext(ctx).Select("local_group_id", "last_error", "next_attempt_at", "lease_until").
+		Where("user_id = ? AND local_group_id IN ? AND kind = ? AND status = ?", userID, ids, SeedanceAssetCleanupKindGroupDelete, SeedanceAssetCleanupStatusPending).
+		Find(&jobs).Error; err != nil {
+		return err
+	}
+	byGroup := make(map[uint]SeedanceAssetCleanupJob, len(jobs))
+	for _, job := range jobs {
+		byGroup[job.LocalGroupID] = job
+	}
+	now := time.Now().Unix()
+	for index := range groups {
+		if job, found := byGroup[groups[index].ID]; found {
+			groups[index].DeletionRetryAt = job.NextAttemptAt
+			if job.LeaseUntil <= now {
+				groups[index].DeletionError = job.LastError
+			}
+		}
+	}
+	return nil
 }
 
 // SeedanceAssetGroupReplica 保存本地素材组在其他上游账号中的对应组。
@@ -57,67 +225,58 @@ type SeedanceAssetStorage struct {
 	Bucket   string `gorm:"size:64"`
 }
 
-// NormalizeSeedanceAssetGroupName 生成跨数据库一致的素材组名称键。
-func NormalizeSeedanceAssetGroupName(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
-}
-
-// BeforeSave 在数据库边界统一维护名称键，使并发写入也受同一用户唯一约束保护。
+// BeforeSave 在数据库边界清理素材组名称的首尾空格。
 func (group *SeedanceAssetGroup) BeforeSave(_ *gorm.DB) error {
 	group.Name = strings.TrimSpace(group.Name)
-	nameKey := NormalizeSeedanceAssetGroupName(group.Name)
-	group.NameKey = &nameKey
 	return nil
-}
-
-// IsSeedanceAssetGroupNameDuplicated 检查同一用户下是否已有相同名称的素材组，排除指定记录本身。
-func IsSeedanceAssetGroupNameDuplicated(id uint, userID int, name string) (bool, error) {
-	if DB == nil {
-		return false, errors.New("database is not initialized")
-	}
-	trimmedName := strings.TrimSpace(name)
-	if trimmedName == "" {
-		return false, nil
-	}
-	nameKey := NormalizeSeedanceAssetGroupName(trimmedName)
-	query := DB.Model(&SeedanceAssetGroup{}).
-		Where("user_id = ? AND (name_key = ? OR LOWER(name) = LOWER(?))", userID, nameKey, trimmedName)
-	if id > 0 {
-		query = query.Where("id <> ?", id)
-	}
-	var count int64
-	if err := query.Count(&count).Error; err != nil {
-		return false, err
-	}
-	return count > 0, nil
 }
 
 // SeedanceAsset 保存上游素材状态及其所属用户，所有读取必须带 UserID 条件。
 type SeedanceAsset struct {
-	UploadBytes        int64                `gorm:"-" json:"-"`
-	ID                 uint                 `gorm:"primaryKey;index:idx_seedance_asset_user_group_id,priority:3;index:idx_seedance_asset_status_key_poll_due,priority:4;index:idx_seedance_asset_user_group_pending_status,priority:4" json:"id"`
-	UserID             int                  `gorm:"index;not null;index:idx_seedance_asset_user_group_id,priority:1;index:idx_seedance_asset_user_group_pending_status,priority:1" json:"user_id"`
-	ChannelID          int                  `gorm:"index;not null" json:"channel_id"`
-	GroupID            string               `gorm:"index;size:128;not null;index:idx_seedance_asset_user_group_id,priority:2;index:idx_seedance_asset_user_group_pending_status,priority:2" json:"group_id"`
-	AssetID            string               `gorm:"uniqueIndex;size:128;not null" json:"asset_id"`
-	Name               string               `gorm:"size:64;not null" json:"name"`
-	AssetType          string               `gorm:"size:16;not null" json:"asset_type"`
-	SourceURL          string               `gorm:"size:2048;not null" json:"-"`
-	ObjectKey          string               `gorm:"index;size:640" json:"-"`
-	Storage            SeedanceAssetStorage `gorm:"embedded;embeddedPrefix:oss_" json:"-"`
-	KeyFingerprint     string               `gorm:"size:64" json:"-"`
-	AccountFingerprint string               `gorm:"size:64" json:"-"`
-	UpstreamDeletedAt  int64                `gorm:"not null;default:0" json:"-"`
-	PreviewURL         string               `gorm:"size:4096" json:"preview_url,omitempty"`
-	Status             string               `gorm:"index;size:32;not null" json:"status"`
-	StatusKey          *string              `gorm:"size:32;index:idx_seedance_asset_status_key_poll_due,priority:1" json:"-"`
-	PendingStatus      *bool                `gorm:"index:idx_seedance_asset_user_group_pending_status,priority:3" json:"-"`
-	FailureCode        string               `gorm:"size:128" json:"failure_code,omitempty"`
-	PollAttempts       int                  `gorm:"not null;default:0" json:"-"`
-	NextPollAt         int64                `gorm:"index;index:idx_seedance_asset_status_key_poll_due,priority:2;not null;default:0" json:"-"`
-	PollLeaseUntil     int64                `gorm:"index;index:idx_seedance_asset_status_key_poll_due,priority:3;not null;default:0" json:"-"`
-	CreatedAt          time.Time            `json:"created_at"`
-	UpdatedAt          time.Time            `json:"updated_at"`
+	UploadBytes             int64                `gorm:"-" json:"-"`
+	ID                      uint                 `gorm:"primaryKey;index:idx_seedance_asset_user_group_id,priority:3;index:idx_seedance_asset_status_key_poll_due,priority:4;index:idx_seedance_asset_user_group_pending_status,priority:4" json:"id"`
+	UserID                  int                  `gorm:"index;not null;index:idx_seedance_asset_user_group_id,priority:1;index:idx_seedance_asset_user_group_pending_status,priority:1" json:"user_id"`
+	ChannelID               int                  `gorm:"index;not null" json:"channel_id"`
+	GroupID                 string               `gorm:"index;size:128;not null;index:idx_seedance_asset_user_group_id,priority:2;index:idx_seedance_asset_user_group_pending_status,priority:2" json:"group_id"`
+	AssetID                 string               `gorm:"uniqueIndex;size:128;not null" json:"asset_id"`
+	PrimaryUpstreamID       string               `gorm:"size:128" json:"-"`
+	PrimarySyncScope        string               `gorm:"type:text" json:"-"`
+	LocalOnly               *bool                `json:"-"`
+	CompatOptimizeReplicaID uint                 `json:"-"`
+	Name                    string               `gorm:"size:64;not null" json:"name"`
+	AssetType               string               `gorm:"size:16;not null" json:"asset_type"`
+	SourceURL               string               `gorm:"size:2048;not null" json:"-"`
+	ObjectKey               string               `gorm:"index;size:640" json:"-"`
+	Storage                 SeedanceAssetStorage `gorm:"embedded;embeddedPrefix:oss_" json:"-"`
+	KeyFingerprint          string               `gorm:"size:64" json:"-"`
+	AccountFingerprint      string               `gorm:"size:64" json:"-"`
+	UpstreamDeletedAt       int64                `gorm:"not null;default:0" json:"-"`
+	PreviewURL              string               `gorm:"size:4096" json:"preview_url,omitempty"`
+	Status                  string               `gorm:"index;size:32;not null" json:"status"`
+	StatusKey               *string              `gorm:"size:32;index:idx_seedance_asset_status_key_poll_due,priority:1" json:"-"`
+	PendingStatus           *bool                `gorm:"index:idx_seedance_asset_user_group_pending_status,priority:3" json:"-"`
+	FailureCode             string               `gorm:"size:128" json:"failure_code,omitempty"`
+	PollAttempts            int                  `gorm:"not null;default:0" json:"-"`
+	NextPollAt              int64                `gorm:"index;index:idx_seedance_asset_status_key_poll_due,priority:2;not null;default:0" json:"-"`
+	PollLeaseUntil          int64                `gorm:"index;index:idx_seedance_asset_status_key_poll_due,priority:3;not null;default:0" json:"-"`
+	CreatedAt               time.Time            `json:"created_at"`
+	UpdatedAt               time.Time            `json:"updated_at"`
+}
+
+// UpstreamAssetID 区分稳定的公开素材 ID 和优化后的上游素材 ID。
+func (asset *SeedanceAsset) UpstreamAssetID() string {
+	if asset == nil || asset.LocalOnly != nil && (*asset.LocalOnly || asset.PrimaryUpstreamID == "") {
+		return ""
+	}
+	if asset.PrimaryUpstreamID != "" {
+		return asset.PrimaryUpstreamID
+	}
+	return asset.AssetID
+}
+
+// IsReplicaManaged 表示本站素材没有独占的主账号，审核状态由账号副本汇总。
+func (asset *SeedanceAsset) IsReplicaManaged() bool {
+	return asset != nil && asset.LocalOnly != nil && !*asset.LocalOnly && asset.PrimaryUpstreamID == ""
 }
 
 // SeedanceAssetSize 独立记录已知对象大小，避免给大素材表新增或回填列。
@@ -128,23 +287,24 @@ type SeedanceAssetSize struct {
 }
 
 func CheckSeedanceAssetCapacity(ctx context.Context, userID int, incomingBytes int64) error {
-	return checkSeedanceAssetCapacity(DB.WithContext(ctx), userID, incomingBytes)
+	return checkSeedanceAssetCapacity(DB.WithContext(ctx), userID, incomingBytes, common.GetManagementRateLimits().AssetLimits)
 }
 
-func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64) error {
+func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64, limits common.PrivateAssetLimits) error {
 	if incomingBytes < 0 {
 		return errors.New("invalid private asset size")
 	}
-	if constant.PrivateAssetUserMaxCount > 0 {
+	if limits.UserMaxCount > 0 {
 		var count int64
 		if err := tx.Model(&SeedanceAsset{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
 			return err
 		}
-		if count >= int64(constant.PrivateAssetUserMaxCount) {
+		if count >= limits.UserMaxCount {
 			return errors.New("private asset count limit exceeded")
 		}
 	}
-	if constant.PrivateAssetUserMaxBytes > 0 {
+	if limits.UserStorageMiB > 0 {
+		maxBytes := limits.UserStorageMiB << 20
 		var used int64
 		assets := tx.NamingStrategy.TableName("SeedanceAsset")
 		sizes := tx.NamingStrategy.TableName("SeedanceAssetSize")
@@ -152,7 +312,7 @@ func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64) er
 		if err := tx.Table(assets+" AS a").Joins("LEFT JOIN "+sizes+" AS s ON s.asset_id = a.id").Where("a.user_id = ? AND a.object_key <> ?", userID, "").Select("COALESCE(SUM(CASE WHEN s.asset_id IS NULL THEN ? ELSE s.bytes END), 0)", int64(50<<20)).Scan(&used).Error; err != nil {
 			return err
 		}
-		if incomingBytes > constant.PrivateAssetUserMaxBytes || used > constant.PrivateAssetUserMaxBytes-incomingBytes {
+		if incomingBytes > maxBytes || used > maxBytes-incomingBytes {
 			return errors.New("private asset storage limit exceeded")
 		}
 	}
@@ -184,6 +344,18 @@ func (asset *SeedanceAsset) BeforeSave(_ *gorm.DB) error {
 	asset.StatusKey = &statusKey
 	pendingStatus := SeedanceAssetStatusRequiresRefresh(statusKey)
 	asset.PendingStatus = &pendingStatus
+	return nil
+}
+
+// migrateSeedanceAssetGroupNameUniqueness 移除旧版本的素材组名称唯一索引。
+func migrateSeedanceAssetGroupNameUniqueness(db *gorm.DB) error {
+	const index = "idx_seedance_asset_group_user_name_key"
+	if !db.Migrator().HasIndex(&SeedanceAssetGroup{}, index) {
+		return nil
+	}
+	if err := db.Migrator().DropIndex(&SeedanceAssetGroup{}, index); err != nil {
+		return fmt.Errorf("remove Seedance asset group name index: %w", err)
+	}
 	return nil
 }
 
@@ -256,6 +428,7 @@ type SeedanceAssetReplica struct {
 	ChannelID          int       `gorm:"index;not null"`
 	AccountFingerprint string    `gorm:"size:64;not null;uniqueIndex:idx_seedance_asset_replica_account,priority:2"`
 	KeyFingerprint     string    `gorm:"size:64;not null"`
+	SyncScope          string    `gorm:"type:text" json:"-"`
 	UpstreamGroupID    string    `gorm:"size:128;not null"`
 	UpstreamAssetID    string    `gorm:"size:128;not null"`
 	ProvisionStatus    string    `gorm:"size:16;not null;index"`
@@ -270,6 +443,13 @@ type SeedanceAssetReplica struct {
 	UpdatedAt          time.Time `json:"-"`
 }
 
+type SeedanceAssetSyncTarget struct {
+	ChannelID          int
+	AccountFingerprint string
+	KeyFingerprint     string
+	SyncScope          string
+}
+
 const (
 	SeedanceAssetReplicaCreating = "Creating"
 	SeedanceAssetReplicaReady    = "Ready"
@@ -278,12 +458,16 @@ const (
 
 const MaxSeedanceAssetAffinityReferences = 32
 
+const SeedanceAssetSyncMaxAttempts = 6
+
+const SeedanceAssetReviewTimeoutCode = "review_timeout"
+
 // ErrSeedanceAssetUnavailable 表示素材不存在、已删除或不属于当前用户。
 var ErrSeedanceAssetUnavailable = errors.New("private asset is unavailable")
 
 // CreateSeedanceAssetInGroup 与分组删除共享数据库锁，仅允许仍可用的分组接收最终素材。
 // 外部上传不持有锁，失败由调用方补偿；锁只覆盖状态校验与本地落库。
-func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error {
+func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset, syncTargets ...SeedanceAssetSyncTarget) error {
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// SQLite 无行锁，先执行无值变化的更新取得写锁，避免读快照升级写锁的竞态。
 		if tx.Dialector.Name() == "sqlite" {
@@ -293,13 +477,14 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error
 			}
 		}
 		var group SeedanceAssetGroup
-		if constant.PrivateAssetUserMaxCount > 0 || constant.PrivateAssetUserMaxBytes > 0 {
+		limits := common.GetManagementRateLimits().AssetLimits
+		if limits.UserMaxCount > 0 || limits.UserStorageMiB > 0 {
 			// 各素材组先锁同一用户的首组，不同组并发创建也不能突破累计配额。
 			var guard SeedanceAssetGroup
 			if err := lockForUpdate(tx).Where("user_id = ?", asset.UserID).Order("id").First(&guard).Error; err != nil {
 				return err
 			}
-			if err := checkSeedanceAssetCapacity(tx, asset.UserID, asset.UploadBytes); err != nil {
+			if err := checkSeedanceAssetCapacity(tx, asset.UserID, asset.UploadBytes, limits); err != nil {
 				return err
 			}
 		}
@@ -314,6 +499,25 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset) error
 		}
 		if asset.UploadBytes > 0 {
 			if err := tx.Create(&SeedanceAssetSize{AssetID: asset.ID, UserID: asset.UserID, Bytes: asset.UploadBytes}).Error; err != nil {
+				return err
+			}
+		}
+		if len(syncTargets) > 0 {
+			if strings.EqualFold(group.GroupType, "LivenessFace") || asset.LocalOnly != nil && *asset.LocalOnly {
+				return errors.New("this asset cannot be copied to other accounts")
+			}
+			replicas := make([]SeedanceAssetReplica, 0, len(syncTargets))
+			for _, target := range syncTargets {
+				replicas = append(replicas, SeedanceAssetReplica{
+					UserID: asset.UserID, LocalGroupID: group.ID, LocalAssetID: asset.ID,
+					ChannelID: target.ChannelID, AccountFingerprint: target.AccountFingerprint,
+					KeyFingerprint: target.KeyFingerprint, SyncScope: target.SyncScope, ProvisionStatus: SeedanceAssetReplicaCreating,
+					Status: "Pending", NextPollAt: time.Now().Unix(),
+				})
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "local_asset_id"}, {Name: "account_fingerprint"}}, DoNothing: true,
+			}).CreateInBatches(&replicas, 100).Error; err != nil {
 				return err
 			}
 		}
@@ -442,7 +646,7 @@ func FindSeedanceAssetGroupReplica(ctx context.Context, userID int, localGroupID
 }
 
 // FindSeedanceAssetGroupReplicasForAccount 一次读取请求涉及的组副本，避免逐组查询。
-func FindSeedanceAssetGroupReplicasForAccount(ctx context.Context, userID int, localGroupIDs []uint, accountFingerprint string) (map[uint]*SeedanceAssetGroupReplica, error) {
+func FindSeedanceAssetGroupReplicasForAccount(ctx context.Context, userID int, localGroupIDs []uint, accountFingerprint string, compatibleFingerprints ...string) (map[uint]*SeedanceAssetGroupReplica, error) {
 	replicas := make(map[uint]*SeedanceAssetGroupReplica, len(localGroupIDs))
 	if DB == nil {
 		return nil, errors.New("database is not initialized")
@@ -455,12 +659,14 @@ func FindSeedanceAssetGroupReplicasForAccount(ctx context.Context, userID int, l
 	}
 	var rows []SeedanceAssetGroupReplica
 	if err := DB.WithContext(ctx).
-		Where("user_id = ? AND local_group_id IN ? AND account_fingerprint = ?", userID, localGroupIDs, accountFingerprint).
+		Where("user_id = ? AND local_group_id IN ? AND account_fingerprint IN ?", userID, localGroupIDs, append([]string{accountFingerprint}, compatibleFingerprints...)).
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	for index := range rows {
-		replicas[rows[index].LocalGroupID] = &rows[index]
+		if replicas[rows[index].LocalGroupID] == nil || rows[index].AccountFingerprint == accountFingerprint {
+			replicas[rows[index].LocalGroupID] = &rows[index]
+		}
 	}
 	return replicas, nil
 }
@@ -484,7 +690,7 @@ func FindSeedanceAssetReplica(ctx context.Context, userID int, localAssetID uint
 }
 
 // FindSeedanceAssetReplicasForAccount 一次读取请求涉及的素材副本，避免逐素材查询。
-func FindSeedanceAssetReplicasForAccount(ctx context.Context, userID int, localAssetIDs []uint, accountFingerprint string) (map[uint]*SeedanceAssetReplica, error) {
+func FindSeedanceAssetReplicasForAccount(ctx context.Context, userID int, localAssetIDs []uint, accountFingerprint string, compatibleFingerprints ...string) (map[uint]*SeedanceAssetReplica, error) {
 	replicas := make(map[uint]*SeedanceAssetReplica, len(localAssetIDs))
 	if DB == nil {
 		return nil, errors.New("database is not initialized")
@@ -497,12 +703,14 @@ func FindSeedanceAssetReplicasForAccount(ctx context.Context, userID int, localA
 	}
 	var rows []SeedanceAssetReplica
 	if err := DB.WithContext(ctx).
-		Where("user_id = ? AND local_asset_id IN ? AND account_fingerprint = ?", userID, localAssetIDs, accountFingerprint).
+		Where("user_id = ? AND local_asset_id IN ? AND account_fingerprint IN ?", userID, localAssetIDs, append([]string{accountFingerprint}, compatibleFingerprints...)).
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	for index := range rows {
-		replicas[rows[index].LocalAssetID] = &rows[index]
+		if replicas[rows[index].LocalAssetID] == nil || rows[index].AccountFingerprint == accountFingerprint {
+			replicas[rows[index].LocalAssetID] = &rows[index]
+		}
 	}
 	return replicas, nil
 }
@@ -560,7 +768,33 @@ func claimSeedanceAssetGroupReplica(ctx context.Context, userID int, localGroupI
 			Status:             SeedanceAssetReplicaCreating,
 			LeaseUntil:         leaseUntil,
 		}
-		if createErr := DB.WithContext(ctx).Create(replica).Error; createErr == nil {
+		created := false
+		createErr := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if tx.Dialector.Name() == "sqlite" {
+				if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", localGroupID, userID).
+					UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+					return err
+				}
+			}
+			var group SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", localGroupID, userID, "Deleting").First(&group).Error; err != nil {
+				return err
+			}
+			var existing SeedanceAssetGroupReplica
+			err := tx.Where("user_id = ? AND local_group_id = ? AND account_fingerprint = ?", userID, localGroupID, accountFingerprint).First(&existing).Error
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			created = true
+			return tx.Create(replica).Error
+		})
+		if createErr != nil {
+			return nil, false, createErr
+		}
+		if created {
 			return replica, true, nil
 		}
 		replica, err = lookup()
@@ -699,7 +933,38 @@ func claimSeedanceAssetReplica(ctx context.Context, asset *SeedanceAsset, localG
 			ProvisionStatus:    SeedanceAssetReplicaCreating,
 			PollLeaseUntil:     leaseUntil,
 		}
-		if createErr := DB.WithContext(ctx).Create(replica).Error; createErr == nil {
+		created := false
+		createErr := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if tx.Dialector.Name() == "sqlite" {
+				if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", localGroupID, asset.UserID).
+					UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+					return err
+				}
+			}
+			var group SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", localGroupID, asset.UserID, "Deleting").First(&group).Error; err != nil {
+				return err
+			}
+			var current SeedanceAsset
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", asset.ID, asset.UserID, "Deleting").First(&current).Error; err != nil {
+				return err
+			}
+			var existing SeedanceAssetReplica
+			err := tx.Where("user_id = ? AND local_asset_id = ? AND account_fingerprint = ?", asset.UserID, asset.ID, accountFingerprint).First(&existing).Error
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			// 创建副本也受删除屏障保护，删除快照完成后不能新增漏清理的映射。
+			created = true
+			return tx.Create(replica).Error
+		})
+		if createErr != nil {
+			return nil, false, createErr
+		}
+		if created {
 			return replica, true, nil
 		}
 		replica, err = lookup()
@@ -833,7 +1098,7 @@ func ListDueSeedanceAssetReplicas(now int64, limit int) ([]*SeedanceAssetReplica
 		Where("LOWER(status) IN ?", []string{"processing", "pending"}).
 		Where("(next_poll_at = 0 OR next_poll_at <= ?)", now).
 		Where("(poll_lease_until = 0 OR poll_lease_until <= ?)", now).
-		Order("id asc").Limit(limit).Find(&replicas).Error
+		Order("next_poll_at ASC").Order("id ASC").Limit(limit).Find(&replicas).Error
 	return replicas, err
 }
 
@@ -913,10 +1178,11 @@ func ListDueSeedanceAssets(now int64, limit int) ([]*SeedanceAsset, error) {
 		limit = 1
 	}
 	var assets []*SeedanceAsset
-	err := DB.Where("status_key IN ('processing', 'pending')").
+	err := DB.Where("(status_key IN ('processing', 'pending') OR (status_key = ? AND failure_code = ?))", "failed", SeedanceAssetReviewTimeoutCode).
+		Where("(local_only IS NULL OR local_only = ? OR primary_upstream_id <> ?)", true, "").
 		Where("(next_poll_at = 0 OR next_poll_at <= ?)", now).
 		Where("(poll_lease_until = 0 OR poll_lease_until <= ?)", now).
-		Order("id asc").Limit(limit).Find(&assets).Error
+		Order("next_poll_at ASC").Order("id ASC").Limit(limit).Find(&assets).Error
 	return assets, err
 }
 
@@ -929,7 +1195,8 @@ func HasDueSeedanceAssets(now int64) bool {
 		ID uint
 	}
 	result := DB.Model(&SeedanceAsset{}).
-		Where("status_key IN ('processing', 'pending')").
+		Where("(status_key IN ('processing', 'pending') OR (status_key = ? AND failure_code = ?))", "failed", SeedanceAssetReviewTimeoutCode).
+		Where("(local_only IS NULL OR local_only = ? OR primary_upstream_id <> ?)", true, "").
 		Where("(next_poll_at = 0 OR next_poll_at <= ?)", now).
 		Where("(poll_lease_until = 0 OR poll_lease_until <= ?)", now).
 		Select("id").Limit(1).Find(&marker)
@@ -945,7 +1212,7 @@ func ClaimSeedanceAssetForPolling(id uint, expectedUpdatedAt time.Time, now, lea
 	updatedAt := maxSeedanceAssetUpdateTime(expectedUpdatedAt)
 	result := DB.Model(&SeedanceAsset{}).
 		Where("id = ? AND updated_at = ?", id, expectedUpdatedAt).
-		Where("status_key IN ('processing', 'pending')").
+		Where("(status_key IN ('processing', 'pending') OR (status_key = ? AND failure_code = ?))", "failed", SeedanceAssetReviewTimeoutCode).
 		Where("(next_poll_at = 0 OR next_poll_at <= ?)", now).
 		Where("(poll_lease_until = 0 OR poll_lease_until <= ?)", now).
 		Updates(map[string]any{

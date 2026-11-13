@@ -48,6 +48,10 @@ func managementRateLimitTestRouter(t *testing.T) *gin.Engine {
 	router.GET("/sensitive", CriticalRateLimit(), finish)
 	router.GET("/usage", authenticated, TokenQueryRateLimit(), finish)
 	router.GET("/logs", authenticated, TokenQueryRateLimit(), finish)
+	router.GET("/assets", authenticated, SeedanceAssetRateLimit(), finish)
+	router.GET("/assets-detail", authenticated, SeedanceAssetRateLimit(), finish)
+	router.GET("/asset-upload", UploadRateLimit(), finish)
+	router.GET("/asset-download", DownloadRateLimit(), finish)
 	return router
 }
 
@@ -76,6 +80,9 @@ func TestManagementRateLimitScopesAndHotUpdates(t *testing.T) {
 			settings.LoginIP = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
 			settings.Sensitive = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
 			settings.TokenQuery = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			settings.SeedanceAsset = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			settings.AssetUpload = common.ManagementRateLimit{Enabled: true, Requests: 2, WindowSeconds: 60}
+			settings.AssetDownload = common.ManagementRateLimit{Enabled: true, Requests: 1, WindowSeconds: 60}
 			setManagementRateLimitTestSettings(t, settings)
 			router := managementRateLimitTestRouter(t)
 			request := func(path, address string, id int) *httptest.ResponseRecorder {
@@ -94,6 +101,25 @@ func TestManagementRateLimitScopesAndHotUpdates(t *testing.T) {
 			assert.Equal(t, 429, request("/login", address, 0).Code)
 			assert.Equal(t, 204, request("/logout", address, 0).Code)
 			assert.Equal(t, 204, request("/sensitive", address, 0).Code)
+			assert.Equal(t, 204, request("/assets", address, 41).Code)
+			assert.Equal(t, 204, request("/assets-detail", "192.0.2.111:1000", 41).Code)
+			assert.Equal(t, 429, request("/assets", address, 41).Code)
+			assert.Equal(t, 204, request("/assets", address, 42).Code)
+			assert.Equal(t, 401, request("/assets", address, 0).Code)
+			assert.Equal(t, 204, request("/asset-upload", address, 0).Code)
+			assert.Equal(t, 204, request("/asset-upload", address, 0).Code)
+			assert.Equal(t, 429, request("/asset-upload", address, 0).Code)
+			assert.Equal(t, 204, request("/asset-upload", "192.0.2.111:1000", 0).Code)
+			assert.Equal(t, 204, request("/asset-download", address, 0).Code)
+			assert.Equal(t, 429, request("/asset-download", address, 0).Code)
+			settings.SeedanceAsset.Requests = 4
+			settings.AssetUpload.Enabled = false
+			settings.AssetDownload.WindowSeconds = 90
+			setManagementRateLimitTestSettings(t, settings)
+			assert.Equal(t, 204, request("/assets", address, 41).Code)
+			assert.Equal(t, 204, request("/asset-upload", address, 0).Code)
+			assert.Equal(t, 204, request("/asset-download", address, 0).Code)
+			assert.Equal(t, 429, request("/asset-download", address, 0).Code)
 
 			settings.LoginIP.Requests = 10
 			setManagementRateLimitTestSettings(t, settings)

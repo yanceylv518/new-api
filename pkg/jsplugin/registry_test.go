@@ -1245,6 +1245,8 @@ func TestSubmitResponseTypesContract(t *testing.T) {
 		{"SSE declared", `submitResponseTypes:["json","sse"],`, `export function parseSubmitEvent(){return {state:null,done:true};}`, true},
 		{"host JSON utility", `requiredCapabilities:["json-clone@1"],`, "", true},
 		{"owned resource management", `requiredCapabilities:["owned-resources@1"],`, "", true},
+		{"inline artifact content", `requiredCapabilities:["artifact-base64@1"],`, "", true},
+		{"unsupported inline artifact version", `requiredCapabilities:["artifact-base64@2"],`, "", false},
 		{"unsupported resource version", `requiredCapabilities:["owned-resources@2"],`, "", false},
 		{"SSE delta", `submitResponseTypes:["sse"],requiredCapabilities:["submit-sse-delta@1"],`, `export function parseSubmitEventDelta(){return {changes:[],state:null,done:true};}`, true},
 		{"SSE delta missing hook", `submitResponseTypes:["sse"],requiredCapabilities:["submit-sse-delta@1"],`, `export function parseSubmitEvent(){return {state:null,done:true};}`, false},

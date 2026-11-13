@@ -2,18 +2,127 @@ package controller
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 )
+
+func TestUpdateChannelPartialFieldsMySQL(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN is not configured")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(db.Migrator().CurrentDatabase(), "codex_origin_"))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousMemory := common.RedisEnabled, common.MemoryCacheEnabled
+	previousRegistry := jsplugin.DefaultRegistry
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
+	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousType, previousLogType)
+		common.RedisEnabled, common.MemoryCacheEnabled = previousRedis, previousMemory
+		jsplugin.DefaultRegistry = previousRegistry
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.AuditLog{}))
+	registry := jsplugin.NewRegistry()
+	for _, key := range []string{"doubao", "anyllm"} {
+		source, sourceErr := builtinplugins.Source(key)
+		require.NoError(t, sourceErr)
+		_, registerErr := registry.RegisterFactory(source, jsplugin.Options{Key: key})
+		require.NoError(t, registerErr)
+	}
+	jsplugin.DefaultRegistry = registry
+	user := model.User{Id: 1, Username: "partial-update-fixture", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "partial-update"}
+	require.NoError(t, db.Create(&user).Error)
+	for _, tc := range []struct {
+		name           string
+		kind           int
+		setting, other string
+	}{
+		{"legacy_doubao", constant.ChannelTypeDoubaoVideo, `{"seedance_asset_url":"https://fixture.example/assets","seedance_asset_share_group":"fixture","video_routing_rules":[{"model":"doubao-seedance-2-0-260128","mode":"deny","resolutions":["4k"]}],"future":9007199254740993}`, ""},
+		{"doubao_plugin", constant.ChannelTypeTaskPlugin, `{"task_plugin_key":"doubao","seedance_asset_url":"https://fixture.example/assets","seedance_asset_share_group":"fixture","video_routing_rules":[{"model":"doubao-seedance-2-0-260128","mode":"deny","resolutions":["4k"]}],"future":9007199254740993}`, ""},
+		{"anyllm_plugin", constant.ChannelTypeTaskPlugin, `{"task_plugin_key":"anyllm","seedance_asset_url":"https://fixture.example/assets","seedance_asset_share_group":"fixture","video_routing_rules":[{"model":"doubao-seedance-2-0-260128","mode":"allow","resolutions":["4k"]}],"future":9007199254740993}`, ""},
+		{"new_api_extension", constant.ChannelTypeNewAPI, `{"task_extend_plugin_keys":["doubao"],"video_routing_rules":[{"model":"doubao-seedance-2-0-260128","mode":"deny","resolutions":["4k"]}],"future":9007199254740993}`, ""},
+		{"vertex_region", constant.ChannelTypeVertexAi, `{"future":9007199254740993}`, `{"default":"us-central1"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := model.Channel{Type: tc.kind, Name: tc.name, Key: "fixture-key", Status: common.ChannelStatusEnabled, BaseURL: common.GetPointer("https://fixture.example/custom"), Models: "doubao-seedance-2-0-260128", Group: "default", Setting: &tc.setting, Other: tc.other, OtherSettings: `{"future":9007199254740993}`}
+			require.NoError(t, channel.Insert())
+			for _, update := range []map[string]any{{"priority": 8}, {"priority": 0}, {"weight": 15}, {"weight": 0}, {"name": "renamed"}, {"models": "doubao-seedance-2-0-260128,doubao-seedance-2-0-fast-260128"}, {"group": "vip"}} {
+				body := map[string]any{"id": channel.Id}
+				for key, value := range update {
+					body[key] = value
+				}
+				raw, marshalErr := common.Marshal(body)
+				require.NoError(t, marshalErr)
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Set("id", 1)
+				ctx.Set("role", common.RoleAdminUser)
+				ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel/", bytes.NewReader(raw))
+				ctx.Request.Header.Set("Content-Type", "application/json")
+				UpdateChannel(ctx)
+				var response struct {
+					Success bool   `json:"success"`
+					Message string `json:"message"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				require.True(t, response.Success, "%s: %s", fmt.Sprint(update), response.Message)
+				var saved model.Channel
+				require.NoError(t, db.First(&saved, channel.Id).Error)
+				assert.Equal(t, channel.Type, saved.Type)
+				assert.Equal(t, channel.BaseURL, saved.BaseURL)
+				assert.Equal(t, channel.Key, saved.Key)
+				assert.Equal(t, channel.Setting, saved.Setting)
+				assert.Equal(t, channel.OtherSettings, saved.OtherSettings)
+				assert.Equal(t, channel.Other, saved.Other)
+				if value, edited := update["models"]; edited {
+					assert.Equal(t, value, saved.Models)
+				} else {
+					assert.Equal(t, channel.Models, saved.Models)
+				}
+				if value, edited := update["group"]; edited {
+					assert.Equal(t, value, saved.Group)
+				} else {
+					assert.Equal(t, channel.Group, saved.Group)
+				}
+				channel.Models, channel.Group = saved.Models, saved.Group
+				if value, ok := update["priority"]; ok {
+					assert.EqualValues(t, value, saved.GetPriority())
+				}
+				if value, ok := update["weight"]; ok {
+					assert.EqualValues(t, value, saved.GetWeight())
+				}
+				if value, ok := update["name"]; ok {
+					assert.Equal(t, value, saved.Name)
+				}
+			}
+		})
+	}
+}
 
 func TestChannelHasSensitiveChanges(t *testing.T) {
 	baseURL := "https://api.example.com"

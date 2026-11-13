@@ -438,3 +438,26 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, 100, cached.RemainQuota)
 }
+
+func TestUnusedTokenQuotaEditCanRebuildColdCache(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	token.RemainQuota = 200
+	require.NoError(t, token.Update())
+	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 200, loaded.RemainQuota)
+	assert.Zero(t, loaded.UsedQuota)
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 50, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	loaded, err = GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 150, loaded.RemainQuota)
+	assert.Equal(t, 50, loaded.UsedQuota)
+}

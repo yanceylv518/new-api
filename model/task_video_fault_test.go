@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -41,6 +42,240 @@ func (videoAuditRedisHook) BeforeProcessPipeline(ctx context.Context, _ []redis.
 	return ctx, nil
 }
 func (videoAuditRedisHook) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
+
+func TestVideoSettlementConcurrentTokenQuotaEdit(t *testing.T) {
+	address := os.Getenv("TASK_PLUGIN_TEST_REDIS_ADDR")
+	if address == "" {
+		t.Skip("TASK_PLUGIN_TEST_REDIS_ADDR is unset")
+	}
+	require.Equal(t, "127.0.0.1:26379", address)
+	for _, order := range []string{"edit_before_settlement", "edit_before_cache_finish", "edit_after_cold_finish", "edit_with_pending_batch", "edit_before_settlement_with_pending", "edit_with_large_usage", "edit_cache_failure"} {
+		t.Run(order, func(t *testing.T) {
+			truncateTables(t)
+			client := redis.NewClient(&redis.Options{Addr: address, MaxRetries: -1})
+			oldRDB, oldRedis := common.RDB, common.RedisEnabled
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() {
+				common.RDB, common.RedisEnabled = oldRDB, oldRedis
+				assert.NoError(t, client.Close())
+			})
+			require.NoError(t, client.FlushDB(t.Context()).Err())
+			require.NoError(t, DB.Create(&User{Id: 91, Username: "token-edit", AffCode: "token-edit", Quota: 900, UsedQuota: 100}).Error)
+			require.NoError(t, DB.Create(&Channel{Id: 91, UsedQuota: 100}).Error)
+			token := Token{Id: 91, UserId: 91, Key: "video-token-edit-test", RemainQuota: 900, UsedQuota: 100}
+			if order == "edit_with_large_usage" {
+				token.UsedQuota = 9_007_199_254_740_993
+			}
+			require.NoError(t, DB.Create(&token).Error)
+			task := Task{TaskID: "token-edit-task", UserId: 91, ChannelId: 91, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: 91}}
+			require.NoError(t, DB.Create(&task).Error)
+			_, err := GetTokenByKey(token.Key, false)
+			require.NoError(t, err)
+			if order == "edit_with_pending_batch" || order == "edit_before_settlement_with_pending" {
+				resetBatchUpdateTestState(t)
+				common.BatchUpdateEnabled = true
+				accepted, err := TryReserveTokenQuota(token.Id, token.Key, 70, false)
+				require.NoError(t, err)
+				require.True(t, accepted)
+			}
+			token.RemainQuota = 500
+			if order == "edit_before_settlement" || order == "edit_before_settlement_with_pending" {
+				require.NoError(t, token.Update())
+			}
+			if order == "edit_cache_failure" {
+				injected := errors.New("injected token cache failure")
+				failed := false
+				client.AddHook(videoAuditRedisHook{before: func(_ context.Context, cmd redis.Cmder) error {
+					if cmd.Name() == "eval" && !failed {
+						failed = true
+						return injected
+					}
+					return nil
+				}})
+				require.ErrorIs(t, token.Update(), injected)
+				require.True(t, failed)
+				var unchanged Token
+				require.NoError(t, DB.First(&unchanged, token.Id).Error)
+				assert.Equal(t, 900, unchanged.RemainQuota)
+				require.NoError(t, token.Update())
+			}
+			injected := false
+			client.AddHook(videoAuditRedisHook{before: func(ctx context.Context, cmd redis.Cmder) error {
+				if !isVideoFinishCommand(cmd) || injected {
+					return nil
+				}
+				injected = true
+				if order == "edit_before_cache_finish" || order == "edit_with_large_usage" {
+					return token.Update()
+				}
+				if order == "edit_after_cold_finish" || order == "edit_with_pending_batch" {
+					return client.Del(ctx, getTokenCacheKey(token.Key)).Err()
+				}
+				return nil
+			}})
+			task.Status = TaskStatusSuccess
+			won, err := FinalizeVideoTask(t.Context(), &task, TaskStatusQueued, 60)
+			require.NoError(t, err)
+			require.True(t, won)
+			require.True(t, injected)
+			if order == "edit_after_cold_finish" || order == "edit_with_pending_batch" {
+				require.NoError(t, token.Update())
+			}
+			// fence 到期后走真实冷填充，不能让旧额度影子重新授权请求。
+			require.NoError(t, client.PExpireAt(t.Context(), getTokenCacheFenceKey(token.Key), time.Unix(1, 0)).Err())
+			var stored Token
+			require.NoError(t, DB.First(&stored, token.Id).Error)
+			cached, err := GetTokenByKey(token.Key, false)
+			require.NoError(t, err)
+			pending := 0
+			if order == "edit_with_pending_batch" || order == "edit_before_settlement_with_pending" {
+				pending = 70
+			}
+			assert.Equal(t, stored.RemainQuota-pending, cached.RemainQuota)
+			assert.Equal(t, stored.UsedQuota+pending, cached.UsedQuota)
+			amount := 600
+			if pending > 0 {
+				amount = 500
+			}
+			accepted, err := TryReserveTokenQuota(token.Id, token.Key, amount, false)
+			require.NoError(t, err)
+			assert.False(t, accepted, "old quota must not authorize a new request")
+		})
+	}
+}
+
+func TestVideoSettlementAndTokenEditConcurrently(t *testing.T) {
+	address := os.Getenv("TASK_PLUGIN_TEST_REDIS_ADDR")
+	if address == "" {
+		t.Skip("TASK_PLUGIN_TEST_REDIS_ADDR is unset")
+	}
+	require.Equal(t, "127.0.0.1:26379", address)
+	truncateTables(t)
+	client := redis.NewClient(&redis.Options{Addr: address, MaxRetries: -1})
+	oldRDB, oldRedis := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = oldRDB, oldRedis
+		assert.NoError(t, client.Close())
+	})
+	require.NoError(t, client.FlushDB(t.Context()).Err())
+	connection, err := DB.DB()
+	require.NoError(t, err)
+	// SQLite :memory: 按连接隔离，保留单连接仍可验证并发调用与 Redis 交错。
+	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		connection.SetMaxOpenConns(32)
+	}
+	t.Cleanup(func() { connection.SetMaxOpenConns(1) })
+	const count = 64
+	tasks := make([]Task, count)
+	tokens := make([]Token, count)
+	for i := range count {
+		id := 3000 + i
+		require.NoError(t, DB.Create(&User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: 900, UsedQuota: 100}).Error)
+		require.NoError(t, DB.Create(&Channel{Id: id, UsedQuota: 100}).Error)
+		tokens[i] = Token{Id: id, UserId: id, Key: fmt.Sprintf("concurrent-token-%d", id), RemainQuota: 900, UsedQuota: 100}
+		require.NoError(t, DB.Create(&tokens[i]).Error)
+		tasks[i] = Task{TaskID: fmt.Sprintf("concurrent-edit-%d", id), UserId: id, ChannelId: id, Quota: 100, Status: TaskStatusQueued, PrivateData: TaskPrivateData{TokenId: id}}
+		require.NoError(t, DB.Create(&tasks[i]).Error)
+		_, err := GetTokenByKey(tokens[i].Key, false)
+		require.NoError(t, err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, count*2)
+	var workers sync.WaitGroup
+	for i := range count {
+		workers.Go(func() {
+			<-start
+			task := tasks[i]
+			task.Status = TaskStatusSuccess
+			won, err := FinalizeVideoTask(t.Context(), &task, TaskStatusQueued, 60)
+			if err == nil && !won {
+				err = errors.New("settlement did not commit")
+			}
+			results <- err
+		})
+		workers.Go(func() {
+			<-start
+			token := tokens[i]
+			token.RemainQuota = 500
+			results <- token.Update()
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+	for i := range count {
+		require.NoError(t, client.PExpireAt(t.Context(), getTokenCacheFenceKey(tokens[i].Key), time.Unix(1, 0)).Err())
+		var stored Token
+		require.NoError(t, DB.First(&stored, tokens[i].Id).Error)
+		cached, err := GetTokenByKey(tokens[i].Key, false)
+		require.NoError(t, err)
+		assert.Equal(t, stored.RemainQuota, cached.RemainQuota)
+		assert.Equal(t, stored.UsedQuota, cached.UsedQuota)
+		assert.Contains(t, []int{500, 540}, stored.RemainQuota)
+		accepted, err := TryReserveTokenQuota(stored.Id, stored.Key, 600, false)
+		require.NoError(t, err)
+		assert.False(t, accepted)
+	}
+}
+
+func TestAsyncSubmissionCacheRecoversAfterCommit(t *testing.T) {
+	address := os.Getenv("TASK_PLUGIN_TEST_REDIS_ADDR")
+	if address == "" {
+		t.Skip("TASK_PLUGIN_TEST_REDIS_ADDR is unset")
+	}
+	require.Equal(t, "127.0.0.1:26379", address)
+	truncateTables(t)
+	client := redis.NewClient(&redis.Options{Addr: address, MaxRetries: -1})
+	oldRDB, oldRedis := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = oldRDB, oldRedis
+		assert.NoError(t, client.Close())
+	})
+	require.NoError(t, client.FlushDB(t.Context()).Err())
+	require.NoError(t, DB.Create(&User{Id: 92, Username: "async-cache", AffCode: "async-cache", Quota: 900}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: 92}).Error)
+	token := Token{Id: 92, UserId: 92, Key: "async-cache-test", RemainQuota: 900, UsedQuota: 100}
+	require.NoError(t, DB.Create(&token).Error)
+	task := Task{TaskID: "async-cache", UserId: 92, ChannelId: 92, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{TokenId: 92, SubmissionPending: true, InitialAccountingPending: true}}
+	require.NoError(t, DB.Create(&task).Error)
+	_, err := GetUserCache(92)
+	require.NoError(t, err)
+	_, err = GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	injected := false
+	client.AddHook(videoAuditRedisHook{before: func(_ context.Context, cmd redis.Cmder) error {
+		if isVideoFinishCommand(cmd) && !injected {
+			injected = true
+			return errors.New("injected submission cache failure")
+		}
+		return nil
+	}})
+	final := task
+	final.Status, final.Quota = TaskStatusSubmitted, 60
+	final.PrivateData.SubmissionPending = false
+	won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: 100, UpdateToken: true})
+	require.NoError(t, err)
+	require.True(t, won)
+	require.True(t, injected)
+	var stored User
+	require.NoError(t, DB.First(&stored, 92).Error)
+	assert.Equal(t, 940, stored.Quota)
+	cached, err := GetUserCache(92)
+	require.NoError(t, err)
+	assert.Equal(t, 940, cached.Quota)
+	cachedToken, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 940, cachedToken.RemainQuota)
+	assert.Equal(t, 60, cachedToken.UsedQuota)
+	won, err = PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: 100, UpdateToken: true})
+	require.NoError(t, err)
+	assert.False(t, won)
+}
 
 // 子进程复用测试二进制，不依赖shell、不携带生产凭证；只访问固定的隔离库和测试Redis DB4。
 func TestVideoProcessWorker(t *testing.T) {
@@ -383,4 +618,51 @@ func TestVideoSettlementCacheFaultWindows(t *testing.T) {
 			t.Logf("FAULT mode=%s db_quota=%d recovery_after_eviction=%d", strings.TrimSpace(mode), stored.Quota, cached.Quota)
 		})
 	}
+}
+
+func TestImmediateTaskCacheRecoversAfterCommit(t *testing.T) {
+	db := openVideoDeepDatabase(t, "video_submission_")
+	require.NoError(t, db.AutoMigrate(&VideoTaskPendingLog{}))
+	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(&VideoTaskPendingLog{})) })
+	require.NoError(t, db.Create(&User{Id: 1, Username: "submission-owner", AffCode: "submission-owner", Quota: 900}).Error)
+	require.NoError(t, db.Create(&Token{Id: 1, UserId: 1, Key: "submission-local-token", RemainQuota: 900, UsedQuota: 100}).Error)
+	require.NoError(t, db.Create(&Channel{Id: 1}).Error)
+	task := Task{TaskID: "submission-cache", UserId: 1, ChannelId: 1, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{TokenId: 1, SubmissionPending: true, InitialAccountingPending: true}}
+	require.NoError(t, db.Create(&task).Error)
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:26379", DB: 4, MaxRetries: -1})
+	oldRDB, oldRedis := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() { common.RDB, common.RedisEnabled = oldRDB, oldRedis; assert.NoError(t, client.Close()) })
+	require.NoError(t, client.FlushDB(t.Context()).Err())
+	_, err := GetUserCache(1)
+	require.NoError(t, err)
+	var token Token
+	require.NoError(t, db.First(&token, 1).Error)
+	_, err = cacheInitToken(token)
+	require.NoError(t, err)
+	injected := false
+	client.AddHook(videoAuditRedisHook{before: func(_ context.Context, cmd redis.Cmder) error {
+		if isVideoFinishCommand(cmd) && !injected {
+			injected = true
+			return fmt.Errorf("injected submission cache failure")
+		}
+		return nil
+	}})
+	final := task
+	final.Status, final.Quota = TaskStatusSuccess, 60
+	final.PrivateData.SubmissionPending = false
+	won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: 100, UpdateToken: true})
+	require.NoError(t, err)
+	require.True(t, won)
+	require.True(t, injected)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 940, user.Quota)
+	cached, err := GetUserCache(1)
+	require.NoError(t, err)
+	assert.Equal(t, 940, cached.Quota)
+	cachedToken, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 940, cachedToken.RemainQuota)
+	assert.Equal(t, 60, cachedToken.UsedQuota)
 }

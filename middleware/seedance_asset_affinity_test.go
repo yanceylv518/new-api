@@ -94,22 +94,46 @@ func TestRewriteSeedanceJSONRejectsUnknownReference(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidSeedanceAssetRequest)
 }
 
+func TestRewriteSeedanceJSONSupportsLocalLinkAcrossRetries(t *testing.T) {
+	raw := []byte(`{"content":[{"image_url":{"url":"asset://local-image"}}]}`)
+	first := map[string]string{"local-image": "https://media.example.com/input.jpg?signature=first"}
+	second := map[string]string{"local-image": "https://media.example.com/input.jpg?signature=second"}
+	rewritten, changed, err := rewriteSeedanceJSON(raw, nil, first)
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Contains(t, string(rewritten), first["local-image"])
+	retried, changed, err := rewriteSeedanceJSON(rewritten, first, second)
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Contains(t, string(retried), second["local-image"])
+}
+
 func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
+	previousSnapshotEnabled := constant.TaskRequestSnapshotEnabled.Load()
+	constant.TaskRequestSnapshotEnabled.Store(true)
+	t.Cleanup(func() { constant.TaskRequestSnapshotEnabled.Store(previousSnapshotEnabled) })
 	service.InitHttpClient()
-	source, err := builtinplugins.Source("doubao")
-	require.NoError(t, err)
-	plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{Key: "doubao"})
-	require.NoError(t, err)
 	const modelName = "doubao-seedance-2-0-260128"
 	const prompt = "keep asset://local-asset as text"
 	content := `[{"type":"text","text":"` + prompt + `"},{"type":"image_url","role":"reference_image","image_url":{"url":"asset://local-asset"}}]`
-	for _, surface := range []string{"native", "video_json", "video_multipart"} {
-		t.Run(surface, func(t *testing.T) {
+	for _, tc := range []struct{ surface, pluginKey string }{
+		{"native", "doubao"}, {"video_json", "doubao"}, {"video_multipart", "doubao"},
+		{"native", "anyllm"}, {"video_json", "anyllm"}, {"video_multipart", "anyllm"},
+		{"video_image", "anyllm"}, {"responses", "anyllm"},
+	} {
+		t.Run(tc.surface+"/"+tc.pluginKey, func(t *testing.T) {
+			surface := tc.surface
+			source, err := builtinplugins.Source(tc.pluginKey)
+			require.NoError(t, err)
+			plugin, err := pluginruntime.NewRegistry().RegisterFactory(source, pluginruntime.Options{Key: tc.pluginKey})
+			require.NoError(t, err)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			t.Cleanup(func() { common.CleanupBodyStorage(c) })
 			path := "/v1/videos"
 			if surface == "native" {
 				path = "/doubao/api/v3/contents/generations/tasks"
+			} else if surface == "responses" {
+				path = "/v1/responses"
 			}
 			if surface == "video_multipart" {
 				var body bytes.Buffer
@@ -122,6 +146,9 @@ func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
 				c.Request.Header.Set("Content-Type", writer.FormDataContentType())
 			} else {
 				body := `{"model":"` + modelName + `","content":` + content + `,"duration":4,"resolution":"480p","generate_audio":false}`
+				if surface == "video_image" {
+					body = `{"model":"` + modelName + `","prompt":"` + prompt + `","image":"asset://local-asset","duration":4,"resolution":"480p","generate_audio":false}`
+				}
 				c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 				c.Request.Header.Set("Content-Type", "application/json")
 			}
@@ -131,10 +158,14 @@ func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
 			if surface == "native" {
 				resolved, err = plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, route.JSValue())
 			} else {
-				protocol := pluginruntime.ProtocolRequestContext{RouteRequestContext: route, Protocol: "openai_video", Operation: "create", Model: modelName}
-				resolved, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, protocol.JSValue())
+				protocolName := "openai_video"
+				if surface == "responses" {
+					protocolName = "openai_responses"
+				}
+				protocol := pluginruntime.ProtocolRequestContext{RouteRequestContext: route, Protocol: protocolName, Operation: "create", Model: modelName}
+				resolved, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{protocolName, "decodeRequest"}, protocol.JSValue())
 				c.Set(pluginruntime.ContextKeyProtocolRequest, protocol)
-				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_video", Model: modelName})
+				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: protocolName, Model: modelName})
 			}
 			require.NoError(t, err)
 			route.RequestBody = resolved.(map[string]any)["requestBody"]
@@ -167,10 +198,15 @@ func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
 						return
 					}
 					received.Store(true)
-					assert.Equal(t, prompt, request.Content[0].Text)
 					assert.Equal(t, 4, request.Duration)
 					assert.False(t, request.GenerateAudio)
-					if !assert.Equal(t, "asset://"+remoteID, request.Content[1].ImageURL.URL) {
+					var gotText, gotImage bool
+					for _, item := range request.Content {
+						gotText = gotText || item.Text == prompt
+						gotImage = gotImage || item.ImageURL.URL == "asset://"+remoteID
+					}
+					assert.True(t, gotText)
+					if !assert.True(t, gotImage) {
 						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
@@ -180,8 +216,22 @@ func TestSeedancePluginSnapshotsSubmitSelectedAccountAsset(t *testing.T) {
 				t.Cleanup(upstream.Close)
 				mapping := map[string]string{"local-asset": remoteID}
 				require.NoError(t, rewriteSeedanceRequestBody(c, previous, mapping))
+				clientBody, exists := c.Get(pluginruntime.ContextKeyClientRequestBody)
+				require.True(t, exists)
+				encoded, err := common.Marshal(clientBody)
+				require.NoError(t, err)
+				if surface == "video_image" {
+					assert.Contains(t, string(encoded), `"image":"asset://local-asset"`)
+				} else {
+					assert.Contains(t, string(encoded), `"url":"asset://local-asset"`)
+				}
+				assert.NotContains(t, string(encoded), `"url":"asset://remote-`)
+				channelType := constant.ChannelTypeDoubaoVideo
+				if tc.pluginKey == "anyllm" {
+					channelType = constant.ChannelTypeTaskPlugin
+				}
 				info := &relaycommon.RelayInfo{
-					ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeDoubaoVideo, ChannelBaseUrl: upstream.URL, ApiKey: key, UpstreamModelName: modelName},
+					ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: channelType, ChannelBaseUrl: upstream.URL, ApiKey: key, UpstreamModelName: modelName},
 					OriginModelName: modelName, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task-test"},
 				}
 				adaptor := taskplugin.New(plugin)

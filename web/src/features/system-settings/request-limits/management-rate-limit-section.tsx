@@ -46,6 +46,9 @@ import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
 
 const maxRateLimitValue = 2_147_483_647
+const maxPrivateAssetSizeMiB = 8_796_093_022_206
+const maxPrivateAssetStorageMiB = 8_796_093_022_207
+const maxPrivateAssetCount = Number.MAX_SAFE_INTEGER
 const limitSchema = z.object({
   enabled: z.boolean(),
   requests: z.number().int().min(1).max(maxRateLimitValue),
@@ -59,6 +62,17 @@ const managementRateLimitsSchema = z.object({
   session_refresh: limitSchema,
   token_query: limitSchema,
   sensitive: limitSchema,
+  seedance_asset: limitSchema,
+  asset_upload: limitSchema,
+  asset_download: limitSchema,
+  asset_limits: z.object({
+    image_mib: z.number().int().min(1).max(maxPrivateAssetSizeMiB),
+    video_mib: z.number().int().min(1).max(maxPrivateAssetSizeMiB),
+    audio_mib: z.number().int().min(1).max(maxPrivateAssetSizeMiB),
+    compat_image_mib: z.number().int().min(1).max(maxPrivateAssetSizeMiB),
+    user_max_count: z.number().int().min(0).max(maxPrivateAssetCount),
+    user_storage_mib: z.number().int().min(0).max(maxPrivateAssetStorageMiB),
+  }),
 })
 
 type ManagementRateLimits = z.infer<typeof managementRateLimitsSchema>
@@ -79,6 +93,48 @@ const policies = [
   { key: 'session_refresh', label: 'Session refresh (per account)' },
   { key: 'token_query', label: 'Token usage and logs (per account)' },
   { key: 'sensitive', label: 'Other sensitive actions' },
+  { key: 'seedance_asset', label: 'Asset library requests (per account)' },
+  { key: 'asset_upload', label: 'Asset uploads (per IP)' },
+  { key: 'asset_download', label: 'Public asset downloads (per IP)' },
+] as const
+
+const assetLimitFields = [
+  {
+    key: 'image_mib',
+    label: 'Image file size (MiB)',
+    min: 1,
+    max: maxPrivateAssetSizeMiB,
+  },
+  {
+    key: 'video_mib',
+    label: 'Video file size (MiB)',
+    min: 1,
+    max: maxPrivateAssetSizeMiB,
+  },
+  {
+    key: 'audio_mib',
+    label: 'Audio file size (MiB)',
+    min: 1,
+    max: maxPrivateAssetSizeMiB,
+  },
+  {
+    key: 'compat_image_mib',
+    label: 'Compatibility API image size (MiB)',
+    min: 1,
+    max: maxPrivateAssetSizeMiB,
+  },
+  {
+    key: 'user_max_count',
+    label: 'Asset count per account',
+    min: 0,
+    max: maxPrivateAssetCount,
+  },
+  {
+    key: 'user_storage_mib',
+    label: 'Asset storage per account (MiB)',
+    min: 0,
+    max: maxPrivateAssetStorageMiB,
+  },
 ] as const
 
 export function ManagementRateLimitSection({ value }: { value: string }) {
@@ -96,6 +152,15 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
     resolver: zodResolver(managementRateLimitsSchema, {
       error: (issue) => {
         const property = issue.path?.at(-1)
+        const assetField = assetLimitFields.find(
+          (item) => item.key === property
+        )
+        if (assetField) {
+          return t('Enter a whole number between {{min}} and {{max}}', {
+            min: assetField.min,
+            max: assetField.max,
+          })
+        }
         if (property !== 'requests' && property !== 'window_seconds') return
         return t('Enter a whole number between 1 and {{max}}', {
           max: maxRateLimitValue,
@@ -147,8 +212,9 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
           form.reset(values)
         },
         onError: (error) => {
-          if (!axios.isAxiosError(error) || error.response?.status !== 409)
+          if (!axios.isAxiosError(error) || error.response?.status !== 409) {
             return
+          }
           const data: unknown = error.response.data
           if (
             !data ||
@@ -156,16 +222,18 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
             !('code' in data) ||
             data.code !== 'MANAGEMENT_RATE_LIMITS_CONFLICT' ||
             !('data' in data)
-          )
+          ) {
             return
+          }
           const current = data.data
           if (
             !current ||
             typeof current !== 'object' ||
             !('value' in current) ||
             typeof current.value !== 'string'
-          )
+          ) {
             return
+          }
           const limits = parseManagementRateLimits(current.value)
           if (limits) {
             latestSaved.current = { value: current.value, limits }
@@ -201,7 +269,7 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
           )}
           <p className='text-muted-foreground text-sm'>
             {t(
-              'Saved limits take effect without restarting. Requests also remain subject to the global IP limit.'
+              'Saved limits take effect without restarting. Other rate limits may also apply.'
             )}
           </p>
           {policies.map(({ key, label }) => (
@@ -221,6 +289,13 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
                         <FormDescription>
                           {t(
                             'All API keys belonging to the same account share the query limit.'
+                          )}
+                        </FormDescription>
+                      )}
+                      {key === 'seedance_asset' && (
+                        <FormDescription>
+                          {t(
+                            'The website and all API keys belonging to the same account share this limit.'
                           )}
                         </FormDescription>
                       )}
@@ -275,6 +350,50 @@ export function ManagementRateLimitSection({ value }: { value: string }) {
               </div>
             </fieldset>
           ))}
+          <fieldset
+            aria-label={t('Private asset limits')}
+            className='space-y-3'
+          >
+            <legend className='text-sm font-medium'>
+              {t('Private asset limits')}
+            </legend>
+            <p className='text-muted-foreground text-sm'>
+              {t(
+                'Set account limits to 0 for unlimited. Upstream limits may still apply.'
+              )}
+            </p>
+            <div className='grid gap-4 sm:grid-cols-2'>
+              {assetLimitFields.map(({ key, label, min, max }) => (
+                <FormField
+                  key={key}
+                  control={form.control}
+                  name={`asset_limits.${key}`}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t(label)}</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={
+                            Number.isFinite(field.value) ? field.value : ''
+                          }
+                          type='number'
+                          min={min}
+                          max={max}
+                          step={1}
+                          disabled={updateOption.isPending}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              ))}
+            </div>
+          </fieldset>
         </SettingsForm>
       </Form>
     </SettingsSection>

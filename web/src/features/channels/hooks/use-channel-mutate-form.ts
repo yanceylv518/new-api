@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation } from '@tanstack/react-query'
+import { isAxiosError } from 'axios'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -71,12 +72,17 @@ export function useChannelMutateForm(props: UseChannelMutateFormParams) {
       if (props.isEditing && props.currentRow) {
         const payload = transformFormDataToUpdatePayload(
           data,
-          props.currentRow.id
+          props.currentRow.id,
+          props.currentRow
         )
         if (!data.key?.trim()) {
           delete payload.key
         }
         if (!canEditSensitive) {
+          delete payload.setting_patch
+          delete payload.settings_patch
+          delete payload.setting_base
+          delete payload.settings_base
           for (const field of SENSITIVE_UPDATE_FIELDS) {
             delete payload[field]
           }
@@ -116,6 +122,14 @@ export function useChannelMutateForm(props: UseChannelMutateFormParams) {
       props.onSuccess()
     },
     onError: (error: unknown) => {
+      if (isAxiosError(error) && error.response?.status === 409) {
+        handleServerError(error, undefined, {
+          title: t(
+            'Channel settings changed. Reload the channel before saving.'
+          ),
+        })
+        return
+      }
       handleServerError(error, t(ERROR_MESSAGES.CREATE_FAILED))
     },
   })

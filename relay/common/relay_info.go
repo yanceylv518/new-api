@@ -109,6 +109,8 @@ type RelayInfo struct {
 	// separate from OriginModelName and UpstreamModelName so virtual pricing
 	// aliases never participate in channel selection or upstream routing.
 	BillingModelName string
+	// 继承原模型价格时，用户折扣仍按请求模型独立匹配。
+	DiscountModelName string
 
 	RequestURLPath     string
 	RequestHeaders     map[string]string
@@ -148,7 +150,8 @@ type RelayInfo struct {
 	// "" or "wallet" => wallet; "subscription" => subscription
 	BillingSource string
 	// SubscriptionId is the user_subscriptions.id used when BillingSource == "subscription"
-	SubscriptionId int
+	SubscriptionId          int
+	SubscriptionPeriodStart int64
 	// SubscriptionPreConsumed is the amount pre-consumed on subscription item (quota units or 1)
 	SubscriptionPreConsumed int64
 	// SubscriptionPostDelta is the post-consume delta applied to amount_used (quota units; can be negative).
@@ -867,6 +870,16 @@ func (info *RelayInfo) GetBillingModelName() string {
 	return info.OriginModelName
 }
 
+func (info *RelayInfo) GetDiscountModelName() string {
+	if info == nil {
+		return ""
+	}
+	if info.DiscountModelName != "" {
+		return info.DiscountModelName
+	}
+	return info.GetBillingModelName()
+}
+
 func (info *RelayInfo) GetUpstreamModelName() string {
 	if info == nil || info.ChannelMeta == nil {
 		return ""
@@ -1008,6 +1021,7 @@ type OriginTaskRef struct {
 	Action         string
 	Status         string
 	Data           []byte
+	VideoInput     string
 }
 
 type TaskRelayInfo struct {
@@ -1123,6 +1137,7 @@ type TaskInfo struct {
 	TotalTokens      int             `json:"total_tokens,omitempty"`      // 用于按倍率计费
 	UsageFacts       map[string]any  `json:"usage_facts,omitempty"`
 	PluginState      json.RawMessage `json:"plugin_state,omitempty"`
+	TaskData         json.RawMessage `json:"-"`
 }
 
 func FailTaskInfo(reason string) *TaskInfo {

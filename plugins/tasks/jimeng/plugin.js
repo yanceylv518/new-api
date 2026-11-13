@@ -7,7 +7,7 @@ export const meta = {
     en: "Volcengine Jimeng video generation (text-to-video, image-to-video, and first-and-last-frame)",
     zh: "火山引擎即梦视频生成（文生视频、图生视频、首尾帧）",
   },
-  version: "1.1.0",
+  version: "1.1.2",
   author: { name: "QuantumNous" },
   channelTypes: [51],
   models: ["jimeng_vgfm_t2v_l20"],
@@ -161,7 +161,7 @@ function decodeNativeRequest(ctx) {
 }
 
 function endpoint(ctx, action) {
-  return ctx.baseUrl + (viaGateway(ctx) ? "/jimeng/" : "/") + "?Action=" + action + "&Version=2022-08-31";
+  return String(ctx.baseUrl || "").replace(/\/+$/, "") + "/?Action=" + action + "&Version=2022-08-31";
 }
 
 function requestHeaders(ctx, method, url, bodyText) {
@@ -377,7 +377,7 @@ export function buildQueryRequest(ctx) {
 export function parseTaskResult(ctx, body) {
   const data = body.data || {};
   if (body.code !== 10000) {
-    return { code: body.code || 0, status: "FAILURE", progress: "100%", reason: body.message || "" };
+    throw new Error(body.message || "Jimeng task query failed");
   }
   if (data.status === "in_queue") {
     const result = { code: 0, status: "QUEUED", progress: "10%", reason: "" };

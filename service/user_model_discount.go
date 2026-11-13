@@ -65,7 +65,7 @@ func taskUserModelDiscount(task *model.Task, result *relaycommon.TaskInfo) (*hos
 		if result.CompletionTokens > 0 {
 			evaluation.Context.OutputTokens = float64(result.CompletionTokens)
 		}
-		evaluation.Context.ApplyUsageFacts(result.UsageFacts)
+		evaluation.Context.ApplyUsageFacts(taskCompletionBillingFacts(result.UsageFacts))
 	}
 	bps, err := evaluation.Evaluate()
 	if err != nil {

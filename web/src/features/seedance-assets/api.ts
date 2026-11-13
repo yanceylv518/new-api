@@ -18,15 +18,23 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { t } from 'i18next'
+import * as z from 'zod'
 
 import { api } from '@/lib/api'
+
+import type { SeedanceAssetUploadLimits } from './lib/upload'
+
+// 素材导入最长等待十分钟，额外预留原件传输和素材组检查的时间。
+const ASSET_UPLOAD_TIMEOUT_MS = 15 * 60 * 1000
 
 // HTTP 200 也可能携带业务失败，统一抛出错误以保留表单并显示失败反馈。
 function checked<T extends { success: boolean; message?: string }>(
   response: T
 ): T {
   if (!response.success) {
-    throw new Error(response.message || t('Request failed'))
+    throw new Error(
+      response.message ? t(response.message) : t('Request failed')
+    )
   }
   return response
 }
@@ -39,6 +47,8 @@ export type SeedanceAssetGroup = {
   tags?: string
   status?: string
   group_type?: string
+  deletion_error?: string
+  deletion_retry_at?: number
 }
 export type SeedanceAssetValidationSession = {
   id: number
@@ -51,6 +61,7 @@ export type SeedanceAssetValidationSession = {
   group_id?: string
   local_group_id?: number
   last_error?: string
+  status_check_retrying?: boolean
   created_at: number
   updated_at: number
 }
@@ -61,6 +72,7 @@ export type SeedanceAsset = {
   name: string
   asset_type: string
   status: string
+  failure_code?: string
   preview_url?: string
 }
 
@@ -90,6 +102,28 @@ type SeedanceAssetBatchDeleteResponse = {
   success: boolean
   message?: string
   data: SeedanceAssetBatchDeleteResult
+}
+
+export async function getSeedanceAssetUploadLimits(
+  signal?: AbortSignal
+): Promise<SeedanceAssetUploadLimits> {
+  const response = checked(
+    (
+      await api.get<SeedanceAssetResponse<unknown>>(
+        '/api/user/seedance/upload-limits',
+        { signal, disableDuplicate: true, timeout: 5000 }
+      )
+    ).data
+  )
+  const limit = z.number().int().min(1).max(8_796_093_022_206)
+  const parsed = z
+    .object({ image_mib: limit, video_mib: limit, audio_mib: limit })
+    .parse(response.data)
+  return {
+    Image: parsed.image_mib,
+    Video: parsed.video_mib,
+    Audio: parsed.audio_mib,
+  }
 }
 
 // 分组与素材列表由 React Query 单独管理缓存；绕过 HTTP 去重，取消后不会重用旧请求。
@@ -230,7 +264,7 @@ export async function uploadSeedanceAsset(payload: {
         // 上传队列负责显示错误；取消时不弹出脱离页面的全局错误提示。
         {
           signal: payload.signal,
-          timeout: 120000,
+          timeout: ASSET_UPLOAD_TIMEOUT_MS,
           skipErrorHandler: true,
           skipBusinessError: true,
           onUploadProgress: (event: AxiosProgressEvent) => {

@@ -99,7 +99,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, H3 multimodal reference, H3-Context-IR, and video regeneration)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、H3 多模态参考、H3-Context-IR 和视频再生成）",
   },
-  version: "1.3.8",
+  version: "1.3.9",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -1090,8 +1090,7 @@ export function buildQueryRequest(ctx) {
 export function parseTaskResult(ctx, body) {
   const apiError = h3APIError(body);
   if (apiError) {
-    if (apiError.statusCode === 408 || apiError.statusCode === 429 || apiError.statusCode >= 500) throw new Error(apiError.message);
-    return { code: apiError.statusCode, status: "FAILURE", progress: "100%", reason: apiError.message };
+    throw new Error(apiError.message);
   }
   const h3Task = h3QueryTask(body);
   if (h3Task) {
@@ -1113,7 +1112,7 @@ export function parseTaskResult(ctx, body) {
     return h3Result;
   }
   if (body.base_resp && body.base_resp.status_code !== 0) {
-    return { code: body.base_resp.status_code || 0, status: "FAILURE", progress: "100%", reason: body.base_resp.status_msg || "" };
+    throw new Error(body.base_resp.status_msg || "Hailuo task query failed");
   }
   const base = body.base_resp || {};
   const statuses = { Preparing: "IN_PROGRESS", Queueing: "IN_PROGRESS", Processing: "IN_PROGRESS", Success: "SUCCESS", Fail: "FAILURE" };

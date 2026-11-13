@@ -12,6 +12,20 @@ import (
 // TestFormatUserLogsStripsQuotaSaturation verifies the admin-only quota
 // saturation marker (nested under other.admin_info) is removed for non-admin
 // log views, since formatUserLogs strips the whole admin_info object.
+func TestMappedModelLogKeepsAdminEvidenceAndUserAlias(t *testing.T) {
+	const other = `{"upstream_model_name":"real-model","response_model":{"model":"real-model"},"is_model_mapped":true,"public_id":9007199254740993,"admin_info":{"upstream_model_name":"real-model"}}`
+	userLogs := []*Log{{ModelName: "public-model", Type: LogTypeError, Content: "real-model is unavailable", Other: other}}
+	formatUserLogs(userLogs, 0)
+	assert.Equal(t, "public-model is unavailable", userLogs[0].Content)
+	assert.NotContains(t, userLogs[0].Other, "real-model")
+	assert.NotContains(t, userLogs[0].Other, "is_model_mapped")
+	assert.Contains(t, userLogs[0].Other, `"public_id":9007199254740993`)
+	adminLogs := []*Log{{ModelName: "public-model", Type: LogTypeError, Content: "real-model is unavailable", Other: other}}
+	FormatAdminLogs(adminLogs)
+	assert.Equal(t, "real-model is unavailable", adminLogs[0].Content)
+	assert.Equal(t, other, adminLogs[0].Other)
+}
+
 func TestFormatUserLogsStripsQuotaSaturation(t *testing.T) {
 	other := common.MapToJsonStr(map[string]any{
 		"model_price": 0.004,

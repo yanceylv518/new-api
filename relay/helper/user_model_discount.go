@@ -17,7 +17,7 @@ func PrepareUserModelDiscount(c *gin.Context, info *relaycommon.RelayInfo, input
 	if info == nil || info.IsChannelTest || info.UserModelDiscountEvaluation != nil {
 		return nil
 	}
-	name := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
+	name := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetDiscountModelName()))
 	rule, source := info.UserModelDiscountBPS.RuleAt(name, info.StartTime.Unix())
 	if source == "" {
 		return nil

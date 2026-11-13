@@ -9,7 +9,7 @@ export const meta = {
     en: "SunoAPI project music and lyrics generation",
     zh: "SunoAPI 项目 音乐与歌词生成",
   },
-  version: "1.1.0",
+  version: "1.1.1",
   author: { name: "QuantumNous" },
   channelTypes: [36],
   models: ["suno_music", "suno_lyrics"],
@@ -114,7 +114,7 @@ export function buildSubmitRequest(ctx) {
   if (typeof incoming["Content-Type"] === "string" && incoming["Content-Type"]) headers["Content-Type"] = incoming["Content-Type"];
   if (typeof incoming.Accept === "string" && incoming.Accept) headers.Accept = incoming.Accept;
   return {
-    url: ctx.baseUrl + "/suno/submit/" + normalized.action,
+    url: trimmed(ctx.baseUrl).replace(/\/+$/, "") + "/submit/" + normalized.action,
     method: "POST",
     headers: headers,
     body: normalized.body,
@@ -142,7 +142,7 @@ export function extractUsage(ctx) {
 
 export function buildBatchQueryRequest(ctx, tasks) {
   return {
-    url: ctx.baseUrl + "/suno/fetch",
+    url: trimmed(ctx.baseUrl).replace(/\/+$/, "") + "/fetch",
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
     body: {

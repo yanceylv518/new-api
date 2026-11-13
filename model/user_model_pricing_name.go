@@ -19,6 +19,23 @@ func HasPriceOrRatioEntry(name string) bool {
 	return billing_setting.GetBillingMode(formatted) == billing_setting.BillingModeTieredExpr
 }
 
+// ResolveTaskPriceModel 别名独立价格优先，否则继承本次渠道对应的原模型价格。
+func ResolveTaskPriceModel(pluginKey, name, declared string) string {
+	if declared == "" {
+		return name
+	}
+	if HasPriceOrRatioEntry(name) {
+		return name
+	}
+	if _, ok := ratio_setting.GetDefaultModelPriceMap()[name]; ok {
+		return name
+	}
+	if _, ok := billing_setting.GetPluginBillingExpr(pluginKey, name); ok {
+		return name
+	}
+	return declared
+}
+
 // ResolveUserModelPricingName 与目标价格解析使用同一身份，避免修饰符绕过折扣。
 func ResolveUserModelPricingName(origin string) string {
 	var candidates []string

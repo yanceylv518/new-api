@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
@@ -20,6 +21,8 @@ import (
 )
 
 const seedanceAssetReferencePrefix = "asset://"
+
+var errSeedanceAssetAccountUnavailable = errors.New("The real-person assets are unavailable for this model and group. Use a verified group available to this API key.")
 
 // ErrInvalidSeedanceAssetRequest 表示引用格式无效或所选接口不支持本地素材引用。
 var ErrInvalidSeedanceAssetRequest = errors.New("invalid private asset request")
@@ -171,7 +174,86 @@ func extractSeedanceAssetIDs(c *gin.Context) ([]string, error) {
 	return nil, nil
 }
 
-func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key string) error {
+// prepareSeedanceAssetRouting 限制真人素材归属，并按请求范围筛选素材已就绪的账号。
+func prepareSeedanceAssetRouting(c *gin.Context, modelName string) error {
+	pluginKey := c.GetString("expected_task_plugin_key")
+	if pluginKey != "doubao" && pluginKey != "anyllm" && pluginKey != "originocean" {
+		return nil
+	}
+	assetIDs, exists := common.GetContextKeyType[[]string](c, constant.ContextKeySeedanceAssetReferences)
+	if !exists {
+		var err error
+		assetIDs, err = extractSeedanceAssetIDs(c)
+		if err != nil {
+			return fmt.Errorf("%w: failed to inspect references: %w", ErrInvalidSeedanceAssetRequest, err)
+		}
+		common.SetContextKey(c, constant.ContextKeySeedanceAssetReferences, assetIDs)
+	}
+	if len(assetIDs) == 0 {
+		return nil
+	}
+	userID := c.GetInt("id")
+	ownedGroups := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAsset{}).Select("group_id").
+		Where("user_id = ? AND asset_id IN ? AND status <> ?", userID, assetIDs, "Deleting")
+	var groups []model.SeedanceAssetGroup
+	if err := model.DB.WithContext(c.Request.Context()).
+		Where("user_id = ? AND group_id IN (?) AND status <> ? AND LOWER(group_type) = ?", userID, ownedGroups, "Deleting", "livenessface").
+		Find(&groups).Error; err != nil {
+		return err
+	}
+	var accountFingerprint, keyFingerprint string
+	accountFingerprints := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		fingerprint := group.AccountFingerprint
+		if fingerprint == "" && group.KeyFingerprint != "" {
+			original, err := model.CacheGetChannel(group.ChannelID)
+			if err != nil {
+				return errSeedanceAssetAccountUnavailable
+			}
+			fingerprint = model.SeedanceAssetAccountFingerprint(original, group.KeyFingerprint)
+		}
+		if fingerprint == "" || group.KeyFingerprint == "" ||
+			(keyFingerprint != "" && keyFingerprint != group.KeyFingerprint && accountFingerprint != fingerprint) {
+			return errSeedanceAssetAccountUnavailable
+		}
+		accountFingerprint, keyFingerprint = fingerprint, group.KeyFingerprint
+		accountFingerprints[fingerprint] = struct{}{}
+	}
+	if accountFingerprint == "" {
+		return prepareSeedanceReadyChannels(c, modelName, assetIDs)
+	}
+	constraints := service.GetChannelConstraints(c)
+	// 所有真人组必须被同一候选账号识别，兼容同账号的新旧摘要而不放宽到其他账号。
+	for fingerprint := range accountFingerprints {
+		constraints.AddFilter(dto.ChannelFilter{
+			Kind:                            dto.FilterSeedanceAssetAccount,
+			SeedanceAssetAccountFingerprint: fingerprint,
+			SeedanceAssetKeyFingerprint:     keyFingerprint,
+		})
+	}
+	if pin, found, _ := constraints.ResolvedPin(); found {
+		usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+		groups := []string{usingGroup}
+		if usingGroup == "auto" {
+			groups = service.GetRequestAutoGroups(c, c.GetString("user_group"))
+		}
+		allowed := false
+		for _, group := range groups {
+			if model.IsChannelEnabledForGroupModel(group, modelName, pin.ChannelId) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return errSeedanceAssetAccountUnavailable
+		}
+	}
+	common.SetContextKey(c, constant.ContextKeySeedanceAssetAccountFingerprint, accountFingerprint)
+	common.SetContextKey(c, constant.ContextKeySeedanceAssetKeyFingerprint, keyFingerprint)
+	return prepareSeedanceReadyChannels(c, modelName, assetIDs)
+}
+
+func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key string, modelNames ...string) error {
 	assetIDs, exists := common.GetContextKeyType[[]string](c, constant.ContextKeySeedanceAssetReferences)
 	if c.Request == nil {
 		if exists && len(assetIDs) > 0 {
@@ -193,13 +275,25 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 	if !service.SupportsSeedanceAssets(channel) {
 		return fmt.Errorf("%w: selected channel does not support Seedance assets", ErrInvalidSeedanceAssetRequest)
 	}
-	client, err := service.NewSeedanceAssetClientForSelectedKey(channel, key)
-	if err != nil {
-		return err
+	client, clientErr := service.NewSeedanceAssetClientForSelectedKey(channel, key)
+	modelName := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
+	if len(modelNames) > 0 {
+		modelName = modelNames[0]
 	}
-	newMapping, err := service.MapSeedanceAssetsToAccount(c.Request.Context(), c.GetInt("id"), client, assetIDs)
+	if value, exists := c.Get(seedanceReadyScopeKey); exists {
+		if scope, ok := value.(*seedanceReadyScope); ok && scope.models[channel.Id] != "" {
+			modelName = scope.models[channel.Id]
+		}
+	}
+	var newMapping map[string]string
+	var err error
+	if modelName == "" {
+		newMapping, err = service.MapSeedanceAssetsToAccount(c.Request.Context(), c.GetInt("id"), client, assetIDs)
+	} else {
+		newMapping, err = service.MapSeedanceAssetsToModelAccount(c.Request.Context(), c.GetInt("id"), client, channel, modelName, assetIDs)
+	}
 	if err != nil {
-		return err
+		return errors.Join(err, clientErr)
 	}
 	previousMapping, _ := common.GetContextKeyType[map[string]string](c, constant.ContextKeySeedanceAssetMapping)
 	if maps.Equal(previousMapping, newMapping) && previousMapping != nil {
@@ -213,6 +307,20 @@ func prepareSeedanceAssetRequest(c *gin.Context, channel *model.Channel, key str
 }
 
 func rewriteSeedanceRequestBody(c *gin.Context, previousMapping, newMapping map[string]string) error {
+	if _, exists := c.Get(pluginruntime.ContextKeyClientRequestBody); !exists {
+		c.Set(pluginruntime.ContextKeyClientRequestBody, nil)
+		if constant.TaskRequestSnapshotEnabled.Load() {
+			if request, ok := common.GetContextKeyType[pluginruntime.RouteRequestContext](c, pluginruntime.ContextKeyRouteRequest); ok {
+				if body, ok := request.Body.(map[string]any); ok && body["kind"] == string(pluginruntime.BodyJSON) {
+					if value, exists := body["value"]; exists {
+						c.Set(pluginruntime.ContextKeyClientRequestBody, value)
+					}
+				} else if value, exists := c.Get("task_request"); exists {
+					c.Set(pluginruntime.ContextKeyClientRequestBody, value)
+				}
+			}
+		}
+	}
 	// 插件在分配渠道前已解码请求，必须同步快照，避免驱动或二次解码再次发送原账号的 ID。
 	snapshots := make(map[string]any, 4)
 	for _, key := range []string{"task_request", pluginruntime.ContextKeyRouteRequest, pluginruntime.ContextKeyProtocolRequest, pluginruntime.ContextKeyRequestBodyText} {
@@ -447,22 +555,27 @@ func rewriteSeedanceJSONValue(raw json.RawMessage, mediaField bool, previousMapp
 
 func rewriteSeedanceAssetReference(value string, previousMapping, newMapping map[string]string) (string, bool, error) {
 	raw := strings.TrimSpace(value)
-	if len(raw) < len(seedanceAssetReferencePrefix) || !strings.EqualFold(raw[:len(seedanceAssetReferencePrefix)], seedanceAssetReferencePrefix) {
-		return value, false, nil
+	localID := ""
+	if len(raw) >= len(seedanceAssetReferencePrefix) && strings.EqualFold(raw[:len(seedanceAssetReferencePrefix)], seedanceAssetReferencePrefix) {
+		localID = raw[len(seedanceAssetReferencePrefix):]
 	}
-	assetID := raw[len(seedanceAssetReferencePrefix):]
-	localID := assetID
 	for candidateLocalID, previousRemoteID := range previousMapping {
-		if previousRemoteID == assetID {
+		if previousRemoteID == raw || localID != "" && previousRemoteID == localID {
 			localID = candidateLocalID
 			break
 		}
+	}
+	if localID == "" {
+		return value, false, nil
 	}
 	remoteID, exists := newMapping[localID]
 	if !exists {
 		return "", false, fmt.Errorf("%w: reference has no mapping for selected account", ErrInvalidSeedanceAssetRequest)
 	}
-	rewritten := seedanceAssetReferencePrefix + remoteID
+	rewritten := remoteID
+	if !strings.HasPrefix(remoteID, "http://") && !strings.HasPrefix(remoteID, "https://") {
+		rewritten = seedanceAssetReferencePrefix + remoteID
+	}
 	return rewritten, rewritten != value, nil
 }
 

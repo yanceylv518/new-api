@@ -12,6 +12,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRouteRequestWithModelKeepsOriginalAndJSONOrder(t *testing.T) {
+	original := RouteRequestContext{
+		Params:   map[string]string{"model": "short"},
+		Body:     map[string]any{"kind": string(BodyJSON), "value": map[string]any{"model_name": "short", "model": "other", "enabled": false}},
+		BodyText: []byte(`{"enabled":false,"model_name":"short","model":"other"}`),
+	}
+	updated, err := original.WithModel("short", "declared")
+	require.NoError(t, err)
+	assert.Equal(t, "short", original.Params["model"])
+	assert.Equal(t, "declared", updated.Params["model"])
+	assert.Equal(t, `{"enabled":false,"model_name":"declared","model":"other"}`, string(updated.BodyText))
+	assert.Equal(t, `{"enabled":false,"model_name":"short","model":"other"}`, string(original.BodyText))
+	assert.Equal(t, "short", original.Body.(map[string]any)["value"].(map[string]any)["model_name"])
+	assert.Equal(t, "declared", updated.Body.(map[string]any)["value"].(map[string]any)["model_name"])
+
+	fields := map[string][]string{"model": {"short"}, "prompt": {"unchanged"}}
+	multipart := RouteRequestContext{Body: map[string]any{"kind": string(BodyMultipart), "fields": fields}}
+	updated, err = multipart.WithModel("short", "declared")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"short"}, fields["model"])
+	assert.Equal(t, []string{"declared"}, updated.Body.(map[string]any)["fields"].(map[string][]string)["model"])
+	_, err = multipart.WithModel("missing", "declared")
+	assert.Error(t, err)
+}
+
 func TestRegistryIndexesNativeRoutesAndProtocolsInOneGeneration(t *testing.T) {
 	registry := NewRegistry()
 	plugin, err := CompilePlugin(routingTestPluginSource(
@@ -59,6 +84,35 @@ func TestRegistryIndexesNativeRoutesAndProtocolsInOneGeneration(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "openai_responses", endpoint.Protocol)
 	assert.Equal(t, []ProtocolBinding{endpoint}, generation.LookupEndpointCandidates("POST", "/v1/responses", "video-alpha"))
+}
+
+func TestRegistrySharedNativeRoutesRequireMatchingProtocolAndKeepCandidates(t *testing.T) {
+	source := func(key, protocol string) string {
+		return routingTestPluginSource(key, 0, `["video-alpha"]`, fmt.Sprintf(`routes:[{method:"POST",path:"/video/tasks",protocol:%q,type:"submit",decode:"create",render:"result"}]`, protocol), `export const native={create(ctx){return {kind:"submit",model:"video-alpha",requestBody:ctx.body.value}},result(ctx,task){return task}};`)
+	}
+	registry := NewRegistry()
+	first, err := registry.RegisterFactory(source("alpha", "video-v3"), Options{})
+	require.NoError(t, err)
+	second, err := registry.RegisterFactory(source("beta", "video-v3"), Options{})
+	require.NoError(t, err)
+	generation := registry.Generation()
+	assert.Len(t, generation.Routes(), 1)
+	candidates := generation.LookupDeclaredRouteCandidates("POST", "/video/tasks")
+	require.Len(t, candidates, 2)
+	assert.Same(t, first, candidates[0].Plugin)
+	assert.Same(t, second, candidates[1].Plugin)
+	pinned := PinnedRoute{Generation: generation, Plugin: first, Route: candidates[0].Route, Candidates: candidates}
+	assert.ElementsMatch(t, []constant.TaskPlatform{"alpha", "beta"}, pinned.Platforms())
+	selected, ok := pinned.ForPlatform("beta")
+	require.True(t, ok)
+	assert.Same(t, second, selected.Plugin)
+	_, ok = pinned.ForPlatform("unrelated")
+	assert.False(t, ok)
+	for _, protocol := range []string{"", "different"} {
+		_, err = registry.RegisterFactory(source("foreign", protocol), Options{})
+		assert.Error(t, err)
+		assert.Same(t, generation, registry.Generation())
+	}
 }
 
 func TestRegistryIndexesSharedEndpointCandidatesForDistinctLegacyProviders(t *testing.T) {

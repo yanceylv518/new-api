@@ -1,9 +1,13 @@
 package model
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -82,7 +86,46 @@ func CreateSeedanceAssetCleanupJob(job *SeedanceAssetCleanupJob) error {
 	return nil
 }
 
-// QueueSeedanceAssetDeletion 在一个事务内标记素材并建立后台删除任务，避免出现已标记但没有任务的孤儿状态。
+// NewSeedanceAssetDeleteCleanupJobs 为原素材和全部账号副本创建独立的删除任务。
+func NewSeedanceAssetDeleteCleanupJobs(asset *SeedanceAsset, replicas []SeedanceAssetReplica) []SeedanceAssetCleanupJob {
+	if asset == nil {
+		return nil
+	}
+	jobs := make([]SeedanceAssetCleanupJob, 0, len(replicas)+1)
+	jobs = append(jobs, SeedanceAssetCleanupJob{
+		Kind: SeedanceAssetCleanupKindAssetDelete, UserID: asset.UserID, LocalAssetID: asset.ID,
+		ChannelID: asset.ChannelID, KeyFingerprint: asset.KeyFingerprint,
+		UpstreamID: asset.UpstreamAssetID(), UpstreamDoneAt: asset.UpstreamDeletedAt,
+		ObjectKey: asset.ObjectKey, Storage: asset.Storage,
+		Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp(),
+	})
+	for _, replica := range replicas {
+		jobs = append(jobs, SeedanceAssetCleanupJob{
+			Kind: SeedanceAssetCleanupKindReplicaDelete, UserID: replica.UserID,
+			LocalAssetID: replica.LocalAssetID, LocalMappingID: replica.ID,
+			ChannelID: replica.ChannelID, KeyFingerprint: replica.KeyFingerprint,
+			UpstreamID: replica.UpstreamAssetID, UpstreamDoneAt: replica.UpstreamDeletedAt,
+			Status: SeedanceAssetCleanupStatusPending, NextAttemptAt: common.GetTimestamp(),
+		})
+	}
+	for index := range jobs {
+		job := &jobs[index]
+		resourceID := job.LocalAssetID
+		if job.Kind == SeedanceAssetCleanupKindReplicaDelete {
+			resourceID = job.LocalMappingID
+		}
+		// 与既有清理任务使用相同摘要，保持幂等身份不变。
+		hash := sha256.New()
+		for _, part := range []string{job.Kind, fmt.Sprintf("%d", job.UserID), fmt.Sprintf("%d", resourceID)} {
+			_, _ = hash.Write([]byte(part))
+			_, _ = hash.Write([]byte{0})
+		}
+		job.DedupKey = hex.EncodeToString(hash.Sum(nil))
+	}
+	return jobs
+}
+
+// QueueSeedanceAssetDeletion 锁内读取完整副本快照，再标记删除并建立清理任务。
 func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanupJob) error {
 	if DB == nil {
 		return errors.New("database is not initialized")
@@ -93,14 +136,47 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	assets := make([]SeedanceAsset, 0, len(jobs))
+	seen := make(map[uint]bool, len(jobs))
+	for _, job := range jobs {
+		if (job.Kind != SeedanceAssetCleanupKindAssetDelete && job.Kind != SeedanceAssetCleanupKindReplicaDelete) || job.UserID == 0 || job.LocalAssetID == 0 || strings.TrimSpace(job.DedupKey) == "" {
+			return errors.New("invalid Seedance asset deletion job")
+		}
+		if seen[job.LocalAssetID] {
+			continue
+		}
+		var asset SeedanceAsset
+		if err := DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.LocalAssetID, job.UserID).First(&asset).Error; err != nil {
+			return err
+		}
+		assets = append(assets, asset)
+		seen[asset.ID] = true
+	}
+	slices.SortFunc(assets, func(left, right SeedanceAsset) int {
+		if order := cmp.Compare(left.UserID, right.UserID); order != 0 {
+			return order
+		}
+		if order := strings.Compare(left.GroupID, right.GroupID); order != 0 {
+			return order
+		}
+		return cmp.Compare(left.ID, right.ID)
+	})
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for index := range jobs {
-			job := &jobs[index]
-			if (job.Kind != SeedanceAssetCleanupKindAssetDelete && job.Kind != SeedanceAssetCleanupKindReplicaDelete) || job.UserID == 0 || job.LocalAssetID == 0 || strings.TrimSpace(job.DedupKey) == "" {
-				return errors.New("invalid Seedance asset deletion job")
+		lockedAssets := make([]SeedanceAsset, 0, len(assets))
+		for _, snapshot := range assets {
+			// 与导入完成、组删除一致，先锁组再锁素材；SQLite 先取得写锁。
+			if tx.Dialector.Name() == "sqlite" {
+				if err := tx.Model(&SeedanceAsset{}).Where("id = ? AND user_id = ?", snapshot.ID, snapshot.UserID).
+					UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+					return err
+				}
+			}
+			var group SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("user_id = ? AND group_id = ?", snapshot.UserID, snapshot.GroupID).First(&group).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
 			}
 			var asset SeedanceAsset
-			if err := tx.Where("id = ? AND user_id = ?", job.LocalAssetID, job.UserID).First(&asset).Error; err != nil {
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", snapshot.ID, snapshot.UserID).First(&asset).Error; err != nil {
 				return err
 			}
 			// 已进入删除状态的素材允许幂等重新入队，避免 MySQL 将无值变化更新报告为零行。
@@ -112,12 +188,19 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 					return err
 				}
 			}
-			if job.Kind == SeedanceAssetCleanupKindReplicaDelete {
-				var replica SeedanceAssetReplica
-				if err := tx.Where("id = ? AND user_id = ? AND local_asset_id = ?", job.LocalMappingID, job.UserID, job.LocalAssetID).First(&replica).Error; err != nil {
-					return err
-				}
+			lockedAssets = append(lockedAssets, asset)
+		}
+		// 所有删除屏障就绪后才建立读快照，既包含已完成导入，又避免空范围间隙锁。
+		freshJobs := make([]SeedanceAssetCleanupJob, 0, len(jobs))
+		for _, asset := range lockedAssets {
+			var replicas []SeedanceAssetReplica
+			if err := tx.Where("user_id = ? AND local_asset_id = ?", asset.UserID, asset.ID).Order("id ASC").Find(&replicas).Error; err != nil {
+				return err
 			}
+			freshJobs = append(freshJobs, NewSeedanceAssetDeleteCleanupJobs(&asset, replicas)...)
+		}
+		for index := range freshJobs {
+			job := &freshJobs[index]
 			if job.Status == "" {
 				job.Status = SeedanceAssetCleanupStatusPending
 			}
@@ -128,28 +211,27 @@ func QueueSeedanceAssetDeletion(ctx context.Context, jobs []SeedanceAssetCleanup
 			lookup := tx.Where("dedup_key = ?", job.DedupKey).First(&existing)
 			switch {
 			case lookup.Error == nil:
+				if err := lockForUpdate(tx).Where("id = ?", existing.ID).First(&existing).Error; err != nil {
+					return err
+				}
+				if existing.LeaseUntil > common.GetTimestamp() {
+					continue
+				}
+				updates := map[string]any{
+					"channel_id": job.ChannelID, "key_fingerprint": job.KeyFingerprint,
+					"upstream_id": job.UpstreamID, "upstream_done_at": job.UpstreamDoneAt,
+					"object_key": job.ObjectKey, "next_attempt_at": common.GetTimestamp(), "lease_until": int64(0),
+				}
+				if existing.UpstreamID == job.UpstreamID {
+					updates["upstream_done_at"] = max(existing.UpstreamDoneAt, job.UpstreamDoneAt)
+				}
 				if existing.Status == SeedanceAssetCleanupStatusCompleted {
-					if err := tx.Model(&existing).Updates(map[string]any{
-						"status":          SeedanceAssetCleanupStatusPending,
-						"attempts":        0,
-						"next_attempt_at": common.GetTimestamp(),
-						"lease_until":     0,
-						"last_error":      "",
-					}).Error; err != nil {
-						return err
-					}
-				} else if existing.LeaseUntil <= common.GetTimestamp() {
-					// 用户再次点击删除时立即唤醒已退避任务；有效租约中的 worker 不被抢占。
-					updates := map[string]any{
-						"next_attempt_at": common.GetTimestamp(),
-						"lease_until":     0,
-					}
-					if job.UpstreamDoneAt > 0 {
-						updates["upstream_done_at"] = job.UpstreamDoneAt
-					}
-					if err := tx.Model(&existing).Updates(updates).Error; err != nil {
-						return err
-					}
+					updates["status"] = SeedanceAssetCleanupStatusPending
+					updates["attempts"] = 0
+					updates["last_error"] = ""
+				}
+				if err := tx.Model(&existing).Updates(updates).Error; err != nil {
+					return err
 				}
 			case errors.Is(lookup.Error, gorm.ErrRecordNotFound):
 				if err := tx.Create(job).Error; err != nil {
@@ -350,7 +432,7 @@ func CompleteSeedanceAssetCleanupJob(id uint, leaseUntil int64) (bool, error) {
 	return result.RowsAffected == 1, nil
 }
 
-// MarkSeedanceAssetCleanupUpstreamDone 记录删除已获上游确认，避免 OSS 重试时重复调用上游。
+// MarkSeedanceAssetCleanupUpstreamDone 标记上游阶段已结束；本站删除允许放弃失败的上游操作。
 func MarkSeedanceAssetCleanupUpstreamDone(id uint, leaseUntil, doneAt int64) (bool, error) {
 	if doneAt <= 0 {
 		doneAt = common.GetTimestamp()

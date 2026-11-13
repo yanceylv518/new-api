@@ -10,6 +10,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestKlingNativeResourceSubmitDeclarations(t *testing.T) {
+	source, err := builtinplugins.Source("kling")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "kling"})
+	require.NoError(t, err)
+	for _, tc := range []struct{ action, field string }{{"video_extend", "video_id"}, {"multi_elements_add", "session_id"}, {"multi_elements_delete", "session_id"}, {"multi_elements_clear", "session_id"}, {"multi_elements_preview", "session_id"}} {
+		t.Run(tc.action, func(t *testing.T) {
+			body := map[string]any{"model_name": "kling-v1", tc.field: "owned-resource"}
+			value, err := plugin.Engine.CallMember(t.Context(), "native", "decodeSubmit", map[string]any{"action": tc.action, "body": map[string]any{"kind": "json", "value": body}})
+			require.NoError(t, err)
+			intent := decodePluginValue(t, value)
+			require.NotEmpty(t, intent["originResource"])
+			_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"action": tc.action, "upstreamModel": "kling-v1", "baseUrl": "https://provider.example", "apiKey": "fixture", "requestBody": intent["requestBody"]})
+			require.ErrorContains(t, err, "account binding")
+		})
+	}
+}
+
 func TestKlingResponsesProtocol(t *testing.T) {
 	testVideoResponsesProtocol(t, videoResponsesTestCase{
 		pluginKey: "kling",
@@ -38,6 +56,34 @@ func TestKlingResponsesProtocol(t *testing.T) {
 	})
 }
 
+func TestKlingMetadataCannotChangeAuthorizedModelOrBilledRequest(t *testing.T) {
+	source, err := builtinplugins.Source("kling")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "kling"})
+	require.NoError(t, err)
+	for _, request := range []map[string]any{
+		{"model_name": "kling-v3", "duration": 5, "mode": "std", "sound": "off", "metadata": map[string]any{"model_name": "kling-v3-omni", "duration": 10, "mode": "pro", "sound": "on"}},
+		{"model": "public-alias", "metadata": map[string]any{"duration": 10, "mode": "pro", "sound": "on"}},
+	} {
+		ctx := map[string]any{"upstreamModel": "kling-v3", "model": "public-alias", "action": "text_to_video", "baseUrl": "https://provider.example", "apiKey": "fixture-access|fixture-secret", "requestBody": request, "usagePurpose": "facts"}
+		built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+		require.NoError(t, err)
+		body := built.(map[string]any)["body"].(map[string]any)
+		usage, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+		require.NoError(t, err)
+		facts := usage.(map[string]any)
+		assert.Equal(t, "kling-v3", body["model_name"])
+		assert.Equal(t, body["duration"], facts["seconds"])
+		if body["mode"] == "std" {
+			assert.Equal(t, "720p", facts["resolution"])
+			assert.Equal(t, "silent", facts["audio"])
+		} else {
+			assert.Equal(t, "1080p", facts["resolution"])
+			assert.Equal(t, "sound", facts["audio"])
+		}
+	}
+}
+
 func TestKlingResourceManagementRequiresItsCreationAccount(t *testing.T) {
 	source, err := builtinplugins.Source("kling")
 	require.NoError(t, err)
@@ -60,6 +106,10 @@ func TestKlingResourceManagementRequiresItsCreationAccount(t *testing.T) {
 			created, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"action": resource.creation, "baseUrl": "https://provider.example/kling", "apiKey": "sk-fixture-a", "publicTaskId": "task-created"}, map[string]any{"body": map[string]any{"code": 0, "data": map[string]any{resource.field: "resource-owned"}}})
 			require.NoError(t, err)
 			state := created.(map[string]any)["state"]
+			previous, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"action": resource.creation, "baseUrl": "https://provider.example", "apiKey": "sk-fixture-a", "publicTaskId": "task-before-prefix"}, map[string]any{"body": map[string]any{"code": 0, "data": map[string]any{resource.field: "resource-owned"}}})
+			require.NoError(t, err)
+			_, err = plugin.Engine.Call(t.Context(), "buildNativeRequest", map[string]any{"path": path, "method": http.MethodPost, "requestBody": intent["requestBody"], "baseUrl": "https://provider.example/kling", "apiKey": "sk-fixture-a", "resourceTask": map[string]any{"action": resource.creation, "status": "SUCCESS", "state": previous.(map[string]any)["state"]}})
+			require.NoError(t, err)
 			for _, account := range []struct {
 				key, base string
 				allowed   bool
@@ -96,13 +146,13 @@ func TestKlingRequestURLsRespectConfiguredPrefix(t *testing.T) {
 	}{
 		{"official", "https://provider.example", "access|secret", false, "https://provider.example"},
 		{"official trailing slash", "https://provider.example/", "access|secret", false, "https://provider.example"},
-		{"gateway root", "https://provider.example", "gateway-token", true, "https://provider.example/kling"},
+		{"gateway root", "https://provider.example", "gateway-token", true, "https://provider.example"},
 		{"gateway prefix", "https://provider.example/kling", "gateway-token", true, "https://provider.example/kling"},
 		{"gateway prefix trailing slashes", "https://provider.example/kling///", "gateway-token", true, "https://provider.example/kling"},
 		{"nested gateway prefix", "https://provider.example/proxy/kling/", "gateway-token", true, "https://provider.example/proxy/kling"},
 		{"legacy relay prefix", "https://provider.example/kling/", "sk-test", false, "https://provider.example/kling"},
 		{"vendor custom prefix", "https://provider.example/kling/", "access|secret", false, "https://provider.example/kling"},
-		{"different suffix", "https://provider.example/kling-proxy/", "gateway-token", true, "https://provider.example/kling-proxy/kling"},
+		{"different suffix", "https://provider.example/kling-proxy/", "gateway-token", true, "https://provider.example/kling-proxy"},
 	}
 	hooks := []struct {
 		name   string

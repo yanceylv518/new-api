@@ -40,6 +40,19 @@ func newSeedanceAssetMappingError(c *gin.Context, err error) *types.NewAPIError 
 		statusCode = http.StatusConflict
 		code = types.ErrorCode("private_asset_mapping_pending")
 		c.Header("Retry-After", seedanceAssetMappingRetryAfterSeconds)
+	} else if errors.Is(err, errSeedanceAssetAccountUnavailable) {
+		statusCode = http.StatusConflict
+		code = types.ErrorCode("private_asset_account_unavailable")
+	} else if errors.Is(err, errSeedanceAssetChannelOutsideGroup) {
+		statusCode = http.StatusForbidden
+		code = types.ErrorCode("private_asset_channel_unavailable")
+	} else if errors.Is(err, errSeedanceAssetSynchronizationFailed) {
+		statusCode = http.StatusServiceUnavailable
+		code = types.ErrorCode("private_asset_sync_failed")
+	} else if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
+		statusCode = http.StatusServiceUnavailable
+		code = types.ErrorCode("private_asset_service_unavailable")
+		c.Header("Retry-After", seedanceAssetMappingRetryAfterSeconds)
 	} else if errors.Is(err, ErrInvalidSeedanceAssetRequest) || errors.Is(err, model.ErrSeedanceAssetUnavailable) {
 		statusCode = http.StatusBadRequest
 		code = types.ErrorCode("private_asset_invalid")
@@ -66,15 +79,15 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		_, pinned, _ := constraints.ResolvedPin()
-		if !pinned {
-			// Select a channel for the user
-			// check token model mapping
+		pin, pinned, _ := constraints.ResolvedPin()
+		if !pinned || pin.Source == taskdto.PinSourceOriginTask {
 			if message := tokenModelLimitDenial(c, modelRequest.Model); message != "" {
 				abortWithOpenAiMessage(c, http.StatusForbidden, message)
 				return
 			}
-
+		}
+		if !pinned {
+			// Select a channel for the user
 			if shouldSelectChannel {
 				if modelRequest.Model == "" {
 					abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorModelNameRequired))
@@ -100,6 +113,15 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		if pinned || shouldSelectChannel {
+			if err := prepareVideoRouting(c, modelRequest.Model); err != nil {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, err.Error(), types.ErrorCodeInvalidRequest)
+				return
+			}
+			if routingErr := prepareSeedanceAssetRouting(c, modelRequest.Model); routingErr != nil {
+				assetErr := newSeedanceAssetMappingError(c, routingErr)
+				abortWithOpenAiMessage(c, assetErr.StatusCode, assetErr.Error(), assetErr.GetErrorCode())
+				return
+			}
 			usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 			var selectErr *service.ChannelSelectError
 			channel, _, selectErr = service.SelectChannelForRequest(c, modelRequest.Model, &service.RetryParam{
@@ -110,6 +132,32 @@ func Distribute() func(c *gin.Context) {
 				Retry:       common.GetPointer(0),
 			})
 			if selectErr != nil {
+				if scope, ok := c.Get(seedanceReadyScopeKey); ok && (selectErr.NoAvailableChannel || selectErr.FilterKind == taskdto.FilterSeedanceAssetReady) {
+					if ready, valid := scope.(*seedanceReadyScope); valid {
+						mappingErr := error(service.ErrSeedanceAssetMappingPending)
+						if !ready.pending && ready.failed {
+							mappingErr = errSeedanceAssetSynchronizationFailed
+						}
+						assetErr := newSeedanceAssetMappingError(c, mappingErr)
+						abortWithOpenAiMessage(c, assetErr.StatusCode, assetErr.Error(), assetErr.GetErrorCode())
+						return
+					}
+				}
+				if selectErr.FilterKind == taskdto.FilterVideoRouting {
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "No available channel supports the requested video resolution")
+					return
+				}
+				if selectErr.NoAvailableChannel || selectErr.FilterKind == taskdto.FilterTaskPluginIdentity {
+					if detail := rejectedTaskPluginError(c, modelRequest.Model, usingGroup); detail != "" {
+						abortWithOpenAiMessage(c, http.StatusBadRequest, detail, types.ErrorCodeInvalidRequest)
+						return
+					}
+				}
+				if (selectErr.NoAvailableChannel || selectErr.FilterKind == taskdto.FilterSeedanceAssetAccount) && common.GetContextKeyString(c, constant.ContextKeySeedanceAssetAccountFingerprint) != "" {
+					assetErr := newSeedanceAssetMappingError(c, errSeedanceAssetAccountUnavailable)
+					abortWithOpenAiMessage(c, assetErr.StatusCode, assetErr.Error(), assetErr.GetErrorCode())
+					return
+				}
 				if selectErr.FilterKind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
@@ -139,6 +187,85 @@ func Distribute() func(c *gin.Context) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+
+// 仅在路由失败时检查被拒绝的插件是否有满足其他约束的渠道。
+func rejectedTaskPluginError(c *gin.Context, modelName, usingGroup string) string {
+	value, exists := c.Get(contextKeyTaskPluginDecodeFailures)
+	rejected, ok := value.([]taskPluginDecodeFailure)
+	if !exists || !ok || len(rejected) == 0 {
+		return ""
+	}
+	pinnedValue, exists := c.Get(jsplugin.ContextKeyPinnedPlugin)
+	pinned, ok := pinnedValue.(jsplugin.PinnedPlugin)
+	if !exists || !ok || pinned.Generation == nil {
+		return ""
+	}
+	filter := taskdto.ChannelFilter{Kind: taskdto.FilterTaskPluginIdentity, TaskPluginKey: rejected[0].plugin.Meta.Key, TaskPluginChannelIDs: make(map[int]struct{})}
+	restricted := true
+	for _, failure := range rejected {
+		filter.TaskPluginKeys = append(filter.TaskPluginKeys, failure.plugin.Meta.Key)
+		if len(failure.channelIDs) == 0 {
+			restricted = false
+		} else {
+			for _, id := range failure.channelIDs {
+				filter.TaskPluginChannelIDs[id] = struct{}{}
+			}
+		}
+		for _, channelType := range failure.plugin.Meta.ChannelTypes {
+			if plugin, found := pinned.Generation.GetByChannelType(channelType); found && plugin == failure.plugin {
+				filter.TaskPluginChannelTypes = append(filter.TaskPluginChannelTypes, channelType)
+			}
+		}
+	}
+	if !restricted {
+		filter.TaskPluginChannelIDs = nil
+	}
+	constraints := service.GetChannelConstraints(c)
+	filters := make([]taskdto.ChannelFilter, 0, len(constraints.Filters))
+	for _, existing := range constraints.Filters {
+		if existing.Kind != taskdto.FilterTaskPluginIdentity {
+			filters = append(filters, existing)
+		}
+	}
+	filters = append(filters, filter)
+	var channel *model.Channel
+	if pin, found, _ := constraints.ResolvedPin(); found {
+		candidate, err := model.CacheGetChannel(pin.ChannelId)
+		if err == nil && candidate != nil && candidate.Status == common.ChannelStatusEnabled {
+			if satisfied, _ := model.ChannelSatisfiesFilters(candidate, modelName, filters); satisfied {
+				channel = candidate
+			}
+		}
+	} else {
+		groups := []string{usingGroup}
+		if usingGroup == "auto" {
+			groups = service.GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+		}
+		for _, group := range groups {
+			candidate, err := model.GetRandomSatisfiedChannel(group, modelName, 0, filters)
+			if err != nil {
+				return ""
+			}
+			if candidate != nil && candidate.Status == common.ChannelStatusEnabled {
+				channel = candidate
+				break
+			}
+		}
+	}
+	if channel == nil {
+		return ""
+	}
+	for _, failure := range rejected {
+		if channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI {
+			if channel.GetSetting().BindsTaskPlugin(failure.plugin.Meta.Key) {
+				return failure.detail
+			}
+		} else if plugin, found := pinned.Generation.GetByChannelType(channel.Type); found && plugin == failure.plugin {
+			return failure.detail
+		}
+	}
+	return ""
 }
 
 // noAvailableChannelMessage explains a 503 for a task-plugin-claimed model.
@@ -171,6 +298,9 @@ func channelMatchesExpectedTaskPlugin(c *gin.Context, channel *model.Channel, ex
 	}
 	if c != nil {
 		if _, matched := pinnedEndpointCandidateForChannel(c, channel, expected); matched {
+			return true
+		}
+		if _, matched := pinnedNativeCandidateForChannel(c, channel, expected); matched {
 			return true
 		}
 	}
@@ -216,6 +346,9 @@ func pinnedEndpointCandidateForChannel(c *gin.Context, channel *model.Channel, e
 		if candidate.Plugin.Meta.Key == expected {
 			expectedOwned = true
 		}
+		if len(candidate.ChannelIDs) > 0 && !slices.Contains(candidate.ChannelIDs, channel.Id) {
+			continue
+		}
 		if channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI {
 			// A New API channel may bind several candidates. The first bound
 			// candidate in generation order executes, so the billing provider
@@ -228,6 +361,33 @@ func pinnedEndpointCandidateForChannel(c *gin.Context, channel *model.Channel, e
 		}
 		plugin, indexed := pinned.Generation.GetByChannelType(channel.Type)
 		if indexed && plugin == candidate.Plugin {
+			selected = candidate
+		}
+	}
+	return selected, expectedOwned && selected.Plugin != nil
+}
+
+func pinnedNativeCandidateForChannel(c *gin.Context, channel *model.Channel, expected string) (jsplugin.RouteBinding, bool) {
+	value, exists := c.Get(jsplugin.ContextKeyPinnedRoute)
+	pinned, ok := value.(jsplugin.PinnedRoute)
+	if !exists || !ok || pinned.Generation == nil || len(pinned.Candidates) == 0 {
+		return jsplugin.RouteBinding{}, false
+	}
+	var selected jsplugin.RouteBinding
+	expectedOwned := false
+	for _, candidate := range pinned.Candidates {
+		if candidate.Plugin == nil {
+			continue
+		}
+		expectedOwned = expectedOwned || candidate.Plugin.Meta.Key == expected
+		if len(candidate.ChannelIDs) > 0 && !slices.Contains(candidate.ChannelIDs, channel.Id) {
+			continue
+		}
+		if channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI {
+			if selected.Plugin == nil && channel.GetSetting().BindsTaskPlugin(candidate.Plugin.Meta.Key) {
+				selected = candidate
+			}
+		} else if plugin, found := pinned.Generation.GetByChannelType(channel.Type); found && plugin == candidate.Plugin {
 			selected = candidate
 		}
 	}
@@ -404,6 +564,7 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	} else if strings.Contains(c.Request.URL.Path, "/v1/videos/") && strings.HasSuffix(c.Request.URL.Path, "/remix") {
 		relayMode := relayconstant.RelayModeVideoSubmit
 		c.Set("relay_mode", relayMode)
+		modelRequest.Model = getTaskOriginModelName(c)
 		shouldSelectChannel = false
 	} else if strings.Contains(c.Request.URL.Path, "/v1/videos") {
 		//curl https://api.openai.com/v1/videos \
@@ -535,6 +696,11 @@ func TokenModelLimitAllows(limit map[string]bool, model string) bool {
 	return limit[ratio_setting.RoutingMatchModelName(model)]
 }
 
+// TokenModelLimitDenial 返回令牌模型限制的拒绝原因。
+func TokenModelLimitDenial(c *gin.Context, modelName string) string {
+	return tokenModelLimitDenial(c, modelName)
+}
+
 func tokenModelLimitDenial(c *gin.Context, modelName string) string {
 	if !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
 		return ""
@@ -556,7 +722,7 @@ func tokenModelLimitDenial(c *gin.Context, modelName string) string {
 // 修复 #4834: GET /v1/video/generations/:task_id && /v1/video/:task_id 此前不解析 model，
 // 当 token 启用「可用模型限制」时，下游 modelLimitEnable 校验会因
 // modelRequest.Model 为空而误报 "This token has no access to model"。
-// 从已存储的任务记录中回填 OriginModelName 即可让校验走在正确的模型上。
+// 任务查询和 remix 从用户自己的源任务恢复模型名，兼容历史模型字段。
 func getTaskOriginModelName(c *gin.Context) string {
 	if !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
 		return ""
@@ -564,12 +730,26 @@ func getTaskOriginModelName(c *gin.Context) string {
 
 	taskId := c.Param("task_id")
 	if taskId == "" {
+		taskId = c.Param("video_id")
+	}
+	if taskId == "" {
 		return ""
 	}
 
 	userId := c.GetInt("id")
 	if task, exist, err := model.GetByTaskId(userId, taskId); err == nil && exist && task != nil {
-		return task.Properties.OriginModelName
+		if task.Properties.OriginModelName != "" {
+			return task.Properties.OriginModelName
+		}
+		if task.Properties.UpstreamModelName != "" {
+			return task.Properties.UpstreamModelName
+		}
+		var data struct {
+			Model string `json:"model"`
+		}
+		if task.GetData(&data) == nil {
+			return data.Model
+		}
 	}
 	return ""
 }
@@ -581,6 +761,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		logTaskPluginChannelDecision(c, nil, modelName, "channel_rejected", "nil_channel")
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
+	if err := channel.ValidateConfigurationEncoding(); err != nil {
+		return types.NewError(errors.New("selected channel settings are invalid"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
 	if expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
 		logTaskPluginChannelDecision(c, channel, modelName, "channel_rejected", "identity_mismatch")
 		return types.NewError(
@@ -591,11 +774,20 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	}
 	if candidate, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
 		if value, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
-			if pinned, ok := value.(jsplugin.PinnedEndpoint); ok && candidate.Plugin != nil && candidate.Plugin != pinned.Plugin {
+			if pinned, ok := value.(jsplugin.PinnedEndpoint); ok && candidate.Plugin != nil && (candidate.Plugin != pinned.Plugin || (len(candidate.ChannelIDs) > 0 && pinned.MappedModel != candidate.Model)) {
 				previousPlugin := pinned.Plugin.Meta.Key
 				pinned.Plugin = candidate.Plugin
 				pinned.Protocol = candidate.Protocol
 				pinned.Operation = candidate.Operation
+				if len(candidate.ChannelIDs) > 0 {
+					pinned.MappedModel = candidate.Model
+					if protocolValue, exists := c.Get(jsplugin.ContextKeyProtocolRequest); exists {
+						if protocolContext, valid := protocolValue.(jsplugin.ProtocolRequestContext); valid {
+							protocolContext.UpstreamModel = candidate.Model
+							c.Set(jsplugin.ContextKeyProtocolRequest, protocolContext)
+						}
+					}
+				}
 				c.Set(jsplugin.ContextKeyPinnedEndpoint, pinned)
 				c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: pinned.Generation, Plugin: candidate.Plugin})
 				c.Set("expected_task_plugin_key", candidate.Plugin.Meta.Key)
@@ -613,6 +805,22 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 				)
 			}
 		}
+	}
+	if candidate, matched := pinnedNativeCandidateForChannel(c, channel, expectedPlugin); matched {
+		pinned, _ := common.GetContextKeyType[jsplugin.PinnedRoute](c, jsplugin.ContextKeyPinnedRoute)
+		pinned.Plugin, pinned.Route, pinned.DeclaredModel = candidate.Plugin, candidate.Route, candidate.DeclaredModel
+		c.Set(jsplugin.ContextKeyPinnedRoute, pinned)
+		c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: pinned.Generation, Plugin: candidate.Plugin})
+		c.Set("expected_task_plugin_key", candidate.Plugin.Meta.Key)
+		c.Set("task_plugin_key", candidate.Plugin.Meta.Key)
+		c.Set("platform", candidate.Plugin.Meta.Key)
+	}
+	if task, ok := common.GetContextKeyType[*model.Task](c, jsplugin.ContextKeyOriginResourceTask); ok && task != nil {
+		resourceChannel, err := model.GetResourceTaskChannel(task, channel)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithStatusCode(http.StatusForbidden), types.ErrOptionWithSkipRetry())
+		}
+		channel = resourceChannel
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
@@ -645,9 +853,65 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	var key string
+	var index int
+	var newAPIError *types.NewAPIError
+	if fingerprint := common.GetContextKeyString(c, constant.ContextKeySeedanceAssetKeyFingerprint); fingerprint != "" {
+		accountFingerprint := common.GetContextKeyString(c, constant.ContextKeySeedanceAssetAccountFingerprint)
+		if !model.SeedanceAssetAccountFingerprintMatches(channel, fingerprint, accountFingerprint) {
+			return newSeedanceAssetMappingError(c, errSeedanceAssetAccountUnavailable)
+		}
+		if model.SeedanceAssetSharedAccountMatches(channel, accountFingerprint) {
+			key, index, newAPIError = channel.GetNextEnabledKey()
+			if newAPIError == nil && strings.TrimSpace(key) == "" {
+				for candidateIndex, candidate := range channel.GetKeys() {
+					if strings.TrimSpace(candidate) == "" {
+						continue
+					}
+					if status, exists := channel.ChannelInfo.MultiKeyStatusList[candidateIndex]; exists && status != common.ChannelStatusEnabled {
+						continue
+					}
+					key, index = candidate, candidateIndex
+					break
+				}
+				if strings.TrimSpace(key) == "" {
+					return newSeedanceAssetMappingError(c, errSeedanceAssetAccountUnavailable)
+				}
+			}
+		} else {
+			key, index, newAPIError = channel.GetEnabledKeyByFingerprint(fingerprint)
+		}
+		if newAPIError != nil {
+			return newSeedanceAssetMappingError(c, errSeedanceAssetAccountUnavailable)
+		}
+	} else {
+		key, index, newAPIError = channel.GetNextEnabledKey()
+	}
 	if newAPIError != nil {
 		return newAPIError
+	}
+	if value, exists := c.Get(seedanceReadyScopeKey); exists {
+		if scope, valid := value.(*seedanceReadyScope); valid {
+			allowed := scope.keys[channel.Id]
+			fingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(key)))
+			if _, found := allowed[fingerprint]; !found {
+				key = ""
+				for _, candidate := range channel.GetKeys() {
+					candidateFingerprint := fmt.Sprintf("%x", common.Sha256Raw([]byte(candidate)))
+					if _, found := allowed[candidateFingerprint]; !found {
+						continue
+					}
+					selected, selectedIndex, selectedErr := channel.GetEnabledKeyByFingerprint(candidateFingerprint)
+					if selectedErr == nil {
+						key, index = selected, selectedIndex
+						break
+					}
+				}
+				if key == "" {
+					return newSeedanceAssetMappingError(c, service.ErrSeedanceAssetMappingPending)
+				}
+			}
+		}
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
@@ -681,7 +945,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	case constant.ChannelTypeCoze:
 		c.Set("bot_id", channel.Other)
 	}
-	if err := prepareSeedanceAssetRequest(c, channel, key); err != nil {
+	if err := prepareSeedanceAssetRequest(c, channel, key, modelName); err != nil {
 		return newSeedanceAssetMappingError(c, err)
 	}
 	return nil

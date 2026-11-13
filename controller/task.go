@@ -50,13 +50,13 @@ func GetTask(c *gin.Context) {
 	if createdAt == 0 {
 		createdAt = task.SubmitTime
 	}
-	failReason := task.FailReason
+	failReason := service.PublicTaskModelText(task.FailReason, task.Properties.OriginModelName, task.Properties.UpstreamModelName)
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"task_id":     task.TaskID,
-		"platform":    task.Platform,
+		"platform":    model.PublicTaskPlatform(task.Platform),
 		"status":      task.Status,
 		"progress":    task.Progress,
 		"fail_reason": failReason,
@@ -105,7 +105,7 @@ func GetTaskRequestSnapshot(c *gin.Context) {
 	}
 	common.ApiSuccess(c, gin.H{
 		"task_id":        snapshot.PublicTaskID,
-		"platform":       snapshot.Platform,
+		"platform":       model.PublicTaskPlatform(snapshot.Platform),
 		"model":          snapshot.Model,
 		"body":           body,
 		"body_bytes":     snapshot.BodyBytes,
@@ -266,7 +266,7 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if task == nil || !taskHasPluginExecution(task) {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	channelModel, err := model.CacheGetChannel(task.ChannelId)
+	channelModel, err := model.GetTaskChannel(task)
 	if err != nil {
 		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
@@ -282,12 +282,23 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(channelModel.Type)
 	}
+	setting := channelModel.GetSetting()
+	channelType := channelModel.Type
+	if task.PrivateData.TransportSaved {
+		baseURL, setting.Proxy = task.PrivateData.BaseURL, task.PrivateData.Proxy
+		channelType = task.PrivateData.ChannelType
+	}
+	headers, err := task.GetTransportHeaderOverride(channelModel)
+	if err != nil {
+		return nil, err
+	}
 	adaptor.Init(&relaycommon.RelayInfo{
 		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelType:    channelModel.Type,
-			ChannelBaseUrl: baseURL,
-			ApiKey:         pluginKey,
-			ChannelSetting: channelModel.GetSetting(),
+			ChannelType:     channelType,
+			ChannelBaseUrl:  baseURL,
+			ApiKey:          pluginKey,
+			ChannelSetting:  setting,
+			HeadersOverride: headers,
 		},
 	})
 	return adaptor, nil
@@ -504,6 +515,9 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		if viewerRole >= common.RoleAdminUser {
+			item.Properties, item.Data, item.FailReason = task.Properties, task.Data, task.FailReason
+		}
 		item.LegacyVideoAvailable = legacyVideoAvailable(task)
 		item.ResultDiscarded = task.PrivateData.ResultDiscarded
 		if task.Status == model.TaskStatusSuccess {

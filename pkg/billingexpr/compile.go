@@ -26,6 +26,7 @@ const (
 // Format: "v1:tier(...)" → version=1, body="tier(...)".
 // No prefix defaults to DefaultExprVersion.
 func ParseExprVersion(exprStr string) (version int, body string) {
+	exprStr = PublicExpression(exprStr)
 	if strings.HasPrefix(exprStr, "v1:") {
 		return 1, exprStr[3:]
 	}
@@ -110,12 +111,14 @@ func usesRequestProbe(node ast.Node) bool {
 }
 
 type cachedEntry struct {
-	prog          *vm.Program
-	usedVars      map[string]bool
-	usedUsageKeys map[string]bool
-	requestRules  []RequestRuleTrace
-	version       int
-	fixedPricing  bool
+	prog           *vm.Program
+	usedVars       map[string]bool
+	usedUsageKeys  map[string]bool
+	requestRules   []RequestRuleTrace
+	taskRequest    TaskRequestPlan
+	taskRequestErr error
+	version        int
+	fixedPricing   bool
 }
 
 var (
@@ -185,6 +188,9 @@ func compileFromCacheByHash(exprStr, hash string) (*vm.Program, error) {
 }
 
 func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
+	if hash == "" {
+		hash = ExprHashString(exprStr)
+	}
 	cacheMu.RLock()
 	if entry, ok := cache[hash]; ok {
 		cacheMu.RUnlock()
@@ -199,6 +205,7 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("expr compile error: %w", err)
 	}
+	taskRequest, taskRequestErr := inspectTaskRequestPlan(tree.Node)
 	fixedPricing := ast.Find(tree.Node, func(node ast.Node) bool {
 		identifier, ok := node.(*ast.IdentifierNode)
 		return ok && identifier.Value == "fixed"
@@ -218,12 +225,14 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 	}
 
 	entry := &cachedEntry{
-		prog:          prog,
-		usedVars:      extractUsedVars(prog),
-		usedUsageKeys: extractUsedUsageKeys(prog),
-		requestRules:  patcher.requestRules,
-		version:       version,
-		fixedPricing:  fixedPricing,
+		prog:           prog,
+		usedVars:       extractUsedVars(prog),
+		usedUsageKeys:  extractUsedUsageKeys(prog),
+		requestRules:   patcher.requestRules,
+		taskRequest:    taskRequest,
+		taskRequestErr: taskRequestErr,
+		version:        version,
+		fixedPricing:   fixedPricing,
 	}
 	cacheMu.Lock()
 	if len(cache) >= maxCacheSize {
@@ -241,7 +250,7 @@ func ExprVersion(exprStr string) int {
 	if exprStr == "" {
 		return DefaultExprVersion
 	}
-	hash := ExprHashString(exprStr)
+	hash := TaskRequestExpressionHash(exprStr)
 	cacheMu.RLock()
 	if entry, ok := cache[hash]; ok {
 		cacheMu.RUnlock()
@@ -300,6 +309,9 @@ func UsedVarsByHash(exprStr, hash string) map[string]bool {
 	if exprStr == "" {
 		return nil
 	}
+	if hash == "" {
+		hash = ExprHashString(exprStr)
+	}
 	cacheMu.RLock()
 	if entry, ok := cache[hash]; ok {
 		cacheMu.RUnlock()
@@ -327,7 +339,7 @@ func UsedUsageKeys(exprStr string) map[string]bool {
 	if exprStr == "" {
 		return nil
 	}
-	hash := ExprHashString(exprStr)
+	hash := TaskRequestExpressionHash(exprStr)
 	cacheMu.RLock()
 	if entry, ok := cache[hash]; ok {
 		cacheMu.RUnlock()

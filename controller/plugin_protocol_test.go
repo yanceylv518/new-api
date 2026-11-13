@@ -244,7 +244,7 @@ func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObser
 	previousMemoryCache := common.MemoryCacheEnabled
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}, &model.VideoTaskPendingLog{}))
 	model.DB = database
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
@@ -486,6 +486,7 @@ func TestServeTaskPluginProtocolStreamsPinnedGenerationWithHostFraming(t *testin
 			UserId:   userID,
 			Platform: platform,
 			Status:   status,
+			Data:     []byte(`{"usage":{"total_tokens":40594}}`),
 		}, true, nil
 	}
 
@@ -509,6 +510,7 @@ func TestServeTaskPluginProtocolStreamsPinnedGenerationWithHostFraming(t *testin
 	assert.Contains(t, recorder.Body.String(), `"sequence_number":7`)
 	assert.Contains(t, recorder.Body.String(), "old-generation")
 	assert.NotContains(t, recorder.Body.String(), "new-generation")
+	assert.Contains(t, recorder.Body.String(), `"task_usage":"{\"total_tokens\":40594}"`)
 }
 
 func TestServeTaskPluginProtocolStreamMissingRenderEventsUsesFailureEnvelope(t *testing.T) {
@@ -669,7 +671,7 @@ func TestServeTaskPluginProtocolNonStreamUsesFinalHookAndHostEnvelope(t *testing
 			UserId:   71,
 			Status:   model.TaskStatusSuccess,
 		}
-		task.SetData(map[string]any{"value": "plugin-semantic-result"})
+		task.SetData(map[string]any{"value": "plugin-semantic-result", "usage": map[string]any{"total_tokens": 40594}})
 		return task, true, nil
 	}
 
@@ -685,6 +687,7 @@ func TestServeTaskPluginProtocolNonStreamUsesFinalHookAndHostEnvelope(t *testing
 	assert.Equal(t, "video-model", response.Model)
 	assert.Equal(t, "task_final", response.Metadata["task_id"])
 	assert.Equal(t, "kept", response.Metadata["plugin_field"])
+	assert.JSONEq(t, `{"total_tokens":40594}`, response.Metadata["task_usage"])
 	require.Len(t, response.Output, 1)
 	assert.Equal(t, "item_task_final_0", response.Output[0].ID)
 	assert.Equal(t, "completed", response.Output[0].Status)
@@ -1018,6 +1021,45 @@ func TestServeTaskPluginProtocolBackgroundNonStreamReturnsPendingWithoutObservat
 	assert.NotEqual(t, "text/event-stream", recorder.Header().Get("Content-Type"))
 }
 
+func TestServeTaskPluginProtocolBackgroundPreservesCurrentTaskData(t *testing.T) {
+	db, dialect := openTaskDialectDatabase(t, &model.Task{})
+	previousDB := model.DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB = db
+	common.SetDatabaseTypes(dialect, dialect)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+	pinned := compilePluginProtocolTestEndpoint(t, "background-persistence", `
+		export const protocols = {openai_responses: {
+			renderEvents: function() { return {events: [], done: false}; },
+			renderFinal: function() { return {}; }
+		}};
+	`)
+	task := model.Task{TaskID: "task_background_persisted", Platform: constant.TaskPlatform(pinned.Plugin.Meta.Key), UserId: 71, Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{InitialAccountingPending: true}}
+	require.NoError(t, db.Create(&task).Error)
+	stale := task
+	task.PrivateData.InitialAccountingPending = false
+	task.PrivateData.PluginState = []byte(`{"checkpoint":"current"}`)
+	require.NoError(t, db.Model(&model.Task{}).Where("id = ?", task.ID).Update("private_data", task.PrivateData).Error)
+	c, recorder := newPluginProtocolTestContext(false, false)
+	setProtocolRequestBackground(c, true)
+	deps := pluginProtocolTestDeps()
+	deps.submit = func(_ *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		outcome := pluginProtocolTestOutcome(info, pinned.Plugin.Meta.Key, stale.TaskID)
+		outcome.Task = &stale
+		return outcome, nil
+	}
+	serveTaskPluginProtocol(c, pinned, deps)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	var stored model.Task
+	require.NoError(t, db.First(&stored, task.ID).Error)
+	assert.True(t, stored.PrivateData.ResponsesBackground)
+	assert.False(t, stored.PrivateData.InitialAccountingPending)
+	assert.JSONEq(t, `{"checkpoint":"current"}`, string(stored.PrivateData.PluginState))
+}
+
 func TestServeTaskPluginProtocolBackgroundStreamEntersObservation(t *testing.T) {
 	pinned := compilePluginProtocolTestEndpoint(t, "background-stream", `
 		export const protocols = {openai_responses: {
@@ -1172,6 +1214,7 @@ func TestRetrieveTaskPluginResponseSuccessRendersFinal(t *testing.T) {
 		Status:     model.TaskStatusSuccess,
 		Properties: model.Properties{OriginModelName: "video-model"},
 		CreatedAt:  1_710_000_000,
+		Data:       []byte(`{"usage":{"total_tokens":40594}}`),
 	}, true, nil)
 
 	retrieveTaskPluginResponse(c, deps)
@@ -1183,6 +1226,7 @@ func TestRetrieveTaskPluginResponseSuccessRendersFinal(t *testing.T) {
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	assert.Equal(t, "completed", response.Status)
 	assert.Equal(t, "resp_retrieve_success", response.ID)
+	assert.JSONEq(t, `{"total_tokens":40594}`, response.Metadata["task_usage"])
 	require.Len(t, response.Output, 1)
 	require.Len(t, response.Output[0].Content, 1)
 	assert.Equal(t, "retrieved-final", response.Output[0].Content[0].Text)
@@ -1208,6 +1252,7 @@ func TestRetrieveTaskPluginResponseStreamOnlySuccessSynthesizesFromEvents(t *tes
 		Status:     model.TaskStatusSuccess,
 		Properties: model.Properties{OriginModelName: "video-model"},
 		CreatedAt:  1_710_000_000,
+		Data:       []byte(`{"usage":{"total_tokens":40594}}`),
 	}, true, nil)
 
 	retrieveTaskPluginResponse(c, deps)
@@ -1219,6 +1264,7 @@ func TestRetrieveTaskPluginResponseStreamOnlySuccessSynthesizesFromEvents(t *tes
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	assert.Equal(t, "completed", response.Status)
 	require.NotEmpty(t, response.Output)
+	assert.JSONEq(t, `{"total_tokens":40594}`, response.Metadata["task_usage"])
 }
 
 func TestRetrieveTaskPluginResponseStreamOnlyPendingAndFailureStayHostEnvelopes(t *testing.T) {
@@ -1482,6 +1528,7 @@ func newPluginProtocolTestContext(stream, requestBodyStream bool) (*gin.Context,
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
 	common.SetContextKey(c, constant.ContextKeyUserId, 71)
+	common.SetContextKey(c, constant.ContextKeyUserQuota, common.MaxQuota)
 	common.SetContextKey(c, constant.ContextKeyTokenId, 81)
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 	c.Set("resolved_task_model", "video-model")
@@ -1637,6 +1684,7 @@ func newImageProtocolTestContext(responseFormat string) (*gin.Context, *httptest
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{}`))
 	common.SetContextKey(c, constant.ContextKeyUserId, 71)
+	common.SetContextKey(c, constant.ContextKeyUserQuota, common.MaxQuota)
 	common.SetContextKey(c, constant.ContextKeyTokenId, 81)
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 	c.Set("resolved_task_model", "image-model")

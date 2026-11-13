@@ -12,50 +12,40 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 )
 
 func TestDeleteRedemptionBatch(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
-			var driver, logDriver gorm.Dialector
+			var dsn, logDSN string
 			dbType := common.DatabaseTypeSQLite
 			switch dialect {
 			case "sqlite":
-				driver = sqlite.Open(":memory:")
-				logDriver = sqlite.Open(":memory:")
 			case "mysql":
-				dsn := os.Getenv("TEST_MYSQL_DSN")
+				dsn = os.Getenv("TEST_MYSQL_DSN")
 				if dsn == "" {
 					t.Skip("TEST_MYSQL_DSN is not configured")
 				}
-				driver = mysql.Open(dsn)
-				logDSN := os.Getenv("TEST_MYSQL_LOG_DSN")
+				logDSN = os.Getenv("TEST_MYSQL_LOG_DSN")
 				if logDSN == "" {
 					logDSN = dsn
 				}
-				logDriver = mysql.Open(logDSN)
 				dbType = common.DatabaseTypeMySQL
 			case "postgres":
-				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				dsn = os.Getenv("TEST_POSTGRES_DSN")
 				if dsn == "" {
 					t.Skip("TEST_POSTGRES_DSN is not configured")
 				}
-				driver = postgres.Open(dsn)
-				logDSN := os.Getenv("TEST_POSTGRES_LOG_DSN")
+				logDSN = os.Getenv("TEST_POSTGRES_LOG_DSN")
 				if logDSN == "" {
 					logDSN = dsn
 				}
-				logDriver = postgres.Open(logDSN)
 				dbType = common.DatabaseTypePostgreSQL
 			}
-			db, err := gorm.Open(driver, &gorm.Config{})
-			require.NoError(t, err)
+			// 使用独立库，避免同一整包内其他用例留下的表破坏空库前提。
+			db, _ := newAuditTestDatabase(t, dialect, dsn)
 			sqlDB, err := db.DB()
 			require.NoError(t, err)
 			sqlDB.SetMaxOpenConns(1)
@@ -68,8 +58,7 @@ func TestDeleteRedemptionBatch(t *testing.T) {
 			require.NoError(t, db.Raw(query).Scan(&version).Error)
 			t.Logf("database version: %s", version)
 
-			logDB, err := gorm.Open(logDriver, &gorm.Config{})
-			require.NoError(t, err)
+			logDB, _ := newAuditTestDatabase(t, dialect, logDSN)
 			logSQL, err := logDB.DB()
 			require.NoError(t, err)
 			logSQL.SetMaxOpenConns(1)
@@ -85,7 +74,7 @@ func TestDeleteRedemptionBatch(t *testing.T) {
 				common.SetDatabaseTypes(previousMain, previousLog)
 				common.RedisEnabled = previousRedis
 			})
-			for _, table := range []any{&model.User{}, &model.Redemption{}} {
+			for _, table := range []any{&model.User{}, &model.UserAccessToken{}, &model.Redemption{}} {
 				require.False(t, db.Migrator().HasTable(table), "use an empty test database")
 				require.NoError(t, db.AutoMigrate(table))
 				t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
@@ -93,9 +82,12 @@ func TestDeleteRedemptionBatch(t *testing.T) {
 			require.False(t, logDB.Migrator().HasTable(&model.AuditLog{}), "use an empty test log database")
 			require.NoError(t, logDB.AutoMigrate(&model.AuditLog{}))
 			t.Cleanup(func() { require.NoError(t, logDB.Migrator().DropTable(&model.AuditLog{})) })
-			token := "redemption-audit-test-token"
-			admin := model.User{Username: "redemption-audit-admin", Password: "unused", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &token}
+			token := model.AccessTokenPrefix + "redemption-audit-test-token"
+			admin := model.User{Username: "redemption-audit-admin", Password: "unused", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default"}
 			require.NoError(t, db.Create(&admin).Error)
+			grant := &model.UserAccessToken{UserId: admin.Id, TokenHash: model.AccessTokenFingerprint(token)}
+			require.NoError(t, grant.SetScopes([]string{"redemption:write"}))
+			require.NoError(t, model.CreateUserAccessToken(admin.Id, grant, 1))
 			codes := make([]model.Redemption, 16)
 			for index := range codes {
 				codes[index] = model.Redemption{Name: "selected", Key: fmt.Sprintf("%032d", index+1), Quota: 100, Status: common.RedemptionCodeStatusEnabled}

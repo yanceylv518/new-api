@@ -12,6 +12,7 @@ import (
 // name, so the first segment is uniformly ":key"; it carries the plugin key
 // on submit routes and the task id on read routes.
 func SetTaskRouter(router *gin.Engine) {
+	router.POST("/v1/tasks/:key/callback", middleware.RouteTag("relay"), middleware.DisableCache(), controller.TaskPluginCallback)
 	taskSubmitRouter := router.Group("/v1/tasks")
 	taskSubmitRouter.Use(middleware.RouteTag("relay"), middleware.TokenAuth())
 	{

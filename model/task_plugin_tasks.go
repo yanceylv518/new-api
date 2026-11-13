@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
@@ -16,16 +18,48 @@ const TaskCancelledReason = "task cancelled by user"
 
 var ErrTaskPluginResourceAmbiguous = errors.New("resource has multiple creation records; provide its origin task ID")
 
+// MarkTaskPluginNativeDeleted 锁定最新记录，只写删除标记，避免覆盖并发结算的私有数据。
+func MarkTaskPluginNativeDeleted(ctx context.Context, task *Task) error {
+	var current Task
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		if current.Status != TaskStatusSuccess && current.Status != TaskStatusFailure {
+			return errors.New("task settlement is incomplete")
+		}
+		if current.PrivateData.NativeDeleted {
+			return nil
+		}
+		current.PrivateData.NativeDeleted = true
+		return tx.Model(&current).Update("private_data", current.PrivateData).Error
+	})
+	if err == nil {
+		*task = current
+	}
+	return err
+}
+
 type TaskPluginResourceReference struct {
-	ID     string   `json:"id"`
-	Action string   `json:"action"`
-	Paths  []string `json:"paths"`
-	TaskID string   `json:"taskId,omitempty"`
+	ID      string   `json:"id"`
+	Action  string   `json:"action"`
+	Actions []string `json:"actions,omitempty"`
+	Paths   []string `json:"paths"`
+	TaskID  string   `json:"taskId,omitempty"`
 }
 
 func (reference TaskPluginResourceReference) Validate() error {
-	if strings.TrimSpace(reference.ID) == "" || len(reference.ID) > 191 || strings.TrimSpace(reference.Action) == "" || len(reference.Action) > 40 || len(reference.Paths) == 0 || len(reference.Paths) > 8 || len(reference.TaskID) > 191 {
+	if strings.TrimSpace(reference.ID) == "" || len(reference.ID) > 191 || len(reference.Action) > 40 || len(reference.Paths) == 0 || len(reference.Paths) > 8 || len(reference.TaskID) > 191 || (reference.Action == "") == (len(reference.Actions) == 0) || len(reference.Actions) > 16 {
 		return fmt.Errorf("invalid task resource reference")
+	}
+	actions := reference.Actions
+	if reference.Action != "" {
+		actions = []string{reference.Action}
+	}
+	for _, action := range actions {
+		if strings.TrimSpace(action) == "" || len(action) > 40 {
+			return fmt.Errorf("invalid task resource action")
+		}
 	}
 	for _, path := range reference.Paths {
 		if strings.TrimSpace(path) == "" || len(path) > 128 {
@@ -35,31 +69,45 @@ func (reference TaskPluginResourceReference) Validate() error {
 	return nil
 }
 
-// FindTaskPluginUserResource 复用成功创建任务作为归属记录，按游标读取，避免新增任务表字段或全表迁移。
-func FindTaskPluginUserResource(ctx context.Context, userID int, platforms []constant.TaskPlatform, reference TaskPluginResourceReference) (*Task, error) {
+// FindTaskPluginUserResource 先用资源索引定位任务，再核对结构化结果、用户和账号归属。
+func FindTaskPluginUserResource(ctx context.Context, userID int, platforms []constant.TaskPlatform, reference TaskPluginResourceReference, meta jsplugin.Meta) (*Task, error) {
 	if err := reference.Validate(); err != nil {
 		return nil, err
 	}
 	if userID <= 0 || len(platforms) == 0 {
 		return nil, fmt.Errorf("invalid resource owner")
 	}
-	query := DB.WithContext(ctx).Where("user_id = ? AND platform IN ? AND action = ? AND status = ?", userID, platforms, reference.Action, TaskStatusSuccess)
+	actions := reference.Actions
+	if reference.Action != "" {
+		actions = []string{reference.Action}
+	}
+	query := DB.WithContext(ctx).Where("user_id = ? AND platform IN ? AND action IN ? AND status = ?", userID, platforms, actions, TaskStatusSuccess)
 	if reference.TaskID != "" {
 		query = query.Where("task_id = ?", reference.TaskID)
-	}
-	// 普通资源 ID 可先缩小候选；特殊字符仍按结构化快照核对，不能因 JSON 转义漏掉归属。
-	if strings.IndexFunc(reference.ID, func(r rune) bool {
-		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.')
-	}) < 0 {
-		column := query.Statement.Quote("data")
-		castType := "TEXT"
-		if query.Dialector.Name() == "mysql" {
-			castType = "CHAR"
+	} else {
+		definition := taskResourceIndexForMeta(meta)
+		keys := make([]string, 0, len(reference.Paths))
+		for _, path := range reference.Paths {
+			if !slices.Contains(definition.Paths, path) {
+				return nil, ErrTaskResourceIndexUnavailable
+			}
+			keys = append(keys, taskResourceKey(path, reference.ID))
 		}
-		pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(reference.ID) + "%"
-		query = query.Where("CAST("+column+" AS "+castType+") LIKE ? ESCAPE '!'", pattern)
+		var state TaskResourceIndexState
+		if err := DB.WithContext(ctx).First(&state, "id = ?", definition.ID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrTaskResourceIndexPending
+			}
+			return nil, err
+		}
+		if !state.Completed {
+			return nil, ErrTaskResourceIndexPending
+		}
+		resources := DB.Model(&TaskResource{}).Select("task_id").
+			Where("user_id = ? AND platform IN ? AND action IN ? AND resource_key IN ?", userID, platforms, actions, keys)
+		query = query.Where("id IN (?)", resources)
 	}
-	const batchSize = 100
+	const batchSize = 2
 	var found *Task
 	var beforeID int64
 	for {
@@ -107,20 +155,22 @@ func FindTaskPluginUserResource(ctx context.Context, userID int, platforms []con
 // TaskPluginTaskFilter 描述插件任务列表的服务端过滤条件。
 // 模型过滤基于持久化的 Properties JSON，保证 SQLite、MySQL、PostgreSQL 查询一致。
 type TaskPluginTaskFilter struct {
-	Platforms        []constant.TaskPlatform
-	TaskIDs          []string
-	ExternalTaskIDs  []string
-	Model            string
-	Models           []string
-	DataFilters      map[string][]string
-	Statuses         []TaskStatus
-	Actions          []string
-	CancelledOnly    bool
-	ExcludeCancelled bool
-	ExcludeExpired   bool
-	ServiceTier      string
-	CreatedAfter     int64
-	CreatedBefore    int64
+	Platforms            []constant.TaskPlatform
+	TaskIDs              []string
+	ExternalTaskIDs      []string
+	Model                string
+	Models               []string
+	DataFilters          map[string][]string
+	Statuses             []TaskStatus
+	Actions              []string
+	CancelledOnly        bool
+	ExcludeCancelled     bool
+	ExcludeExpired       bool
+	ExpiredOnly          bool
+	ExcludeNativeDeleted bool
+	ServiceTier          string
+	CreatedAfter         int64
+	CreatedBefore        int64
 }
 
 // ListTaskPluginUserTasks 只返回当前用户可见且属于插件历史平台标识的任务。
@@ -147,6 +197,17 @@ func CountTaskPluginUserTasks(userID int, filter TaskPluginTaskFilter) (int64, e
 
 // applyTaskPluginTaskFilter 将插件列表谓词收敛在模型层，控制器无需直接执行方言 SQL。
 func applyTaskPluginTaskFilter(query *gorm.DB, filter TaskPluginTaskFilter) *gorm.DB {
+	if filter.ExcludeNativeDeleted {
+		column := query.Statement.Quote("private_data")
+		switch query.Dialector.Name() {
+		case "mysql":
+			query = query.Where("COALESCE(CASE WHEN JSON_VALID(" + column + ") THEN JSON_UNQUOTE(JSON_EXTRACT(" + column + ", '$.native_deleted')) END, 'false') <> 'true'")
+		case "postgres":
+			query = query.Where("COALESCE(" + column + "::jsonb ->> 'native_deleted', 'false') <> 'true'")
+		case "sqlite":
+			query = query.Where("COALESCE(CASE WHEN json_valid(" + column + ") THEN json_extract(" + column + ", '$.native_deleted') END, 0) = 0")
+		}
+	}
 	if len(filter.Platforms) > 0 {
 		query = query.Where("platform IN ?", filter.Platforms)
 	}
@@ -177,6 +238,9 @@ func applyTaskPluginTaskFilter(query *gorm.DB, filter TaskPluginTaskFilter) *gor
 	}
 	if filter.ExcludeExpired {
 		query = query.Where("COALESCE("+taskPluginDataField(query, "status")+", '') <> ?", "expired")
+	}
+	if filter.ExpiredOnly {
+		query = query.Where("COALESCE("+taskPluginDataField(query, "status")+", '') = ?", "expired")
 	}
 	if len(filter.Statuses) > 0 {
 		query = query.Where("status IN ?", filter.Statuses)

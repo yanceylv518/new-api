@@ -1,8 +1,8 @@
 export type JSONValue = null | boolean | number | string | readonly JSONValue[] | {readonly [key: string]: JSONValue};
-export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "json-order@1" | "owned-resources@1";
+export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "json-order@1" | "owned-resources@1" | "owned-submit-resources@1" | "shared-native-routes@1" | "poll-task-data@1" | "artifact-base64@1" | "task-callback@1";
 /** Kinds of upstream a driver can address: the vendor API itself, or another New API gateway with the same plugin installed. */
 export type UpstreamKind = "vendor" | "new_api";
-/** Host-injected on every driver hook context. With "new_api" the driver uses its own native-route prefix and the host already set Bearer credentials. */
+/** Host-injected on every driver hook context. With "new_api" the host sets Bearer credentials; service prefixes come from the configured Base URL. */
 export interface UpstreamContext {kind: UpstreamKind}
 export type MutableJSON<T> = T extends readonly (infer Item)[] ? MutableJSON<Item>[] : T extends object ? {-readonly [Key in keyof T]: MutableJSON<T[Key]>} : T;
 export interface HostUtils {
@@ -29,13 +29,13 @@ export type DecodedBody =
 
 export interface NativeDecodeContext {method: string; path: string; params: Readonly<Record<string, string>>; query: Readonly<Record<string, readonly string[]>>; body: DecodedBody; model?: string; upstreamModel?: string}
 export interface ProtocolDecodeContext extends NativeDecodeContext {protocol: ProtocolName; operation: string; model: string; upstreamModel?: string; stream: boolean}
-export type SubmitIntent = {kind: "submit"; model: string; action?: string; requestBody?: unknown; originTaskIds?: readonly string[]};
+export type SubmitIntent = {kind: "submit"; model: string; action?: string; requestBody?: unknown; originTaskIds?: readonly string[]; originResource?: ResourceReference};
 export type QueryIntent = {kind: "query"; taskIds: readonly string[]; externalTaskIds?: readonly string[]; model?: string; models?: readonly string[]; actions?: readonly string[]; statuses?: readonly ("queued" | "running" | "succeeded" | "failed")[]; dataFilters?: Readonly<{template?: readonly string[]; resolution?: readonly string[]}>; listOptions?: {pageNum: number; pageSize: number; serviceTier?: "default" | "flex"; lookbackSeconds?: number; createdAfter?: number; createdBefore?: number}};
 export type DeleteIntent = {kind: "delete"; taskId: string; model?: string};
-export type ResourceReference = {id: string; action: string; paths: readonly string[]; taskId?: string};
+export type ResourceReference = {id: string; action?: string; actions?: readonly string[]; paths: readonly string[]; taskId?: string};
 export type ProxyIntent = {kind: "proxy"; model: string; requestBody?: unknown; originResource?: ResourceReference};
 export type TaskIntent = SubmitIntent | QueryIntent | DeleteIntent | ProxyIntent;
-export interface NativeRoute {method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; path: string; type: "submit" | "query" | "dynamic"; action?: string; taskIdParam?: string; decode?: string; render: string; models?: readonly string[]; retainResult?: boolean}
+export interface NativeRoute {method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; path: string; protocol?: string; type: "submit" | "query" | "dynamic"; action?: string; taskIdParam?: string; decode?: string; render: string; models?: readonly string[]; retainResult?: boolean}
 export type ProtocolName = "openai_responses" | "openai_video" | "openai_image";
 export type ResponsesMode = "stream" | "sync" | "background";
 export type ProtocolClaim =
@@ -57,15 +57,16 @@ export type UsageFieldSchema = {displayOrder?: number; when?: readonly UsageFiel
   | {enum: readonly string[]; unitLabel?: never; description?: LocalizedText; enumLabels?: Readonly<Record<string, LocalizedText>>});
 export type UsageExample = {label: string; facts: Readonly<Record<string, string | number | boolean>>};
 export type UsageProfile = {models: readonly string[]; schema: Readonly<Record<string, UsageFieldSchema>>; examples?: readonly UsageExample[]};
-export interface Meta {requiredCapabilities?: readonly HostCapability[]; submitResponseTypes?: readonly ("json" | "sse")[]; sortPriority?: number; website?: string; apiVersion: 1; key: string; name: string; icon?: string; description?: LocalizedText; version: string; author: {name: string; url?: string}; baseUrl?: string; channelTypes?: readonly number[]; models: readonly string[]; fetchMode: "per_task" | "batch"; allowedHosts?: readonly string[]; upstreams?: readonly UpstreamKind[]; routes?: readonly NativeRoute[]; protocols?: readonly ProtocolClaim[]; usageSchema?: Readonly<Record<string, UsageFieldSchema>>; usageExamples?: readonly UsageExample[]; usageProfiles?: readonly UsageProfile[]; auth?: "none" | "api_key" | "vertex_oauth" | {type: "none" | "api_key" | "oauth2_jwt"}}
+export interface Meta {requiredCapabilities?: readonly HostCapability[]; resourcePaths?: readonly string[]; submitResponseTypes?: readonly ("json" | "sse")[]; sortPriority?: number; website?: string; apiVersion: 1; key: string; name: string; icon?: string; description?: LocalizedText; version: string; author: {name: string; url?: string}; baseUrl?: string; channelTypes?: readonly number[]; models: readonly string[]; fetchMode: "per_task" | "batch"; allowedHosts?: readonly string[]; upstreams?: readonly UpstreamKind[]; routes?: readonly NativeRoute[]; protocols?: readonly ProtocolClaim[]; usageSchema?: Readonly<Record<string, UsageFieldSchema>>; usageExamples?: readonly UsageExample[]; usageProfiles?: readonly UsageProfile[]; auth?: "none" | "api_key" | "vertex_oauth" | {type: "none" | "api_key" | "oauth2_jwt"}}
 export interface TaskView {task_id: string; platform?: string; action?: string; status: string; progress?: string; fail_reason?: string; created_at?: number; updated_at?: number; data?: unknown; properties?: Record<string, unknown>}
-export interface DriverContext {requestBody: unknown; requestHeaders: Readonly<Record<string, string>>; action: string; model: string; upstreamModel: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext; files: readonly FileReference[]; publicTaskId: string; originTasks?: readonly {taskId: string; upstreamTaskId: string; action: string; status: string; data: unknown}[]}
+export interface OwnedResourceTask {taskId: string; action: string; status: string; data: unknown; state: unknown; transportSaved: boolean}
+export interface DriverContext {requestBody: unknown; requestHeaders: Readonly<Record<string, string>>; action: string; model: string; upstreamModel: string; declaredModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext; files: readonly FileReference[]; publicTaskId: string; originTasks?: readonly {taskId: string; upstreamTaskId: string; action: string; status: string; data: unknown; videoInput?: "video" | "none" | ""}[]; resourceTask?: OwnedResourceTask}
 export interface TaskQueryContext {taskId: string; publicTaskId: string; action: string; model: string; upstreamModel: string; baseUrl: string; apiKey?: string; authHeader: string; auth?: unknown; upstream: UpstreamContext; data: unknown; state: unknown}
 export interface BatchQueryContext {baseUrl: string; apiKey?: string; authHeader: string; auth?: unknown; upstream: UpstreamContext; tasks: readonly TaskQueryContext[]}
 export type HookHTTPResponse = {readonly status: number; readonly headers: Readonly<Record<string, string>>}
-export interface RequestDescriptor {responseType?: "json" | "sse"; url: string; method?: string; headers?: Record<string, string>; /** JSON body may contain FilePlaceholder objects at any depth; the host replaces each with a Base64 or data-URL string. */ body?: unknown; credentialless?: boolean; action?: string; model?: string; rewriteModel?: string; bodyType?: "json" | "multipart"; parts?: readonly {name: string; value?: unknown; fileRef?: string; filename?: string}[]}
+export interface RequestDescriptor {responseType?: "json" | "sse"; url: string; method?: string; headers?: Record<string, string>; /** JSON body may contain FilePlaceholder objects at any depth; the host replaces each with a Base64 or data-URL string. */ body?: unknown; credentialless?: boolean; /** 提交请求声明 task-callback@1 后，宿主向 JSON 顶层 bodyField 写入绑定本站任务的回调地址。 */ callback?: {url: string; bodyField: string}; /** Content requests only: bounded JSON string paths containing Base64 media, in fallback order. */ base64ContentPaths?: readonly string[]; contentType?: string; action?: string; model?: string; rewriteModel?: string; bodyType?: "json" | "multipart"; parts?: readonly {name: string; value?: unknown; fileRef?: string; filename?: string}[]}
 export interface UpstreamResponse {statusCode: number; headers: Readonly<Record<string, readonly string[]>>; body: unknown}
-export interface NormalizedTaskResult {taskId?: string; status: "NOT_START" | "SUBMITTED" | "QUEUED" | "IN_PROGRESS" | "SUCCESS" | "FAILURE" | "UNKNOWN"; progress?: string; reason?: string; url?: string; remoteUrl?: string; completionTokens?: number; totalTokens?: number}
+export interface NormalizedTaskResult {taskId?: string; status: "NOT_START" | "SUBMITTED" | "QUEUED" | "IN_PROGRESS" | "SUCCESS" | "FAILURE" | "UNKNOWN"; progress?: string; reason?: string; url?: string; remoteUrl?: string; completionTokens?: number; totalTokens?: number; taskData?: JSONValue}
 export interface TaskArtifact {key: string; type: "video" | "audio" | "image" | "file"; mimeType?: string}
 export declare const meta: Meta;
 export declare const native: Record<string, ((ctx: NativeDecodeContext) => TaskIntent) | ((ctx: NativeDecodeContext, task: TaskView | readonly TaskView[]) => unknown)> & {error?: (ctx: NativeDecodeContext, error: {code: string; message: string; httpStatus: number; retryable: boolean}) => unknown};
@@ -77,7 +78,7 @@ export declare const protocols: {
 };
 export declare function buildSubmitRequest(ctx: DriverContext): RequestDescriptor;
 /** 为动态 proxy 路由构造不创建任务的受控 JSON 请求。 */
-export declare function buildNativeRequest(ctx: NativeDecodeContext & {requestBody: unknown; model: string; upstreamModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext; resourceTask?: {taskId: string; action: string; status: string; data: unknown; state: unknown}}): RequestDescriptor;
+export declare function buildNativeRequest(ctx: NativeDecodeContext & {requestBody: unknown; model: string; upstreamModel?: string; baseUrl: string; apiKey?: string; authHeader: string; upstream: UpstreamContext; resourceTask?: OwnedResourceTask}): RequestDescriptor;
 /** 动态 proxy 路由的响应包络。 */
 export declare function proxyResponse(ctx: NativeDecodeContext, response: {statusCode: number; body: unknown}): unknown;
 export interface SubmitEvent {event: string; id: string; data: string}
@@ -99,7 +100,9 @@ export declare function buildBatchQueryRequest(ctx: BatchQueryContext, tasks: re
 export declare function parseTaskResult(ctx: TaskQueryContext, body: unknown, response: HookHTTPResponse): NormalizedTaskResult;
 export declare function parseBatchResult(ctx: BatchQueryContext, body: unknown, response: HookHTTPResponse): readonly (NormalizedTaskResult & {taskId: string; data?: unknown; state?: unknown})[];
 export declare function extractUsage(ctx: DriverContext & {usagePurpose?: "facts" | "billing_ratios"}): Readonly<Record<string, string | number | boolean>> | null;
+/** 为调用方隐藏内部供应商详情；不改变服务端诊断、HTTP 状态或重试决策。 */
+export declare function publicErrorMessage(error: {httpStatus: number; code: string; message: string; local: boolean}): string;
 export declare function extractUsageOnSubmit(ctx: DriverContext, taskData: unknown): Readonly<Record<string, string | number | boolean>> | null;
 export declare function extractUsageOnComplete(task: TaskQueryContext, result: NormalizedTaskResult, data: unknown): Readonly<Record<string, string | number | boolean>> | null;
-export declare function listArtifacts(task: {taskId: string; upstreamTaskId: string; status: string; action: string; data: unknown; producerVersion: string}): readonly TaskArtifact[];
+export declare function listArtifacts(task: {taskId: string; upstreamTaskId: string; status: string; action: string; data: unknown; state: unknown; producerVersion: string}): readonly TaskArtifact[];
 export declare function buildContentRequest(ctx: DriverContext & {artifactKey: string; data: unknown; state?: unknown; upstreamTaskId: string; clientRequest: {method: "GET" | "HEAD"; headers: Readonly<Record<string, string>>}}): RequestDescriptor;

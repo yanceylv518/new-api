@@ -160,7 +160,7 @@ func TestRedeemRejectsWalletOverflow(t *testing.T) {
 	assert.Equal(t, common.MaxWalletQuota-10, user.Quota)
 
 	var redemption Redemption
-	require.NoError(t, DB.First(&redemption, "key = ?", key).Error)
+	require.NoError(t, DB.Where(&Redemption{Key: key}).First(&redemption).Error)
 	assert.Equal(t, common.RedemptionCodeStatusEnabled, redemption.Status)
 }
 

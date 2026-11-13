@@ -12,14 +12,7 @@ const KLING_CLASSIC_MODELS = [
   "kling-v3-omni",
 ];
 
-const KLING_NEW_MODELS = [
-  "kling-3.0",
-  "kling-3.0-turbo",
-  "kling-3.0-omni",
-  "kling-o1",
-  "kling-2.6",
-  "kling-2.5-turbo",
-];
+const KLING_NEW_MODELS = ["kling-3.0", "kling-3.0-turbo", "kling-3.0-omni", "kling-o1", "kling-2.6", "kling-2.5-turbo"];
 
 const KLING_MODELS = KLING_CLASSIC_MODELS.concat(KLING_NEW_MODELS);
 
@@ -191,7 +184,14 @@ function klingRoutes() {
   }
   for (const action of KLING_NEW_ACTIONS) {
     const endpoint = KLING_NEW_ENDPOINTS[action];
-    routes.push({ method: "POST", path: "/kling" + endpoint.path + "/:model", type: "submit", action: action, decode: "decodeNewSubmit", render: "newTaskCreated" });
+    routes.push({
+      method: "POST",
+      path: "/kling" + endpoint.path + "/:model",
+      type: "submit",
+      action: action,
+      decode: "decodeNewSubmit",
+      render: "newTaskCreated",
+    });
   }
   routes.push({ method: "GET", path: "/kling/tasks", type: "dynamic", action: "list", decode: "decodeNewTaskList", render: "newTaskList" });
   return routes;
@@ -199,7 +199,14 @@ function klingRoutes() {
 
 export const meta = {
   apiVersion: 1,
-  requiredCapabilities: ["owned-resources@1"],
+  requiredCapabilities: ["owned-resources@1", "owned-submit-resources@1"],
+  resourcePaths: [
+    "data.session_id", "session_id", "data.task_result.videos.#.id", "task_result.videos.#.id",
+    "data.task_result.voices.#.voice_id", "data.task_result.voice_id", "data.voices.#.voice_id", "data.voice_id",
+    "task_result.voices.#.voice_id", "task_result.voice_id", "voices.#.voice_id", "voice_id",
+    "data.task_result.elements.#.element_id", "data.task_result.element_id", "data.elements.#.element_id", "data.element_id",
+    "task_result.elements.#.element_id", "task_result.element_id", "elements.#.element_id", "element_id",
+  ],
   key: "kling",
   name: "Kling",
   icon: "Kling.Color",
@@ -207,7 +214,7 @@ export const meta = {
     en: "Kuaishou Kling video generation and media APIs",
     zh: "快手可灵视频生成及媒体接口",
   },
-  version: "1.3.2",
+  version: "1.3.6",
   author: { name: "QuantumNous" },
   channelTypes: [50],
   models: KLING_MODELS,
@@ -256,14 +263,7 @@ const KLING_SYNC_ACTIONS = [
   "presets_elements",
 ];
 
-const KLING_MODEL_ACTIONS = [
-  "text_to_video",
-  "image_to_video",
-  "omni_video",
-  "multi_image_to_video",
-  "motion_control",
-  "multi_elements",
-];
+const KLING_MODEL_ACTIONS = ["text_to_video", "image_to_video", "omni_video", "multi_image_to_video", "motion_control", "multi_elements"];
 
 const KLING_VIDEO_METERED_ACTIONS = KLING_MODEL_ACTIONS.concat(["video_extend", "advanced_lip_sync", "avatar_image_to_video", "effects"], KLING_NEW_ACTIONS);
 
@@ -352,9 +352,7 @@ function isNewKlingAction(action) {
 }
 
 function apiRoot(ctx) {
-  const base = trimmed(ctx.baseUrl).replace(/\/+$/, "");
-  if (base.toLowerCase().endsWith("/kling")) return base;
-  return base + (viaGateway(ctx) ? "/kling" : "");
+  return trimmed(ctx.baseUrl).replace(/\/+$/, "");
 }
 
 function newSubmitURL(ctx, action, model) {
@@ -368,10 +366,14 @@ function newQueryURL(ctx, taskId) {
 }
 
 function submitModel(ctx, req) {
-  return (ctx && ctx.upstreamModel) ||
-    (ctx && ctx.model) ||
-    (req && (req.model_name || req.model)) ||
-    "kling-v1";
+  return (ctx && ctx.upstreamModel) || (ctx && ctx.model) || (req && (req.model_name || req.model)) || "kling-v1";
+}
+
+function submitBody(req) {
+  const metadata = req && req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
+  const body = Object.assign({}, metadata, req || {});
+  delete body.metadata;
+  return body;
 }
 
 function resolveKlingMode(model, mode) {
@@ -407,12 +409,8 @@ function validateKlingDuration(value) {
 }
 
 function outboundDuration(req) {
-  const n = Number(req && req.duration);
-  if (Number.isFinite(n) && n > 0) return n;
-  const metadata = (req && req.metadata) || {};
-  const fromMeta = Number(metadata.duration);
-  if (Number.isFinite(fromMeta) && fromMeta > 0) return fromMeta;
-  return 5;
+  const value = req && req.duration;
+  return value === undefined ? 5 : validateKlingDuration(value);
 }
 
 function newRequestSettings(req) {
@@ -467,14 +465,19 @@ function requestKlingOption(req, names) {
 function klingAudioMode(req) {
   const value = requestKlingOption(req, ["sound", "audio", "generate_audio", "keep_original_sound"]);
   if (typeof value === "boolean") return value ? "sound" : "silent";
-  const raw = String(value === undefined || value === null ? "" : value).trim().toLowerCase();
+  const raw = String(value === undefined || value === null ? "" : value)
+    .trim()
+    .toLowerCase();
   return ["1", "true", "yes", "on", "sound", "audio", "enabled", "generate"].includes(raw) ? "sound" : "silent";
 }
 
 function hasKlingVideoReference(req, action) {
   if (action !== "omni_video") return false;
   const value = requestKlingOption(req, ["video_list", "videos", "video_url", "video", "input_video", "reference_video"]);
-  if (Array.isArray(value)) return value.some(function (item) { return Boolean(trimmed(item && typeof item === "object" ? item.url || item.video_url : item)); });
+  if (Array.isArray(value))
+    return value.some(function (item) {
+      return Boolean(trimmed(item && typeof item === "object" ? item.url || item.video_url : item));
+    });
   if (value && typeof value === "object" && !Array.isArray(value)) return Boolean(trimmed(value.url || value.video_url || value.uri));
   return Boolean(trimmed(value));
 }
@@ -523,17 +526,55 @@ function decodeNativeSubmit(ctx) {
   if (model === "") model = typeof body.model === "string" ? body.model.trim() : "";
   if (model === "") model = trimmed(ctx.model) || trimmed(ctx.upstreamModel) || "kling-v1";
   if (!KLING_CLASSIC_MODELS.includes(model)) throw new Error("unsupported classic Kling model: " + model);
-  return {
+  const intent = {
     kind: "submit",
     model: model,
     requestBody: Object.assign({}, body),
     action: ctx.action || "text_to_video",
   };
+  const resource = submitResource(body, intent.action);
+  if (resource) intent.originResource = resource;
+  return intent;
+}
+
+function submitResource(body, action) {
+  let field, actions, paths;
+  if (["multi_elements_add", "multi_elements_delete", "multi_elements_clear", "multi_elements_preview"].includes(action) ||
+      (action === "multi_elements" && body.session_id !== undefined)) {
+    field = "session_id";
+    actions = ["multi_elements_init"];
+    paths = ["data.session_id", "session_id"];
+  } else if (action === "video_extend" || body.video_id !== undefined) {
+    field = "video_id";
+    actions = KLING_VIDEO_METERED_ACTIONS;
+    paths = ["data.task_result.videos.#.id", "task_result.videos.#.id"];
+  } else {
+    return null;
+  }
+  const id = typeof body[field] === "string" ? body[field].trim() : "";
+  if (!id || id.length > 191) throw new Error(field + " is required");
+  const resource = { id: id, actions: actions, paths: paths };
+  if (body.origin_task_id !== undefined) {
+    if (typeof body.origin_task_id !== "string" || !body.origin_task_id.trim() || body.origin_task_id.length > 191)
+      throw new Error("origin_task_id must be a gateway task ID");
+    resource.taskId = body.origin_task_id.trim();
+  }
+  return resource;
 }
 
 function resourceAccount(ctx) {
   const baseURL = trimmed(ctx.baseUrl).replace(/\/+$/, "");
   return utils.hmacSHA256("kling-resource:v1:" + baseURL + ":" + ((ctx.upstream && ctx.upstream.kind) || "vendor"), ctx.apiKey);
+}
+
+function resourceAccountMatches(ctx, frozen) {
+  if (frozen === resourceAccount(ctx)) return true;
+  const base = trimmed(ctx.baseUrl).replace(/\/+$/, "");
+  if (!viaGateway(ctx) || !base.toLowerCase().endsWith("/kling")) return false;
+  const previous = base.slice(0, -"/kling".length);
+  // 只接受原自动前缀迁移后的同一实际入口，不放宽密钥或主机绑定。
+  if (previous.toLowerCase().endsWith("/kling")) return false;
+  return frozen === resourceAccount(Object.assign({}, ctx, { baseUrl: previous }));
 }
 
 function decodeNewSubmit(ctx) {
@@ -593,7 +634,13 @@ function splitNewTaskIDs(query, name) {
     .map(function (value) {
       return trimmed(value);
     });
-  if (ids.length > 100 || ids.some(function (value) { return value === "" || value.length > 191; })) throw new Error(name + " accepts at most 100 non-empty IDs");
+  if (
+    ids.length > 100 ||
+    ids.some(function (value) {
+      return value === "" || value.length > 191;
+    })
+  )
+    throw new Error(name + " accepts at most 100 non-empty IDs");
   return ids;
 }
 
@@ -641,7 +688,9 @@ function taskViewMilliseconds(value) {
 function newTaskListItem(view) {
   const records = newTaskRecords(view && view.data);
   const publicTaskID = trimmed(view && view.task_id);
-  let record = records.find(function (item) { return item && trimmed(item.id) === publicTaskID; });
+  let record = records.find(function (item) {
+    return item && trimmed(item.id) === publicTaskID;
+  });
   if (!record) record = records[0] || {};
   const item = Object.assign({}, record);
   if (publicTaskID) item.id = publicTaskID;
@@ -777,7 +826,7 @@ export function buildNativeRequest(ctx) {
   if (action === "delete_voices" || action === "delete_elements") {
     const task = ctx.resourceTask;
     const expectedAction = action === "delete_voices" ? "custom_voices" : "advanced_custom_elements";
-    if (!task || task.action !== expectedAction || task.status !== "SUCCESS" || !task.state || task.state.resource_account !== resourceAccount(ctx)) {
+    if (!task || task.action !== expectedAction || task.status !== "SUCCESS" || !task.state || !resourceAccountMatches(ctx, task.state.resource_account)) {
       throw new Error("resource account binding is unavailable or has changed");
     }
   }
@@ -797,7 +846,14 @@ export function buildNativeRequest(ctx) {
 export function buildSubmitRequest(ctx) {
   if (ctx.action === "delete_voices" || ctx.action === "delete_elements")
     throw new Error("resource deletion requires its authenticated resource management route");
-  const req = ctx.requestBody && typeof ctx.requestBody === "object" && !Array.isArray(ctx.requestBody) ? ctx.requestBody : {};
+  const req = submitBody(ctx.requestBody);
+  const resource = submitResource(req, ctx.action);
+  if (resource) {
+    const task = ctx.resourceTask;
+    if (!task || task.status !== "SUCCESS" || !resource.actions.includes(task.action) ||
+        (task.state && task.state.resource_account ? !resourceAccountMatches(ctx, task.state.resource_account) : !task.transportSaved))
+      throw new Error("resource account binding is unavailable or has changed");
+  }
   if (isNewKlingAction(ctx.action)) {
     const model = submitModel(ctx, req);
     newReservedDuration(req, model, ctx.action);
@@ -812,12 +868,13 @@ export function buildSubmitRequest(ctx) {
   const action = KLING_ENDPOINTS[ctx.action] ? ctx.action : req.image || req.image_url ? "image_to_video" : "text_to_video";
   const model = submitModel(ctx, req);
   const body = Object.assign({}, req);
-  const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata) ? body.metadata : null;
-  if (metadata) {
-    delete body.metadata;
-    Object.assign(body, metadata);
+  delete body.origin_task_id;
+  if (KLING_MODEL_ACTIONS.includes(action)) {
+    body.model_name = model;
+    body.mode = outboundMode(req, model);
   }
-  if (!body.model_name && KLING_MODEL_ACTIONS.includes(action)) body.model_name = model;
+  if (body.model !== undefined) body.model = model;
+  if (KLING_VIDEO_METERED_ACTIONS.includes(action)) body.duration = outboundDuration(req);
   if (body.image) body.image = filePlaceholder(body.image);
   if (body.image_tail) body.image_tail = filePlaceholder(body.image_tail);
   if (body.image_url) body.image_url = filePlaceholder(body.image_url);
@@ -843,7 +900,7 @@ export function parseSubmitResponse(ctx, resp) {
   if (isNewKlingAction(ctx.action)) {
     const newTaskID = trimmed(data.id);
     if (!newTaskID) throw new Error("missing task id");
-    return { taskId: newTaskID, taskData: result };
+    return { taskId: newTaskID, taskData: result, state: { resource_account: resourceAccount(ctx) } };
   }
   const taskId = trimmed(data.task_id || result.task_id || ctx.publicTaskId);
   if (!taskId) throw new Error("missing task_id");
@@ -852,13 +909,14 @@ export function parseSubmitResponse(ctx, resp) {
     if (data.task_id) return { taskId: taskId, taskData: result, state: state };
     return { taskId: taskId, taskData: result, state: state, immediate: { status: "SUCCESS", progress: "100%" } };
   }
-  if (data.task_id) return { taskId: taskId, taskData: result };
-  return { taskId: taskId, taskData: result, immediate: { status: "SUCCESS", progress: "100%" } };
+  const state = { resource_account: resourceAccount(ctx) };
+  if (data.task_id) return { taskId: taskId, taskData: result, state: state };
+  return { taskId: taskId, taskData: result, state: state, immediate: { status: "SUCCESS", progress: "100%" } };
 }
 
 export function extractUsage(ctx) {
   if (ctx.usagePurpose === "billing_ratios") return null;
-  const req = ctx.requestBody || {};
+  const req = submitBody(ctx.requestBody);
   const model = submitModel(ctx, req);
   if (isKlingDimensionPricedModel(model)) return klingDimensionUsage(ctx, req);
   if (KLING_SYNC_ACTIONS.includes(ctx.action)) return { units: 0 };
@@ -891,7 +949,17 @@ export function parseTaskResult(ctx, body) {
   if (body && body.code !== undefined && body.code !== null && String(body.code) !== "0") throw new Error(body.message || "kling query failed");
   const data = body && body.data && typeof body.data === "object" ? body.data : {};
   const rawStatus = trimmed(data.task_status).toLowerCase();
-  const statuses = { submitted: "SUBMITTED", queued: "QUEUED", processing: "IN_PROGRESS", in_progress: "IN_PROGRESS", succeed: "SUCCESS", succeeded: "SUCCESS", failed: "FAILURE", cancelled: "FAILURE", canceled: "FAILURE" };
+  const statuses = {
+    submitted: "SUBMITTED",
+    queued: "QUEUED",
+    processing: "IN_PROGRESS",
+    in_progress: "IN_PROGRESS",
+    succeed: "SUCCESS",
+    succeeded: "SUCCESS",
+    failed: "FAILURE",
+    cancelled: "FAILURE",
+    canceled: "FAILURE",
+  };
   const status = statuses[rawStatus];
   if (!status) return { status: "UNKNOWN", reason: "unknown task status: " + String(data.task_status || "") };
   const result = { code: body.code || 0, taskId: data.task_id || ctx.taskId, status: status, reason: data.task_status_msg || "" };
@@ -912,7 +980,10 @@ export function parseTaskResult(ctx, body) {
 function parseNewTaskResult(ctx, body) {
   if (body && body.code !== undefined && body.code !== null && String(body.code) !== "0") throw new Error(body.message || "kling query failed");
   const records = newTaskRecords(body);
-  const record = records.find(function (item) { return item && trimmed(item.id) === trimmed(ctx.taskId); }) || (records.length === 1 ? records[0] : null);
+  const record =
+    records.find(function (item) {
+      return item && trimmed(item.id) === trimmed(ctx.taskId);
+    }) || (records.length === 1 ? records[0] : null);
   if (!record) return { status: "UNKNOWN", reason: "Kling task was not returned by the query endpoint" };
   const statusMap = { submitted: "SUBMITTED", processing: "IN_PROGRESS", succeeded: "SUCCESS", failed: "FAILURE" };
   const rawStatus = trimmed(record.status).toLowerCase();
@@ -943,7 +1014,12 @@ function artifactEntries(value) {
     for (const key of ["videos", "audios", "images"]) {
       if (!Array.isArray(result[key])) continue;
       for (const item of result[key]) {
-        if (item && typeof item === "object" && trimmed(item.url)) entries.push({ type: key === "videos" ? "video" : key === "audios" ? "audio" : "image", url: trimmed(item.url), duration: key === "videos" ? newOutputDuration(item.duration) : null });
+        if (item && typeof item === "object" && trimmed(item.url))
+          entries.push({
+            type: key === "videos" ? "video" : key === "audios" ? "audio" : "image",
+            url: trimmed(item.url),
+            duration: key === "videos" ? newOutputDuration(item.duration) : null,
+          });
       }
     }
   }
@@ -963,12 +1039,18 @@ export function listArtifacts(task) {
 export function buildContentRequest(ctx) {
   const entries = artifactEntries(ctx.data);
   let entry;
-  if (ctx.artifactKey === "video") entry = entries.find(function (item) { return item.type === "video"; });
+  if (ctx.artifactKey === "video")
+    entry = entries.find(function (item) {
+      return item.type === "video";
+    });
   else {
     const match = /^(video|audio|image)-(\d+)$/.exec(String(ctx.artifactKey || ""));
     if (match) {
-      const type = match[1], index = Number(match[2]) - 1;
-      entry = entries.filter(function (item) { return item.type === type; })[index];
+      const type = match[1],
+        index = Number(match[2]) - 1;
+      entry = entries.filter(function (item) {
+        return item.type === type;
+      })[index];
     }
   }
   const url = entry ? entry.url : "";
@@ -1190,12 +1272,16 @@ export const protocols = {
         created_at: data.created_at || 0,
       };
       if (data.updated_at) output.completed_at = data.updated_at;
-      const videos = artifactEntries(task).filter(function (entry) { return entry.type === "video"; });
+      const videos = artifactEntries(task).filter(function (entry) {
+        return entry.type === "video";
+      });
       if (videos.length && videos[0].duration) output.seconds = videos[0].duration;
       if (response.code !== 0 && response.message) output.error = { message: response.message, code: String(response.code) };
       if (data.task_status === "failed") output.error = { message: data.task_status_msg, code: "" };
       if (data && Array.isArray(response.data)) {
-        const record = newTaskRecords(response).find(function (item) { return item && String(item.id || "") === String(task.task_id || ""); });
+        const record = newTaskRecords(response).find(function (item) {
+          return item && String(item.id || "") === String(task.task_id || "");
+        });
         if (record && record.message) output.error = { message: record.message, code: "" };
       }
       return output;

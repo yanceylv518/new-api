@@ -36,17 +36,27 @@ type ChannelPin struct {
 type ChannelFilterKind string
 
 const (
-	FilterRequestPath        ChannelFilterKind = "request_path"
-	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
-	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
+	FilterRequestPath          ChannelFilterKind = "request_path"
+	FilterTaskPluginIdentity   ChannelFilterKind = "task_plugin_identity"
+	FilterResponsesWebSocket   ChannelFilterKind = "responses_websocket"
+	FilterSeedanceAssetAccount ChannelFilterKind = "seedance_asset_account"
+	FilterSeedanceAssetReady   ChannelFilterKind = "seedance_asset_ready"
+	FilterVideoRouting         ChannelFilterKind = "video_routing"
 )
 
 type ChannelFilter struct {
-	Kind                   ChannelFilterKind
-	RequestPath            string
-	TaskPluginKey          string
-	TaskPluginKeys         []string
-	TaskPluginChannelTypes []int
+	VideoRoutingResolution          string
+	VideoRoutingModel               string
+	VideoRoutingChannelModels       map[int]string
+	Kind                            ChannelFilterKind
+	RequestPath                     string
+	TaskPluginKey                   string
+	TaskPluginKeys                  []string
+	TaskPluginChannelTypes          []int
+	TaskPluginChannelIDs            map[int]struct{}
+	SeedanceAssetAccountFingerprint string
+	SeedanceAssetKeyFingerprint     string
+	SeedanceAssetReadyKeys          map[int]map[string]struct{}
 }
 
 type ChannelConstraints struct {

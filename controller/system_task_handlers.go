@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,7 +23,12 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(billingRefundHandler{})
+	service.RegisterSystemTaskHandler(taskResourceIndexHandler{})
 	service.RegisterSystemTaskHandler(seedanceAssetPollHandler{})
+	service.RegisterSystemTaskHandler(seedanceAssetSyncHandler{})
+	service.RegisterSystemTaskHandler(seedanceAssetDiscoveryHandler{})
+	service.RegisterSystemTaskHandler(seedanceValidationPollHandler{})
 	service.RegisterSystemTaskHandler(seedanceAssetCleanupHandler{})
 }
 
@@ -139,10 +145,65 @@ func (midjourneyPollHandler) Run(ctx context.Context, task *model.SystemTask, ru
 // task existence check so an idle system schedules no rows.
 type asyncTaskPollHandler struct{}
 
+type billingRefundHandler struct{}
+
+func (billingRefundHandler) Type() string { return model.SystemTaskTypeBillingRefund }
+func (billingRefundHandler) Enabled() bool {
+	return model.HasPendingBillingRefunds() || model.HasExpiredBillingRefunds() || model.HasPendingVideoTaskLogs()
+}
+func (billingRefundHandler) Interval() time.Duration { return 15 * time.Second }
+func (billingRefundHandler) NewPayload() any         { return nil }
+func (billingRefundHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	var runErr error
+	budgetExhausted := false
+	// 各恢复队列使用独立预算，日志库故障不阻塞视频轮询或饿死退款清理。
+	for _, retry := range []func(context.Context) error{
+		model.RetryBillingRefunds,
+		func(ctx context.Context) error {
+			return model.RetryTaskInitialAccounting(ctx, service.RecoverTaskInitialAccounting)
+		},
+		model.RetryVideoTaskLogs,
+	} {
+		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := retry(attempt)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			budgetExhausted = true
+		}
+		runErr = errors.Join(runErr, err)
+	}
+	status := model.SystemTaskStatusSucceeded
+	if runErr != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, map[string]bool{"budget_exhausted": budgetExhausted}, runErr)
+}
+
+type taskResourceIndexHandler struct{}
+
+func (taskResourceIndexHandler) Type() string            { return model.SystemTaskTypeTaskResourceIndex }
+func (taskResourceIndexHandler) Enabled() bool           { return model.HasPendingTaskResourceIndexes() }
+func (taskResourceIndexHandler) Interval() time.Duration { return 15 * time.Second }
+func (taskResourceIndexHandler) NewPayload() any         { return nil }
+func (taskResourceIndexHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err := model.BackfillTaskResourceIndexes(attempt)
+	budgetExhausted := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+	if budgetExhausted {
+		err = nil
+	}
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, map[string]bool{"budget_exhausted": budgetExhausted}, err)
+}
+
 func (asyncTaskPollHandler) Type() string { return model.SystemTaskTypeAsyncTaskPoll }
 
 func (asyncTaskPollHandler) Enabled() bool {
-	return constant.UpdateTask && (model.HasUnfinishedSyncTasks() || model.HasPendingVideoTaskLogs())
+	return constant.UpdateTask && model.HasUnfinishedSyncTasks()
 }
 
 func (asyncTaskPollHandler) Interval() time.Duration { return 15 * time.Second }
@@ -169,6 +230,100 @@ func (seedanceAssetPollHandler) NewPayload() any { return nil }
 
 func (seedanceAssetPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary, err := service.RunSeedanceAssetPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+// seedanceAssetSyncHandler 主动导入上传时持久化的跨账号素材副本。
+type seedanceAssetSyncHandler struct{}
+
+func (seedanceAssetSyncHandler) Type() string { return model.SystemTaskTypeSeedanceAssetSync }
+
+func (seedanceAssetSyncHandler) Enabled() bool {
+	return model.HasDueSeedanceAssetSync(common.GetTimestamp())
+}
+
+func (seedanceAssetSyncHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (seedanceAssetSyncHandler) NewPayload() any { return nil }
+
+func (seedanceAssetSyncHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunSeedanceAssetSynchronizationOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	if err := model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, summary, ""); err != nil {
+		common.SysLog(fmt.Sprintf("system task %s failed to persist result: %v", task.TaskID, err))
+		return
+	}
+	if summary.Claimed > 0 && model.HasDueSeedanceAssetSync(common.GetTimestamp()) {
+		if _, _, err := service.EnqueueSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil); err != nil {
+			common.SysError("failed to enqueue remaining Seedance asset synchronization: " + err.Error())
+		}
+	}
+}
+
+type seedanceAssetDiscoveryHandler struct{}
+
+func (seedanceAssetDiscoveryHandler) Type() string { return model.SystemTaskTypeSeedanceAssetDiscovery }
+
+func (seedanceAssetDiscoveryHandler) Enabled() bool {
+	return model.HasDueSeedanceAssetDiscovery(common.GetTimestamp())
+}
+
+func (seedanceAssetDiscoveryHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (seedanceAssetDiscoveryHandler) NewPayload() any { return nil }
+
+func (seedanceAssetDiscoveryHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	const maxBatches = 10
+	processed := 0
+	var runErr error
+	for range maxBatches {
+		found, err := service.RunSeedanceAssetDiscoveryBatch(ctx)
+		if err != nil {
+			runErr = errors.Join(runErr, err)
+			break
+		}
+		if !found {
+			break
+		}
+		processed++
+	}
+	status, message := model.SystemTaskStatusSucceeded, ""
+	if runErr != nil {
+		status, message = model.SystemTaskStatusFailed, runErr.Error()
+	}
+	if err := model.FinishSystemTask(task.TaskID, runnerID, status, map[string]int{"batches": processed}, message); err != nil {
+		common.SysError(fmt.Sprintf("system task %s failed to persist result: %v", task.TaskID, err))
+		return
+	}
+	if runErr == nil && ctx.Err() == nil && processed > 0 && model.HasDueSeedanceAssetDiscovery(common.GetTimestamp()) {
+		if _, _, err := service.EnqueueSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery, nil); err != nil {
+			common.SysError("failed to enqueue remaining Seedance asset discovery: " + err.Error())
+		}
+	}
+}
+
+// seedanceValidationPollHandler 同步未完成的真人认证会话。
+type seedanceValidationPollHandler struct{}
+
+func (seedanceValidationPollHandler) Type() string { return model.SystemTaskTypeSeedanceValidationPoll }
+
+func (seedanceValidationPollHandler) Enabled() bool {
+	return model.HasDueSeedanceAssetValidationSessions(common.GetTimestamp())
+}
+
+func (seedanceValidationPollHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (seedanceValidationPollHandler) NewPayload() any { return nil }
+
+func (seedanceValidationPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunSeedanceAssetValidationPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	if err != nil {
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
 		return

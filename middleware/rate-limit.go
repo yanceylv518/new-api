@@ -13,11 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	redisRateLimitNamespace         = "rateLimit:v2"
-	seedanceAssetRateLimitRequests  = 60
-	seedanceAssetRateLimitWindowSec = 60
-)
+const redisRateLimitNamespace = "rateLimit:v2"
 
 var inMemoryRateLimiter common.InMemoryRateLimiter
 
@@ -166,16 +162,16 @@ func managementRateLimitFactory(mark string, byUser bool, policy func(common.Man
 }
 
 func DownloadRateLimit() func(c *gin.Context) {
-	return rateLimitFactory(common.DownloadRateLimitNum, common.DownloadRateLimitDuration, "DW")
+	return managementRateLimitFactory("DW", false, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.AssetDownload })
 }
 
 func UploadRateLimit() func(c *gin.Context) {
-	return rateLimitFactory(common.UploadRateLimitNum, common.UploadRateLimitDuration, "UP")
+	return managementRateLimitFactory("UP", false, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.AssetUpload })
 }
 
 // SeedanceAssetRateLimit 为素材库所有读写接口提供统一的用户维度限流。
 func SeedanceAssetRateLimit() func(c *gin.Context) {
-	return userRateLimitFactory(seedanceAssetRateLimitRequests, seedanceAssetRateLimitWindowSec, "SA")
+	return managementRateLimitFactory("SA", true, func(settings common.ManagementRateLimits) common.ManagementRateLimit { return settings.SeedanceAsset })
 }
 
 // userRateLimitFactory creates a rate limiter keyed by authenticated user ID

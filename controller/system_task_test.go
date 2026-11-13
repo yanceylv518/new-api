@@ -1,18 +1,570 @@
 package controller
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
+
+func setupSeedanceSyncTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := os.Getenv("SEEDANCE_SYNC_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("SEEDANCE_SYNC_TEST_MYSQL_DSN is unset")
+	}
+	config, err := driver.ParseDSN(dsn)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_sync_"), "test requires an isolated database")
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	models := []any{&model.User{}, &model.Channel{}, &model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SystemTaskLock{}}
+	for _, item := range models {
+		require.False(t, db.Migrator().HasTable(item), "isolated test database must be empty")
+	}
+	require.NoError(t, db.AutoMigrate(models...))
+	previousDB, previousLog := model.DB, model.LOG_DB
+	previousMain, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousMemory := common.RedisEnabled, common.MemoryCacheEnabled
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
+	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLog
+		common.SetDatabaseTypes(previousMain, previousLogType)
+		common.RedisEnabled, common.MemoryCacheEnabled = previousRedis, previousMemory
+		assert.NoError(t, db.Migrator().DropTable(models...))
+		assert.NoError(t, connection.Close())
+	})
+	return db
+}
+
+func seedSeedanceSyncTestReplicas(t *testing.T, db *gorm.DB, total int) {
+	t.Helper()
+	group := &model.SeedanceAssetGroup{UserID: 1, GroupID: "sync-group", Name: "sync group", Status: "Active"}
+	require.NoError(t, db.Create(group).Error)
+	for index := range total {
+		asset := &model.SeedanceAsset{UserID: 1, GroupID: group.GroupID, AssetID: fmt.Sprintf("sync-asset-%d", index), Name: "fixture", AssetType: "Image", Status: "Active"}
+		require.NoError(t, db.Create(asset).Error)
+		replica := &model.SeedanceAssetReplica{UserID: 1, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: 999, AccountFingerprint: "target", KeyFingerprint: "target", Status: "Pending", ProvisionStatus: model.SeedanceAssetReplicaCreating, PollAttempts: 6, NextPollAt: common.GetTimestamp() - 1}
+		require.NoError(t, db.Create(replica).Error)
+	}
+}
+
+func seedSeedanceDiscoveryChannels(t *testing.T, db *gorm.DB) []*model.Channel {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("unexpected upstream request")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+	channels := make([]*model.Channel, 0, 2)
+	for index := range 2 {
+		channel := &model.Channel{Id: index + 1, Type: constant.ChannelTypeDoubaoVideo, Key: fmt.Sprintf("fixture-discovery-%d", index), BaseURL: &upstream.URL, Group: "default", Models: fmt.Sprintf("doubao-seedance-discovery-%d", index), Status: common.ChannelStatusEnabled}
+		configureSeedanceTestAssetURL(t, channel)
+		require.NoError(t, channel.Insert())
+		channels = append(channels, channel)
+	}
+	return channels
+}
+
+func seedSeedanceDiscoveryAssets(t *testing.T, db *gorm.DB, userID, count int, userGroup string) []model.SeedanceAsset {
+	t.Helper()
+	require.NoError(t, db.Create(&model.User{Id: userID, Username: fmt.Sprintf("discovery-%d", userID), AffCode: fmt.Sprintf("discovery-%d", userID), Group: userGroup, Status: common.UserStatusEnabled}).Error)
+	group := model.SeedanceAssetGroup{UserID: userID, ChannelID: 1, GroupID: fmt.Sprintf("discovery-group-%d", userID), Name: "group", GroupType: "AIGC", Status: "Active"}
+	require.NoError(t, db.Create(&group).Error)
+	localOnly := false
+	assets := make([]model.SeedanceAsset, count)
+	for index := range assets {
+		assets[index] = model.SeedanceAsset{UserID: userID, ChannelID: 1, GroupID: group.GroupID, AssetID: fmt.Sprintf("discovery-%d-%d", userID, index), Name: "asset", AssetType: "Image", LocalOnly: &localOnly, Status: "Active"}
+	}
+	require.NoError(t, db.CreateInBatches(&assets, 100).Error)
+	return assets
+}
+
+func seedanceDiscoveryRequest(t *testing.T, userID int, channel *model.Channel) *gin.Context {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Set("id", userID)
+	c.Set("token_id", 1)
+	c.Set("token_model_limit_enabled", true)
+	c.Set("token_model_limit", map[string]bool{channel.Models: true})
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: channel.Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+	_, _, err := seedanceAssetStatusExpression(c, "seedance_assets", false)
+	require.NoError(t, err)
+	return c
+}
+
+func TestSeedanceDiscoveryResumesMultipleScopes(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	first := seedSeedanceDiscoveryAssets(t, db, 9, 201, "default")
+	seedSeedanceDiscoveryAssets(t, db, 10, 101, "default")
+	linkOnly := true
+	legacy := model.SeedanceAsset{UserID: 9, ChannelID: 1, GroupID: first[0].GroupID, AssetID: "discovery-legacy", Name: "legacy", AssetType: "Image", Status: "Active"}
+	link := model.SeedanceAsset{UserID: 9, ChannelID: 1, GroupID: first[0].GroupID, AssetID: "discovery-link", Name: "link", AssetType: "Image", LocalOnly: &linkOnly, Status: "Active"}
+	humanGroup := model.SeedanceAssetGroup{UserID: 9, ChannelID: 1, GroupID: "discovery-human", Name: "human", GroupType: "LivenessFace", Status: "Active"}
+	require.NoError(t, db.Create(&humanGroup).Error)
+	localOnly := false
+	human := model.SeedanceAsset{UserID: 9, ChannelID: 1, GroupID: humanGroup.GroupID, AssetID: "discovery-human", Name: "human", AssetType: "Image", LocalOnly: &localOnly, Status: "Active"}
+	require.NoError(t, db.Create(&legacy).Error)
+	require.NoError(t, db.Create(&link).Error)
+	require.NoError(t, db.Create(&human).Error)
+
+	requests := []*gin.Context{seedanceDiscoveryRequest(t, 9, channels[0]), seedanceDiscoveryRequest(t, 9, channels[1]), seedanceDiscoveryRequest(t, 10, channels[0])}
+	for _, request := range requests {
+		require.NoError(t, scheduleMissingSeedanceAssetTargets(request))
+	}
+	var jobs []model.SeedanceAssetDiscovery
+	require.NoError(t, db.Order("id").Find(&jobs).Error)
+	require.Len(t, jobs, 3)
+	for index, pair := range []struct {
+		user    int
+		channel *model.Channel
+	}{{9, channels[0]}, {9, channels[1]}, {10, channels[0]}} {
+		scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{pair.channel.Models}, pair.channel.Id)
+		require.NoError(t, err)
+		assert.Equal(t, pair.user, jobs[index].UserID)
+		assert.Equal(t, scope, jobs[index].Scope)
+	}
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&count).Error)
+	assert.EqualValues(t, 300, count)
+	task, err := model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "discovery-old", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, db.First(&jobs[0], jobs[0].ID).Error)
+	assert.Equal(t, first[99].ID, jobs[0].Cursor)
+
+	// 运行中的同范围请求不得被按类型去重的系统任务吞掉。
+	require.NoError(t, scheduleMissingSeedanceAssetTargets(requests[0]))
+	require.NoError(t, db.First(&jobs[0], jobs[0].ID).Error)
+	assert.EqualValues(t, 2, jobs[0].Revision)
+	require.NoError(t, db.Model(&model.SystemTaskLock{}).Where("task_id = ?", claimed.TaskID).Update("locked_until", common.GetTimestamp()-1).Error)
+	require.NoError(t, model.ExpireStaleSystemTaskLocks(common.GetTimestamp()))
+	require.True(t, (seedanceAssetDiscoveryHandler{}).Enabled())
+	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	claimed, ok, err = model.ClaimSystemTask(task.ID, task.Type, "discovery-new", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetDiscoveryHandler{}).Run(t.Context(), claimed, "discovery-new")
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Count(&count).Error)
+	assert.Zero(t, count)
+	for _, item := range []struct{ user, channel, expected int }{{9, 1, 201}, {9, 2, 201}, {10, 1, 101}, {10, 2, 0}} {
+		require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND channel_id = ?", item.user, item.channel).Count(&count).Error)
+		assert.EqualValues(t, item.expected, count)
+	}
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id IN ?", []uint{legacy.ID, link.ID, human.ID}).Count(&count).Error)
+	assert.Zero(t, count)
+	for _, pair := range []struct {
+		user    int
+		channel *model.Channel
+	}{{9, channels[0]}, {9, channels[1]}, {10, channels[0]}} {
+		scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{pair.channel.Models}, pair.channel.Id)
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND channel_id = ? AND sync_scope <> ?", pair.user, pair.channel.Id, scope).Count(&count).Error)
+		assert.Zero(t, count)
+	}
+}
+
+func TestSeedanceDiscoveryRechecksPermissions(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	users := []struct {
+		id      int
+		group   string
+		channel *model.Channel
+	}{{21, "default", channels[1]}, {22, "discovery-revoked", channels[1]}, {23, "default", channels[0]}}
+	for _, user := range users {
+		seedSeedanceDiscoveryAssets(t, db, user.id, 101, user.group)
+		require.NoError(t, scheduleMissingSeedanceAssetTargets(seedanceDiscoveryRequest(t, user.id, user.channel)))
+	}
+	special := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	previous := special.ReadAll()
+	t.Cleanup(func() { special.Clear(); special.AddAll(previous) })
+	special.Set("discovery-revoked", map[string]string{"-:default": "revoked"})
+	require.NoError(t, db.Model(&model.User{}).Where("id = ?", 21).Update("status", common.UserStatusDisabled).Error)
+	require.NoError(t, db.Model(channels[0]).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	task, err := model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "discovery-permissions", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetDiscoveryHandler{}).Run(t.Context(), claimed, "discovery-permissions")
+	var count int64
+	for _, user := range users {
+		require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ?", user.id).Count(&count).Error)
+		assert.EqualValues(t, 100, count)
+	}
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestSeedanceDiscoveryRejectsInvalidScopes(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	seedSeedanceDiscoveryAssets(t, db, 31, 1, "default")
+	invalid := []string{
+		`{"version":1,"models":null,"pinned_channel":1}`,
+		`{"version":1,"groups":["default"],"pinned_channel":1}`,
+		`{"groups":["default"],"models":null,"pinned_channel":1}`,
+		`{"version":2,"groups":["default"],"models":null,"pinned_channel":1}`,
+		`{"version":1,"groups":["default"],"models":null,"pinned_channel":null}`,
+		`{"version":1,"groups":["default",null],"models":null,"pinned_channel":1}`,
+		`{"version":1,"groups":["default"],"models":{},"pinned_channel":1}`,
+	}
+	for _, scope := range invalid {
+		require.NoError(t, model.QueueSeedanceAssetDiscovery(t.Context(), 31, scope))
+	}
+	for range invalid {
+		found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+		assert.True(t, found)
+		assert.Error(t, err)
+	}
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Where("next_attempt_at = ?", -1).Where(map[string]any{"cursor": 0}).Count(&count).Error)
+	assert.EqualValues(t, len(invalid), count)
+
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, []string{channels[0].Models}, channels[0].Id)
+	require.NoError(t, err)
+	unrestricted, err := service.EncodeSeedanceAssetSyncScope(nil, nil, 0)
+	require.NoError(t, err)
+	require.NoError(t, model.QueueSeedanceAssetDiscovery(t.Context(), 31, scope))
+	key := model.SeedanceAssetDiscoveryScopeKey(31, scope)
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Where("scope_key = ?", key).Update("scope", unrestricted).Error)
+	found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	assert.True(t, found)
+	assert.Error(t, err)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, service.QueueSeedanceAssetDiscovery(t.Context(), 31, []string{"default"}, []string{channels[0].Models}, channels[0].Id))
+	for range 2 {
+		found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+		require.NoError(t, err)
+		require.True(t, found)
+	}
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND channel_id = ? AND sync_scope = ?", 31, channels[0].Id, scope).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestSeedanceDiscoveryRecoversAfterConcurrentDeletion(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	assets := seedSeedanceDiscoveryAssets(t, db, 51, 201, "default")
+	otherAssets := seedSeedanceDiscoveryAssets(t, db, 52, 1, "default")
+	for _, userID := range []int{51, 52} {
+		require.NoError(t, service.QueueSeedanceAssetDiscovery(t.Context(), userID, []string{"default"}, []string{channels[0].Models}, channels[0].Id))
+	}
+
+	const callback = "test:discovery-delete-before-schedule-lock"
+	var deleted atomic.Bool
+	var deletionErr error
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != db.NamingStrategy.TableName("SeedanceAssetGroup") {
+			return
+		}
+		if _, locking := tx.Statement.Clauses["FOR"]; !locking || !deleted.CompareAndSwap(false, true) {
+			return
+		}
+		deletionErr = model.QueueSeedanceAssetDeletion(t.Context(), model.NewSeedanceAssetDeleteCleanupJobs(&assets[10], nil))
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
+
+	found, runErr := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.True(t, deleted.Load(), "删除必须发生在调度取组锁之前")
+	require.NoError(t, deletionErr)
+	assert.True(t, found)
+	assert.ErrorIs(t, runErr, model.ErrSeedanceAssetUnavailable)
+	var job model.SeedanceAssetDiscovery
+	require.NoError(t, db.Where("user_id = ?", 51).First(&job).Error)
+	assert.Zero(t, job.Cursor, "失败批次不能推进游标")
+	assert.Equal(t, 1, job.Attempts)
+	assert.Greater(t, job.NextAttemptAt, common.GetTimestamp())
+
+	var deletedAsset model.SeedanceAsset
+	require.NoError(t, db.First(&deletedAsset, assets[10].ID).Error)
+	assert.Equal(t, "Deleting", deletedAsset.Status)
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ?", assets[10].ID).Count(&count).Error)
+	assert.Zero(t, count)
+
+	// 模拟调度器运行：其他用户不应被退避中的任务阻塞。
+	task, err := model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "discovery-concurrent-delete", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetDiscoveryHandler{}).Run(t.Context(), claimed, "discovery-concurrent-delete")
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND local_asset_id = ?", 52, otherAssets[0].ID).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	// 将等待期置为到期，模拟重启或定时调度，不依赖新的用户请求。
+	err = db.Where("user_id = ?", 51).First(&job).Error
+	if err == nil {
+		require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+		assert.True(t, (seedanceAssetDiscoveryHandler{}).Enabled())
+		task, _, err = service.EnqueueSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery, nil)
+		require.NoError(t, err)
+		claimed, ok, err = model.ClaimSystemTask(task.ID, task.Type, "discovery-recovered", common.GetTimestamp()+60)
+		require.NoError(t, err)
+		require.True(t, ok)
+		(seedanceAssetDiscoveryHandler{}).Run(t.Context(), claimed, "discovery-recovered")
+	} else {
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	}
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ?", 51).Count(&count).Error)
+	assert.EqualValues(t, 200, count, "未删除的素材均应补排")
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ?", assets[10].ID).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.First(&deletedAsset, assets[10].ID).Error)
+	assert.Equal(t, "Deleting", deletedAsset.Status)
+}
+
+func TestSeedanceDiscoveryDefersRepeatedUnavailableBatches(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	assets := seedSeedanceDiscoveryAssets(t, db, 53, 1, "default")
+	require.NoError(t, service.QueueSeedanceAssetDiscovery(t.Context(), 53, []string{"default"}, []string{channels[0].Models}, channels[0].Id))
+
+	const callback = "test:discovery-repeated-unavailable"
+	var failures atomic.Int32
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != db.NamingStrategy.TableName("SeedanceAssetGroup") {
+			return
+		}
+		if _, locking := tx.Statement.Clauses["FOR"]; locking && failures.Add(1) <= 7 {
+			tx.AddError(model.ErrSeedanceAssetUnavailable)
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
+
+	var job model.SeedanceAssetDiscovery
+	for attempt := 1; attempt <= 7; attempt++ {
+		if attempt > 1 {
+			require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+		}
+		found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+		assert.True(t, found)
+		require.ErrorIs(t, err, model.ErrSeedanceAssetUnavailable)
+		require.NoError(t, db.Where("user_id = ?", 53).First(&job).Error)
+		assert.Zero(t, job.Cursor)
+		assert.Equal(t, min(attempt, 6), job.Attempts)
+		now := common.GetTimestamp()
+		assert.Greater(t, job.NextAttemptAt, now)
+		assert.LessOrEqual(t, job.NextAttemptAt, now+300)
+		assert.False(t, (seedanceAssetDiscoveryHandler{}).Enabled())
+	}
+	assert.EqualValues(t, 7, failures.Load())
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ?", 53).Count(&count).Error)
+	assert.Zero(t, count)
+
+	// 模拟定时调度恢复，无需再次提交发现请求。
+	require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+	require.True(t, (seedanceAssetDiscoveryHandler{}).Enabled())
+	task, err := model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetDiscovery)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "discovery-retry-recovered", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetDiscoveryHandler{}).Run(t.Context(), claimed, "discovery-retry-recovered")
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Where("user_id = ?", 53).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ? AND local_asset_id = ?", 53, assets[0].ID).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestSeedanceDiscoveryRecoversAfterTransientFailure(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	channels := seedSeedanceDiscoveryChannels(t, db)
+	assets := seedSeedanceDiscoveryAssets(t, db, 41, 101, "default")
+	require.NoError(t, scheduleMissingSeedanceAssetTargets(seedanceDiscoveryRequest(t, 41, channels[0])))
+	found, err := service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.NoError(t, err)
+	require.True(t, found)
+	const callback = "test:discovery-insert-failure"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "seedance_asset_replicas" {
+			tx.AddError(errors.New("temporary insert failure"))
+		}
+	}))
+	found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	assert.True(t, found)
+	assert.ErrorContains(t, err, "temporary insert failure")
+	require.NoError(t, db.Callback().Create().Remove(callback))
+	var job model.SeedanceAssetDiscovery
+	require.NoError(t, db.Where("user_id = ?", 41).First(&job).Error)
+	assert.Equal(t, assets[99].ID, job.Cursor)
+	assert.Equal(t, 1, job.Attempts)
+	assert.Greater(t, job.NextAttemptAt, common.GetTimestamp())
+	require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+	found, err = service.RunSeedanceAssetDiscoveryBatch(t.Context())
+	require.NoError(t, err)
+	require.True(t, found)
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("user_id = ?", 41).Count(&count).Error)
+	assert.EqualValues(t, 101, count)
+	require.NoError(t, db.Model(&model.SeedanceAssetDiscovery{}).Where("user_id = ?", 41).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestSeedanceAssetSyncDefersUnavailableAccounts(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	const total = 41
+	seedSeedanceSyncTestReplicas(t, db, total)
+	task, err := model.CreateSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil, nil)
+	require.NoError(t, err)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "sync-test", time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetSyncHandler{}).Run(t.Context(), claimed, "sync-test")
+	task, err = model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetSync)
+	require.NoError(t, err)
+	assert.Nil(t, task)
+	var deferred int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("next_poll_at > ?", time.Now().Add(10*time.Minute).Unix()).Count(&deferred).Error)
+	assert.EqualValues(t, total, deferred)
+}
+
+func TestSeedanceAssetSyncStopsImmediateRetryWhenNoProgress(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	seedSeedanceSyncTestReplicas(t, db, 1)
+	const callback = "test:reject-seedance-sync-retry"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "seedance_asset_replicas" {
+			tx.AddError(errors.New("retry schedule unavailable"))
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove(callback)) })
+	task, err := model.CreateSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil, nil)
+	require.NoError(t, err)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "sync-test", time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetSyncHandler{}).Run(t.Context(), claimed, "sync-test")
+	active, err := model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetSync)
+	require.NoError(t, err)
+	assert.Nil(t, active)
+	assert.True(t, model.HasDueSeedanceAssetSync(common.GetTimestamp()))
+}
+
+func TestSeedanceAssetSyncDrainsManyUsersWithoutDuplicateCopies(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	var groupCreates, assetCreates atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("Action") {
+		case "CreateAssetGroup":
+			_, _ = fmt.Fprintf(w, `{"Result":{"Id":"group-copy-%d"}}`, groupCreates.Add(1))
+		case "CreateAsset":
+			_, _ = fmt.Fprintf(w, `{"Result":{"Id":"asset-copy-%d"}}`, assetCreates.Add(1))
+		case "GetAsset":
+			_, _ = fmt.Fprint(w, `{"Result":{"Status":"Active"}}`)
+		default:
+			http.Error(w, "unexpected mock action", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-sync-target", BaseURL: &upstream.URL, Group: "default", Models: "doubao-seedance-2-0-260128", Status: common.ChannelStatusEnabled}
+	settings := channel.GetSetting()
+	settings.SeedanceAssetURL = upstream.URL
+	encoded, err := common.Marshal(settings)
+	require.NoError(t, err)
+	setting := string(encoded)
+	channel.Setting = &setting
+	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: channel.Models, ChannelId: channel.Id, Enabled: true}).Error)
+	client, err := service.NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	const users = 200
+	for index := range users {
+		id := index + 1
+		require.NoError(t, db.Create(&model.User{Id: id, Username: fmt.Sprintf("sync-user-%d", id), AffCode: fmt.Sprintf("sync-%d", id), Group: "default", Status: common.UserStatusEnabled}).Error)
+		group := &model.SeedanceAssetGroup{UserID: id, ChannelID: 99, GroupID: fmt.Sprintf("source-group-%d", id), Name: "source", GroupType: "AIGC", Status: "Active", AccountFingerprint: "source"}
+		require.NoError(t, db.Create(group).Error)
+		asset := &model.SeedanceAsset{UserID: id, ChannelID: 99, GroupID: group.GroupID, AssetID: fmt.Sprintf("source-asset-%d", id), Name: "source.png", AssetType: "Image", Status: "Active", SourceURL: "https://8.8.8.8/source.png", AccountFingerprint: "source"}
+		require.NoError(t, db.Create(asset).Error)
+		replica := &model.SeedanceAssetReplica{UserID: id, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: client.AccountFingerprint, KeyFingerprint: client.KeyFingerprint, Status: "Pending", ProvisionStatus: model.SeedanceAssetReplicaCreating, NextPollAt: common.GetTimestamp() - 1}
+		require.NoError(t, db.Create(replica).Error)
+	}
+	task, err := model.CreateSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil, nil)
+	require.NoError(t, err)
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "sync-load", time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	require.True(t, ok)
+	(seedanceAssetSyncHandler{}).Run(t.Context(), claimed, "sync-load")
+	task, err = model.GetActiveSystemTask(model.SystemTaskTypeSeedanceAssetSync)
+	require.NoError(t, err)
+	assert.Nil(t, task)
+	var ready int64
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("provision_status = ? AND status = ?", model.SeedanceAssetReplicaReady, "Active").Count(&ready).Error)
+	assert.EqualValues(t, users, ready)
+	assert.EqualValues(t, users, groupCreates.Load())
+	assert.EqualValues(t, users, assetCreates.Load())
+}
+
+func TestBillingRefundSchedulerIgnoresVideoUpdateSwitch(t *testing.T) {
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}, &model.SystemTask{}, &model.SystemTaskLock{})
+	previousDB, previousUpdate, previousRedis := model.DB, constant.UpdateTask, common.RedisEnabled
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, constant.UpdateTask, common.RedisEnabled = db, false, false
+	common.SetDatabaseTypes(dialect, dialect)
+	t.Cleanup(func() {
+		model.DB, constant.UpdateTask, common.RedisEnabled = previousDB, previousUpdate, previousRedis
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "refund-owner", Quota: 900}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "refund-token", RemainQuota: 900, UsedQuota: 100}).Error)
+	refund := &model.BillingRefund{RequestID: "no-video-refund", UserID: 1, TokenID: 1, Amount: 100, TokenAmount: 100}
+	require.NoError(t, model.QueueBillingRefund(t.Context(), refund))
+	handler := billingRefundHandler{}
+	require.True(t, handler.Enabled())
+	require.NoError(t, model.RetryBillingRefunds(t.Context()))
+	require.NoError(t, db.First(refund, refund.ID).Error)
+	assert.True(t, refund.Completed)
+	assert.False(t, handler.Enabled())
+	var user model.User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 1000, user.Quota)
+}
 
 func TestSystemTaskListFiltersAndPaginationResponse(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

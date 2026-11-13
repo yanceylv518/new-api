@@ -13,6 +13,194 @@ import (
 
 type cacheQuotaResult int
 
+var ErrInsufficientWalletQuota = errors.New("wallet quota insufficient")
+var ErrInsufficientTokenQuota = errors.New("token quota insufficient")
+
+type BillingQuotaReservation struct {
+	UserID, TokenID, Amount          int
+	TokenKey                         string
+	UpdateToken, TokenUnlimited      bool
+	CheckWallet                      bool
+	SubscriptionRequestID, ModelName string
+	SubscriptionID                   int
+	SubscriptionPeriodStart          int64
+	Refund                           *BillingRefund
+	TaskID                           int64
+}
+
+// ReserveBillingQuota 在同一事务预留资金和令牌，任一步失败都不留下部分数据库扣款。
+func ReserveBillingQuota(ctx context.Context, reservation BillingQuotaReservation) (*SubscriptionPreConsumeResult, error) {
+	if reservation.UserID <= 0 || reservation.Amount < 0 || reservation.Amount > common.MaxQuota || reservation.UpdateToken && reservation.TokenID <= 0 {
+		return nil, errors.New("invalid billing reservation")
+	}
+	if reservation.Amount == 0 {
+		return nil, nil
+	}
+	wallet := reservation.SubscriptionRequestID == "" && reservation.SubscriptionID == 0
+	var subscriptionNow int64
+	if reservation.SubscriptionRequestID != "" {
+		subscriptionNow = GetDBTimestamp()
+	}
+	tokenReserved, walletReserved := false, false
+	var subscription *SubscriptionPreConsumeResult
+	err := func() error {
+		if common.RedisEnabled && reservation.UpdateToken {
+			result, err := cacheTryReserveTokenQuota(reservation.TokenID, reservation.TokenKey, int64(reservation.Amount), reservation.TokenUnlimited)
+			if err == nil && result == cacheQuotaPending {
+				if err = recoverVideoTokenQuotaCache(ctx, reservation.TokenKey); err == nil {
+					result, err = cacheTryReserveTokenQuota(reservation.TokenID, reservation.TokenKey, int64(reservation.Amount), reservation.TokenUnlimited)
+				}
+			}
+			if err == nil && result == cacheQuotaMiss {
+				if _, err = GetTokenByKey(reservation.TokenKey, true); err == nil {
+					result, err = cacheTryReserveTokenQuota(reservation.TokenID, reservation.TokenKey, int64(reservation.Amount), reservation.TokenUnlimited)
+				}
+			}
+			if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
+				return ErrQuotaCachePending
+			}
+			if result == cacheQuotaInsufficient {
+				return ErrInsufficientTokenQuota
+			}
+			tokenReserved = true
+		}
+		if common.RedisEnabled && wallet {
+			result, err := cacheTryReserveUserQuota(reservation.UserID, int64(reservation.Amount), reservation.CheckWallet)
+			if err == nil && result == cacheQuotaPending {
+				if err = recoverVideoQuotaCache(ctx, reservation.UserID); err == nil {
+					result, err = cacheTryReserveUserQuota(reservation.UserID, int64(reservation.Amount), reservation.CheckWallet)
+				}
+			}
+			if err == nil && result == cacheQuotaMiss {
+				if _, err = GetUserCache(reservation.UserID); err == nil {
+					result, err = cacheTryReserveUserQuota(reservation.UserID, int64(reservation.Amount), reservation.CheckWallet)
+				}
+			}
+			if err != nil || result == cacheQuotaMiss || result == cacheQuotaPending {
+				return ErrQuotaCachePending
+			}
+			if result == cacheQuotaInsufficient {
+				return ErrInsufficientWalletQuota
+			}
+			walletReserved = true
+		}
+		return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var task *Task
+			if reservation.TaskID > 0 {
+				var err error
+				task, err = lockTaskForUpdate(tx, reservation.TaskID)
+				if err != nil {
+					return err
+				}
+				funding := task.PrivateData.SubmissionFunding
+				if task.UserId != reservation.UserID || task.PrivateData.TokenId != reservation.TokenID || task.Status != TaskStatusUnknown ||
+					!task.PrivateData.SubmissionPending || task.PrivateData.SubmissionFundsCommitted || funding == nil ||
+					funding.UpdateToken != reservation.UpdateToken || funding.ReservedQuota < 0 || funding.ReservedQuota > common.MaxQuota-reservation.Amount {
+					return errors.New("task reservation is no longer available")
+				}
+			}
+			var pending BillingRefund
+			if reservation.Refund != nil && reservation.Refund.ID > 0 {
+				// 与退款执行器保持同一锁序：恢复记录、资金、令牌。
+				if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", reservation.Refund.ID, reservation.UserID).First(&pending).Error; err != nil {
+					return err
+				}
+				if pending.Completed || pending.Amount > common.MaxQuota-reservation.Amount {
+					return errors.New("task reservation is no longer available")
+				}
+			}
+			if wallet {
+				query := tx.Model(&User{}).Where("id = ? AND quota >= ?", reservation.UserID, -common.MaxWalletQuota+int64(reservation.Amount))
+				if reservation.CheckWallet && !common.RedisEnabled {
+					query = query.Where("quota >= ?", reservation.Amount)
+				}
+				result := query.Update("quota", gorm.Expr("quota - ?", reservation.Amount))
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return ErrInsufficientWalletQuota
+				}
+			} else if reservation.SubscriptionRequestID != "" {
+				var err error
+				subscription, err = preConsumeUserSubscriptionTx(tx, reservation.SubscriptionRequestID, reservation.UserID, reservation.ModelName, 0, int64(reservation.Amount), subscriptionNow)
+				if err != nil {
+					return err
+				}
+			} else if err := postConsumeUserSubscriptionDeltaTx(tx, reservation.SubscriptionID, int64(reservation.Amount), reservation.SubscriptionPeriodStart, reservation.UserID); err != nil {
+				return err
+			}
+			if reservation.Refund != nil {
+				// 订阅预留也须与账户删除串行，不能在用户删除后留下新的退款交接。
+				var user User
+				if err := lockForUpdate(tx).Select("id", "status").Where("id = ?", reservation.UserID).First(&user).Error; err != nil {
+					return err
+				}
+				if user.Status != common.UserStatusEnabled {
+					return errors.New("task owner is unavailable")
+				}
+				refund := reservation.Refund
+				if refund.ID > 0 {
+					pending.Amount += reservation.Amount
+					if reservation.UpdateToken {
+						pending.TokenAmount += reservation.Amount
+					}
+					if err := tx.Model(&pending).Updates(map[string]any{"amount": pending.Amount, "token_amount": pending.TokenAmount}).Error; err != nil {
+						return err
+					}
+					*refund = pending
+				} else {
+					refund.UserID, refund.TokenID, refund.Amount = reservation.UserID, reservation.TokenID, reservation.Amount
+					if reservation.UpdateToken {
+						refund.TokenAmount = reservation.Amount
+					}
+					if subscription != nil {
+						refund.SubscriptionID, refund.PeriodStart = subscription.UserSubscriptionId, subscription.PeriodStart
+					}
+					if err := queueBillingRefund(tx, refund); err != nil {
+						return err
+					}
+				}
+			}
+			if task != nil {
+				// 补扣与恢复金额一起提交，进程中断不能丢失已扣的差额。
+				task.PrivateData.SubmissionFunding.ReservedQuota += reservation.Amount
+				if err := tx.Model(task).Update("private_data", task.PrivateData).Error; err != nil {
+					return err
+				}
+			}
+			if !reservation.UpdateToken {
+				return nil
+			}
+			query := tx.Model(&Token{}).Where("id = ? AND user_id = ?", reservation.TokenID, reservation.UserID)
+			if !common.RedisEnabled && !reservation.TokenUnlimited {
+				query = query.Where("remain_quota >= ?", reservation.Amount)
+			}
+			result := query.Updates(map[string]any{"remain_quota": gorm.Expr("remain_quota - ?", reservation.Amount), "used_quota": gorm.Expr("used_quota + ?", reservation.Amount), "accessed_time": common.GetTimestamp()})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrInsufficientTokenQuota
+			}
+			return nil
+		})
+	}()
+	if err != nil {
+		if walletReserved {
+			if _, cacheErr := cacheApplyUserQuotaDelta(reservation.UserID, int64(reservation.Amount)); cacheErr != nil {
+				err = errors.Join(err, ErrQuotaCachePending, cacheErr)
+			}
+		}
+		if tokenReserved {
+			if _, cacheErr := cacheApplyTokenQuotaDelta(reservation.TokenID, reservation.TokenKey, int64(reservation.Amount)); cacheErr != nil {
+				err = errors.Join(err, ErrQuotaCachePending, cacheErr)
+			}
+		}
+	}
+	return subscription, err
+}
+
 var quotaCacheLastWarning atomic.Int64
 
 // 缓存故障时拒绝不安全预扣；进程内最多每30秒告警一次，避免请求量放大日志开销。
@@ -39,7 +227,7 @@ if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   return -1
 end
 local quota = tonumber(redis.call('HGET', KEYS[1], 'Quota'))
-if quota == nil or quota < tonumber(ARGV[1]) then
+if quota == nil or (ARGV[4]~='0' and quota < tonumber(ARGV[1])) then
   return 0
 end
 redis.call('HINCRBY', KEYS[1], 'Quota', -tonumber(ARGV[1]))
@@ -63,7 +251,7 @@ if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   return -1
 end
 local remain = tonumber(redis.call('HGET', KEYS[1], 'RemainQuota'))
-if remain == nil or remain < tonumber(ARGV[1]) then
+if remain == nil or (ARGV[4]~='1' and remain < tonumber(ARGV[1])) then
   return 0
 end
 redis.call('HINCRBY', KEYS[1], 'RemainQuota', -tonumber(ARGV[1]))
@@ -102,9 +290,13 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 	}
 }
 
-func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
+func cacheTryReserveUserQuota(userID int, amount int64, checkAvailable ...bool) (cacheQuotaResult, error) {
+	check := 1
+	if len(checkAvailable) > 0 && !checkAvailable[0] {
+		check = 0
+	}
 	result, err := common.RDB.Eval(context.Background(), userQuotaReserveScript,
-		[]string{getUserCacheKey(userID), videoUserQuotaKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID), videoUserQuotaKey(userID)}, amount, userID, userCacheSchemaVersion, check).Int()
 	return quotaResultFromLua(result, err)
 }
 
@@ -114,9 +306,13 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 	return quotaResultFromLua(result, err)
 }
 
-func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResult, error) {
+func cacheTryReserveTokenQuota(id int, key string, amount int64, unlimited ...bool) (cacheQuotaResult, error) {
+	noLimit := 0
+	if len(unlimited) > 0 && unlimited[0] {
+		noLimit = 1
+	}
 	result, err := common.RDB.Eval(context.Background(), tokenQuotaReserveScript,
-		[]string{getTokenCacheKey(key), videoTokenQuotaKey(key)}, amount, id, common.GetTimestamp()).Int()
+		[]string{getTokenCacheKey(key), videoTokenQuotaKey(key)}, amount, id, common.GetTimestamp(), noLimit).Int()
 	return quotaResultFromLua(result, err)
 }
 

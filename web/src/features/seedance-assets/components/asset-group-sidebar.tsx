@@ -74,6 +74,10 @@ export function AssetGroupSidebar(props: {
   )
   const visibleGroups =
     props.groupCategory === 'LivenessFace' ? humanGroups : aigcGroups
+  const groupNameCounts = new Map<string, number>()
+  for (const group of visibleGroups) {
+    groupNameCounts.set(group.name, (groupNameCounts.get(group.name) ?? 0) + 1)
+  }
 
   const submitNewGroup = async () => {
     const name = newGroupName.trim()
@@ -194,63 +198,96 @@ export function AssetGroupSidebar(props: {
           <nav className={seedanceAssetLayoutClasses.groupSidebarScroll}>
             {visibleGroups.map((group) => {
               const selected = group.group_id === props.selectedId
+              const hasDuplicateName =
+                (groupNameCounts.get(group.name) ?? 0) > 1
               return (
-                <div
-                  key={group.group_id}
-                  className='group flex min-w-0 items-center gap-1'
-                >
-                  <Button
-                    type='button'
-                    variant={selected ? 'secondary' : 'ghost'}
-                    className='min-w-0 flex-1 justify-start'
-                    aria-current={selected ? 'page' : undefined}
-                    title={group.name}
-                    onClick={() => props.onSelect(group)}
-                  >
-                    {selected ? (
-                      <FolderOpen className='text-primary shrink-0' />
-                    ) : (
-                      <Folder className='shrink-0' />
-                    )}
-                    <span className='truncate'>{group.name}</span>
-                    {group.status === 'Deleting' ? (
-                      <span className='text-muted-foreground text-xs'>
-                        {t('Deleting...')}
-                      </span>
-                    ) : null}
-                  </Button>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger
-                      render={
-                        <Button
-                          type='button'
-                          size='icon-xs'
-                          variant='ghost'
-                          className='shrink-0'
-                          title={t('Group actions')}
-                          aria-label={t('Group actions')}
-                        />
+                <div key={group.group_id} className='group min-w-0'>
+                  <div className='flex min-w-0 items-center gap-1'>
+                    <Button
+                      type='button'
+                      variant={selected ? 'secondary' : 'ghost'}
+                      className='min-w-0 flex-1 justify-start'
+                      aria-current={selected ? 'page' : undefined}
+                      aria-label={
+                        hasDuplicateName
+                          ? `${group.name} #${group.id}`
+                          : group.name
                       }
+                      title={
+                        hasDuplicateName
+                          ? `${group.name} #${group.id}`
+                          : group.name
+                      }
+                      onClick={() => props.onSelect(group)}
                     >
-                      <MoreHorizontal aria-hidden='true' />
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align='end'>
-                      <DropdownMenuItem
-                        disabled={group.status === 'Deleting'}
-                        onClick={() => props.onEdit(group)}
+                      {selected ? (
+                        <FolderOpen className='text-primary shrink-0' />
+                      ) : (
+                        <Folder className='shrink-0' />
+                      )}
+                      <span className='truncate'>{group.name}</span>
+                      {hasDuplicateName ? (
+                        <span className='text-muted-foreground shrink-0 text-xs tabular-nums'>
+                          #{group.id}
+                        </span>
+                      ) : null}
+                      {group.status === 'Deleting' ? (
+                        <span className='text-muted-foreground text-xs'>
+                          {group.deletion_error
+                            ? t('Deletion delayed')
+                            : t('Deleting...')}
+                        </span>
+                      ) : null}
+                      {group.status === 'Processing' ||
+                      group.status === 'Pending' ? (
+                        <span className='text-muted-foreground text-xs'>
+                          {t('Processing')}
+                        </span>
+                      ) : null}
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            type='button'
+                            size='icon-xs'
+                            variant='ghost'
+                            className='shrink-0'
+                            title={t('Group actions')}
+                            aria-label={t('Group actions')}
+                          />
+                        }
                       >
-                        <Pencil />
-                        {t('Rename')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        variant='destructive'
-                        onClick={() => props.onDelete(group)}
-                      >
-                        <Trash2 />
-                        {t('Delete')}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                        <MoreHorizontal aria-hidden='true' />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align='end'>
+                        <DropdownMenuItem
+                          disabled={group.status === 'Deleting'}
+                          onClick={() => props.onEdit(group)}
+                        >
+                          <Pencil />
+                          {t('Rename')}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          variant='destructive'
+                          onClick={() => props.onDelete(group)}
+                        >
+                          <Trash2 />
+                          {group.status === 'Deleting'
+                            ? t('Retry deletion')
+                            : t('Delete')}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                  {group.deletion_error ? (
+                    <p
+                      role='status'
+                      className='text-destructive px-2 pb-2 text-xs break-words'
+                    >
+                      {group.deletion_error}
+                    </p>
+                  ) : null}
                 </div>
               )
             })}

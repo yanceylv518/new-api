@@ -29,10 +29,14 @@ func SetUpLogger(server *gin.Engine) {
 			tag = "web"
 		}
 		path := param.Path
-		// OAuth callbacks carry one-time codes and state in the query string.
-		// Redact the log value only; the handler still needs the original query.
-		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
-			path, _, _ = strings.Cut(path, "?")
+		pathOnly, _, _ := strings.Cut(path, "?")
+		// 回调和公开下载查询包含凭证，只脱敏日志，不影响后续处理。
+		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") ||
+			strings.HasPrefix(path, "/doubao/api/assets/public/") || strings.HasPrefix(path, "/doubao/api/a/") ||
+			strings.HasPrefix(path, "/doubao/api/assets/liveness/callback") ||
+			(strings.HasPrefix(pathOnly, "/v1/seedance/validation-sessions/") && strings.HasSuffix(pathOnly, "/callback")) ||
+			(strings.HasPrefix(pathOnly, "/v1/tasks/") && strings.HasSuffix(pathOnly, "/callback")) {
+			path = pathOnly
 		}
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),

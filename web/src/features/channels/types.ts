@@ -80,7 +80,10 @@ export type Channel = z.infer<typeof channelSchema>
 // ============================================================================
 
 export interface ChannelSettings {
+  video_routing_rules?: VideoRoutingRule[]
   task_plugin_key?: string
+  seedance_asset_url?: string
+  seedance_asset_share_group?: string
   task_extend_plugin_keys?: string[]
   force_format?: boolean
   thinking_to_content?: boolean
@@ -91,6 +94,12 @@ export interface ChannelSettings {
   system_prompt_override?: boolean
   http_protocol?: 'auto' | 'http1' | string
   http2_connection_shards?: number
+}
+
+export type VideoRoutingRule = {
+  model: string
+  mode: 'allow' | 'deny'
+  resolutions: ('480p' | '720p' | '1080p' | '4k')[]
 }
 
 export interface ChannelOtherSettings {

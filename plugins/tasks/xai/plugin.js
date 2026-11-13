@@ -81,7 +81,7 @@ export const meta = {
     en: "xAI Grok Imagine video generation (text-to-video, image-to-video, reference-to-video, video editing, and video extension)",
     zh: "xAI Grok Imagine 视频生成（文生视频、图生视频、参考生视频、视频编辑、视频延长）",
   },
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "QuantumNous" },
   channelTypes: [48], // xAI-type channels serve the video API with the same key
   baseUrl: "https://api.x.ai",
@@ -143,10 +143,9 @@ function plainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
-// Another New API gateway serves the xAI wire format only on this plugin's
-// prefixed native routes.
+// 服务前缀由管理员在渠道 BaseURL 中配置。
 function apiRoot(ctx) {
-  return ctx.baseUrl + (ctx.upstream && ctx.upstream.kind === "new_api" ? "/xai" : "");
+  return trimmed(ctx.baseUrl).replace(/\/+$/, "");
 }
 
 function videoModel(identity) {

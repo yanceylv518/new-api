@@ -47,6 +47,7 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 		hookContext["resourceTask"] = map[string]any{
 			"taskId": task.TaskID, "action": task.Action, "status": string(task.Status),
 			"data": jsonValue(task.Data), "state": jsonValue(task.PrivateData.PluginState),
+			"transportSaved": task.PrivateData.TransportSaved,
 		}
 	}
 	if err := a.applyUpstreamCredentials(hookContext, channelType, key, proxy); err != nil {
@@ -88,6 +89,9 @@ func (a *TaskAdaptor) ExecuteNativeRequest(
 	}
 	for name, headerValue := range descriptor.Headers {
 		request.Header.Set(name, headerValue)
+	}
+	if err := channel.ApplyTaskHeaderOverrides(request, a.info, nil, true); err != nil {
+		return nil, err
 	}
 	client, err := service.GetHttpClientWithProxy(proxy)
 	if err != nil {

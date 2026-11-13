@@ -8,7 +8,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/bytedance/gopkg/util/gopool"
 )
 
 // notifyLimitStore is used for in-memory rate limiting when Redis is disabled
@@ -27,9 +26,9 @@ func getDuration() time.Duration {
 	return time.Duration(minute) * time.Minute
 }
 
-// startCleanupTask starts a background task to clean up expired entries
+// 清理器与进程同寿命，不占用处理请求和退款的共享工作池。
 func startCleanupTask() {
-	gopool.Go(func() {
+	go func() {
 		for {
 			time.Sleep(time.Hour)
 			now := time.Now()
@@ -42,7 +41,7 @@ func startCleanupTask() {
 				return true
 			})
 		}
-	})
+	}()
 }
 
 // CheckNotificationLimit checks if the user has exceeded their notification limit

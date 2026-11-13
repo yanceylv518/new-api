@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -67,10 +68,15 @@ func RefreshManagementRateLimits() error {
 // UpdateManagementRateLimits 以页面读取值校验过期保存，行锁同时保护不同节点的写入。
 // expected 为 nil 仅供服务端直接更新；管理接口必须提供读取时的配置。
 func UpdateManagementRateLimits(raw string, expected *string) (string, error) {
-	value, err := canonicalManagementRateLimits(raw)
+	candidate, err := common.ParseManagementRateLimits(raw)
 	if err != nil {
 		return "", err
 	}
+	var supplied map[string]json.RawMessage
+	if err := common.UnmarshalJsonStr(raw, &supplied); err != nil {
+		return "", err
+	}
+	var value string
 	var expectedValue string
 	if expected != nil {
 		expectedValue, err = canonicalManagementRateLimits(*expected)
@@ -99,6 +105,28 @@ func UpdateManagementRateLimits(raw string, expected *string) (string, error) {
 		if expected != nil && current != expectedValue {
 			return &ManagementRateLimitConflictError{CurrentValue: current}
 		}
+		currentSettings, err := common.ParseManagementRateLimits(current)
+		if err != nil {
+			return err
+		}
+		// 旧页面不认识新字段时，保留当前配置，避免保存其他限流时覆盖它们。
+		if _, present := supplied["seedance_asset"]; !present {
+			candidate.SeedanceAsset = currentSettings.SeedanceAsset
+		}
+		if _, present := supplied["asset_upload"]; !present {
+			candidate.AssetUpload = currentSettings.AssetUpload
+		}
+		if _, present := supplied["asset_download"]; !present {
+			candidate.AssetDownload = currentSettings.AssetDownload
+		}
+		if _, present := supplied["asset_limits"]; !present {
+			candidate.AssetLimits = currentSettings.AssetLimits
+		}
+		encoded, err := common.Marshal(candidate)
+		if err != nil {
+			return err
+		}
+		value = string(encoded)
 		return tx.Model(&Option{}).Where(&Option{Key: option.Key}).Update("value", value).Error
 	})
 	if err != nil {

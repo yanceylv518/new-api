@@ -2,6 +2,7 @@ package billingexpr
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/QuantumNous/new-api/common"
 )
@@ -33,9 +34,16 @@ func ComputeTieredQuotaWithRequest(snap *BillingSnapshot, params TokenParams, re
 	if err != nil {
 		return TieredResult{}, err
 	}
+	if snap.TaskUsageBilling && (math.IsNaN(cost) || math.IsInf(cost, 0)) {
+		return TieredResult{}, fmt.Errorf("task completion expression produced a non-finite cost")
+	}
 
 	quotaBeforeGroup := quotaConversion(cost, snap)
-	afterGroup, clamp := common.QuotaRoundChecked(quotaBeforeGroup * snap.GroupRatio)
+	quotaAfterGroup := quotaBeforeGroup * snap.GroupRatio
+	if snap.TaskUsageBilling && (math.IsNaN(quotaBeforeGroup) || math.IsInf(quotaBeforeGroup, 0) || math.IsNaN(quotaAfterGroup) || math.IsInf(quotaAfterGroup, 0)) {
+		return TieredResult{}, fmt.Errorf("task completion expression produced a non-finite quota")
+	}
+	afterGroup, clamp := common.QuotaRoundChecked(quotaAfterGroup)
 	crossed := trace.MatchedTier != snap.EstimatedTier
 
 	result := TieredResult{

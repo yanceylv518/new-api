@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -21,6 +22,69 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
+
+func TestRetiredVideoAccountingMarkersAreClearedWithoutLosingLogs(t *testing.T) {
+	truncateTables(t)
+	user := User{Username: "legacy-accounting-owner", AffCode: "legacy-accounting-owner", Quota: 900, UsedQuota: 100}
+	require.NoError(t, DB.Create(&user).Error)
+	task := Task{TaskID: "legacy-accounting-task", UserId: user.Id, Status: TaskStatusSuccess, Quota: 100}
+	require.NoError(t, DB.Create(&task).Error)
+	original := Log{UserId: user.Id, RequestId: "legacy-existing-log", CreatedAt: 1234, Quota: 100, Type: LogTypeConsume}
+	require.NoError(t, DB.Create(&original).Error)
+	delivery := Log{UserId: user.Id, RequestId: "legacy-delivery-log", CreatedAt: 1235, Quota: 50, Type: LogTypeConsume}
+	payload, err := common.Marshal(delivery)
+	require.NoError(t, err)
+	const retiredPayload = "legacy-accounting-unverified"
+	pending := []VideoTaskPendingLog{
+		{TaskID: -1, Kind: "", Payload: ""},
+		{TaskID: -2, Kind: "", Payload: string(payload)},
+		{TaskID: -3, Kind: "manual", Payload: retiredPayload},
+		{TaskID: -4, Kind: "delivery", Payload: retiredPayload},
+		{TaskID: -5, Kind: "manual", Payload: ""},
+		{TaskID: 6, Kind: "delivery", Payload: "invalid-json"},
+	}
+	for i := range videoLogRetryBatch + 1 {
+		pending = append(pending, VideoTaskPendingLog{TaskID: -1000 - int64(i), Payload: retiredPayload})
+	}
+	require.NoError(t, DB.Session(&gorm.Session{SkipHooks: true}).CreateInBatches(&pending, 64).Error)
+	require.NoError(t, migrateVideoTaskLogKinds(DB))
+	require.NoError(t, migrateVideoTaskLogKinds(DB))
+	var markers int64
+	require.NoError(t, DB.Model(&VideoTaskPendingLog{}).Where("payload = ?", retiredPayload).Count(&markers).Error)
+	assert.EqualValues(t, 1, markers)
+	for _, id := range []int64{-1, -5} {
+		var accounting VideoTaskPendingLog
+		require.NoError(t, DB.First(&accounting, "task_id = ?", id).Error)
+		assert.Equal(t, videoLogKindAccounting, accounting.Kind)
+		assert.Empty(t, accounting.Payload)
+	}
+	var queued VideoTaskPendingLog
+	require.NoError(t, DB.First(&queued, "task_id = ?", -2).Error)
+	assert.Equal(t, videoLogKindDelivery, queued.Kind)
+	require.NoError(t, DeliverVideoTaskLog(t.Context(), -4))
+	require.NoError(t, DeliverVideoTaskLog(t.Context(), -2))
+	require.NoError(t, DeliverVideoTaskLog(t.Context(), -2))
+	require.NoError(t, DB.Model(&VideoTaskPendingLog{}).Where("task_id IN ?", []int64{-2, -3, -4}).Count(&markers).Error)
+	assert.Zero(t, markers)
+	require.ErrorContains(t, DeliverVideoTaskLog(t.Context(), 6), "decode video billing log")
+	var invalid VideoTaskPendingLog
+	require.NoError(t, DB.First(&invalid, "task_id = ?", 6).Error)
+	assert.Equal(t, "invalid-json", invalid.Payload)
+	var logs []Log
+	require.NoError(t, DB.Order("id").Find(&logs).Error)
+	require.Len(t, logs, 2)
+	assert.Equal(t, original.RequestId, logs[0].RequestId)
+	assert.Equal(t, delivery.RequestId, logs[1].RequestId)
+	assert.Equal(t, delivery.Quota, logs[1].Quota)
+	var stored User
+	var storedTask Task
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Equal(t, 900, stored.Quota)
+	assert.Equal(t, 100, stored.UsedQuota)
+	assert.Equal(t, 100, storedTask.Quota)
+	assert.Equal(t, TaskStatus(TaskStatusSuccess), storedTask.Status)
+}
 
 // 真实数据库执行终态事务，覆盖中途故障回滚、重试和成功/取消争抢同一任务。
 func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
@@ -323,4 +387,411 @@ func TestVideoTaskAtomicSettlementDatabaseMatrix(t *testing.T) {
 			t.Logf("LOAD engine=%s tasks=%d attempts=%d users=%d workers=%d db_connections=%d elapsed=%s attempts_per_second=%.1f p50=%s p95=%s p99=%s accounting=exact", engine, taskCount, len(latencies), userCount, workerCount, connection.Stats().MaxOpenConnections, elapsed, float64(len(latencies))/elapsed.Seconds(), latencies[len(latencies)/2], latencies[len(latencies)*95/100], latencies[len(latencies)*99/100])
 		})
 	}
+}
+
+func TestTaskAccountingSurvivesStaleTaskUpdates(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("terminal_%t", terminal), func(t *testing.T) {
+			truncateTables(t)
+			require.NoError(t, DB.Create(&User{Id: 79, Username: "stale-update-owner", AffCode: "stale-update-owner", Quota: 900}).Error)
+			require.NoError(t, DB.Create(&Channel{Id: 79}).Error)
+			task := Task{TaskID: "stale-accounting-update", UserId: 79, ChannelId: 79, Quota: 100, Status: TaskStatusQueued, Progress: "10%", PrivateData: TaskPrivateData{InitialAccountingPending: true}}
+			require.NoError(t, DB.Create(&task).Error)
+			stale := task
+			accounting := task
+			won, err := CommitTaskInitialAccounting(t.Context(), &accounting, &Log{UserId: 79, Quota: 100, RequestId: "stale-accounting-update"})
+			require.NoError(t, err)
+			require.True(t, won)
+			require.NoError(t, DB.Model(&Task{}).Where("id = ?", task.ID).Update("progress", "60%").Error)
+			require.NoError(t, stale.MarkReconciliation(t.Context(), TaskStatusQueued, "overdue"))
+			require.NoError(t, stale.SetResponsesBackground(t.Context()))
+			var stored Task
+			require.NoError(t, DB.First(&stored, task.ID).Error)
+			assert.Equal(t, "60%", stored.Progress)
+			assert.True(t, stored.PrivateData.ReconciliationRequired)
+			assert.False(t, stored.PrivateData.InitialAccountingPending)
+			assert.True(t, stored.PrivateData.ResponsesBackground)
+			if terminal {
+				stale.Status, stale.Progress = TaskStatusSuccess, "100%"
+				won, err = FinalizeVideoTask(t.Context(), &stale, TaskStatusQueued, 50)
+			} else {
+				stale.Progress = "70%"
+				won, err = stale.UpdateWithStatus(TaskStatusQueued)
+			}
+			require.NoError(t, err)
+			require.True(t, won)
+			require.NoError(t, DB.First(&stored, task.ID).Error)
+			assert.False(t, stored.PrivateData.InitialAccountingPending)
+			assert.True(t, stored.PrivateData.ResponsesBackground)
+			won, err = CommitTaskInitialAccounting(t.Context(), &task)
+			require.NoError(t, err)
+			assert.False(t, won)
+			var user User
+			var channel Channel
+			var logs int64
+			require.NoError(t, DB.First(&user, 79).Error)
+			require.NoError(t, DB.First(&channel, 79).Error)
+			require.NoError(t, DB.Model(&Log{}).Where("user_id = ?", 79).Count(&logs).Error)
+			if terminal {
+				assert.Equal(t, 950, user.Quota)
+				assert.Equal(t, 50, user.UsedQuota)
+				assert.EqualValues(t, 50, channel.UsedQuota)
+			} else {
+				assert.Equal(t, 900, user.Quota)
+				assert.Equal(t, 100, user.UsedQuota)
+				assert.EqualValues(t, 100, channel.UsedQuota)
+			}
+			assert.Equal(t, 1, user.RequestCount)
+			assert.EqualValues(t, 1, logs)
+		})
+	}
+	t.Run("submission evidence", func(t *testing.T) {
+		truncateTables(t)
+		task := Task{TaskID: "stale-submission-evidence", Status: TaskStatusUnknown, PrivateData: TaskPrivateData{SubmissionPending: true, InitialAccountingPending: true}}
+		require.NoError(t, DB.Create(&task).Error)
+		stale := task
+		current := task
+		current.PrivateData.SubmissionResponse = []byte(`{"parsed":{"taskId":"upstream"}}`)
+		won, err := PersistTaskSubmission(t.Context(), &current, false)
+		require.NoError(t, err)
+		require.True(t, won)
+		stale.PrivateData.PollFailures++
+		won, err = stale.UpdateWithStatus(TaskStatusUnknown)
+		require.NoError(t, err)
+		assert.False(t, won)
+		var stored Task
+		require.NoError(t, DB.First(&stored, task.ID).Error)
+		assert.JSONEq(t, string(current.PrivateData.SubmissionResponse), string(stored.PrivateData.SubmissionResponse))
+	})
+	t.Run("changed reservation", func(t *testing.T) {
+		truncateTables(t)
+		require.NoError(t, DB.Create(&User{Id: 78, Username: "changed-owner", AffCode: "changed-owner", Quota: 900}).Error)
+		require.NoError(t, DB.Create(&Channel{Id: 78}).Error)
+		task := Task{TaskID: "changed-accounting-reservation", UserId: 78, ChannelId: 78, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{SubmissionPending: true, InitialAccountingPending: true}}
+		require.NoError(t, DB.Create(&task).Error)
+		stale := task
+		final := task
+		final.Status, final.Progress, final.Quota = TaskStatusSuccess, "100%", 50
+		final.PrivateData.SubmissionPending = false
+		won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: 100})
+		require.NoError(t, err)
+		require.True(t, won)
+		won, err = CommitTaskInitialAccounting(t.Context(), &stale, &Log{UserId: 78, Quota: 100, RequestId: task.TaskID})
+		require.ErrorContains(t, err, "snapshot changed")
+		assert.False(t, won)
+		var stored Task
+		var user User
+		require.NoError(t, DB.First(&stored, task.ID).Error)
+		require.NoError(t, DB.First(&user, 78).Error)
+		assert.True(t, stored.PrivateData.InitialAccountingPending)
+		assert.Equal(t, 950, user.Quota)
+		assert.Zero(t, user.UsedQuota)
+		won, err = CommitTaskInitialAccounting(t.Context(), &stored, &Log{UserId: 78, Quota: 50, RequestId: task.TaskID})
+		require.NoError(t, err)
+		require.True(t, won)
+		require.NoError(t, DB.First(&user, 78).Error)
+		assert.Equal(t, 50, user.UsedQuota)
+		assert.Equal(t, 1, user.RequestCount)
+		var logs []Log
+		require.NoError(t, DB.Where("user_id = ?", 78).Find(&logs).Error)
+		require.Len(t, logs, 1)
+		assert.Equal(t, 50, logs[0].Quota)
+	})
+	t.Run("concurrent updates", func(t *testing.T) {
+		truncateTables(t)
+		connection, err := DB.DB()
+		require.NoError(t, err)
+		connection.SetMaxOpenConns(32)
+		t.Cleanup(func() { connection.SetMaxOpenConns(1) })
+		require.NoError(t, DB.Create(&User{Id: 80, Username: "concurrent-owner", AffCode: "concurrent-owner", Quota: 900}).Error)
+		require.NoError(t, DB.Create(&Channel{Id: 80}).Error)
+		task := Task{TaskID: "concurrent-accounting-update", UserId: 80, ChannelId: 80, Quota: 100, Status: TaskStatusQueued, Progress: "10%", PrivateData: TaskPrivateData{InitialAccountingPending: true}}
+		require.NoError(t, DB.Create(&task).Error)
+		start := make(chan struct{})
+		results := make(chan error, 64)
+		var workers sync.WaitGroup
+		for index := range 64 {
+			workers.Go(func() {
+				<-start
+				copy := task
+				var err error
+				switch index % 4 {
+				case 0:
+					_, err = CommitTaskInitialAccounting(t.Context(), &copy, &Log{UserId: 80, Quota: 100, RequestId: task.TaskID})
+				case 1:
+					err = copy.MarkReconciliation(t.Context(), TaskStatusQueued, "overdue")
+				case 2:
+					err = copy.SetResponsesBackground(t.Context())
+				default:
+					copy.Progress = "20%"
+					_, err = copy.UpdateWithStatus(TaskStatusQueued)
+				}
+				results <- err
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		for err := range results {
+			require.NoError(t, err)
+		}
+		var stored Task
+		var user User
+		var channel Channel
+		var logs int64
+		require.NoError(t, DB.First(&stored, task.ID).Error)
+		require.NoError(t, DB.First(&user, 80).Error)
+		require.NoError(t, DB.First(&channel, 80).Error)
+		require.NoError(t, DB.Model(&Log{}).Where("user_id = ?", 80).Count(&logs).Error)
+		assert.False(t, stored.PrivateData.InitialAccountingPending)
+		assert.True(t, stored.PrivateData.ResponsesBackground)
+		assert.Equal(t, 900, user.Quota)
+		assert.Equal(t, 100, user.UsedQuota)
+		assert.Equal(t, 1, user.RequestCount)
+		assert.EqualValues(t, 100, channel.UsedQuota)
+		assert.EqualValues(t, 1, logs)
+	})
+}
+
+func TestImmediateTaskFundingDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name, funding, failTable string
+		actual, reserved         int
+		updateToken, async       bool
+	}{
+		{"wallet partial refund", "wallet", "", 50, 100, true, false},
+		{"wallet full refund", "wallet", "", 0, 100, true, false},
+		{"wallet same amount", "wallet", "", 100, 100, true, false},
+		{"playground skips token", "wallet", "", 50, 100, false, false},
+		{"subscription refund", "subscription", "", 50, 100, true, false},
+		{"wallet failure rolls back", "wallet", "users", 50, 100, true, false},
+		{"token failure rolls back", "wallet", "tokens", 50, 100, true, false},
+		{"subscription failure rolls back", "subscription", "user_subscriptions", 50, 100, true, false},
+		{"async wallet refund", "wallet", "", 50, 100, true, true},
+		{"async wallet same amount", "wallet", "", 100, 100, true, true},
+		{"async playground refund", "wallet", "", 50, 100, false, true},
+		{"async subscription refund", "subscription", "", 50, 100, true, true},
+		{"async subscription failure rolls back", "subscription", "user_subscriptions", 50, 100, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncateTables(t)
+			userQuota := 900
+			if tc.funding == "subscription" {
+				userQuota = 1000
+			}
+			require.NoError(t, DB.Create(&User{Id: 81, Username: "immediate-owner", AffCode: "immediate-owner", Quota: userQuota}).Error)
+			require.NoError(t, DB.Create(&Token{Id: 81, UserId: 81, Key: "immediate-local-token", RemainQuota: 900, UsedQuota: 100}).Error)
+			require.NoError(t, DB.Create(&Channel{Id: 81}).Error)
+			if tc.funding == "subscription" {
+				require.NoError(t, DB.Create(&UserSubscription{Id: 81, UserId: 81, AmountTotal: 1000, AmountUsed: 100}).Error)
+			}
+			staged := Task{TaskID: "immediate-funding", UserId: 81, ChannelId: 81, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{SubmissionPending: true, InitialAccountingPending: true, BillingSource: tc.funding, TokenId: 81}}
+			if tc.funding == "subscription" {
+				staged.PrivateData.SubscriptionId = 81
+			}
+			require.NoError(t, DB.Create(&staged).Error)
+			final := staged
+			final.Status, final.Progress, final.Quota = TaskStatusSuccess, "100%", tc.actual
+			if tc.actual == 0 {
+				final.Status = TaskStatusFailure
+			}
+			if tc.async {
+				final.Status, final.Progress = TaskStatusSubmitted, "10%"
+			}
+			final.PrivateData.SubmissionPending = false
+			if tc.failTable != "" {
+				require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("immediate-funding-failure", func(tx *gorm.DB) {
+					if tx.Statement.Table == tc.failTable {
+						tx.AddError(errors.New("injected funding failure"))
+					}
+				}))
+				won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: tc.reserved, UpdateToken: tc.updateToken})
+				require.Error(t, err)
+				assert.False(t, won)
+				require.NoError(t, DB.Callback().Update().Remove("immediate-funding-failure"))
+				var retained Task
+				var retainedUser User
+				var retainedToken Token
+				require.NoError(t, DB.First(&retained, staged.ID).Error)
+				require.NoError(t, DB.First(&retainedUser, 81).Error)
+				require.NoError(t, DB.First(&retainedToken, 81).Error)
+				assert.Equal(t, TaskStatus(TaskStatusUnknown), retained.Status)
+				assert.True(t, retained.PrivateData.SubmissionPending)
+				assert.Equal(t, 100, retained.Quota)
+				assert.Equal(t, userQuota, retainedUser.Quota)
+				assert.Equal(t, 900, retainedToken.RemainQuota)
+			}
+			won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: tc.reserved, UpdateToken: tc.updateToken})
+			require.NoError(t, err)
+			require.True(t, won)
+			var stored Task
+			var user User
+			var token Token
+			var marker VideoTaskPendingLog
+			require.NoError(t, DB.First(&stored, staged.ID).Error)
+			require.NoError(t, DB.First(&user, 81).Error)
+			require.NoError(t, DB.First(&token, 81).Error)
+			if !tc.async {
+				require.NoError(t, DB.First(&marker, "task_id = ?", -staged.ID).Error)
+				assert.Empty(t, marker.Payload)
+			}
+			assert.Equal(t, final.Status, stored.Status)
+			assert.Equal(t, tc.actual, stored.Quota)
+			assert.True(t, stored.PrivateData.SubmissionFundsCommitted)
+			assert.True(t, stored.PrivateData.InitialAccountingPending)
+			assert.Zero(t, user.UsedQuota)
+			if tc.funding == "wallet" {
+				assert.Equal(t, userQuota+tc.reserved-tc.actual, user.Quota)
+			} else {
+				var subscription UserSubscription
+				require.NoError(t, DB.First(&subscription, 81).Error)
+				assert.EqualValues(t, tc.actual, subscription.AmountUsed)
+				assert.Equal(t, userQuota, user.Quota)
+			}
+			if tc.updateToken {
+				assert.Equal(t, 1000-tc.actual, token.RemainQuota)
+				assert.Equal(t, tc.actual, token.UsedQuota)
+			} else {
+				assert.Equal(t, 900, token.RemainQuota)
+				assert.Equal(t, 100, token.UsedQuota)
+			}
+			won, err = PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: tc.reserved, UpdateToken: tc.updateToken})
+			require.NoError(t, err)
+			assert.False(t, won)
+			require.NoError(t, DB.First(&user, 81).Error)
+			if tc.funding == "wallet" {
+				assert.Equal(t, userQuota+tc.reserved-tc.actual, user.Quota)
+			} else {
+				assert.Equal(t, userQuota, user.Quota)
+			}
+		})
+	}
+	t.Run("insufficient reservation leaves intent unchanged", func(t *testing.T) {
+		truncateTables(t)
+		staged := Task{TaskID: "insufficient-reservation", UserId: 82, ChannelId: 82, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{SubmissionPending: true, InitialAccountingPending: true}}
+		require.NoError(t, DB.Create(&staged).Error)
+		final := staged
+		final.Status, final.Quota = TaskStatusSuccess, 101
+		final.PrivateData.SubmissionPending = false
+		won, err := PersistTaskSubmission(t.Context(), &final, true, ImmediateTaskFunding{ReservedQuota: 100})
+		require.Error(t, err)
+		assert.False(t, won)
+		var stored Task
+		require.NoError(t, DB.First(&stored, staged.ID).Error)
+		assert.Equal(t, TaskStatus(TaskStatusUnknown), stored.Status)
+		assert.True(t, stored.PrivateData.SubmissionPending)
+		assert.False(t, stored.PrivateData.SubmissionFundsCommitted)
+	})
+}
+
+func TestImmediateTaskFundingConcurrentLoad(t *testing.T) {
+	truncateTables(t)
+	const users, workers, initialQuota = 200, 64, 10000000
+	count := 4096
+	if value := os.Getenv("VIDEO_IMMEDIATE_AUDIT_TASKS"); value != "" {
+		var err error
+		count, err = strconv.Atoi(value)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, users)
+		require.LessOrEqual(t, count, 65536)
+	}
+	connection, err := DB.DB()
+	require.NoError(t, err)
+	if DB.Dialector.Name() != "sqlite" {
+		connection.SetMaxOpenConns(workers)
+		connection.SetMaxIdleConns(workers)
+		t.Cleanup(func() { connection.SetMaxOpenConns(1); connection.SetMaxIdleConns(1) })
+	}
+	expected, reserved, requests := make([]int, users), make([]int, users), make([]int, users)
+	tasks := make([]Task, count)
+	for index := range tasks {
+		owner, actual := index%users, []int{0, 50, 100}[index%3]
+		reserved[owner] += 100
+		expected[owner] += actual
+		requests[owner]++
+		tasks[index] = Task{TaskID: fmt.Sprintf("immediate-load-%d", index), UserId: 1000 + owner, ChannelId: 1000 + owner, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{TokenId: 1000 + owner, SubmissionPending: true, InitialAccountingPending: true}}
+	}
+	for owner := range users {
+		id := 1000 + owner
+		require.NoError(t, DB.Create(&User{Id: id, Username: fmt.Sprint(id), AffCode: fmt.Sprint(id), Quota: initialQuota - reserved[owner]}).Error)
+		require.NoError(t, DB.Create(&Token{Id: id, UserId: id, Key: fmt.Sprintf("immediate-load-token-%d", id), RemainQuota: initialQuota - reserved[owner], UsedQuota: reserved[owner]}).Error)
+		require.NoError(t, DB.Create(&Channel{Id: id}).Error)
+	}
+	require.NoError(t, DB.CreateInBatches(tasks, 64).Error)
+	type outcome struct {
+		index int
+		won   bool
+		err   error
+	}
+	jobs := make(chan int, workers*2)
+	results := make(chan outcome, count*2)
+	var group sync.WaitGroup
+	started := time.Now()
+	for range workers {
+		group.Go(func() {
+			for index := range jobs {
+				final := tasks[index]
+				final.Quota = []int{0, 50, 100}[index%3]
+				final.Status, final.Progress = TaskStatusSuccess, "100%"
+				if final.Quota == 0 {
+					final.Status = TaskStatusFailure
+				}
+				if index%2 == 1 {
+					final.Status, final.Progress = TaskStatusSubmitted, "10%"
+				}
+				final.PrivateData.SubmissionPending = false
+				won, err := PersistTaskSubmission(t.Context(), &final, true, TaskSubmissionFunding{ReservedQuota: 100, UpdateToken: true})
+				if err == nil && won && index%2 == 1 {
+					log := &Log{UserId: final.UserId, Type: LogTypeConsume, ModelName: "submission-load", Quota: final.Quota, RequestId: final.TaskID}
+					_, err = CommitTaskInitialAccounting(t.Context(), &final, log)
+				}
+				results <- outcome{index: index, won: won, err: err}
+			}
+		})
+	}
+	for index := range tasks {
+		jobs <- index
+		jobs <- index
+	}
+	close(jobs)
+	group.Wait()
+	close(results)
+	wins := make([]int, count)
+	for result := range results {
+		require.NoError(t, result.err)
+		if result.won {
+			wins[result.index]++
+		}
+	}
+	for _, winsForTask := range wins {
+		assert.Equal(t, 1, winsForTask)
+	}
+	for pass := 0; pass < (count+videoLogRetryBatch-1)/videoLogRetryBatch+1 && HasPendingVideoTaskLogs(); pass++ {
+		require.NoError(t, RetryTaskInitialAccounting(t.Context(), func(ctx context.Context, task *Task) error {
+			log := &Log{UserId: task.UserId, Type: LogTypeConsume, ModelName: "immediate-load", Quota: task.Quota, RequestId: task.TaskID}
+			_, err := CommitTaskInitialAccounting(ctx, task, log)
+			return err
+		}))
+	}
+	assert.False(t, HasPendingVideoTaskLogs())
+	for owner := range users {
+		var user User
+		var token Token
+		var channel Channel
+		require.NoError(t, DB.First(&user, 1000+owner).Error)
+		require.NoError(t, DB.First(&token, 1000+owner).Error)
+		require.NoError(t, DB.First(&channel, 1000+owner).Error)
+		assert.Equal(t, initialQuota-expected[owner], user.Quota)
+		assert.Equal(t, expected[owner], user.UsedQuota)
+		assert.Equal(t, requests[owner], user.RequestCount)
+		assert.Equal(t, user.Quota, token.RemainQuota)
+		assert.Equal(t, user.UsedQuota, token.UsedQuota)
+		assert.EqualValues(t, expected[owner], channel.UsedQuota)
+	}
+	var logs, pending int64
+	require.NoError(t, DB.Model(&Log{}).Count(&logs).Error)
+	require.NoError(t, DB.Model(&Task{}).Where("status NOT IN ?", []TaskStatus{TaskStatusSubmitted, TaskStatusSuccess, TaskStatusFailure}).Count(&pending).Error)
+	assert.EqualValues(t, count, logs)
+	assert.Zero(t, pending)
+	t.Logf("SUBMISSION_LOAD engine=%s tasks=%d attempts=%d users=%d workers=%d elapsed=%s accounting=exact", DB.Dialector.Name(), count, count*2, users, workers, time.Since(started))
 }

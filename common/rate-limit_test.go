@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +17,60 @@ func TestManagementRateLimitDefaultsAreValid(t *testing.T) {
 	require.NoError(t, err)
 	_, err = ParseManagementRateLimits(string(encoded))
 	require.NoError(t, err)
+}
+
+func TestManagementRateLimitLegacyAssetDefaultsAndInvalidValues(t *testing.T) {
+	previousCount, previousBytes := constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes
+	constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = 1234, 2048<<20
+	t.Cleanup(func() {
+		constant.PrivateAssetUserMaxCount, constant.PrivateAssetUserMaxBytes = previousCount, previousBytes
+	})
+	defaults := DefaultManagementRateLimits()
+	assert.EqualValues(t, 1234, defaults.AssetLimits.UserMaxCount)
+	assert.EqualValues(t, 2048, defaults.AssetLimits.UserStorageMiB)
+	encoded, err := Marshal(defaults)
+	require.NoError(t, err)
+	var legacy map[string]any
+	require.NoError(t, Unmarshal(encoded, &legacy))
+	for _, key := range []string{"seedance_asset", "asset_upload", "asset_download", "asset_limits"} {
+		delete(legacy, key)
+	}
+	legacyEncoded, err := Marshal(legacy)
+	require.NoError(t, err)
+	settings, err := ParseManagementRateLimits(string(legacyEncoded))
+	require.NoError(t, err)
+	assert.Equal(t, defaults, settings)
+
+	for _, key := range []string{"seedance_asset", "asset_upload", "asset_download"} {
+		for _, invalid := range []any{nil, map[string]any{"requests": 1, "window_seconds": 60}, map[string]any{"enabled": true, "requests": 0, "window_seconds": 60}} {
+			legacy[key] = invalid
+			value, marshalErr := Marshal(legacy)
+			require.NoError(t, marshalErr)
+			_, parseErr := ParseManagementRateLimits(string(value))
+			assert.Error(t, parseErr, "%s: %v", key, invalid)
+		}
+		delete(legacy, key)
+	}
+	for _, invalid := range []any{nil, map[string]any{}, map[string]any{"image_mib": 1}} {
+		legacy["asset_limits"] = invalid
+		value, marshalErr := Marshal(legacy)
+		require.NoError(t, marshalErr)
+		_, parseErr := ParseManagementRateLimits(string(value))
+		assert.Error(t, parseErr)
+	}
+	for _, mutate := range []func(*PrivateAssetLimits){
+		func(limits *PrivateAssetLimits) { limits.ImageMiB = 0 },
+		func(limits *PrivateAssetLimits) { limits.CompatImageMiB = MaxPrivateAssetSizeMiB + 1 },
+		func(limits *PrivateAssetLimits) { limits.UserMaxCount = -1 },
+		func(limits *PrivateAssetLimits) { limits.UserStorageMiB = MaxPrivateAssetStorageMiB + 1 },
+	} {
+		invalid := defaults
+		mutate(&invalid.AssetLimits)
+		value, marshalErr := Marshal(invalid)
+		require.NoError(t, marshalErr)
+		_, parseErr := ParseManagementRateLimits(string(value))
+		assert.Error(t, parseErr)
+	}
 }
 
 func TestManagementRateLimitRequiresExplicitBoolean(t *testing.T) {
@@ -42,6 +97,20 @@ func TestManagementRateLimitRequiresExplicitBoolean(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestPrivateAssetUploadBodyUsesConfiguredLimit(t *testing.T) {
+	previous := managementRateLimits.Load()
+	t.Cleanup(func() { managementRateLimits.Store(previous) })
+	settings := DefaultManagementRateLimits()
+	settings.AssetLimits.VideoMiB = 200
+	encoded, err := Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, LoadManagementRateLimits(string(encoded)))
+	assert.EqualValues(t, 51<<20, RequestBodyLimitForPath("POST", "/doubao/api/assets/upload", 128<<20))
+	assert.EqualValues(t, 201<<20, RequestBodyLimitForPath("POST", "/v1/seedance/assets/upload", 128<<20))
+	assert.EqualValues(t, 128<<20, RequestBodyLimitForPath("POST", "/v1/videos", 128<<20))
+	assert.EqualValues(t, 128<<20, RequestBodyLimitForPath("GET", "/doubao/api/assets/upload", 128<<20))
 }
 
 func TestManagementRateLimitPreservesLongEnvironmentDefaults(t *testing.T) {

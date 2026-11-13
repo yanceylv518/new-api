@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	maxPluginResponseTaskTokens    = 1<<53 - 1
 	pluginResponseStatusInProgress = "in_progress"
 	pluginResponseStatusCompleted  = "completed"
 	pluginResponseStatusFailed     = "failed"
@@ -600,6 +601,33 @@ func (m *PluginResponsesMachine) FinalResponse(payload any, taskStatus string) (
 	return response, nil
 }
 
+// SetTaskUsage 单独公开媒体计费用量，不把视频 token 冒充文本输入或输出 token。
+func (m *PluginResponsesMachine) SetTaskUsage(data json.RawMessage) {
+	var body struct {
+		Usage map[string]json.RawMessage `json:"usage"`
+	}
+	if common.Unmarshal(data, &body) != nil {
+		return
+	}
+	usage := make(map[string]json.RawMessage)
+	for _, key := range []string{"total_tokens", "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens"} {
+		raw := body.Usage[key]
+		if common.GetJsonType(raw) != "number" {
+			continue
+		}
+		var count int64
+		if common.Unmarshal(raw, &count) != nil || count < 0 || count > maxPluginResponseTaskTokens {
+			continue
+		}
+		usage[key] = raw
+	}
+	if len(usage) > 0 {
+		if encoded, err := common.Marshal(usage); err == nil {
+			m.metadata["task_usage"] = string(encoded)
+		}
+	}
+}
+
 // FinalFromEvents synthesizes the retrieval Response for stream-only plugins
 // from one renderEvents call at terminal task status. Synthesis runs on a
 // scratch machine so a hook failure leaves the receiver untouched and the
@@ -610,6 +638,9 @@ func (m *PluginResponsesMachine) FinalFromEvents(result ProtocolEventResult, tas
 	}
 	scratch := NewPluginResponsesMachine(m.taskID, m.model, m.createdAt, m.limits)
 	scratch.background = m.background
+	if usage, ok := m.metadata["task_usage"]; ok {
+		scratch.metadata["task_usage"] = usage
+	}
 	scratch.started = true
 	if _, err := scratch.ApplyTick(result, taskStatus); err != nil {
 		return nil, err
@@ -824,7 +855,7 @@ func (m *PluginResponsesMachine) finalMetadata(pluginValue any) map[string]strin
 			if len(metadata) >= pluginLimit {
 				break
 			}
-			if _, hostOwned := m.metadata[key]; hostOwned {
+			if _, hostOwned := m.metadata[key]; hostOwned || key == "task_usage" {
 				continue
 			}
 			rawValue := pluginMetadata[key]

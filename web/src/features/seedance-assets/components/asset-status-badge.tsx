@@ -64,6 +64,8 @@ export function AssetStatusBadge(props: { asset: SeedanceAsset }) {
   const { t } = useTranslation()
   const statusLabel = getStatusLabel(props.asset.status)
   const isBusy = statusLabel === 'Processing' || statusLabel === 'Deleting...'
+  const reviewTimedOut =
+    statusLabel === 'Failed' && props.asset.failure_code === 'review_timeout'
   return (
     <StatusBadge
       variant={getStatusVariant(props.asset.status)}
@@ -76,7 +78,7 @@ export function AssetStatusBadge(props: { asset: SeedanceAsset }) {
           aria-hidden='true'
         />
       ) : null}
-      {t(statusLabel)}
+      {reviewTimedOut ? t('Review timed out') : t(statusLabel)}
     </StatusBadge>
   )
 }

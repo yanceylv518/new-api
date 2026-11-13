@@ -2,12 +2,15 @@ package model
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 // TaskAliasTarget is one mapping-derived alias after cross-channel aggregation.
@@ -19,10 +22,18 @@ type TaskAliasTarget struct {
 	PluginKey string
 }
 
+type TaskChannelAlias struct {
+	Alias     string
+	Declared  string
+	PluginKey string
+	ChannelID int
+}
+
 type taskAliasView struct {
 	generation uint64
 	expiresAt  time.Time
 	byFold     map[string]TaskAliasTarget
+	byGroup    map[string]map[string][]TaskChannelAlias
 }
 
 const taskAliasViewTTL = 60 * time.Second
@@ -45,6 +56,41 @@ func ResolveTaskModelAlias(g *jsplugin.RoutingGeneration, name string) (TaskAlia
 	}
 	target, ok := view.byFold[jsplugin.ASCIIFold(name)]
 	return target, ok
+}
+
+// ResolveTaskModelAliasesForGroups 仅返回指定分组中配置了该映射且绑定插件的渠道。
+func ResolveTaskModelAliasesForGroups(g *jsplugin.RoutingGeneration, name string, groups []string) []TaskChannelAlias {
+	if g == nil || name == "" || len(groups) == 0 {
+		return nil
+	}
+	view := loadFreshTaskAliasView(g)
+	if view == nil {
+		return nil
+	}
+	var matches []TaskChannelAlias
+	seen := make(map[TaskChannelAlias]struct{})
+	for _, group := range groups {
+		for _, target := range view.byGroup[group][jsplugin.ASCIIFold(name)] {
+			if _, exists := seen[target]; !exists {
+				seen[target] = struct{}{}
+				matches = append(matches, target)
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	spelling := ""
+	for _, target := range matches {
+		if target.Alias == name {
+			spelling = name
+			break
+		}
+		if spelling == "" || target.Alias < spelling {
+			spelling = target.Alias
+		}
+	}
+	return slices.DeleteFunc(matches, func(target TaskChannelAlias) bool { return target.Alias != spelling })
 }
 
 func loadFreshTaskAliasView(g *jsplugin.RoutingGeneration) *taskAliasView {
@@ -87,13 +133,14 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 		generation: genNum,
 		expiresAt:  time.Now().Add(taskAliasViewTTL),
 		byFold:     make(map[string]TaskAliasTarget),
+		byGroup:    make(map[string]map[string][]TaskChannelAlias),
 	}
 	if DB == nil {
 		return view
 	}
 
 	var channels []Channel
-	err := DB.Select("id", "type", "models", "model_mapping").
+	err := DB.Select("id", "type", "models", "model_mapping", "group", "setting").
 		Where("status = ?", common.ChannelStatusEnabled).
 		Find(&channels).Error
 	if err != nil {
@@ -104,6 +151,13 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 	drafts := make(map[string]*taskAliasDraft)
 	for i := range channels {
 		channel := &channels[i]
+		var setting kitdto.ChannelSettings
+		if (channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI) && channel.Setting != nil && *channel.Setting != "" {
+			if err := common.UnmarshalJsonStr(*channel.Setting, &setting); err != nil {
+				common.SysError(fmt.Sprintf("task alias view: channel %d has invalid settings", channel.Id))
+				continue
+			}
+		}
 		mappingJSON := channel.GetModelMapping()
 		if mappingJSON == "" || mappingJSON == "{}" {
 			continue
@@ -141,6 +195,28 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 				continue
 			}
 			fold := jsplugin.ASCIIFold(alias)
+			for _, candidate := range generation.PluginsByModel(declared) {
+				bound := false
+				if channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI {
+					bound = setting.BindsTaskPlugin(candidate.Meta.Key)
+				} else if indexed, found := generation.GetByChannelType(channel.Type); found {
+					bound = indexed == candidate
+				}
+				if !bound {
+					continue
+				}
+				for _, group := range channel.GetGroups() {
+					if group == "" {
+						continue
+					}
+					if view.byGroup[group] == nil {
+						view.byGroup[group] = make(map[string][]TaskChannelAlias)
+					}
+					view.byGroup[group][fold] = append(view.byGroup[group][fold], TaskChannelAlias{
+						Alias: alias, Declared: declared, PluginKey: candidate.Meta.Key, ChannelID: channel.Id,
+					})
+				}
+			}
 			draft := drafts[fold]
 			if draft == nil {
 				draft = &taskAliasDraft{byPlugin: make(map[string]map[string]struct{})}

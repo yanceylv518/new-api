@@ -3,6 +3,7 @@ package controller
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -19,8 +20,10 @@ import (
 
 func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	task := &model.Task{
-		TaskID:   "task_public",
-		Platform: "document-parser",
+		TaskID:     "task_public",
+		Platform:   "document-parser",
+		Properties: model.Properties{OriginModelName: "public-model", UpstreamModelName: "real-model"},
+		Data:       []byte(`{"model":"real-model"}`),
 		PrivateData: model.TaskPrivateData{
 			Key:            "channel-secret-canary",
 			UpstreamTaskID: "upstream-private",
@@ -47,6 +50,10 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	userView := tasksToDto([]*model.Task{task}, false, common.RoleCommonUser)[0]
 	assert.Nil(t, userView.AdminInfo)
 	assert.Nil(t, userView.RootInfo)
+	publicJSON, err := common.Marshal(userView)
+	require.NoError(t, err)
+	assert.NotContains(t, string(publicJSON), "real-model")
+	assert.Contains(t, string(publicJSON), "public-model")
 
 	adminView := tasksToDto([]*model.Task{task}, false, common.RoleAdminUser)[0]
 	require.NotNil(t, adminView.AdminInfo)
@@ -61,6 +68,8 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	assert.Equal(t, "/v1/documents", adminView.AdminInfo.RequestPath)
 	assert.Equal(t, []string{"8", "12"}, adminView.AdminInfo.UseChannel)
 	assert.Nil(t, adminView.RootInfo)
+	assert.Equal(t, task.Properties, adminView.Properties)
+	assert.Equal(t, task.Data, adminView.Data)
 
 	rootView := tasksToDto([]*model.Task{task}, false, common.RoleRootUser)[0]
 	require.NotNil(t, rootView.AdminInfo)
@@ -83,6 +92,54 @@ func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	userJSON, err := common.Marshal(userView)
 	require.NoError(t, err)
 	assert.NotContains(t, string(userJSON), "use_channel")
+}
+
+func TestAdapterTaskIdentityIsAdminOnly(t *testing.T) {
+	task := &model.Task{TaskID: "task_public", Platform: "anyllm", PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "anyllm", Name: "Doubao Video（AnyLLM）", Version: "1.1.0"}}}}
+	user := tasksToDto([]*model.Task{task}, false, common.RoleCommonUser)[0]
+	encoded, err := common.Marshal(user)
+	require.NoError(t, err)
+	assert.Equal(t, "doubao", user.Platform)
+	assert.NotContains(t, strings.ToLower(string(encoded)), "anyllm")
+	admin := tasksToDto([]*model.Task{task}, false, common.RoleAdminUser)[0]
+	require.NotNil(t, admin.AdminInfo)
+	require.NotNil(t, admin.AdminInfo.TaskPlugin)
+	assert.Equal(t, "Doubao Video（AnyLLM）", admin.AdminInfo.TaskPlugin.Name)
+}
+
+func TestTaskPublicPlatformFilterIncludesAdapterAndKeepsUserScope(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.Task{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	for _, user := range []int{7, 8} {
+		for _, platform := range []constant.TaskPlatform{"doubao", "anyllm", "hailuo"} {
+			task := &model.Task{UserId: user, Platform: platform, Status: model.TaskStatusSuccess}
+			require.NoError(t, db.Create(task).Error)
+		}
+	}
+	params := model.SyncTaskQueryParams{Platform: "doubao"}
+	rows := model.TaskGetAllUserTask(7, 0, 10, params)
+	require.Len(t, rows, 2)
+	for _, row := range rows {
+		assert.Equal(t, 7, row.UserId)
+		assert.Contains(t, []constant.TaskPlatform{"doubao", "anyllm"}, row.Platform)
+	}
+	assert.EqualValues(t, len(rows), model.TaskCountAllUserTask(7, params))
+	assert.Len(t, model.TaskGetAllUserTask(7, 1, 1, params), 1)
+	assert.EqualValues(t, 4, model.TaskCountAllTasks(params))
+	assert.Len(t, model.TaskGetAllTasks(0, 10, params), 4)
+	params.UserID = "7"
+	assert.Len(t, model.TaskGetAllTasks(0, 10, params), 2)
+	assert.EqualValues(t, 2, model.TaskCountAllTasks(params))
+	params.Platform = "anyllm"
+	assert.Len(t, model.TaskGetAllTasks(0, 10, params), 1)
+	assert.EqualValues(t, 1, model.TaskCountAllTasks(params))
+	assert.Empty(t, model.TaskGetAllUserTask(7, 0, 10, params))
+	assert.Zero(t, model.TaskCountAllUserTask(7, params))
+	params.Platform = "hailuo"
+	assert.Len(t, model.TaskGetAllUserTask(7, 0, 10, params), 1)
+	assert.EqualValues(t, 1, model.TaskCountAllUserTask(7, params))
 }
 
 func TestTaskLogRetryChainSnapshotRoundTrip(t *testing.T) {

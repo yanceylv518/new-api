@@ -64,6 +64,43 @@ export const protocols = {openai_video: {
 }};
 `
 
+func TestTaskManagementUsesChannelHeaderOverrides(t *testing.T) {
+	service.InitHttpClient()
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, "Bearer configured-header", r.Header.Get("Authorization"))
+		assert.Equal(t, "tenant-fixture", r.Header.Get("X-Tenant"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	source := mockPlugin + `
+export function buildTaskActionRequest(ctx) { return {url:ctx.baseUrl+"/delete", method:"DELETE", headers:{Authorization:"Bearer plugin-default"}}; }
+export function buildNativeRequest(ctx) { return {url:ctx.baseUrl+"/resource", method:"POST", headers:{Authorization:"Bearer plugin-default"}}; }
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: upstream.URL, ApiKey: "fixture", HeadersOverride: map[string]any{"Authorization": "Bearer configured-header", "X-Tenant": "tenant-fixture"}}})
+	_, err = adaptor.ExecuteTaskAction(t.Context(), "delete", &model.Task{TaskID: "task-owned"}, upstream.URL, "fixture", "")
+	require.NoError(t, err)
+	_, err = adaptor.ExecuteNativeRequest(t.Context(), pluginruntime.RouteRequestContext{}, "mock-v1", "mock-v1", upstream.URL, "fixture", constant.ChannelTypeTaskPlugin, "")
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+}
+
+func TestTaskAdaptorPreservesPlainTextCompletionUsage(t *testing.T) {
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "fixture", UpstreamModelName: "mock-v1"}, OriginModelName: "mock-v1"})
+	result, err := adaptor.ParseTaskResult(&model.Task{TaskID: "task_text", Properties: model.Properties{OriginModelName: "mock-v1"}}, &http.Response{StatusCode: http.StatusOK}, []byte("completed text response"))
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatusSuccess, result.Status)
+	assert.Equal(t, 23, result.TotalTokens)
+}
+
 // 智能时长须能穿过宿主请求校验，但负计费事实仍拒绝，且上游保留 -1 而预估为正数。
 func TestDoubaoSmartDurationRequestAndBillingBoundaries(t *testing.T) {
 	source, err := plugins.Source("doubao")
@@ -79,9 +116,9 @@ func TestDoubaoSmartDurationRequestAndBillingBoundaries(t *testing.T) {
 			value, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
 			require.NoError(t, err)
 			facts := value.(map[string]any)
-			_, _, err = adaptor.validatedUsageRatios(facts, "doubao-seedance-2-0-oinone")
+			validated, _, err := adaptor.validatedUsageRatios(facts, "doubao-seedance-2-0-oinone")
 			require.NoError(t, err)
-			assert.Greater(t, facts["tokens"].(float64), float64(0))
+			assert.Greater(t, validated["tokens"].(float64), float64(0))
 			built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
 			require.NoError(t, err)
 			assert.EqualValues(t, -1, built.(map[string]any)["body"].(map[string]any)["duration"])
@@ -1111,15 +1148,15 @@ export function extractUsageOnComplete(task, result, body) { return (body || {})
 		usage map[string]any
 	}{
 		{
-			name:  "oversized completion duration is discarded",
+			name:  "oversized completion duration remains pending",
 			usage: map[string]any{"duration": relaycommon.MaxTaskDurationSeconds + 1},
 		},
 		{
-			name:  "oversized completion count is discarded",
+			name:  "oversized completion count remains pending",
 			usage: map[string]any{"count": dto.MaxImageN + 1},
 		},
 		{
-			name:  "completion hook numeric string is discarded",
+			name:  "completion hook numeric string remains pending",
 			usage: map[string]any{"duration": "5"},
 		},
 	} {
@@ -1128,9 +1165,8 @@ export function extractUsageOnComplete(task, result, body) { return (body || {})
 			body, marshalErr := common.Marshal(map[string]any{"completionUsage": testCase.usage})
 			require.NoError(t, marshalErr)
 			result, parseErr := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, body)
-			require.NoError(t, parseErr)
-			assert.Nil(t, result.UsageFacts)
-			assert.Zero(t, result.TotalTokens)
+			require.ErrorContains(t, parseErr, "plugin completion usage invalid")
+			assert.Nil(t, result)
 		})
 	}
 
@@ -1847,11 +1883,12 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 			body, err := common.Marshal(map[string]any{"usage": map[string]any{"units": tc.units, "mode": tc.mode}})
 			require.NoError(t, err)
 			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK}, body)
-			require.NoError(t, err)
 			if tc.accepted {
+				require.NoError(t, err)
 				assert.Equal(t, map[string]any{"units": tc.units, "mode": tc.mode}, result.UsageFacts)
 			} else {
-				assert.Nil(t, result.UsageFacts)
+				require.Error(t, err)
+				assert.Nil(t, result)
 			}
 		}
 	})
@@ -1873,6 +1910,24 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 		assert.Equal(t, 6.0, cost)
 	})
 
+	t.Run("completion hook errors do not block failed tasks", func(t *testing.T) {
+		failedHook := strings.Replace(source, `export function extractUsageOnComplete(ctx,result,body){return body.usage;}`, `export function extractUsageOnComplete(){throw new Error("usage unavailable");}`, 1)
+		for _, status := range []string{"SUCCESS", "FAILURE"} {
+			pluginSource := strings.Replace(failedHook, `export function parseTaskResult(){return {status:"SUCCESS"};}`, `export function parseTaskResult(){return {status:"`+status+`"};}`, 1)
+			plugin, err := pluginruntime.NewRegistry().Register(pluginSource, pluginruntime.Options{})
+			require.NoError(t, err)
+			adaptor := New(plugin)
+			result, err := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK}, []byte(`{}`))
+			if status == "SUCCESS" {
+				require.Error(t, err)
+				assert.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, status, result.Status)
+			}
+		}
+	})
+
 	t.Run("mixed batch selects schema by task rather than adaptor", func(t *testing.T) {
 		adaptor, _, _ := newRequest(t, "public-alias", "image", map[string]any{})
 		tasks := []*model.Task{
@@ -1889,11 +1944,11 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 ]}`)
 		results, err := adaptor.ParseBatchResult(tasks, &http.Response{StatusCode: http.StatusOK}, body)
 		require.NoError(t, err)
-		require.Len(t, results, 4)
-		assert.Nil(t, results["endpoint-image"].TaskInfo.UsageFacts, "endpoint upstream must keep the origin profile's count ceiling")
+		require.Len(t, results, 2)
+		assert.NotContains(t, results, "endpoint-image")
 		assert.Equal(t, map[string]any{"units": 500000.0, "mode": "video"}, results["video-task"].TaskInfo.UsageFacts)
 		assert.Equal(t, map[string]any{"units": 2.0, "mode": "image"}, results["image-task"].TaskInfo.UsageFacts)
-		assert.Nil(t, results["invalid-image"].TaskInfo.UsageFacts)
+		assert.NotContains(t, results, "invalid-image")
 	})
 }
 
@@ -2302,7 +2357,7 @@ func TestTaskAdaptorChainsDoubaoThroughNewAPIUpstream(t *testing.T) {
 	adaptor := New(plugin)
 	const modelName = "doubao-seedance-1-0-pro-250528"
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: modelName},
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL + "/doubao", ApiKey: "sk-gateway", UpstreamModelName: modelName},
 		OriginModelName: modelName,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_local"},
 	}
@@ -2328,7 +2383,7 @@ func TestTaskAdaptorChainsDoubaoThroughNewAPIUpstream(t *testing.T) {
 		Properties:  model.Properties{OriginModelName: modelName, UpstreamModelName: modelName},
 		PrivateData: model.TaskPrivateData{UpstreamTaskID: parsed.UpstreamTaskID},
 	}
-	queryResp, err := adaptor.FetchTask(gateway.URL, "sk-gateway", task, "")
+	queryResp, err := adaptor.FetchTask(gateway.URL+"/doubao", "sk-gateway", task, "")
 	require.NoError(t, err)
 	queryBody, err := io.ReadAll(queryResp.Body)
 	require.NoError(t, err)
@@ -2360,7 +2415,7 @@ func TestTaskAdaptorChainsSunoBatchFetchThroughNewAPIUpstream(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: "suno_music"},
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL + "/suno", ApiKey: "sk-gateway", UpstreamModelName: "suno_music"},
 		OriginModelName: "suno_music",
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_local", Action: "MUSIC"},
 	}
@@ -2386,7 +2441,7 @@ func TestTaskAdaptorChainsSunoBatchFetchThroughNewAPIUpstream(t *testing.T) {
 		Properties:  model.Properties{OriginModelName: "suno_music", UpstreamModelName: "suno_music"},
 		PrivateData: model.TaskPrivateData{UpstreamTaskID: parsed.UpstreamTaskID},
 	}
-	batchResp, err := adaptor.FetchBatchTasks(gateway.URL, "sk-gateway", []*model.Task{task}, "")
+	batchResp, err := adaptor.FetchBatchTasks(gateway.URL+"/suno", "sk-gateway", []*model.Task{task}, "")
 	require.NoError(t, err)
 	batchBody, err := io.ReadAll(batchResp.Body)
 	require.NoError(t, err)

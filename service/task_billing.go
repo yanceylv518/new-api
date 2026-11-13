@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -20,26 +21,17 @@ import (
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
 	tracked := task.PrivateData.InitialAccountingPending
-	if tracked {
-		won, err := model.CommitTaskInitialAccounting(c.Request.Context(), task)
-		if err != nil {
-			logger.LogWarn(c, "initial task accounting is pending: "+err.Error())
-			return
-		}
-		if !won {
-			return
-		}
-	}
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费
-	if common.StringsContains(constant.TaskPricePatches, info.OriginModelName) {
+	if common.StringsContains(constant.TaskPricePatches, info.GetBillingModelName()) {
 		logContent = fmt.Sprintf("%s，按次计费", logContent)
 	} else {
 		var contents []string
@@ -85,7 +77,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	}
 	if snap := info.TieredBillingSnapshot; snap != nil {
 		other.SetPublic("billing_mode", "tiered_expr")
-		other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(snap.ExprString)))
+		other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(billingexpr.PublicExpression(snap.ExprString))))
 		other.SetPublic("matched_tier", snap.EstimatedTier)
 		if len(snap.UsageFacts) > 0 {
 			other.SetPublic("usage_facts", snap.UsageFacts)
@@ -97,7 +89,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	AppendRelayLogAdminInfo(c, info, other)
 	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
-	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
+	params := model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
 		ModelName: info.OriginModelName,
 		TokenName: tokenName,
@@ -106,7 +98,34 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		TokenId:   info.TokenId,
 		Group:     info.UsingGroup,
 		Other:     other,
-	})
+	}
+	if tracked {
+		var initialLog *model.Log
+		if common.LogConsumeEnabled {
+			initialLog = model.BuildConsumeLog(c, info.UserId, params)
+			if initialLog.RequestId == "" {
+				initialLog.RequestId = common.NewRequestId()
+			}
+		}
+		won, err := model.CommitTaskInitialAccounting(c.Request.Context(), task, initialLog)
+		if err != nil {
+			logger.LogWarn(c, "initial task accounting is pending: "+err.Error())
+			return
+		}
+		if !won {
+			return
+		}
+		if initialLog != nil && model.LOG_DB != model.DB {
+			if err := model.DeliverVideoTaskLog(c.Request.Context(), -task.ID); err != nil {
+				logger.LogWarn(c, "initial task log delivery pending: "+err.Error())
+			}
+		}
+		if initialLog != nil && common.DataExportEnabled {
+			model.LogQuotaData(model.QuotaDataLogParams{UserID: info.UserId, Username: initialLog.Username, ModelName: params.ModelName, Quota: params.Quota, CreatedAt: initialLog.CreatedAt, UseGroup: params.Group, TokenID: params.TokenId, ChannelID: params.ChannelId, NodeName: common.NodeName})
+		}
+	} else {
+		model.RecordConsumeLog(c, info.UserId, params)
+	}
 	if !tracked {
 		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
 		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.DiscountAmounts.ChannelQuota(info.PriceData.Quota))
@@ -114,16 +133,51 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 }
 
 func RecoverTaskInitialAccounting(ctx context.Context, task *model.Task) error {
+	if task.PrivateData.SubmissionFunding != nil {
+		won, err := model.PersistTaskSubmission(ctx, task, false)
+		if err != nil {
+			return err
+		}
+		if !won {
+			return fmt.Errorf("task submission changed during funding recovery")
+		}
+	}
 	if !task.PrivateData.InitialAccountingPending {
 		return nil
 	}
-	won, err := model.CommitTaskInitialAccounting(ctx, task)
+	other := taskBillingOther(task)
+	other.SetPublic("is_task", true)
+	var initialLog *model.Log
+	if common.LogConsumeEnabled {
+		var user model.User
+		if err := model.DB.WithContext(ctx).Select("username").Where("id = ?", task.UserId).First(&user).Error; err != nil {
+			return fmt.Errorf("load task accounting owner: %w", err)
+		}
+		tokenName := ""
+		if task.PrivateData.TokenId > 0 {
+			var token model.Token
+			err := model.DB.WithContext(ctx).Select("name").Where("id = ? AND user_id = ?", task.PrivateData.TokenId, task.UserId).First(&token).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("load task accounting token: %w", err)
+			}
+			if err == nil {
+				tokenName = token.Name
+			}
+		}
+		initialLog = &model.Log{UserId: task.UserId, Username: user.Username, CreatedAt: common.GetTimestamp(), Type: model.LogTypeConsume, Content: "task initial accounting recovered", ChannelId: task.ChannelId, ModelName: taskModelName(task), Quota: task.Quota, TokenId: task.PrivateData.TokenId, TokenName: tokenName, Group: task.Group, Other: other.JSONString(), RequestId: common.NewRequestId()}
+	}
+	won, err := model.CommitTaskInitialAccounting(ctx, task, initialLog)
 	if err != nil || !won {
 		return err
 	}
-	other := taskBillingOther(task)
-	other.SetPublic("is_task", true)
-	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{UserId: task.UserId, LogType: model.LogTypeConsume, Content: "task initial accounting recovered", ChannelId: task.ChannelId, ModelName: taskModelName(task), Quota: task.Quota, TokenId: task.PrivateData.TokenId, Group: task.Group, Other: other})
+	// 独立日志库由费用恢复任务投递，轮询只等待主库的原子记账。
+	if initialLog != nil && common.DataExportEnabled {
+		nodeName := task.PrivateData.NodeName
+		if nodeName == "" {
+			nodeName = common.NodeName
+		}
+		model.LogQuotaData(model.QuotaDataLogParams{UserID: task.UserId, Username: initialLog.Username, ModelName: initialLog.ModelName, Quota: task.Quota, CreatedAt: initialLog.CreatedAt, UseGroup: task.Group, TokenID: task.PrivateData.TokenId, ChannelID: task.ChannelId, NodeName: nodeName})
+	}
 	return nil
 }
 
@@ -161,7 +215,7 @@ func taskBillingOther(task *model.Task) *model.LogOther {
 		}
 		if snap := bc.TieredSnapshot; snap != nil {
 			other.SetPublic("billing_mode", "tiered_expr")
-			other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(snap.ExprString)))
+			other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(billingexpr.PublicExpression(snap.ExprString))))
 			other.SetPublic("matched_tier", snap.EstimatedTier)
 			if len(snap.UsageFacts) > 0 {
 				other.SetPublic("usage_facts", snap.UsageFacts)
@@ -486,18 +540,103 @@ func taskQuotaByTokens(task *model.Task, totalTokens int) (int, string, *common.
 	return actualQuota, reason, clamp, types.NewDiscountAmounts(originalQuota, actualQuota), true
 }
 
-// EvaluateTaskCompletionUsage evaluates actual facts against the frozen task
-// expression. It neither mutates the snapshot nor moves funds: synchronous
-// submission and polling have different persistence and settlement barriers.
+var ErrTaskMeasuredUsageUnavailable = errors.New("task measured image usage is unavailable")
+
+func taskImageUsageCount(value any) (int, bool) {
+	var count float64
+	switch number := value.(type) {
+	case int:
+		count = float64(number)
+	case int64:
+		count = float64(number)
+	case float64:
+		count = number
+	default:
+		return 0, false
+	}
+	if math.IsNaN(count) || count < 0 || count > dto.MaxImageN || math.Trunc(count) != count {
+		return 0, false
+	}
+	return int(count), true
+}
+
+// taskCompletionBillingFacts 保留没有有效图片产出数量时的预扣估算。
+func taskCompletionBillingFacts(facts map[string]any) map[string]any {
+	value, exists := facts["image_count"]
+	if !exists {
+		return facts
+	}
+	if count, valid := taskImageUsageCount(value); valid && count >= 1 {
+		return facts
+	}
+	filtered := maps.Clone(facts)
+	delete(filtered, "image_count")
+	return filtered
+}
+
+// validateTaskImageTierUsage 不允许缺失的图片分档沿用非零预算完成结算。
+func validateTaskImageTierUsage(snap *billingexpr.BillingSnapshot, facts map[string]any) error {
+	fields := []string{"images_up_to_1_5k", "images_above_1_5k"}
+	if _, exists := snap.UsageFacts[fields[0]]; !exists {
+		return nil
+	}
+	if _, exists := snap.UsageFacts[fields[1]]; !exists {
+		return nil
+	}
+	keys := billingexpr.UsedUsageKeys(snap.ExprString)
+	if !keys[fields[0]] && !keys[fields[1]] {
+		return nil
+	}
+	total, measured := 0, false
+	for _, field := range fields {
+		value, present := facts[field]
+		if !present {
+			// 单档模型可以省略恒为零的另一档，非零估算必须被实测值替换。
+			if count, valid := taskImageUsageCount(snap.UsageFacts[field]); !valid || count != 0 {
+				return fmt.Errorf("%w: %s", ErrTaskMeasuredUsageUnavailable, field)
+			}
+			continue
+		}
+		count, valid := taskImageUsageCount(value)
+		if !valid {
+			return fmt.Errorf("%w: invalid %s", ErrTaskMeasuredUsageUnavailable, field)
+		}
+		total += count
+		measured = true
+	}
+	if !measured || total < 1 || total > dto.MaxImageN {
+		return ErrTaskMeasuredUsageUnavailable
+	}
+	if value, present := facts["image_count"]; present {
+		if count, valid := taskImageUsageCount(value); !valid || count != total {
+			return fmt.Errorf("%w: image count does not match pixel tiers", ErrTaskMeasuredUsageUnavailable)
+		}
+	}
+	return nil
+}
+
+// EvaluateTaskCompletionUsage 仅计算冻结表达式；持久化和资金操作由各结算入口负责。
 func EvaluateTaskCompletionUsage(snap *billingexpr.BillingSnapshot, facts map[string]any) (billingexpr.TieredResult, map[string]any, error) {
 	if snap == nil {
 		return billingexpr.TieredResult{}, nil, fmt.Errorf("task billing snapshot is missing")
 	}
+	if err := validateTaskImageTierUsage(snap, facts); err != nil {
+		return billingexpr.TieredResult{}, nil, err
+	}
 	usage := make(map[string]any, len(snap.UsageFacts)+len(facts))
 	maps.Copy(usage, snap.UsageFacts)
-	maps.Copy(usage, facts)
-	result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: usage})
-	if err == nil && (result.ActualQuotaBeforeGroup < 0 || math.IsNaN(result.ActualQuotaBeforeGroup)) {
+	maps.Copy(usage, taskCompletionBillingFacts(facts))
+	sealed, err := billingexpr.TaskRequestCiphertext(snap.ExprString, snap.EncryptedRequestContext)
+	if err != nil {
+		return billingexpr.TieredResult{}, nil, err
+	}
+	requestInput, err := billingexpr.RestoreTaskRequest(sealed)
+	if err != nil {
+		return billingexpr.TieredResult{}, nil, fmt.Errorf("restore task billing request: %w", err)
+	}
+	requestInput.Usage = usage
+	result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, billingexpr.TokenParams{}, requestInput)
+	if err == nil && (result.ActualQuotaBeforeGroup < 0 || math.IsNaN(result.ActualQuotaBeforeGroup) || math.IsInf(result.ActualQuotaBeforeGroup, 0)) {
 		err = fmt.Errorf("task completion expression produced an invalid cost")
 	}
 	return result, usage, err

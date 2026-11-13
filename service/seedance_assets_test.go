@@ -25,11 +25,15 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
 	"image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +46,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -57,6 +62,301 @@ type fakePrivateAssetOSSClient struct {
 	deletedKey string
 	putErr     error
 	deleteErr  error
+}
+
+func seedanceAssetTestChannel(t *testing.T, channel *model.Channel) *model.Channel {
+	t.Helper()
+	settings := channel.GetSetting()
+	if settings.SeedanceAssetURL == "" {
+		settings.SeedanceAssetURL = strings.TrimRight(channel.GetBaseURL(), "/")
+		if !strings.HasSuffix(settings.SeedanceAssetURL, "/seedance") {
+			settings.SeedanceAssetURL += "/v2/assets"
+		}
+		encoded, err := common.Marshal(settings)
+		require.NoError(t, err)
+		value := string(encoded)
+		channel.Setting = &value
+	}
+	return channel
+}
+
+func TestSeedanceAssetExplicitURLDoesNotAppendPaths(t *testing.T) {
+	for _, endpoint := range []string{"/", "/api/ark/assets", "/seedance", "/custom/asset-action"} {
+		t.Run(endpoint, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				assert.Equal(t, endpoint, r.URL.Path)
+				assert.Equal(t, "CreateAssetGroup", r.URL.Query().Get("Action"))
+				assert.Equal(t, "2024-01-01", r.URL.Query().Get("Version"))
+				_, _ = io.WriteString(w, `{"Result":{"Id":"group-explicit"}}`)
+			}))
+			defer server.Close()
+			videoBase := server.URL + "/doubao"
+			settings, err := common.Marshal(map[string]string{"seedance_asset_url": server.URL + endpoint})
+			require.NoError(t, err)
+			value := string(settings)
+			channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-key", BaseURL: &videoBase, Setting: &value}
+			client, err := NewSeedanceAssetClient(channel)
+			require.NoError(t, err)
+			var response map[string]any
+			require.NoError(t, client.CreateSeedanceAssetGroup(t.Context(), "test", "AIGC", &response))
+			assert.EqualValues(t, 1, requests.Load())
+			assert.Equal(t, server.URL+"/doubao", channel.GetBaseURL())
+			channel.Setting = nil
+			_, err = NewSeedanceAssetClient(channel)
+			assert.ErrorContains(t, err, "complete Seedance asset service URL")
+			assert.EqualValues(t, 1, requests.Load())
+		})
+	}
+}
+
+func TestSeedanceAssetExplicitURLKeepsExistingAccountBindings(t *testing.T) {
+	for _, base := range []string{"https://provider.example", "https://provider.example/seedance"} {
+		t.Run(base, func(t *testing.T) {
+			channel := seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-key", BaseURL: &base})
+			client, err := NewSeedanceAssetClient(channel)
+			require.NoError(t, err)
+			path := "/v2/assets"
+			if strings.HasSuffix(base, "/seedance") {
+				path = ""
+			}
+			assert.Equal(t, seedanceAssetAccountFingerprint(base, path, client.KeyFingerprint), client.AccountFingerprint)
+		})
+	}
+}
+
+func TestSeedanceJSONActionAssetsUseExplicitEndpointAndIsolateAccounts(t *testing.T) {
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/material", r.URL.Path)
+		assert.Empty(t, r.URL.RawQuery)
+		assert.Equal(t, "Bearer fixture-material-key", r.Header.Get("Authorization"))
+		var body map[string]string
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		actions = append(actions, body["Action"])
+		if body["Name"] == "fail" {
+			_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"NotFound.fixture","Message":"AnyLLM https://private.example/internal"}}}`)
+			return
+		}
+		assert.Equal(t, "preserved", body["Name"])
+		_, _ = io.WriteString(w, `{"Result":{"Id":"asset-fixture","Status":"Active"}}`)
+	}))
+	defer server.Close()
+	base := server.URL + "/api/v1"
+	settings := `{"task_plugin_key":"anyllm","seedance_asset_url":"` + server.URL + `/api/material"}`
+	channel := &model.Channel{Id: 17, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "fixture-material-key", BaseURL: &base, Setting: &settings}
+	client, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	assert.True(t, SupportsSeedanceAssets(channel))
+	assert.False(t, client.SupportsGroupRename())
+	for _, action := range []string{"CreateAssetGroup", "GetAssetGroup", "CreateAsset", "GetAsset", "DeleteAsset", "DeleteAssetGroup", "CreateVisualValidateSession", "GetVisualValidateResult"} {
+		var result seedanceAssetResponse
+		require.NoError(t, client.call(t.Context(), action, map[string]string{"Name": "preserved", "Id": "owned-id"}, &result))
+		assert.Equal(t, "asset-fixture", result.Result.ID)
+	}
+	assert.Len(t, actions, 8)
+	assert.ErrorContains(t, client.UpdateSeedanceAssetGroup(t.Context(), "owned-id", "new name", &struct{}{}), "does not support")
+	assert.Len(t, actions, 8)
+	alias := *channel
+	alias.Id = 18
+	aliasClient, err := NewSeedanceAssetClient(&alias)
+	require.NoError(t, err)
+	assert.Equal(t, client.AccountFingerprint, aliasClient.AccountFingerprint)
+	alias.Key = "fixture-other-material-key"
+	otherKeyClient, err := NewSeedanceAssetClient(&alias)
+	require.NoError(t, err)
+	assert.NotEqual(t, client.AccountFingerprint, otherKeyClient.AccountFingerprint)
+	other := *channel
+	otherSettings := strings.ReplaceAll(settings, `"anyllm"`, `"doubao"`)
+	other.Setting = &otherSettings
+	otherClient, err := NewSeedanceAssetClient(&other)
+	require.NoError(t, err)
+	assert.NotEqual(t, client.AccountFingerprint, otherClient.AccountFingerprint)
+	var rejected seedanceAssetResponse
+	err = client.call(t.Context(), "GetVisualValidateResult", map[string]string{"Name": "fail"}, &rejected)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "AnyLLM")
+	assert.NotContains(t, err.Error(), "private.example")
+	var upstream *seedanceAssetUpstreamError
+	require.ErrorAs(t, err, &upstream)
+	assert.Equal(t, "NotFound.fixture", upstream.code)
+	assert.Equal(t, "GetVisualValidateResult", upstream.action)
+	channel.Setting = nil
+	_, err = NewSeedanceAssetClient(channel)
+	assert.Error(t, err)
+}
+
+func TestSeedanceAssetAccountIdentityUsesMaterialEndpoint(t *testing.T) {
+	const key = "fixture-material-key"
+	for _, plugin := range []string{"doubao", "anyllm"} {
+		for _, endpoint := range []string{"https://provider.example/v2/assets", "https://provider.example/seedance", "https://provider.example/api/material"} {
+			t.Run(plugin+"/"+endpoint, func(t *testing.T) {
+				setting := `{"task_plugin_key":"` + plugin + `","seedance_asset_url":"` + endpoint + `"}`
+				base := "https://provider.example"
+				channel := &model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: key, BaseURL: &base, Setting: &setting}
+				client, err := NewSeedanceAssetClient(channel)
+				require.NoError(t, err)
+				protocol := ""
+				if plugin == "anyllm" {
+					protocol = "json-action"
+				}
+				legacy := seedanceAssetAccountFingerprint(endpoint, protocol, client.KeyFingerprint)
+				for _, videoURL := range []string{base + "/doubao", base + "/api/v1", "https://video.example/custom"} {
+					alias := *channel
+					alias.BaseURL = &videoURL
+					aliasClient, err := NewSeedanceAssetClient(&alias)
+					require.NoError(t, err)
+					assert.Equal(t, client.AccountFingerprint, aliasClient.AccountFingerprint)
+					assert.True(t, model.SeedanceAssetAccountFingerprintMatches(&alias, client.KeyFingerprint, legacy))
+					assert.True(t, aliasClient.matchesAccountFingerprint(legacy))
+					assert.False(t, model.SeedanceAssetAccountFingerprintMatches(&alias, "different-key", legacy))
+				}
+				other := *channel
+				otherSetting := strings.ReplaceAll(setting, endpoint, "https://other.example/material")
+				other.Setting = &otherSetting
+				assert.False(t, model.SeedanceAssetAccountFingerprintMatches(&other, client.KeyFingerprint, legacy))
+				slashSetting := strings.ReplaceAll(setting, endpoint, endpoint+"/")
+				channel.Setting = &slashSetting
+				assert.Equal(t, client.AccountFingerprint, model.SeedanceAssetAccountFingerprint(channel, client.KeyFingerprint))
+				assert.True(t, model.SeedanceAssetAccountFingerprintMatches(channel, client.KeyFingerprint, legacy))
+			})
+		}
+	}
+	assert.Empty(t, model.SeedanceAssetAccountFingerprint(nil, "key"))
+	assert.False(t, model.SeedanceAssetAccountFingerprintMatches(nil, "key", ""))
+}
+
+func TestSeedanceValidationPendingUsesCodesAndPreservesOtherFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, code, message string
+		status              int
+		pending, raw        bool
+	}{
+		{"wrapped NotFound", "NotFound", "Ark rejected the request (NotFound)", 404, true, false},
+		{"localized NotFound", "NotFound", "认证结果暂不可用", 200, true, false},
+		{"request ID suffix", "NotFound.request123", "not ready", 404, true, false},
+		{"legacy embedded code", "", "Volc GetVisualValidateResult failed: NotFound.request123: The specified token Visual Face token is not found.", 500, true, false},
+		{"verification not complete", "OperationConflict", "Real-person verification is not complete", 409, true, false},
+		{"conflict with request ID", "OperationConflict.request123", "not complete", 409, true, false},
+		{"other conflict", "ResourceConflict", "group conflict", 409, false, false},
+		{"invalid operation", "OperationConflict", "invalid operation", 400, false, false},
+		{"forbidden conflict", "OperationConflict", "account rejected", 403, false, false},
+		{"unauthorized conflict", "OperationConflict", "invalid key", 401, false, false},
+		{"expired token", "TokenExpired", "session expired", 400, false, false},
+		{"authorization", "AccessDenied", "account rejected", 403, false, false},
+		{"router JSON 404", "not_found", "no such route", 404, false, false},
+		{"router text 404", "", "404 page not found", 404, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.raw {
+					_, _ = io.WriteString(w, tc.message)
+					return
+				}
+				body, err := common.Marshal(map[string]any{"ResponseMetadata": map[string]any{"Error": map[string]string{"Code": tc.code, "Message": tc.message}}})
+				assert.NoError(t, err)
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+			client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-key", BaseURL: &server.URL}))
+			require.NoError(t, err)
+			_, err = client.GetSeedanceAssetValidationResult(t.Context(), "fixture-validation-token", "")
+			if tc.pending {
+				assert.ErrorIs(t, err, ErrSeedanceAssetValidationPending)
+			} else {
+				assert.Error(t, err)
+				assert.NotErrorIs(t, err, ErrSeedanceAssetValidationPending)
+			}
+			if tc.code == "NotFound" {
+				err = client.DeleteSeedanceAssetGroup(t.Context(), "fixture-group")
+				assert.Error(t, err)
+				assert.NotErrorIs(t, err, ErrSeedanceAssetNotFound)
+			}
+		})
+	}
+}
+
+func TestSeedanceSyncDatabaseFailureStaysScheduled(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.SeedanceAssetGroup{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}))
+	seedUser(t, 941005, 1000)
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(upstream.Close)
+	channel := seedanceAssetTestChannel(t, &model.Channel{Id: 941005, Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "sync-fixture", BaseURL: &upstream.URL, Group: "default", Models: "doubao-seedance-2-0-fast-260128"})
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+	})
+	client, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	group := &model.SeedanceAssetGroup{UserID: 941005, GroupID: "sync-retry-group", Name: "sync retry", Status: "Active"}
+	require.NoError(t, model.DB.Create(group).Error)
+	asset := &model.SeedanceAsset{UserID: 941005, GroupID: group.GroupID, AssetID: "sync-retry-asset", Name: "image", AssetType: "Image", Status: "Active"}
+	require.NoError(t, model.DB.Create(asset).Error)
+	replica := &model.SeedanceAssetReplica{UserID: 941005, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: client.AccountFingerprint, KeyFingerprint: client.KeyFingerprint, Status: "Pending", ProvisionStatus: model.SeedanceAssetReplicaCreating, NextPollAt: common.GetTimestamp() - 1}
+	require.NoError(t, model.DB.Create(replica).Error)
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Delete(replica).Error)
+		require.NoError(t, model.DB.Delete(asset).Error)
+		require.NoError(t, model.DB.Delete(group).Error)
+	})
+	var injected atomic.Bool
+	const callback = "regression:sync-database-error"
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if !tx.DryRun && tx.Statement.Table == "seedance_assets" && injected.CompareAndSwap(false, true) {
+			tx.AddError(&mysqldriver.MySQLError{Number: 1213, Message: "injected asset read failure"})
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callback)) })
+	summary, err := RunSeedanceAssetSynchronizationOnce(t.Context(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Candidates)
+	require.True(t, injected.Load())
+	require.NoError(t, model.DB.First(replica, replica.ID).Error)
+	assert.Greater(t, replica.NextPollAt, common.GetTimestamp())
+	due, err := model.ListDueSeedanceAssetSync(t.Context(), replica.NextPollAt, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	assert.Equal(t, replica.ID, due[0].ID)
+	assert.Zero(t, upstreamHits.Load())
+}
+
+func TestSeedanceAssetTemporaryErrorsPreservePermanentFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		code      string
+		temporary bool
+	}{
+		{408, "", true}, {429, "", true}, {500, "", true}, {502, "", true}, {503, "", true}, {504, "", true},
+		{401, "ServiceUnavailable", false}, {403, "ServiceUnavailable", false},
+		{404, "NotFound", false}, {400, "InvalidParameter", false},
+	} {
+		t.Run(fmt.Sprintf("%d/%s", tc.status, tc.code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"fixture failure"}}`, tc.code)
+			}))
+			defer server.Close()
+			channel := seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-key", BaseURL: &server.URL})
+			client, err := NewSeedanceAssetClient(channel)
+			require.NoError(t, err)
+			_, _, err = client.GetSeedanceAsset(t.Context(), "fixture-asset")
+			require.Error(t, err)
+			assert.Equal(t, tc.temporary, errors.Is(err, ErrSeedanceAssetServiceTemporary))
+			if tc.temporary {
+				assert.Equal(t, ErrSeedanceAssetServiceTemporary.Error(), err.Error())
+			}
+		})
+	}
+	assert.False(t, isSeedanceAssetServiceTemporary(context.Canceled))
+	assert.True(t, isSeedanceAssetServiceTemporary(context.DeadlineExceeded))
 }
 
 func TestDetectSeedanceAssetContentTypeSupportsHEICExtensionFallback(t *testing.T) {
@@ -84,26 +384,26 @@ func TestFindSeedanceAssetChannelSupportsPluginBeyondFirstPage(t *testing.T) {
 	require.NoError(t, db.Create(&channels).Error)
 	disabled := model.Channel{Id: 102, Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "disabled", BaseURL: &baseURL,
 		ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}}}
-	require.NoError(t, db.Create(&disabled).Error)
+	require.NoError(t, db.Create(seedanceAssetTestChannel(t, &disabled)).Error)
 	// 普通方舟文本渠道不具备旧代理的素材 Action 能力，不能抢占真正素材渠道。
 	textChannel := model.Channel{Id: 1, Type: constant.ChannelTypeVolcEngine, Status: common.ChannelStatusEnabled, Key: "fixture", BaseURL: &baseURL}
 	require.NoError(t, db.Create(&textChannel).Error)
 	wanted := model.Channel{Id: 103, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "fixture", BaseURL: &baseURL, Setting: &doubaoPlugin}
-	require.NoError(t, db.Create(&wanted).Error)
+	require.NoError(t, db.Create(seedanceAssetTestChannel(t, &wanted)).Error)
 	channel, err := FindSeedanceAssetChannel()
 	require.NoError(t, err)
 	assert.Equal(t, wanted.Id, channel.Id)
-	_, err = NewSeedanceAssetClient(channel)
+	_, err = NewSeedanceAssetClient(seedanceAssetTestChannel(t, channel))
 	require.NoError(t, err)
-	_, err = NewSeedanceAssetClient(&channels[0])
+	_, err = NewSeedanceAssetClient(seedanceAssetTestChannel(t, &channels[0]))
 	assert.Error(t, err)
 	volcengine := wanted
 	volcengine.Type = constant.ChannelTypeVolcEngine
-	_, err = NewSeedanceAssetClient(&volcengine)
+	_, err = NewSeedanceAssetClient(seedanceAssetTestChannel(t, &volcengine))
 	assert.Error(t, err)
 }
 
-func TestPollingResolvesDisabledSourceChannelToMatchingEnabledAlias(t *testing.T) {
+func TestUnscopedPollingDoesNotUseMatchingEnabledAlias(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
@@ -120,7 +420,7 @@ func TestPollingResolvesDisabledSourceChannelToMatchingEnabledAlias(t *testing.T
 	t.Cleanup(upstream.Close)
 	baseURL, key := upstream.URL, "same-upstream-key"
 	source := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: key, Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
-	sourceClient, err := NewSeedanceAssetClient(source)
+	sourceClient, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, source))
 	require.NoError(t, err)
 	source.Status = common.ChannelStatusManuallyDisabled
 	alias := *source
@@ -140,11 +440,11 @@ func TestPollingResolvesDisabledSourceChannelToMatchingEnabledAlias(t *testing.T
 	assert.Equal(t, alias.Id, client.ChannelID)
 
 	result := pollSeedanceAsset(context.Background(), asset)
-	require.NoError(t, result.err)
+	require.ErrorIs(t, result.err, ErrSeedanceAssetScopeUnavailable)
 	assert.True(t, result.claimed)
-	assert.True(t, result.updated)
+	assert.False(t, result.updated)
 	require.NoError(t, db.First(asset, asset.ID).Error)
-	assert.Equal(t, "Active", asset.Status)
+	assert.Equal(t, "Processing", asset.Status)
 
 	assert.NoError(t, db.Model(&model.Channel{}).Where("id = ?", alias.Id).Update("key", "different-account-key").Error)
 	_, err = ResolveSeedanceAssetClient(context.Background(), source.Id, asset.KeyFingerprint, asset.AccountFingerprint)
@@ -176,7 +476,7 @@ func TestSeedanceAssetClientRejectsRedirectAndRedactsKey(t *testing.T) {
 		_, _ = io.WriteString(w, `{"code":"Forbidden","message":"credential fixture-private-key rejected"}`)
 	}))
 	t.Cleanup(upstream.Close)
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-private-key", BaseURL: &upstream.URL})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fixture-private-key", BaseURL: &upstream.URL}))
 	require.NoError(t, err)
 	_, _, err = client.GetSeedanceAsset(t.Context(), "asset")
 	assert.ErrorContains(t, err, "307")
@@ -197,7 +497,7 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			t.Cleanup(server.Close)
-			client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+			client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 			require.NoError(t, err)
 			assert.ErrorContains(t, client.CreateSeedanceAssetGroup(t.Context(), "group", "LivenessFace", &struct{}{}), "rejected")
 			assert.ErrorContains(t, client.DeleteSeedanceAsset(t.Context(), "asset"), "rejected")
@@ -210,7 +510,7 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 		_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"ResourceNotFound.Asset","Message":"already deleted"}}}`)
 	}))
 	t.Cleanup(server.Close)
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	assert.NoError(t, client.DeleteSeedanceAsset(t.Context(), "asset"))
 	assert.NoError(t, client.DeleteSeedanceAssetGroup(t.Context(), "group"))
@@ -221,7 +521,7 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 		_, _ = io.WriteString(w, `{"code":"NotFound.20260929104047407D4D891C847F1BBB31","message":"resource does not exist"}`)
 	}))
 	t.Cleanup(notFoundServer.Close)
-	notFoundClient, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &notFoundServer.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	notFoundClient, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &notFoundServer.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	assert.NoError(t, notFoundClient.DeleteSeedanceAsset(t.Context(), "asset"))
 	assert.NoError(t, notFoundClient.DeleteSeedanceAssetGroup(t.Context(), "group"))
@@ -230,17 +530,23 @@ func TestSeedanceMutationsValidateBusinessResponses(t *testing.T) {
 	assert.NotErrorIs(t, err, ErrSeedanceAssetNotFound)
 }
 
-// 非 2xx 响应也必须保留上游正文，不能只返回无上下文的状态码。
+// 临时错误向用户显示通用提示，但错误链仍保留可用于诊断的上游状态和正文。
 func TestSeedanceAssetClientPreservesHTTPErrorBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, `{"error":{"code":"upstream_failure","message":"LivenessFace is unavailable","type":"server_error"}}`)
 	}))
 	t.Cleanup(server.Close)
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	err = client.CreateSeedanceAssetGroup(t.Context(), "group", "LivenessFace", &struct{}{})
-	assert.ErrorContains(t, err, "LivenessFace is unavailable")
+	require.ErrorIs(t, err, ErrSeedanceAssetServiceTemporary)
+	assert.Equal(t, ErrSeedanceAssetServiceTemporary.Error(), err.Error())
+	var upstream *seedanceAssetUpstreamError
+	require.ErrorAs(t, err, &upstream)
+	assert.Equal(t, http.StatusInternalServerError, upstream.httpStatus)
+	assert.Equal(t, "upstream_failure", upstream.code)
+	assert.Contains(t, upstream.message, "LivenessFace is unavailable")
 }
 
 func TestSeedanceAssetClientReportsNonJSONResponse(t *testing.T) {
@@ -249,13 +555,14 @@ func TestSeedanceAssetClientReportsNonJSONResponse(t *testing.T) {
 		_, _ = io.WriteString(w, "<!doctype html><html>not api</html>")
 	}))
 	t.Cleanup(server.Close)
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	err = client.CreateSeedanceAssetGroup(t.Context(), "group", "", &struct{}{})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "invalid JSON")
 	assert.ErrorContains(t, err, "content-type text/html")
-	assert.ErrorContains(t, err, "not api")
+	assert.ErrorContains(t, err, "complete asset endpoint")
+	assert.NotContains(t, err.Error(), "<!doctype html>")
 }
 
 // 创建素材组的类型必须进入上游请求，空值则保持上游默认行为。
@@ -270,7 +577,7 @@ func TestCreateSeedanceAssetGroupForwardsGroupType(t *testing.T) {
 		_, _ = io.WriteString(w, `{"Result":{"Id":"group-created"}}`)
 	}))
 	t.Cleanup(server.Close)
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	var response struct {
 		Result struct {
@@ -307,13 +614,15 @@ func TestSeedanceAssetValidationActionsUseOfficialPayloads(t *testing.T) {
 			assert.Equal(t, "validation-token", body["BytedToken"])
 			assert.Equal(t, "project-a", body["ProjectName"])
 			_, _ = io.WriteString(w, `{"Result":{"GroupId":"group-liveness"}}`)
+		case "GetAssetGroup":
+			_, _ = io.WriteString(w, `{"Result":{"Id":"group-liveness","GroupType":"LivenessFace","Status":"Active"}}`)
 		default:
 			t.Fatalf("unexpected action %q", action)
 		}
 	}))
 	t.Cleanup(server.Close)
 	baseURL := server.URL + "/seedance"
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	created, err := client.CreateSeedanceAssetValidationSession(t.Context(), "https://example.com/callback", "project-a")
 	require.NoError(t, err)
@@ -325,7 +634,7 @@ func TestSeedanceAssetValidationActionsUseOfficialPayloads(t *testing.T) {
 
 	expectedPath = "/v2/assets"
 	rootURL := server.URL
-	rootClient, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &rootURL, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	rootClient, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &rootURL, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	_, err = rootClient.CreateSeedanceAssetValidationSession(t.Context(), "https://example.com/callback", "project-a")
 	require.NoError(t, err)
@@ -385,16 +694,14 @@ func TestSeedanceValidationFallsBackToSupportedChannelAndKeepsEarlyNotFoundPendi
 	t.Setenv("CRYPTO_SECRET", "validation-channel-fallback-test-secret")
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
 	unsupportedURL, selectedURL := unsupportedServer.URL, selectedServer.URL
-	require.NoError(t, db.Create([]*model.Channel{
-		{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &unsupportedURL, Status: common.ChannelStatusEnabled},
-		{Id: 12, Type: constant.ChannelTypeDoubaoVideo, Key: "selected-key", BaseURL: &selectedURL, Status: common.ChannelStatusEnabled},
-	}).Error)
+	channels := []*model.Channel{
+		seedanceAssetTestChannel(t, &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &unsupportedURL, Status: common.ChannelStatusEnabled}),
+		seedanceAssetTestChannel(t, &model.Channel{Id: 12, Type: constant.ChannelTypeDoubaoVideo, Key: "selected-key", BaseURL: &selectedURL, Status: common.ChannelStatusEnabled}),
+	}
+	require.NoError(t, db.Create(channels).Error)
 
 	started, err := StartSeedanceAssetValidationSessionWithFallback(t.Context(), 9,
-		[]*model.Channel{
-			{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "unsupported-key", BaseURL: &unsupportedURL, Status: common.ChannelStatusEnabled},
-			{Id: 12, Type: constant.ChannelTypeDoubaoVideo, Key: "selected-key", BaseURL: &selectedURL, Status: common.ChannelStatusEnabled},
-		}, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
+		channels, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
 	require.NoError(t, err)
 	var session model.SeedanceAssetValidationSession
 	require.NoError(t, db.First(&session, started.Session.ID).Error)
@@ -513,6 +820,8 @@ func TestSeedanceValidationKeepsCiphertextWhenConfiguredSecretIsUnavailable(t *t
 		case "GetVisualValidateResult":
 			resultCalls.Add(1)
 			_, _ = io.WriteString(w, `{"Result":{"GroupId":"retry-group"}}`)
+		case "GetAssetGroup":
+			_, _ = io.WriteString(w, `{"Result":{"Id":"retry-group","GroupType":"LivenessFace","Status":"Active"}}`)
 		default:
 			t.Errorf("unexpected action %q", r.URL.Query().Get("Action"))
 		}
@@ -528,7 +837,7 @@ func TestSeedanceValidationKeepsCiphertextWhenConfiguredSecretIsUnavailable(t *t
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}))
 	baseURL := server.URL
 	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(seedanceAssetTestChannel(t, channel)).Error)
 	started, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "真人认证组"}, "", "https://example.com/callback")
 	require.NoError(t, err)
 
@@ -551,21 +860,30 @@ func TestSeedanceValidationKeepsCiphertextWhenConfiguredSecretIsUnavailable(t *t
 	assert.EqualValues(t, 1, resultCalls.Load())
 }
 
-func TestSeedanceValidationCleansUpUpstreamGroupWhenLocalPublishConflicts(t *testing.T) {
+func TestSeedanceValidationAllowsExistingGroupName(t *testing.T) {
 	previousDB := model.DB
 	previousCryptoSecret := common.CryptoSecret
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	var dialector gorm.Dialector = sqlite.Open(":memory:")
+	if dsn := os.Getenv("TASK_PLUGIN_TEST_MYSQL_DSN"); dsn != "" {
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("TASK_PLUGIN_TEST_POSTGRES_DSN"); dsn != "" {
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("sv%d_", time.Now().UnixNano())}})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	var deleteCalls atomic.Int32
+	var validationCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("Action") {
 		case "CreateVisualValidateSession":
-			_, _ = io.WriteString(w, `{"Result":{"BytedToken":"validation-token","H5Link":"https://example.com/validate"}}`)
+			_, _ = fmt.Fprintf(w, `{"Result":{"BytedToken":"validation-token-%d","H5Link":"https://example.com/validate"}}`, validationCalls.Add(1))
 		case "GetVisualValidateResult":
-			_, _ = io.WriteString(w, `{"Result":{"GroupId":"upstream-liveness"}}`)
+			_, _ = fmt.Fprintf(w, `{"Result":{"GroupId":"upstream-liveness-%d"}}`, validationCalls.Load())
+		case "GetAssetGroup":
+			_, _ = io.WriteString(w, `{"Result":{"Id":"upstream-liveness","GroupType":"LivenessFace","Status":"Active"}}`)
 		case "DeleteAssetGroup":
 			deleteCalls.Add(1)
 			_, _ = io.WriteString(w, `{}`)
@@ -577,6 +895,7 @@ func TestSeedanceValidationCleansUpUpstreamGroupWhenLocalPublishConflicts(t *tes
 		model.DB = previousDB
 		common.CryptoSecret = previousCryptoSecret
 		server.Close()
+		assert.NoError(t, db.Migrator().DropTable(&model.SeedanceAssetValidationSession{}, &model.SeedanceAssetGroup{}, &model.Channel{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}))
 		_ = sqlDB.Close()
 	})
 	model.DB = db
@@ -584,20 +903,41 @@ func TestSeedanceValidationCleansUpUpstreamGroupWhenLocalPublishConflicts(t *tes
 	t.Setenv("CRYPTO_SECRET", "validation-cleanup-test-secret")
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetValidationSession{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}))
 	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, Key: "fixture-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(seedanceAssetTestChannel(t, channel)).Error)
 
 	start, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "重复名称"}, "", "https://example.com/callback")
 	require.NoError(t, err)
 	conflictingGroup := &model.SeedanceAssetGroup{UserID: 9, ChannelID: 1, GroupID: "existing-group", Name: "重复名称"}
 	require.NoError(t, db.Create(conflictingGroup).Error)
 
-	_, err = RefreshSeedanceAssetValidationSession(t.Context(), 9, start.Session.ID)
-	assert.ErrorIs(t, err, model.ErrSeedanceAssetValidationNameExists)
-	assert.EqualValues(t, 1, deleteCalls.Load())
+	completed, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, start.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusSucceeded, completed.Status)
+	assert.NotEqual(t, conflictingGroup.ID, completed.LocalGroupID)
+	assert.Zero(t, deleteCalls.Load())
+	var groups []model.SeedanceAssetGroup
+	require.NoError(t, db.Where("user_id = ? AND name = ?", 9, "重复名称").Find(&groups).Error)
+	assert.Len(t, groups, 2)
 	var session model.SeedanceAssetValidationSession
 	require.NoError(t, db.First(&session, start.Session.ID).Error)
-	assert.Equal(t, model.SeedanceAssetValidationStatusFailed, session.Status)
+	assert.Equal(t, model.SeedanceAssetValidationStatusSucceeded, session.Status)
 	assert.Empty(t, session.BytedTokenCiphertext)
+
+	failed, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "另一个素材组"}, "", "https://example.com/callback")
+	require.NoError(t, err)
+	const rejectPublish = "test:reject-validation-group-publish"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(rejectPublish, func(tx *gorm.DB) {
+		if tx.Statement.Table == db.NamingStrategy.TableName("SeedanceAssetGroup") {
+			tx.AddError(errors.New("fixture group persistence failure"))
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Create().Remove(rejectPublish)) })
+	_, err = RefreshSeedanceAssetValidationSession(t.Context(), 9, failed.Session.ID)
+	require.ErrorContains(t, err, "fixture group persistence failure")
+	assert.EqualValues(t, 1, deleteCalls.Load())
+	var failedSession model.SeedanceAssetValidationSession
+	require.NoError(t, db.First(&failedSession, failed.Session.ID).Error)
+	assert.Equal(t, model.SeedanceAssetValidationStatusFailed, failedSession.Status)
 }
 
 type seedanceDeadlineTransport struct {
@@ -620,7 +960,7 @@ func TestSeedanceProxyRequestHasIndependentDeadline(t *testing.T) {
 	proxyClient.Transport, proxyClient.Timeout = transport, 0
 	t.Cleanup(func() { proxyClient.Transport, proxyClient.Timeout = previousTransport, previousTimeout })
 	baseURL, settings := "https://example.test", `{"proxy":"http://127.0.0.1:9878"}`
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Setting: &settings, Key: "fixture-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Setting: &settings, Key: "fixture-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	_, _, err = client.GetSeedanceAsset(t.Context(), "asset")
 	require.NoError(t, err)
@@ -638,7 +978,7 @@ func TestSeedanceClientBindsSelectedAccountAcrossKeyReordering(t *testing.T) {
 	t.Cleanup(server.Close)
 	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &server.URL, Key: "disabled-key\nselected-key", Status: common.ChannelStatusEnabled,
 		ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}}}
-	client, err := NewSeedanceAssetClient(channel)
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, channel))
 	require.NoError(t, err)
 	_, _, err = client.GetSeedanceAsset(t.Context(), "asset")
 	require.NoError(t, err)
@@ -746,7 +1086,7 @@ func TestSeedanceAssetClientUsesDocumentedIDFields(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	baseURL := server.URL
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 
 	status, previewURL, err := client.GetSeedanceAsset(context.Background(), "asset-1")
@@ -776,7 +1116,7 @@ func TestRollbackSeedanceAssetCleansUpRemoteAndObject(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	baseURL := server.URL
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	objectKey := "private-assets/users/42/2026/09/07/asset.png"
 	require.NoError(t, RollbackSeedanceAsset(context.Background(), client, "asset-rollback", objectKey))
@@ -792,7 +1132,7 @@ func TestSeedanceAssetClientExtractsWrappedMediaResult(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	baseURL := server.URL
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 
 	status, previewURL, err := client.GetSeedanceAsset(context.Background(), "asset-wrapped")
@@ -810,7 +1150,7 @@ func TestSeedanceAssetClientReturnsBusinessError(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	baseURL := server.URL
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	_, _, err = client.GetSeedanceAsset(context.Background(), "asset-failed")
 	require.EqualError(t, err, "seedance asset API request failed: 素材尚未同步到可用账号，请稍后重试")
@@ -829,7 +1169,7 @@ func TestSeedanceAssetClientHonorsContextCancellation(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	baseURL := server.URL
-	client, err := NewSeedanceAssetClient(&model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled})
+	client, err := NewSeedanceAssetClient(seedanceAssetTestChannel(t, &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: "test-key", Status: common.ChannelStatusEnabled}))
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
@@ -874,8 +1214,8 @@ func TestSeedanceAssetPollingReportsCancellation(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
-// 后台轮询必须把审核终态写回本地，并在终态后停止下一轮调度。
-func TestRunSeedanceAssetPollingOnceUpdatesTerminalAsset(t *testing.T) {
+// 缺少原始授权范围时，后台轮询不能访问来源不明的账号。
+func TestRunSeedanceAssetPollingOnceDefersUnscopedAsset(t *testing.T) {
 	previousDB := model.DB
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -898,8 +1238,8 @@ func TestRunSeedanceAssetPollingOnceUpdatesTerminalAsset(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	baseURL := server.URL
-	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Id: 902, Key: "test-key", BaseURL: &baseURL}
-	require.NoError(t, db.Create(channel).Error)
+	channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, Id: 902, Key: "test-key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(seedanceAssetTestChannel(t, channel)).Error)
 	asset := &model.SeedanceAsset{
 		UserID: 1, ChannelID: channel.Id, GroupID: "group-1", AssetID: "asset-poll-1",
 		Name: "clip.mp4", AssetType: "Video", Status: "Processing",
@@ -909,14 +1249,16 @@ func TestRunSeedanceAssetPollingOnceUpdatesTerminalAsset(t *testing.T) {
 	summary, err := RunSeedanceAssetPollingOnce(context.Background(), nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, summary.Candidates)
-	require.Equal(t, 1, summary.Updated)
+	require.Zero(t, summary.Updated)
+	require.Equal(t, 1, summary.RetryScheduled)
+	require.Equal(t, 1, summary.Errors)
 
 	var current model.SeedanceAsset
 	require.NoError(t, db.First(&current, asset.ID).Error)
-	require.Equal(t, "Active", current.Status)
-	require.Equal(t, "GetAsset", upstreamAction)
-	require.Zero(t, current.PollAttempts)
-	require.Zero(t, current.NextPollAt)
+	require.Equal(t, "Processing", current.Status)
+	require.Empty(t, upstreamAction)
+	require.Positive(t, current.PollAttempts)
+	require.Positive(t, current.NextPollAt)
 	require.Zero(t, current.PollLeaseUntil)
 }
 
@@ -943,6 +1285,32 @@ func TestStoreSeedanceAssetUploadPersistsInOSSUntilDeleted(t *testing.T) {
 
 	require.NoError(t, RemoveSeedanceAssetObject(context.Background(), upload.ObjectKey))
 	require.Equal(t, upload.ObjectKey, client.deletedKey)
+}
+
+func TestSeedanceAssetUploadUsesConfiguredFileLimits(t *testing.T) {
+	previous := common.GetManagementRateLimits()
+	t.Cleanup(func() {
+		encoded, err := common.Marshal(previous)
+		require.NoError(t, err)
+		require.NoError(t, common.LoadManagementRateLimits(string(encoded)))
+	})
+	settings := previous
+	settings.AssetLimits.ImageMiB = 1
+	settings.AssetLimits.VideoMiB = 2
+	settings.AssetLimits.AudioMiB = 3
+	settings.AssetLimits.CompatImageMiB = 4
+	encoded, err := common.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, common.LoadManagementRateLimits(string(encoded)))
+	assert.EqualValues(t, 1<<20, SeedanceAssetMaxUploadSize("Image"))
+	assert.EqualValues(t, 2<<20, SeedanceAssetMaxUploadSize("Video"))
+	assert.EqualValues(t, 3<<20, SeedanceAssetMaxUploadSize("Audio"))
+	assert.EqualValues(t, 4<<20, SeedanceAssetMaxMultipartBodySize())
+	assert.EqualValues(t, 5<<20, SeedanceCompatMaxMultipartBodySize())
+	_, err = StoreSeedanceAssetUpload(t.Context(), bytes.NewReader(nil), "image.png", "image/png", "Image", (1<<20)+1, 1)
+	require.ErrorContains(t, err, "1 MB upload limit")
+	_, err = StoreSeedanceCompatImageUpload(t.Context(), bytes.NewReader(nil), "image.png", "image/png", (4<<20)+1, 1)
+	require.ErrorContains(t, err, "4 MB upload limit")
 }
 
 // 可定位的视频流应直接写入 OSS，避免先复制到第二份临时文件。
@@ -1014,7 +1382,7 @@ func TestStoreSeedanceAssetUploadNormalizesProgressiveJPEG(t *testing.T) {
 	client := useFakePrivateAssetOSSStorage(t)
 	progressiveJPEG, err := base64.StdEncoding.DecodeString("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCAAIAAgDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAT/xAAUAQEAAAAAAAAAAAAAAAAAAAAH/9oADAMBAAIQAxAAAAGEKhf/AP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8hf//aAAwDAQACAAMAAAAQ8//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Qf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Qf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8Qf//Z")
 	require.NoError(t, err)
-	progressive, err := isProgressiveJPEG(progressiveJPEG)
+	progressive, err := isProgressiveJPEG(bytes.NewReader(progressiveJPEG))
 	require.NoError(t, err)
 	require.True(t, progressive)
 
@@ -1028,7 +1396,7 @@ func TestStoreSeedanceAssetUploadNormalizesProgressiveJPEG(t *testing.T) {
 		1,
 	)
 	require.NoError(t, err)
-	progressive, err = isProgressiveJPEG(client.putBody)
+	progressive, err = isProgressiveJPEG(bytes.NewReader(client.putBody))
 	require.NoError(t, err)
 	require.False(t, progressive)
 	decoded, err := jpeg.Decode(bytes.NewReader(client.putBody))
@@ -1036,6 +1404,70 @@ func TestStoreSeedanceAssetUploadNormalizesProgressiveJPEG(t *testing.T) {
 	require.Equal(t, 8, decoded.Bounds().Dx())
 	require.Equal(t, 8, decoded.Bounds().Dy())
 	require.Equal(t, int64(len(client.putBody)), upload.Size)
+}
+
+func TestSeedanceImageNormalizationDoesNotLoadNonJPEGIntoMemory(t *testing.T) {
+	const size = 30 << 20
+	path := filepath.Join(t.TempDir(), "large.png")
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = file.Write([]byte{137, 80, 78, 71, 13, 10, 26, 10})
+	require.NoError(t, err)
+	require.NoError(t, file.Truncate(size))
+	require.NoError(t, file.Close())
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	written, err := normalizeSeedanceProgressiveJPEG(t.Context(), path, size)
+	runtime.ReadMemStats(&after)
+	require.NoError(t, err)
+	assert.EqualValues(t, size, written)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(4<<20))
+}
+
+func TestSeedanceProgressiveJPEGMarkerParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		data        []byte
+		progressive bool
+		invalid     bool
+	}{
+		{"non JPEG", []byte{0x89, 'P', 'N', 'G'}, false, false},
+		{"progressive after segment", []byte{0xff, 0xd8, 0xff, 0xe0, 0, 4, 1, 2, 0xff, 0xc2}, true, false},
+		{"baseline before scan", []byte{0xff, 0xd8, 0xff, 0xc0, 0, 2, 0xff, 0xda}, false, false},
+		{"truncated segment", []byte{0xff, 0xd8, 0xff, 0xe0, 0, 4, 1}, false, true},
+		{"invalid marker", []byte{0xff, 0xd8, 1}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			progressive, err := isProgressiveJPEG(bytes.NewReader(tc.data))
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.progressive, progressive)
+		})
+	}
+}
+
+func TestSeedanceImageValidationCancelsWhileDecodeSlotsAreBusy(t *testing.T) {
+	config := image.Config{Width: 1, Height: 1}
+	first, err := acquireSeedanceImageDecode(t.Context(), config)
+	require.NoError(t, err)
+	first = sync.OnceFunc(first)
+	defer first()
+	second, err := acquireSeedanceImageDecode(t.Context(), config)
+	require.NoError(t, err)
+	second = sync.OnceFunc(second)
+	defer second()
+	var input bytes.Buffer
+	require.NoError(t, png.Encode(&input, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, ValidateSeedanceCompatImage(ctx, bytes.NewReader(input.Bytes())), context.Canceled)
+	first()
+	second()
+	require.NoError(t, ValidateSeedanceCompatImage(t.Context(), bytes.NewReader(input.Bytes())))
 }
 
 func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T) {
@@ -1097,6 +1529,9 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 			return
 		}
 		action := request.URL.Query().Get("Action")
+		if action == "" {
+			action = payload["Action"]
+		}
 		apiKey := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
 		actions = append(actions, apiKey+":"+action)
 		writer.Header().Set("Content-Type", "application/json")
@@ -1125,7 +1560,7 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 
 	newClient := func(id int, key string) *SeedanceAssetClient {
 		channel := &model.Channel{Id: id, Type: constant.ChannelTypeDoubaoVideo, Key: key, Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
-		client, clientErr := NewSeedanceAssetClientForSelectedKey(channel, key)
+		client, clientErr := NewSeedanceAssetClientForSelectedKey(seedanceAssetTestChannel(t, channel), key)
 		require.NoError(t, clientErr)
 		return client
 	}
@@ -1163,9 +1598,10 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	assert.Equal(t, clientAAlias.ChannelID, replica.ChannelID)
 	assert.Equal(t, 4, len(actions), "reusing an account alias must not import the asset again")
 
+	jsonSetting := `{"task_plugin_key":"anyllm","seedance_asset_url":"` + otherServer.URL + `/api/material"}`
 	clientB, err := NewSeedanceAssetClientForSelectedKey(&model.Channel{
-		Id: 22, Type: constant.ChannelTypeDoubaoVideo, Key: "key-b",
-		Status: common.ChannelStatusEnabled, BaseURL: &otherServer.URL,
+		Id: 22, Type: constant.ChannelTypeTaskPlugin, Key: "key-b",
+		Status: common.ChannelStatusEnabled, BaseURL: &otherServer.URL, Setting: &jsonSetting,
 	}, "key-b")
 	require.NoError(t, err)
 	otherMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientB, []string{asset.AssetID})
@@ -1175,6 +1611,29 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	require.Len(t, sourceURLs, 2)
 	assert.Equal(t, "https://signed.example/"+asset.ObjectKey, sourceURLs[0])
 	assert.Equal(t, sourceURLs[0], sourceURLs[1])
+	group.Name = "Renamed originals"
+	require.NoError(t, db.Model(group).Update("name", group.Name).Error)
+	actionsBeforeRename := len(actions)
+	renamedMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientB, []string{asset.AssetID})
+	require.NoError(t, err)
+	assert.Equal(t, otherMapping, renamedMapping)
+	assert.Len(t, actions, actionsBeforeRename, "JSON material APIs without group rename must reuse existing replicas")
+	var renamedReplica model.SeedanceAssetGroupReplica
+	require.NoError(t, db.Where("local_group_id = ? AND account_fingerprint = ?", group.ID, clientB.AccountFingerprint).First(&renamedReplica).Error)
+	assert.Equal(t, group.Name, renamedReplica.GroupName)
+
+	legacyFingerprint := seedanceAssetAccountFingerprint(server.URL+"/v2/assets", "", clientA.KeyFingerprint)
+	require.NoError(t, db.Model(&model.SeedanceAssetGroupReplica{}).Where("id = ?", groupReplica.ID).
+		Updates(map[string]any{"account_fingerprint": legacyFingerprint, "group_name": group.Name}).Error)
+	require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("id = ?", replica.ID).Update("account_fingerprint", legacyFingerprint).Error)
+	videoAliasURL := server.URL + "/doubao"
+	aliasSettings := `{"seedance_asset_url":"` + server.URL + `/v2/assets"}`
+	legacyAlias, err := NewSeedanceAssetClient(&model.Channel{Id: 24, Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "key-a", BaseURL: &videoAliasURL, Setting: &aliasSettings})
+	require.NoError(t, err)
+	legacyMapping, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, legacyAlias, []string{asset.AssetID})
+	require.NoError(t, err)
+	assert.Equal(t, mapping, legacyMapping)
+	assert.Len(t, actions, actionsBeforeRename, "legacy fingerprints must reuse stored replicas without reimport")
 
 	primaryClient := newClient(31, "primary-key")
 	primaryGroup := &model.SeedanceAssetGroup{
@@ -1362,7 +1821,7 @@ func TestMapSeedanceAssetsToSelectedAccountHandlesMultipleAssetsInOneRequest(t *
 		}
 	}))
 	t.Cleanup(server.Close)
-	channel := &model.Channel{Id: 43, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key", Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
+	channel := seedanceAssetTestChannel(t, &model.Channel{Id: 43, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key", Status: common.ChannelStatusEnabled, BaseURL: &server.URL})
 	client, err := NewSeedanceAssetClientForSelectedKey(channel, channel.Key)
 	require.NoError(t, err)
 
@@ -1395,7 +1854,7 @@ func TestMapSeedanceAssetsToSelectedAccountHandlesMultipleAssetsInOneRequest(t *
 	assert.EqualValues(t, 1, ossClientBuilds.Load())
 	assert.Zero(t, systemTaskQueries.Load())
 
-	pendingChannel := &model.Channel{Id: 44, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key-pending", Status: common.ChannelStatusEnabled, BaseURL: &server.URL}
+	pendingChannel := seedanceAssetTestChannel(t, &model.Channel{Id: 44, Type: constant.ChannelTypeDoubaoVideo, Key: "multi-key-pending", Status: common.ChannelStatusEnabled, BaseURL: &server.URL})
 	pendingClient, err := NewSeedanceAssetClientForSelectedKey(pendingChannel, pendingChannel.Key)
 	require.NoError(t, err)
 	_, err = MapSeedanceAssetsToAccount(ctx, group.UserID, pendingClient, assetIDs)
@@ -1540,7 +1999,7 @@ func TestSeedanceAssetReplicaBurstIsStableUnderConcurrentLoad(t *testing.T) {
 			Id: index + 100, Type: constant.ChannelTypeDoubaoVideo, Key: key,
 			Status: common.ChannelStatusEnabled, BaseURL: &upstream.URL,
 		}
-		clients[index], err = NewSeedanceAssetClientForSelectedKey(channel, key)
+		clients[index], err = NewSeedanceAssetClientForSelectedKey(seedanceAssetTestChannel(t, channel), key)
 		require.NoError(t, err)
 	}
 

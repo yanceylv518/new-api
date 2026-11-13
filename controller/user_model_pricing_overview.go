@@ -48,7 +48,7 @@ func GetUserModelPricingOverview(c *gin.Context) {
 			Role:   roleFilter,
 			Status: c.Query("status"),
 		},
-		c.Query("summary") == "true",
+		true,
 	)
 	if err != nil {
 		common.ApiError(c, err)

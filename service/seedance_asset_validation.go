@@ -29,6 +29,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -44,11 +45,16 @@ import (
 
 const (
 	seedanceAssetValidationSessionTTL       = 30 * time.Minute
-	seedanceAssetValidationLease            = 30 * time.Second
+	seedanceAssetValidationLease            = 2*seedanceAssetRequestTimeout + 15*time.Second
+	seedanceAssetValidationFinalizeTimeout  = 10 * time.Second
+	seedanceAssetValidationPollBase         = 15 * time.Second
+	seedanceAssetValidationPollMax          = time.Minute
+	seedanceAssetValidationPollJitter       = 11
 	seedanceValidationCipherVersion         = "v1"
 	seedanceAssetValidationProjectNameLimit = 191
 	seedanceAssetValidationDescriptionLimit = 1024
 	seedanceAssetValidationTagsLimit        = 512
+	seedanceAssetValidationRetryMarker      = "validation_status_check_retrying"
 )
 
 var (
@@ -65,44 +71,57 @@ type SeedanceAssetValidationStart struct {
 	LaunchURL  string
 }
 
+type seedanceAssetValidationUpstream struct {
+	BytedToken string
+	H5Link     string
+}
+
 type SeedanceAssetValidationGroupDetails struct {
 	Name        string
 	Description string
 	Tags        string
+	CallbackURL string
 }
 
 type SeedanceAssetValidationSessionView struct {
-	ID           uint   `json:"id"`
-	Status       string `json:"status"`
-	Name         string `json:"name"`
-	Description  string `json:"description,omitempty"`
-	Tags         string `json:"tags,omitempty"`
-	LaunchURL    string `json:"launch_url,omitempty"`
-	ExpiresAt    int64  `json:"expires_at"`
-	GroupID      string `json:"group_id,omitempty"`
-	LocalGroupID uint   `json:"local_group_id,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
-	CreatedAt    int64  `json:"created_at"`
-	UpdatedAt    int64  `json:"updated_at"`
+	ID                  uint   `json:"id"`
+	Status              string `json:"status"`
+	Name                string `json:"name"`
+	Description         string `json:"description,omitempty"`
+	Tags                string `json:"tags,omitempty"`
+	LaunchURL           string `json:"launch_url,omitempty"`
+	ExpiresAt           int64  `json:"expires_at"`
+	GroupID             string `json:"group_id,omitempty"`
+	LocalGroupID        uint   `json:"local_group_id,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+	StatusCheckRetrying bool   `json:"status_check_retrying,omitempty"`
+	CreatedAt           int64  `json:"created_at"`
+	UpdatedAt           int64  `json:"updated_at"`
 }
 
 func BuildSeedanceAssetValidationSessionView(session *model.SeedanceAssetValidationSession) SeedanceAssetValidationSessionView {
 	if session == nil {
 		return SeedanceAssetValidationSessionView{}
 	}
+	lastError := session.LastError
+	retrying := lastError == seedanceAssetValidationRetryMarker
+	if retrying {
+		lastError = ""
+	}
 	return SeedanceAssetValidationSessionView{
-		ID:           session.ID,
-		Status:       session.Status,
-		Name:         session.Name,
-		Description:  session.Description,
-		Tags:         session.Tags,
-		LaunchURL:    session.LaunchURL,
-		ExpiresAt:    session.ExpiresAt,
-		GroupID:      session.UpstreamGroupID,
-		LocalGroupID: session.LocalGroupID,
-		LastError:    session.LastError,
-		CreatedAt:    session.CreatedAt.Unix(),
-		UpdatedAt:    session.UpdatedAt.Unix(),
+		ID:                  session.ID,
+		Status:              session.Status,
+		Name:                session.Name,
+		Description:         session.Description,
+		Tags:                session.Tags,
+		LaunchURL:           session.LaunchURL,
+		ExpiresAt:           session.ExpiresAt,
+		GroupID:             session.UpstreamGroupID,
+		LocalGroupID:        session.LocalGroupID,
+		LastError:           lastError,
+		StatusCheckRetrying: retrying && session.Status == model.SeedanceAssetValidationStatusPending,
+		CreatedAt:           session.CreatedAt.Unix(),
+		UpdatedAt:           session.UpdatedAt.Unix(),
 	}
 }
 
@@ -230,7 +249,7 @@ func seedanceAssetValidationBaseURL() (string, error) {
 		base = strings.TrimSpace(system_setting.ServerAddress)
 	}
 	if err := ValidateSeedanceAssetValidationCallbackURL(base); err != nil {
-		return "", fmt.Errorf("configure ServerAddress or TaskPublicAddress, or provide callback_url: %w", err)
+		return "", fmt.Errorf("configure ServerAddress or TaskPublicAddress: %w", err)
 	}
 	parsed, err := url.Parse(base)
 	if err != nil {
@@ -288,6 +307,7 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 	details.Name = strings.TrimSpace(details.Name)
 	details.Description = strings.TrimSpace(details.Description)
 	details.Tags = strings.TrimSpace(details.Tags)
+	details.CallbackURL = strings.TrimSpace(details.CallbackURL)
 	if utf8.RuneCountInString(details.Name) > 64 {
 		return nil, errors.New("validation group name is too long")
 	}
@@ -296,6 +316,15 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 	}
 	if utf8.RuneCountInString(details.Tags) > seedanceAssetValidationTagsLimit {
 		return nil, errors.New("validation group tags are too long")
+	}
+	if details.CallbackURL != "" {
+		if err := ValidateSeedanceAssetValidationCallbackURL(details.CallbackURL); err != nil {
+			return nil, err
+		}
+	}
+	sealedCallback, err := common.SealTaskSecret(details.CallbackURL)
+	if err != nil {
+		return nil, err
 	}
 	projectName = strings.TrimSpace(projectName)
 	if len(projectName) > seedanceAssetValidationProjectNameLimit {
@@ -344,8 +373,10 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 		Description:        details.Description,
 		Tags:               details.Tags,
 		ProjectName:        projectName,
+		CompatCallbackURL:  sealedCallback,
 		CallbackStateHash:  stateHash,
 		Status:             model.SeedanceAssetValidationStatusCreating,
+		NextPollAt:         now.Add(2*seedanceAssetValidationPollBase).Unix() + int64(userID%seedanceAssetValidationPollJitter),
 		ExpiresAt:          now.Add(seedanceAssetValidationSessionTTL).Unix(),
 	}
 	if err := model.DB.WithContext(ctx).Create(session).Error; err != nil {
@@ -364,10 +395,7 @@ func StartSeedanceAssetValidationSessionWithFallback(ctx context.Context, userID
 			return nil, err
 		}
 	}
-	var upstream struct {
-		BytedToken string
-		H5Link     string
-	}
+	var upstream seedanceAssetValidationUpstream
 	lastErr = nil
 	for index := startIndex; index < len(channels); index++ {
 		if err := ctx.Err(); err != nil {
@@ -455,6 +483,7 @@ func failSeedanceAssetValidationSession(id uint, userID int, message string) err
 			"status":                 model.SeedanceAssetValidationStatusFailed,
 			"last_error":             truncateSeedanceAssetMappingError(message),
 			"byted_token_ciphertext": "",
+			"next_poll_at":           int64(0),
 		}).Error
 }
 
@@ -463,14 +492,17 @@ func RefreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 	return refreshSeedanceAssetValidationSession(ctx, userID, id, "")
 }
 
-func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id uint, projectNameOverride string) (*model.SeedanceAssetValidationSession, error) {
+func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id uint, projectNameOverride string, expectedUpdatedAt ...time.Time) (*model.SeedanceAssetValidationSession, error) {
 	session, err := model.GetSeedanceAssetValidationSession(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
+	if len(expectedUpdatedAt) > 0 && !session.UpdatedAt.Equal(expectedUpdatedAt[0]) {
+		return session, nil
+	}
 	if session.Status == model.SeedanceAssetValidationStatusSucceeded {
 		var group model.SeedanceAssetGroup
-		groupErr := model.DB.WithContext(ctx).Select("id", "status").
+		groupErr := model.DB.WithContext(ctx).
 			Where("id = ? AND user_id = ?", session.LocalGroupID, userID).First(&group).Error
 		if groupErr != nil && !errors.Is(groupErr, gorm.ErrRecordNotFound) {
 			return nil, groupErr
@@ -485,6 +517,25 @@ func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 				return nil, err
 			}
 			return model.GetSeedanceAssetValidationSession(ctx, userID, id)
+		}
+		client, clientErr := ResolveSeedanceAssetClient(ctx, session.ChannelID, session.KeyFingerprint, session.AccountFingerprint)
+		if clientErr != nil {
+			return nil, clientErr
+		}
+		if err := EnsureSeedanceAssetGroupReady(ctx, client, &group); err != nil {
+			if errors.Is(err, ErrSeedanceAssetServiceTemporary) {
+				session.Status, session.LastError = model.SeedanceAssetValidationStatusPending, seedanceAssetValidationRetryMarker
+				return session, nil
+			}
+			if errors.Is(err, ErrSeedanceAssetGroupPending) {
+				session.Status, session.LastError = model.SeedanceAssetValidationStatusPending, ""
+				return session, nil
+			}
+			if errors.Is(err, ErrSeedanceAssetValidationFailed) {
+				session.Status, session.LastError = model.SeedanceAssetValidationStatusFailed, err.Error()
+				return session, nil
+			}
+			return nil, err
 		}
 	}
 	if session.Status == model.SeedanceAssetValidationStatusSucceeded || session.Status == model.SeedanceAssetValidationStatusFailed || session.Status == model.SeedanceAssetValidationStatusExpired || session.Status == model.SeedanceAssetValidationStatusCancelled {
@@ -502,30 +553,47 @@ func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 	}
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetValidationLease/time.Second)
-	claimed, err := model.ClaimSeedanceAssetValidationSession(id, userID, now, leaseUntil)
+	claimed, err := model.ClaimSeedanceAssetValidationSession(id, userID, now, leaseUntil, expectedUpdatedAt...)
 	if err != nil {
 		return nil, err
 	}
 	if !claimed {
 		return model.GetSeedanceAssetValidationSession(ctx, userID, id)
 	}
-	token, err := decryptSeedanceAssetValidationToken(session.BytedTokenCiphertext)
+	client, err := resolveSeedanceAssetClient(ctx, session.ChannelID, session.KeyFingerprint, session.AccountFingerprint, false)
 	if err != nil {
-		return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, err)
-	}
-	client, err := ResolveSeedanceAssetClient(ctx, session.ChannelID, session.KeyFingerprint, session.AccountFingerprint)
-	if err != nil {
-		return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, err)
+		return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, err, "")
 	}
 	projectName := session.ProjectName
 	if projectNameOverride != "" {
 		projectName = projectNameOverride
 	}
-	groupID, err := client.GetSeedanceAssetValidationResult(ctx, token, projectName)
-	if err != nil {
-		return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, err)
+	groupID := session.UpstreamGroupID
+	if groupID == "" {
+		token, tokenErr := decryptSeedanceAssetValidationToken(session.BytedTokenCiphertext)
+		if tokenErr != nil {
+			return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, tokenErr, "")
+		}
+		groupID, err = client.GetSeedanceAssetValidationResult(ctx, token, projectName)
+	} else if client.jsonAction {
+		// 上游已确认认证结果后只等待组就绪，不能再次消费一次性认证令牌。
+		var status string
+		status, err = client.getSeedanceHumanGroupStatus(ctx, groupID)
+		if err == nil {
+			err = seedanceHumanGroupStatusError(status)
+		}
 	}
+	if err != nil {
+		return updateSeedanceAssetValidationPending(ctx, id, userID, leaseUntil, session, err, groupID)
+	}
+	// 已确认的认证结果独立收尾，客户端断开不能取消落库。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), seedanceAssetValidationFinalizeTimeout)
+	defer cancel()
 	if _, err := model.CompleteSeedanceAssetValidationSession(ctx, id, userID, leaseUntil, now, groupID); err != nil {
+		// 收尾超时时无法确认事务是否提交，保留上游素材组并等待租约到期后重试。
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		if errors.Is(err, model.ErrSeedanceAssetValidationSessionClaimed) {
 			current, readErr := model.GetSeedanceAssetValidationSession(ctx, userID, id)
 			if readErr != nil {
@@ -550,18 +618,45 @@ func refreshSeedanceAssetValidationSession(ctx context.Context, userID int, id u
 			"status":                 model.SeedanceAssetValidationStatusFailed,
 			"last_error":             truncateSeedanceAssetMappingError(errors.Join(err, cleanupErr).Error()),
 			"byted_token_ciphertext": "",
+			"next_poll_at":           int64(0),
 		})
 		return nil, errors.Join(err, cleanupErr, updateErr, readErr)
 	}
 	return model.GetSeedanceAssetValidationSession(ctx, userID, id)
 }
 
-func updateSeedanceAssetValidationPending(ctx context.Context, id uint, userID int, leaseUntil int64, previous *model.SeedanceAssetValidationSession, pollErr error) (*model.SeedanceAssetValidationSession, error) {
-	updates := map[string]any{"poll_attempts": previous.PollAttempts + 1}
-	if errors.Is(pollErr, ErrSeedanceAssetValidationPending) {
+func updateSeedanceAssetValidationPending(ctx context.Context, id uint, userID int, leaseUntil int64, previous *model.SeedanceAssetValidationSession, pollErr error, groupID string) (*model.SeedanceAssetValidationSession, error) {
+	attempts := previous.PollAttempts + 1
+	retry := errors.Is(pollErr, ErrSeedanceAssetServiceTemporary) ||
+		errors.Is(pollErr, ErrSeedanceAssetValidationPending) ||
+		errors.Is(pollErr, ErrSeedanceAssetGroupPending) || errors.Is(pollErr, context.Canceled)
+	nextPollAt := previous.ExpiresAt
+	if nextPollAt <= 0 {
+		nextPollAt = common.GetTimestamp() + int64(seedanceAssetValidationSessionTTL/time.Second)
+	}
+	if retry {
+		delay := seedanceAssetValidationPollBase
+		for step := 1; step < attempts && delay < seedanceAssetValidationPollMax; step++ {
+			delay = min(delay*2, seedanceAssetValidationPollMax)
+		}
+		delay += time.Duration(previous.ID%seedanceAssetValidationPollJitter) * time.Second
+		nextPollAt = min(nextPollAt, common.GetTimestamp()+int64(delay/time.Second))
+	}
+	updates := map[string]any{"poll_attempts": attempts, "next_poll_at": nextPollAt}
+	if groupID != "" {
+		updates["upstream_group_id"] = groupID
+	}
+	if errors.Is(pollErr, ErrSeedanceAssetServiceTemporary) {
+		updates["last_error"] = seedanceAssetValidationRetryMarker
+	} else if errors.Is(pollErr, ErrSeedanceAssetValidationPending) || errors.Is(pollErr, ErrSeedanceAssetGroupPending) || errors.Is(pollErr, context.Canceled) {
 		updates["last_error"] = ""
 	} else {
 		updates["last_error"] = truncateSeedanceAssetMappingError(pollErr.Error())
+	}
+	if errors.Is(pollErr, ErrSeedanceAssetValidationFailed) || errors.Is(pollErr, errSeedanceAssetResponse) {
+		updates["status"] = model.SeedanceAssetValidationStatusFailed
+		updates["byted_token_ciphertext"] = ""
+		updates["next_poll_at"] = int64(0)
 	}
 	_, err := model.UpdateSeedanceAssetValidationSession(id, userID, leaseUntil, updates)
 	if err != nil {
@@ -601,10 +696,15 @@ func HashSeedanceAssetValidationState(state string) (string, error) {
 	return seedanceAssetValidationHMAC("seedance-validation-state-v1:" + strings.TrimSpace(state))
 }
 
-func (client *SeedanceAssetClient) CreateSeedanceAssetValidationSession(ctx context.Context, callbackURL, projectName string) (struct {
-	BytedToken string
-	H5Link     string
-}, error) {
+func HashSeedanceAssetValidationToken(token string) (string, error) {
+	return seedanceAssetValidationTokenHash(strings.TrimSpace(token))
+}
+
+func (client *SeedanceAssetClient) CreateSeedanceAssetValidationSession(ctx context.Context, callbackURL, projectName string) (seedanceAssetValidationUpstream, error) {
+	if client.originREST {
+		result, err := client.createOriginValidationSession(ctx)
+		return seedanceAssetValidationUpstream{BytedToken: result.BytedToken, H5Link: result.H5Link}, err
+	}
 	var response seedanceAssetResponse
 	request := map[string]string{"CallbackURL": callbackURL}
 	if strings.TrimSpace(projectName) != "" {
@@ -612,26 +712,14 @@ func (client *SeedanceAssetClient) CreateSeedanceAssetValidationSession(ctx cont
 	}
 	if err := client.call(ctx, "CreateVisualValidateSession", request, &response); err != nil {
 		if isSeedanceAssetValidationUnsupportedError(err) {
-			return struct {
-				BytedToken string
-				H5Link     string
-			}{}, errors.Join(ErrSeedanceAssetValidationUnsupported, err)
+			return seedanceAssetValidationUpstream{}, errors.Join(ErrSeedanceAssetValidationUnsupported, err)
 		}
-		return struct {
-			BytedToken string
-			H5Link     string
-		}{}, err
+		return seedanceAssetValidationUpstream{}, err
 	}
 	if strings.TrimSpace(response.Result.BytedToken) == "" || strings.TrimSpace(response.Result.H5Link) == "" {
-		return struct {
-			BytedToken string
-			H5Link     string
-		}{}, errors.New("upstream returned an incomplete validation session")
+		return seedanceAssetValidationUpstream{}, errors.New("upstream returned an incomplete validation session")
 	}
-	return struct {
-		BytedToken string
-		H5Link     string
-	}{BytedToken: response.Result.BytedToken, H5Link: response.Result.H5Link}, nil
+	return seedanceAssetValidationUpstream{BytedToken: response.Result.BytedToken, H5Link: response.Result.H5Link}, nil
 }
 
 // isSeedanceAssetValidationUnsupportedError limits fallback to errors that identify a missing Action.
@@ -641,6 +729,13 @@ func isSeedanceAssetValidationUnsupportedError(err error) bool {
 	}
 	if errors.Is(err, ErrSeedanceAssetNotFound) {
 		return true
+	}
+	var upstream *seedanceAssetUpstreamError
+	if errors.As(err, &upstream) {
+		code, _, _ := strings.Cut(upstream.code, ".")
+		if strings.EqualFold(code, "UnsupportedAction") || strings.EqualFold(code, "UnsupportedOperation") || strings.EqualFold(code, "NotImplemented") {
+			return true
+		}
 	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{
@@ -663,22 +758,41 @@ func isSeedanceAssetValidationUnsupportedError(err error) bool {
 }
 
 func (client *SeedanceAssetClient) GetSeedanceAssetValidationResult(ctx context.Context, bytedToken, projectName string) (string, error) {
+	if client.originREST {
+		return client.getOriginValidationResult(ctx, bytedToken)
+	}
 	var response seedanceAssetResponse
 	request := map[string]string{"BytedToken": bytedToken}
 	if strings.TrimSpace(projectName) != "" {
 		request["ProjectName"] = strings.TrimSpace(projectName)
 	}
 	if err := client.call(ctx, "GetVisualValidateResult", request, &response); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "visual face token is not found") {
-			return "", ErrSeedanceAssetValidationPending
+		var upstream *seedanceAssetUpstreamError
+		if errors.As(err, &upstream) && upstream.action == "GetVisualValidateResult" && upstream.httpStatus != http.StatusUnauthorized && upstream.httpStatus != http.StatusForbidden {
+			code, _, _ := strings.Cut(upstream.code, ".")
+			// 认证未完成可能返回 NotFound 或 409/OperationConflict，过期仍由会话截止时间处理。
+			if strings.EqualFold(code, "NotFound") || (upstream.httpStatus == http.StatusConflict && strings.EqualFold(code, "OperationConflict")) {
+				return "", ErrSeedanceAssetValidationPending
+			}
 		}
 		if bytedToken != "" && strings.Contains(err.Error(), bytedToken) {
 			return "", errors.New(strings.ReplaceAll(err.Error(), bytedToken, "[redacted]"))
 		}
 		return "", err
 	}
-	if strings.TrimSpace(response.Result.GroupID) == "" {
+	groupID := strings.TrimSpace(response.Result.GroupID)
+	if groupID == "" {
 		return "", ErrSeedanceAssetValidationPending
 	}
-	return response.Result.GroupID, nil
+	if client.jsonAction {
+		// 校验组身份；包装协议还必须等待其显式状态为 Active。
+		status, err := client.getSeedanceHumanGroupStatus(ctx, groupID)
+		if err != nil {
+			return groupID, err
+		}
+		if err := seedanceHumanGroupStatusError(status); err != nil {
+			return groupID, err
+		}
+	}
+	return groupID, nil
 }

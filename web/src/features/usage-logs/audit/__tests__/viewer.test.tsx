@@ -404,6 +404,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   useAuthStore.getState().auth.reset()
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -421,6 +422,72 @@ function renderViewer(scope: 'all' | 'self' = 'self') {
     </QueryClientProvider>
   )
 }
+
+it('searching the default time range includes new records after midnight', async () => {
+  vi.setSystemTime(new Date(2026, 9, 30, 23, 59, 0))
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [], total: 0 } },
+  })
+  renderViewer()
+  await waitFor(() => expect(get).toHaveBeenCalled())
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Search' })).toBeEnabled()
+  )
+
+  vi.setSystemTime(new Date(2026, 9, 31, 0, 1, 0))
+  fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(get).toHaveBeenLastCalledWith('/api/audit/self', {
+      params: expect.objectContaining({
+        start_timestamp: Math.floor(new Date(2026, 9, 31).getTime() / 1000),
+        end_timestamp: Math.floor(new Date(2026, 9, 31, 0, 1).getTime() / 1000),
+      }),
+    })
+  )
+  expect(screen.getByRole('button', { name: 'Reset' })).toBeDisabled()
+})
+
+it('searching keeps a custom audit time range unchanged', async () => {
+  vi.setSystemTime(new Date(2026, 9, 30, 12, 0))
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [], total: 0 } },
+  })
+  renderViewer()
+  await waitFor(() => expect(get).toHaveBeenCalled())
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: /00:00/ }))
+  fireEvent.change(screen.getByLabelText('Start Time'), {
+    target: { value: '2026-10-29T10:00' },
+  })
+  fireEvent.change(screen.getByLabelText('End Time'), {
+    target: { value: '2026-10-29T11:00' },
+  })
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  const start = Math.floor(new Date(2026, 9, 29, 10).getTime() / 1000)
+  const end = Math.floor(new Date(2026, 9, 29, 11).getTime() / 1000)
+  await waitFor(() =>
+    expect(get).toHaveBeenLastCalledWith('/api/audit/self', {
+      params: expect.objectContaining({
+        start_timestamp: start,
+        end_timestamp: end,
+      }),
+    })
+  )
+  const callsBeforeSearch = get.mock.calls.length
+  vi.setSystemTime(new Date(2026, 9, 30, 13, 0))
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(get.mock.calls.length).toBeGreaterThan(callsBeforeSearch)
+  )
+  await waitFor(() =>
+    expect(get).toHaveBeenLastCalledWith('/api/audit/self', {
+      params: expect.objectContaining({
+        start_timestamp: start,
+        end_timestamp: end,
+      }),
+    })
+  )
+})
 
 it('filters own access history by result, generation and time and resets pagination', async () => {
   const get = vi.spyOn(api, 'get').mockResolvedValue({

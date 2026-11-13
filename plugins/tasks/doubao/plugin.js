@@ -1,5 +1,13 @@
 // Seedance 2.0 官方字段需要在各请求入口共用同一白名单。
-const SEEDANCE_20_MODELS = ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615"];
+const SEEDANCE_20_MODELS = [
+  "doubao-seedance-2-0-260128",
+  "doubao-seedance-2-0",
+  "doubao-seedance-2-0-fast-260128",
+  "doubao-seedance-2-0-fast",
+  "doubao-seedance-2-0-mini-260615",
+  "doubao-seedance-2-0-mini",
+];
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5"];
 const DOUBAO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 const DOUBAO_COMPATIBILITY_FIELDS = [
   "content",
@@ -18,6 +26,8 @@ const DOUBAO_COMPATIBILITY_FIELDS = [
   "tools",
   "safety_identifier",
   "omni_reference_task_type",
+  "callback_url",
+  "moderation_options",
 ];
 
 // Seedance capabilities from the Ark model list, not prices: the output
@@ -31,14 +41,21 @@ const VIDEO_MODELS = {
   "doubao-seedance-1-0-lite-i2v": { resolutions: ["480p", "720p", "1080p"] },
   "doubao-seedance-1-5-pro-251215": { resolutions: ["480p", "720p", "1080p"], audio: true },
   "doubao-seedance-2-0-260128": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "doubao-seedance-2-0": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
   "doubao-seedance-2-0-fast-260128": { resolutions: ["480p", "720p"], videoInput: true },
+  "doubao-seedance-2-0-fast": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-0-mini-260615": { resolutions: ["480p", "720p"], videoInput: true },
+  "doubao-seedance-2-0-mini": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-5-260628": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
+  "doubao-seedance-2-5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
 };
 // Every Ark resolution tier; an endpoint ID reached through channel mapping
 // without a declared profile keeps them all.
 const SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p", "4k"];
 const DEFAULT_VIDEO_PROFILE = { resolutions: SEEDANCE_RESOLUTIONS, videoInput: true };
+const VIDEO_FPS = 24;
+// 返回的整数时长向下取整，预扣需覆盖不足一秒的额外帧。
+const VIDEO_RESERVE_EXTRA_FRAMES = VIDEO_FPS - 1;
 
 // Protocol capabilities from the Ark image generation API reference, not prices.
 // presets: accepted `size` resolution tiers; minPixels/maxPixels bound `WxH` sizes.
@@ -173,6 +190,7 @@ const IMAGE_USAGE_SCHEMA = {
   // Successful output images at or below IMAGE_TIER_MAX_PIXELS.
   images_up_to_1_5k: {
     type: "number",
+    displayOrder: 10,
     unit: "count",
     unitLabel: IMAGE_UNIT_LABEL,
     description: { en: "Image generation unit price (1.5K and below)", zh: "图片生成单价（1.5K 及以下）" },
@@ -180,6 +198,7 @@ const IMAGE_USAGE_SCHEMA = {
   // Successful output images above IMAGE_TIER_MAX_PIXELS.
   images_above_1_5k: {
     type: "number",
+    displayOrder: 20,
     unit: "count",
     unitLabel: IMAGE_UNIT_LABEL,
     description: { en: "Image generation unit price (above 1.5K)", zh: "图片生成单价（1.5K 以上）" },
@@ -189,6 +208,7 @@ const IMAGE_USAGE_SCHEMA = {
   // rule, for example max(u("input_images") - 1, 0) * price.
   input_images: {
     type: "number",
+    displayOrder: 30,
     unit: "count",
     unitLabel: IMAGE_UNIT_LABEL,
     description: { en: "Input image unit price", zh: "输入图片单价" },
@@ -276,10 +296,7 @@ function seedanceUsageSchema(profile) {
   return schema;
 }
 
-// Display examples for a token-priced profile: 5-second videos at each tier
-// from the official Ark formula tokens = (input + output seconds) × W × H ×
-// 24 / 1024 with 16:9 max-pixel sizes, cross-checked against Volcengine price
-// examples, plus the reference-video and silent variants the profile prices.
+// 价格表展示 5 秒各档估算及参考视频、有声变体；结算使用上游实际用量。
 function seedanceUsageExamples(profile) {
   const specs = profile.resolutions.map((resolution) => ({
     label: resolution + " · 5s" + (profile.audio ? " · 有声" : ""),
@@ -323,7 +340,8 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.2.1",
+  version: "1.2.15",
+  requiredCapabilities: ["task-callback@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -335,12 +353,21 @@ export const meta = {
     capabilityUsageProfiles(IMAGE_MODELS, seedreamUsageSchema, seedreamUsageExamples)
   ),
   routes: [
-    { method: "POST", path: "/doubao/api/v3/contents/generations/tasks", type: "submit", decode: "createTask", render: "taskCreated" },
-    { method: "GET", path: "/doubao/api/v3/contents/generations/tasks/:task_id", type: "query", render: "taskStatus" },
-    { method: "GET", path: "/doubao/api/v3/contents/generations/tasks", type: "dynamic", action: "list", decode: "listTasks", render: "taskList" },
+    { method: "POST", path: "/doubao/api/v3/contents/generations/tasks", protocol: "seedance-v3", type: "submit", decode: "createTask", render: "taskCreated" },
+    { method: "GET", path: "/doubao/api/v3/contents/generations/tasks/:task_id", protocol: "seedance-v3", type: "query", render: "taskStatus" },
+    {
+      method: "GET",
+      path: "/doubao/api/v3/contents/generations/tasks",
+      protocol: "seedance-v3",
+      type: "dynamic",
+      action: "list",
+      decode: "listTasks",
+      render: "taskList",
+    },
     {
       method: "DELETE",
       path: "/doubao/api/v3/contents/generations/tasks/:task_id",
+      protocol: "seedance-v3",
       type: "dynamic",
       action: "delete",
       decode: "deleteTask",
@@ -348,7 +375,15 @@ export const meta = {
     },
     // The vendor image API answers synchronously and has no task to re-query;
     // the complete response is delivered once and never persisted.
-    { method: "POST", path: "/doubao/api/v3/images/generations", type: "submit", decode: "createImage", render: "imageCreated", retainResult: false },
+    {
+      method: "POST",
+      path: "/doubao/api/v3/images/generations",
+      protocol: "seedream-v3",
+      type: "submit",
+      decode: "createImage",
+      render: "imageCreated",
+      retainResult: false,
+    },
   ],
   protocols: [
     { name: "openai_responses", supports: ["stream", "sync", "background"] },
@@ -361,10 +396,9 @@ function trimmed(value) {
   return String(value || "").trim();
 }
 
-// Another New API gateway serves the Ark wire format only on this plugin's
-// prefixed native routes; Ark itself serves the unprefixed paths.
+// 服务前缀由管理员在渠道 BaseURL 中配置。
 function apiRoot(ctx) {
-  return ctx.baseUrl + (ctx.upstream && ctx.upstream.kind === "new_api" ? "/doubao" : "");
+  return trimmed(ctx.baseUrl).replace(/\/+$/, "");
 }
 
 function objectValue(value, name) {
@@ -448,9 +482,37 @@ function modelCapabilities(model) {
       adaptiveRatio: true,
       generateAudio: true,
       priority: true,
+      lastFrameRequiresFirst: true,
+    };
+  }
+  if (SEEDANCE_25_MODELS.includes(name)) {
+    return {
+      minDuration: 4,
+      maxDuration: 30,
+      autoDuration: true,
+      frames: false,
+      serviceTier: false,
+      draft: true,
+      framesInput: true,
+      lastFrame: true,
+      reference: true,
+      adaptiveRatio: true,
+      generateAudio: true,
+      priority: true,
+      referenceImages: 30,
+      referenceVideos: 10,
+      referenceAudios: 10,
+      audioOnly: true,
     };
   }
   return null;
+}
+
+function validationModel(ctx, model) {
+  for (const candidate of [model, ctx.declaredModel, ctx.model]) {
+    if (modelCapabilities(candidate)) return candidate;
+  }
+  return model;
 }
 
 // 兼容接口以顶层参数为准，未提供时才回退 metadata，避免校验与发送取值不一致。
@@ -530,9 +592,9 @@ function validateGenerationParameters(req, model, strictTypes) {
   if (serviceTierField.present) {
     const serviceTier = typeof serviceTierField.value === "string" ? trimmed(serviceTierField.value) : "";
     if (!["default", "flex"].includes(serviceTier)) throw new Error("service_tier must be default or flex");
-    if (capabilities && !capabilities.serviceTier) throw new Error(model + " does not support service_tier");
     const draftField = requestField(req, "draft");
     if (draftField.present && draftField.value === true && serviceTier === "flex") throw new Error("draft tasks do not support flex service_tier");
+    if (capabilities && !capabilities.serviceTier && serviceTier !== "default") throw new Error(model + " does not support service_tier");
   }
 
   const draftField = requestField(req, "draft");
@@ -648,7 +710,7 @@ function validateDoubaoContent(model, content) {
   if (unlabeledImages > 0 && imageCount !== 1) throw new Error("an image role is required when multiple images are provided");
   if (firstFrames > 1) throw new Error("content accepts at most one first_frame image");
   if (lastFrames > 1) throw new Error("content accepts at most one last_frame image");
-  if (capabilities && lastFrames > 0 && firstFrames === 0) throw new Error("last_frame requires first_frame");
+  if (capabilities && capabilities.lastFrameRequiresFirst && lastFrames > 0 && firstFrames === 0) throw new Error("last_frame requires first_frame");
   const maxImages = (capabilities && capabilities.referenceImages) || 9;
   const maxVideos = (capabilities && capabilities.referenceVideos) || 3;
   const maxAudios = (capabilities && capabilities.referenceAudios) || 3;
@@ -667,6 +729,7 @@ function validateDoubaoContent(model, content) {
     hasVideo: videoCount > 0,
     hasFrames: firstFrames + lastFrames > 0,
     hasReference: imageCount + videoCount + audioCount + draftCount > 0,
+    videoCount: videoCount,
   };
 }
 
@@ -675,11 +738,24 @@ function validateDoubaoOptions(model, req, contentInfo, strictTypes) {
   const capabilities = modelCapabilities(model);
   // 2.0真实请求明确拒绝mov；其他模型仍由各自上游能力决定。
   const outputFormat = requestField(req, "output_format");
-  if (capabilities && outputFormat.present && outputFormat.value !== "mp4") throw new Error(model + " only supports mp4 output_format");
-  // 回调只校验基本结构，不在同步请求中做网络探测；用户标识遵守官方64字符英文串上限。
+  if (SEEDANCE_20_MODELS.includes(modelKey(model)) && outputFormat.present && outputFormat.value !== "mp4")
+    throw new Error(model + " only supports mp4 output_format");
+  // 回调只校验地址结构，实际投递由宿主限制为公网 HTTPS；同步请求不做网络探测。
   const callback = requestField(req, "callback_url");
-  if (callback.present && (typeof callback.value !== "string" || !/^https?:\/\/[^\s/?#]+(?:[/?#][^\s]*)?$/.test(callback.value)))
-    throw new Error("callback_url must be an HTTP or HTTPS URL");
+  if (callback.present) {
+    const address =
+      typeof callback.value === "string" && callback.value.length <= 4096
+        ? callback.value.match(/^https:\/\/([a-z0-9.-]+)(?::([0-9]{1,5}))?(?:[/?][^\s#\\]*)?$/i)
+        : null;
+    if (
+      !address ||
+      !address[1].includes(".") ||
+      /^[0-9.]+$/.test(address[1]) ||
+      /(?:^|\.)localhost\.?$/i.test(address[1]) ||
+      (address[2] && (Number(address[2]) < 1 || Number(address[2]) > 65535))
+    )
+      throw new Error("callback_url must be a public HTTPS domain URL");
+  }
   const safetyIdentifier = requestField(req, "safety_identifier");
   if (
     safetyIdentifier.present &&
@@ -699,8 +775,9 @@ function validateDoubaoOptions(model, req, contentInfo, strictTypes) {
   for (const key of ["generate_audio", "return_last_frame", "watermark", "camera_fixed"]) {
     const field = requestField(req, key);
     if (field.present && typeof field.value !== "boolean") throw new Error(key + " must be a boolean");
-    // 官方文档与真实上游均确认 2.0 不接受该字段，提前拒绝可避免预扣和无效上游请求。
-    if (key === "camera_fixed" && field.present && capabilities) throw new Error(model + " does not support camera_fixed");
+    // 2.0 只兼容 SDK 的 false 默认值，开启固定镜头仍应拒绝。
+    if (key === "camera_fixed" && field.present && SEEDANCE_20_MODELS.includes(modelKey(model)) && field.value !== false)
+      throw new Error(model + " does not support camera_fixed");
     if (key === "generate_audio" && field.present && capabilities && !capabilities.generateAudio) throw new Error(model + " does not support generate_audio");
   }
 
@@ -728,51 +805,62 @@ function validateDoubaoOptions(model, req, contentInfo, strictTypes) {
     )
       throw new Error("tools must be an array of web_search tools");
   }
+  const moderation = requestField(req, "moderation_options");
+  if (moderation.present) objectValue(moderation.value, "moderation_options");
+  if (SEEDANCE_25_MODELS.includes(modelKey(model))) {
+    const taskType = requestField(req, "omni_reference_task_type");
+    if (taskType.present && !["auto", "reference", "edit", "extend"].includes(taskType.value))
+      throw new Error("omni_reference_task_type must be auto, reference, edit, or extend");
+    const ratio = requestField(req, "ratio");
+    const requiresAdaptive = (contentInfo && contentInfo.hasFrames) || taskType.value === "edit" || taskType.value === "extend";
+    if (requiresAdaptive && ratio.present && trimmed(ratio.value) && trimmed(ratio.value) !== "adaptive")
+      throw new Error("Seedance 2.5 frame images, edit, and extend require adaptive ratio");
+    if (taskType.value === "edit" || taskType.value === "extend") {
+      if (!contentInfo || !contentInfo.hasVideo) throw new Error("edit and extend require reference video input");
+      if (taskType.value === "extend" && contentInfo.videoCount > 3) throw new Error("extend accepts at most 3 reference videos");
+      const seconds = requestField(req, "seconds");
+      const duration = requestField(req, "duration");
+      if (taskType.value === "edit" && (seconds.present || duration.present) && Number(seconds.present ? seconds.value : duration.value) !== -1)
+        throw new Error("edit requires automatic duration");
+    }
+  }
 }
 
 function hasVideo(content) {
   return Array.isArray(content) && content.some((item) => item && (item.type === "video_url" || Object.prototype.hasOwnProperty.call(item, "video_url")));
 }
 
+// 样片引用沿用已验证原任务的输入类型，无法确认时不能猜测计价档位。
+function videoInputKind(ctx, content) {
+  const ids = draftTaskIds(content);
+  if (!ids.length) return hasVideo(content) ? "video" : "none";
+  for (const id of ids) {
+    const origin = Array.isArray(ctx.originTasks) && ctx.originTasks.find((task) => task && task.taskId === id);
+    if (!origin || !["none", "video"].includes(origin.videoInput)) throw new Error("draft task input type is unavailable");
+    if (origin.videoInput === "video") return "video";
+  }
+  return "none";
+}
+
 // Capability profile of the executing Seedance model. Channel mapping may send
 // a declared model to an Ark endpoint ID; the declared name still describes it.
 function videoProfile(ctx) {
-  const profile = videoProfileForModel(ctx && ctx.upstreamModel, ctx && ctx.model);
+  const profile = videoProfileForModel(ctx && ctx.upstreamModel, ctx && (ctx.declaredModel || ctx.model));
   if (profile) return profile;
   return DEFAULT_VIDEO_PROFILE;
 }
 
-// Resolution tier the reservation is estimated at: the requested tier or the
-// tier of a WxH size, rejecting tiers the model does not offer. A request that
-// leaves the resolution to Ark reserves the model's highest tier up to 1080p;
-// completion overlays the delivered resolution.
-function videoResolution(ctx) {
-  const req = ctx.requestBody || {};
-  const metadata = req.metadata || {};
-  const profile = videoProfile(ctx);
-  const raw = trimmed(metadata.resolution || req.size).toLowerCase();
-  const recognized = SEEDANCE_RESOLUTIONS.includes(raw) || raw.replace("*", "x").split("x").length === 2;
-  if (!recognized) return profile.resolutions.includes("1080p") ? "1080p" : profile.resolutions[profile.resolutions.length - 1];
-  const resolution = normalizeResolution(raw);
-  if (!profile.resolutions.includes(resolution))
-    throw new Error(trimmed(ctx.upstreamModel || ctx.model) + " resolution must be one of " + profile.resolutions.join(", "));
-  return resolution;
-}
-
-// Max-pixel 16:9 dimensions per resolution tier. Used when ratio is absent or
-// adaptive so the submit-time estimate overestimates rather than underestimates.
-// Official Ark formula: tokens = seconds × width × height × 24 / 1024.
-// Video input duration is omitted; extractUsageOnComplete overlays the real bill.
+// 使用各比例中的最大像素数预扣，最终按上游实际 token 结算。
 function resolutionMaxPixels(resolution) {
-  if (resolution === "480p") return [854, 480];
-  if (resolution === "1080p") return [1920, 1080];
-  if (resolution === "4k") return [3840, 2160];
-  return [1280, 720];
+  if (resolution === "480p") return [864, 496];
+  if (resolution === "1080p") return [1920, 1088];
+  if (resolution === "4k") return [3326, 2494];
+  return [1504, 640];
 }
 
 function estimateTokens(seconds, resolution) {
   const dims = resolutionMaxPixels(resolution);
-  return (seconds * dims[0] * dims[1] * 24) / 1024;
+  return (seconds * dims[0] * dims[1] * VIDEO_FPS) / 1024;
 }
 
 // 明确的零用量与缺失不同；错误类型返回 null，禁止 JS 隐式转换造成低额结算。
@@ -782,20 +870,19 @@ function billingTokenCount(value) {
   return Number.isSafeInteger(tokens) && tokens >= 0 ? tokens : null;
 }
 
-function videoInputRatio(model, resolution, content) {
-  const video = hasVideo(content);
+function videoInputRatio(model, resolution, video) {
   const res = trimmed(resolution).toLowerCase();
-  if (model === "doubao-seedance-2-5-260628") {
+  if (SEEDANCE_25_MODELS.includes(model)) {
     if (res === "1080p") return video ? 7.0 / 10.7 : 11.7 / 10.7;
     return video ? 42 / 70 : 1;
   }
-  if (model === "doubao-seedance-2-0-260128") {
+  if (model === "doubao-seedance-2-0-260128" || model === "doubao-seedance-2-0" || model === "maas-doubao-seedance-2.0") {
     if (res === "1080p") return video ? 31 / 46 : 51 / 46;
     if (res === "4k") return video ? 16 / 46 : 26 / 46;
     return video ? 28 / 46 : 1;
   }
-  if (model === "doubao-seedance-2-0-fast-260128") return video ? 22 / 37 : 1;
-  if (model === "doubao-seedance-2-0-mini-260615") return video ? 14 / 23 : 1;
+  if (model === "doubao-seedance-2-0-fast-260128" || model === "doubao-seedance-2-0-fast") return video ? 22 / 37 : 1;
+  if (model === "doubao-seedance-2-0-mini-260615" || model === "doubao-seedance-2-0-mini") return video ? 14 / 23 : 1;
   return 1;
 }
 
@@ -1091,7 +1178,7 @@ function nativeTask(task) {
 
 function responsesOutputText(ctx, task) {
   const data = artifactData(task);
-  if (!imageTask(ctx) && !Array.isArray(data.data)) return responsesVideoText(ctx);
+  if (!imageTask(ctx) && !imageTask(task) && (trimmed(data.content && data.content.video_url) || !Array.isArray(data.data) || String(task.action || "").includes("video"))) return responsesVideoText(ctx);
   const parts = [];
   imageURLEntries(data).forEach(function (_, index) {
     const artifact = (ctx.artifacts || {})["image-" + (index + 1)];
@@ -1105,8 +1192,32 @@ function responsesOutputText(ctx, task) {
 export const native = {
   createTask: function (ctx) {
     if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
-    const body = ctx.body.value;
-    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
+    const input = ctx.body.value;
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("request body must be an object");
+    const body = Object.assign({}, input);
+    // 方舟 SDK 将未设置的可选字段发送为 null，按未提供处理。
+    for (const key of [
+      "safety_identifier",
+      "callback_url",
+      "return_last_frame",
+      "service_tier",
+      "execution_expires_after",
+      "priority",
+      "generate_audio",
+      "draft",
+      "camera_fixed",
+      "watermark",
+      "seed",
+      "resolution",
+      "ratio",
+      "duration",
+      "frames",
+      "tools",
+      "output_format",
+      "omni_reference_task_type",
+    ]) {
+      if (body[key] === null) delete body[key];
+    }
     const model = trimmed(body.model);
     if (!model) throw new Error("model is required");
     requestResolution(model, body, model);
@@ -1155,7 +1266,7 @@ export const native = {
     const serviceTier = (query["filter.service_tier"] || ["default"])[0];
     if (!["default", "flex"].includes(serviceTier)) throw new Error("filter.service_tier must be default or flex");
     const status = (query["filter.status"] || [""])[0];
-    if (!["", "queued", "running", "cancelled", "succeeded", "failed"].includes(status)) throw new Error("filter.status is invalid");
+    if (!["", "queued", "running", "cancelled", "succeeded", "failed", "expired"].includes(status)) throw new Error("filter.status is invalid");
     const pagination = {};
     for (const field of ["page_num", "page_size"]) {
       const raw = (query[field] || [field === "page_num" ? "1" : "20"])[0];
@@ -1201,6 +1312,8 @@ export const native = {
     return task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : {};
   },
   error: function (ctx, error) {
+    if (ctx.method === "GET" && ctx.params && ctx.params.task_id && error.httpStatus === 404 && error.code === "task_not_found")
+      return { code: "task_not_exist", message: "task_not_exist", data: null };
     return { error: { code: error.code, message: error.message } };
   },
 };
@@ -1219,11 +1332,10 @@ export function buildSubmitRequest(ctx) {
   }
   const req = ctx.requestBody;
   const model = ctx.upstreamModel || req.model || "";
-  requestResolution(model, req, ctx.model || req.model);
-  validateGenerationParameters(req, model, false);
+  const capabilityModel = validationModel(ctx, model);
+  requestResolution(model, req, ctx.declaredModel || ctx.model || req.model);
+  validateGenerationParameters(req, capabilityModel, false);
   const metadata = req.metadata || {};
-  // Reject output tiers the model does not offer before any quota is reserved.
-  videoResolution(ctx);
   const body = Object.assign({ model: req.model || "", content: [] }, metadata);
   // Responses/OpenAI 兼容层把官方选项放在顶层，这些字段必须进入最终上游请求。
   for (const key of DOUBAO_COMPATIBILITY_FIELDS) {
@@ -1231,6 +1343,7 @@ export function buildSubmitRequest(ctx) {
   }
   // 原生 content 的顺序、兼容接口图片和素材引用都必须原样保留。
   body.content = requestContent(req, true);
+  videoInputKind(ctx, body.content);
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
   // duration 别名和智能时长 -1 都必须真正发送；不能截断小数后丢失请求数量。
   const seconds = req.seconds !== undefined ? req.seconds : req.duration;
@@ -1240,9 +1353,16 @@ export function buildSubmitRequest(ctx) {
   const resolutionField = requestField(req, "resolution");
   const sizeField = requestField(req, "size");
   if ((resolutionField.present && trimmed(resolutionField.value)) || (sizeField.present && trimmed(sizeField.value)))
-    body.resolution = requestResolution(model, req, ctx.model || req.model);
-  const contentInfo = validateDoubaoContent(model, body.content);
-  validateDoubaoOptions(model, body, contentInfo, false);
+    body.resolution = requestResolution(model, req, ctx.declaredModel || ctx.model || req.model);
+  const contentInfo = validateDoubaoContent(capabilityModel, body.content);
+  validateDoubaoOptions(capabilityModel, body, contentInfo, false);
+  // 这两个 SDK 默认值不改变生成行为；省略后也兼容拒绝字段本身的上游。
+  if (SEEDANCE_20_MODELS.includes(modelKey(capabilityModel))) {
+    if (body.service_tier === "default") delete body.service_tier;
+    if (body.camera_fixed === false) delete body.camera_fixed;
+  }
+  const callbackURL = body.callback_url;
+  delete body.callback_url;
   const hasReference = contentInfo.hasMedia;
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
@@ -1251,6 +1371,7 @@ export function buildSubmitRequest(ctx) {
     body: body,
     action: hasReference ? "image_to_video" : "text_to_video",
     rewriteModel: body.model,
+    callback: callbackURL === undefined ? undefined : { url: callbackURL, bodyField: "callback_url" },
   };
 }
 
@@ -1268,9 +1389,21 @@ export function parseSubmitResponse(ctx, resp) {
     return { taskId: taskId, taskData: body, immediate: { status: "SUCCESS", progress: "100%", url: trimmed(urls[0].url) } };
   }
   if (!resp.body || !resp.body.id) throw new Error("task_id is empty");
-  // 提交响应只有 ID，先保存服务等级，使第一次轮询前的列表筛选也准确。
+  // 内部保留服务等级供列表筛选，首次轮询前不把推断值当作上游响应。
   const serviceTier = requestField(ctx.requestBody, "service_tier");
-  return { taskId: resp.body.id, taskData: Object.assign({ service_tier: serviceTier.value || "default" }, resp.body) };
+  const taskData = Object.assign({}, resp.body);
+  delete taskData._seedance_inferred_service_tier;
+  if (!Object.prototype.hasOwnProperty.call(taskData, "service_tier")) {
+    taskData.service_tier = serviceTier.value || "default";
+    taskData._seedance_inferred_service_tier = true;
+  }
+  const result = { taskId: resp.body.id, taskData: taskData };
+  if (ctx.requestBody && typeof ctx.requestBody === "object") {
+    const content = requestContent(ctx.requestBody, false);
+    // 已受理任务的恢复上下文可能不包含原任务引用，不能阻止恢复轮询。
+    if (!draftTaskIds(content).length || Array.isArray(ctx.originTasks)) result.state = { video_input: videoInputKind(ctx, content) };
+  }
+  return result;
 }
 
 export function extractUsage(ctx) {
@@ -1284,16 +1417,19 @@ export function extractUsage(ctx) {
   }
   const req = ctx.requestBody || {};
   const model = ctx.upstreamModel || ctx.model || req.model || "";
-  validateGenerationParameters(req, model, false);
+  const capabilityModel = validationModel(ctx, model);
+  validateGenerationParameters(req, capabilityModel, false);
   const content = requestContent(req, false);
-  const contentInfo = content.length ? validateDoubaoContent(model, content) : { hasVisual: false };
-  validateDoubaoOptions(model, req, contentInfo, false);
-  const resolution = requestResolution(model, req, ctx.model || req.model);
+  const contentInfo = content.length ? validateDoubaoContent(capabilityModel, content) : { hasVisual: false };
+  validateDoubaoOptions(capabilityModel, req, contentInfo, false);
+  const resolution = requestResolution(model, req, ctx.declaredModel || ctx.model || req.model);
+  const inputKind = videoInputKind(ctx, content);
+  const billingModel = [model, ctx.declaredModel, ctx.model, req.model].map(modelKey).find((name) => VIDEO_MODELS[name]) || modelKey(model);
   if (ctx.usagePurpose === "billing_ratios") {
     // 预估 token 可以保守取上限，但不得改变未指定分辨率时旧倍率计费的单价。
     const requestedResolution = requestField(req, "resolution");
     const requestedSize = requestField(req, "size");
-    const ratio = videoInputRatio(model, requestedResolution.value || requestedSize.value ? resolution : "", content);
+    const ratio = videoInputRatio(billingModel, requestedResolution.value || requestedSize.value ? resolution : "", inputKind === "video");
     return ratio === 1 ? null : { video_input_ratio: ratio };
   }
   // 官方 frames 优先于 duration；非整数秒不能向下取整后少预扣。
@@ -1304,14 +1440,17 @@ export function extractUsage(ctx) {
   const durationValue = secondsField.present ? secondsField.value : durationField.value;
   let seconds = frames !== null && frames > 0 ? frames / 24 : Number(durationValue || 0);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    seconds = modelKey(model) === "doubao-seedance-2-5-260628" ? 30 : 15;
+    seconds = SEEDANCE_25_MODELS.includes(billingModel) ? 30 : 15;
   }
   if (seconds <= 0) seconds = 5;
   seconds = Math.min(seconds, 3600);
   const profile = videoProfile(ctx);
-  const facts = { tokens: estimateTokens(seconds, resolution), resolution: resolution };
+  const inputSeconds = inputKind === "video" ? (SEEDANCE_25_MODELS.includes(billingModel) ? 30 : 15) : 0;
+  const outputFrames = frames !== null && frames > 0 ? frames : seconds * VIDEO_FPS + VIDEO_RESERVE_EXTRA_FRAMES;
+  const dims = resolutionMaxPixels(resolution);
+  const facts = { tokens: Math.ceil(((outputFrames + inputSeconds * VIDEO_FPS) * dims[0] * dims[1]) / 1024), seconds: seconds, resolution: resolution };
   // 旧表达式仍可引用 video_input，因此无参考视频的模型也保留该事实。
-  facts.video_input = hasVideo(content) ? "video" : "none";
+  facts.video_input = inputKind;
   if (profile.audio) {
     const audio = requestField(req, "generate_audio");
     facts.generate_audio = !audio.present || audio.value !== false;
@@ -1373,10 +1512,56 @@ export function parseTaskResult(ctx, body) {
     return result;
   }
   if (body.status === "failed" || body.status === "expired" || body.status === "cancelled") {
-    const reason = body.status === "cancelled" ? "task cancelled by user" : body.error && body.error.message ? body.error.message : body.status;
-    return { status: "FAILURE", progress: "100%", reason: reason };
+    const error = body.error && typeof body.error === "object" ? publicFailureValue(ctx, body.error) : null;
+    const fallback = typeof body.failure_reason === "string" ? body.failure_reason : typeof body.reason === "string" ? body.reason : typeof body.message === "string" ? body.message : typeof body.error === "string" ? body.error : "";
+    const message = error && typeof error.message === "string" ? error.message : publicFailureValue(ctx, fallback);
+    const reason = body.status === "cancelled" ? "task cancelled by user" : message || body.status;
+    const taskData = Object.assign({}, body);
+    if (body.error !== undefined) taskData.error = error || publicFailureValue(ctx, body.error);
+    for (const key of ["message", "reason", "failure_reason"]) {
+      if (taskData[key] !== undefined) taskData[key] = publicFailureValue(ctx, taskData[key]);
+    }
+    return { status: "FAILURE", progress: "100%", reason: reason, taskData: taskData };
   }
   return { status: "UNKNOWN", reason: "unrecognized status: " + String(body.status || "") };
+}
+
+// 错误详情保留业务原因与代码，只清理渠道身份、凭据和内部任务标识。
+function publicFailureValue(ctx, value) {
+  if (Array.isArray(value)) return value.map((item) => publicFailureValue(ctx, item));
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value)) {
+      const name = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (/^(internal|upstream|provider)/.test(name) ||
+        ["proto", "prototype", "constructor", "apikey", "secretkey", "token", "accesstoken", "refreshtoken", "secret", "password", "authorization", "credentials", "headers", "cookie", "stack", "requestid", "traceid", "channel", "channelid", "channelname"].includes(name)) continue;
+      result[key] = publicFailureValue(ctx, value[key]);
+    }
+    return result;
+  }
+  if (typeof value !== "string") return value;
+  let message = value;
+  const key = String(ctx.apiKey || "");
+  const privateId = String(ctx.taskId || "");
+  const upstreamModel = String(ctx.upstreamModel || "");
+  if (key) message = message.split(key).join("[redacted]");
+  if (privateId && privateId !== ctx.publicTaskId) message = message.split(privateId).join(ctx.publicTaskId || "[redacted]");
+  if (upstreamModel && upstreamModel !== ctx.model) message = message.split(upstreamModel).join(ctx.model || "[redacted]");
+  message = message.replace(/https?:\/\/[^\s<>]+/gi, "[redacted URL]");
+  const hostMatch = String(ctx.baseUrl || "").match(/^https?:\/\/(?:[^@/]*@)?([^/:?#]+)/i);
+  if (hostMatch) {
+    const host = hostMatch[1];
+    const labels = host.split(".");
+    const brand = labels.find((label) => label.length >= 4 && !["www", "api", "openapi", "cloud", "video", "gateway", "volces", "volcengine"].includes(label.toLowerCase()));
+    for (const name of [host, brand]) {
+      if (!name) continue;
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      message = message.replace(new RegExp(escaped, "gi"), "[redacted]");
+    }
+  }
+  return message.replace(/\b(?:bearer\s+|sk-)[^\s,;<>]+/gi, "[redacted]")
+    .replace(/\b(?:api[_-]?key|token|secret|authorization)\s*[:=]\s*[^\s,;<>]+/gi, "[redacted]")
+    .replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 2048);
 }
 
 function artifactData(ctx) {
@@ -1388,7 +1573,7 @@ function artifactData(ctx) {
 export function listArtifacts(task) {
   if (task.status !== "SUCCESS") return [];
   const data = artifactData(task);
-  if (imageTask(task) || Array.isArray(data.data)) {
+  if (imageTask(task) || (!trimmed(data.content && data.content.video_url) && Array.isArray(data.data) && !String(task.action || "").includes("video"))) {
     return imageURLEntries(data).map(function (item, index) {
       const artifact = { key: "image-" + (index + 1), type: "image" };
       if (item.output_format === "png") artifact.mimeType = "image/png";
@@ -1399,7 +1584,7 @@ export function listArtifacts(task) {
   const content = data.content || {};
   const artifacts = [];
   if (trimmed(content.video_url)) artifacts.push({ key: "video", type: "video" });
-  if (trimmed(content.last_frame_url)) artifacts.push({ key: "last_frame", type: "image", mimeType: "image/png" });
+  if (trimmed(content.last_frame_url)) artifacts.push({ key: "last_frame", type: "image" });
   return artifacts;
 }
 
@@ -1418,7 +1603,7 @@ export function buildContentRequest(ctx) {
     url = trimmed(urls[ctx.artifactKey]);
   }
   if (!url) throw new Error("artifact_not_found");
-  return { url: url, method: ctx.clientRequest.method, credentialless: true };
+  return { url: url, method: ctx.artifactKey === "last_frame" ? "GET" : ctx.clientRequest.method, credentialless: true };
 }
 
 export function extractUsageOnComplete(task, taskResult, body) {
@@ -1431,6 +1616,8 @@ export function extractUsageOnComplete(task, taskResult, body) {
   // 明确的 completion_tokens=0 是有效计费用量，只有缺失或非法值才回退总量。
   if (tokens === null) tokens = totalTokens;
   if (tokens !== null) facts.tokens = tokens;
+  // 结算秒数只取成功响应的实际时长，不回退请求时长或智能时长预算。
+  if (typeof body.duration === "number" && Number.isFinite(body.duration) && body.duration > 0 && body.duration <= 3600) facts.seconds = body.duration;
   const content = body.content || {};
   const resolution = trimmed(content.resolution || body.resolution).toLowerCase();
   if (videoProfile(task).resolutions.includes(resolution)) facts.resolution = resolution;
@@ -1598,10 +1785,11 @@ export const protocols = {
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
       const effectiveModel = ctx.upstreamModel || model;
       requestResolution(effectiveModel, requestBody, model);
-      validateGenerationParameters(requestBody, effectiveModel, false);
+      const capabilityModel = validationModel(ctx, effectiveModel);
+      validateGenerationParameters(requestBody, capabilityModel, false);
       const content = requestContent(requestBody, true);
-      const contentInfo = validateDoubaoContent(effectiveModel, content);
-      validateDoubaoOptions(effectiveModel, requestBody, contentInfo, false);
+      const contentInfo = validateDoubaoContent(capabilityModel, content);
+      validateDoubaoOptions(capabilityModel, requestBody, contentInfo, false);
       const intent = { kind: "submit", model: model, action: contentInfo.hasMedia ? "image_to_video" : "text_to_video", requestBody: requestBody };
       const originTaskIds = draftTaskIds(content);
       if (originTaskIds.length) intent.originTaskIds = originTaskIds;
@@ -1617,8 +1805,10 @@ export const protocols = {
         const events = previousState && previousState.status === status ? [] : [{ type: "output", data: text }];
         return { events: events, state: state, done: true };
       }
-      if (status === "FAILURE")
-        return { events: [{ type: "error", code: "task_failed", message: task.fail_reason || "task failed" }], state: state, done: true };
+      if (status === "FAILURE") {
+        const error = task.data && task.data.error;
+        return { events: [{ type: "error", code: error && error.code ? String(error.code) : "task_failed", message: task.fail_reason || "task failed" }], state: state, done: true };
+      }
       if (previousState && previousState.status === status && previousState.progress === progress) return { events: [], state: state, done: false };
       const event = { type: "progress", message: status.toLowerCase() };
       if (progress !== null) event.progress = progress;
@@ -1653,7 +1843,13 @@ const legacyRenderers = {
       created_at: task.created_at,
       completed_at: task.updated_at,
     };
-    if (data.status === "failed") output.error = { message: data.error ? data.error.message || "" : "", code: data.error ? data.error.code || "" : "" };
+    for (const field of ["duration", "resolution", "ratio", "output_format", "service_tier", "draft", "execution_expires_after", "usage"]) {
+      if (Object.prototype.hasOwnProperty.call(data, field)) output[field] = data[field];
+    }
+    if (task.status === "FAILURE") {
+      const error = data.error && typeof data.error === "object" && !Array.isArray(data.error) ? data.error : {};
+      output.error = Object.assign({}, error, { message: error.message || task.fail_reason || "failed" });
+    }
     return output;
   },
 };
@@ -1666,16 +1862,20 @@ protocols.openai_video = {
       const req = Object.assign({}, ctx.body.value);
       const model = ctx.upstreamModel || ctx.model;
       requestResolution(model, req, ctx.model);
-      validateGenerationParameters(req, model, false);
+      const capabilityModel = validationModel(ctx, model);
+      validateGenerationParameters(req, capabilityModel, false);
       const content = requestContent(req, true);
-      const contentInfo = validateDoubaoContent(model, content);
-      validateDoubaoOptions(model, req, contentInfo, false);
-      return {
+      const contentInfo = validateDoubaoContent(capabilityModel, content);
+      validateDoubaoOptions(capabilityModel, req, contentInfo, false);
+      const intent = {
         kind: "submit",
         model: ctx.model,
         action: contentInfo.hasMedia ? "image_to_video" : "text_to_video",
         requestBody: Object.assign({}, req, { model: ctx.model }),
       };
+      const originTaskIds = draftTaskIds(content);
+      if (originTaskIds.length) intent.originTaskIds = originTaskIds;
+      return intent;
     }
     const first = function (name) {
       const values = (ctx.body.fields || {})[name] || [];
@@ -1699,15 +1899,16 @@ protocols.openai_video = {
         req[key] = value;
       }
     }
-    if (req.metadata !== undefined) {
+    for (const key of ["metadata", "moderation_options"]) {
+      if (req[key] === undefined) continue;
       let parsed;
       try {
-        parsed = JSON.parse(req.metadata);
+        parsed = JSON.parse(req[key]);
       } catch (e) {
-        throw new Error("metadata must be a JSON object string", { cause: e });
+        throw new Error(key + " must be a JSON object string", { cause: e });
       }
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("metadata must be a JSON object string");
-      req.metadata = parsed;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(key + " must be a JSON object string");
+      req[key] = parsed;
     }
     if (typeof req.content === "string") {
       let parsed;
@@ -1722,18 +1923,22 @@ protocols.openai_video = {
     if ((ctx.body.files || []).length) throw new Error("Doubao requires image and video references to be URLs inside metadata.content");
     const model = ctx.upstreamModel || ctx.model;
     requestResolution(model, req, ctx.model);
-    validateGenerationParameters(req, model, false);
+    const capabilityModel = validationModel(ctx, model);
+    validateGenerationParameters(req, capabilityModel, false);
     if (req.seconds !== undefined) req.seconds = Number(req.seconds);
     else if (req.duration !== undefined) req.seconds = Number(req.duration);
     const content = requestContent(req, true);
-    const contentInfo = validateDoubaoContent(model, content);
-    validateDoubaoOptions(model, req, contentInfo, false);
-    return {
+    const contentInfo = validateDoubaoContent(capabilityModel, content);
+    validateDoubaoOptions(capabilityModel, req, contentInfo, false);
+    const intent = {
       kind: "submit",
       model: ctx.model,
       action: contentInfo.hasMedia ? "image_to_video" : "text_to_video",
       requestBody: Object.assign({}, req, { model: ctx.model }),
     };
+    const originTaskIds = draftTaskIds(content);
+    if (originTaskIds.length) intent.originTaskIds = originTaskIds;
+    return intent;
   },
   render: function (ctx, task) {
     return legacyRenderers.openai_video(task);

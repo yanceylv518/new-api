@@ -22,13 +22,15 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskjsplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
 const (
-	maxTaskPluginNativeListPage = 100000
-	maxTaskPluginNativePageSize = 100
+	maxTaskPluginNativeListPage   = 100000
+	maxTaskPluginNativePageSize   = 100
+	taskPluginNativeActionTimeout = 90 * time.Second
 )
 
 // RelayTaskPluginNativeAction 处理动态任务插件管理路由。
@@ -115,16 +117,30 @@ func RelayTaskPluginNativeProxy(c *gin.Context) {
 			return
 		}
 	}
+	baseURL, proxy, channelType := channelModel.GetBaseURL(), channelModel.GetSetting().Proxy, channelModel.Type
+	if resourceTask != nil && resourceTask.PrivateData.TransportSaved {
+		baseURL, proxy = resourceTask.PrivateData.BaseURL, resourceTask.PrivateData.Proxy
+		channelType = resourceTask.PrivateData.ChannelType
+	}
 	adaptor := taskjsplugin.New(pinned.Plugin)
+	headers := channelModel.GetHeaderOverride()
+	if resourceTask != nil {
+		headers, err = resourceTask.GetTransportHeaderOverride(channelModel)
+		if err != nil {
+			respondTaskPluginNativeActionError(c, http.StatusBadGateway, "resource_account_unavailable", "Resource account binding is unavailable")
+			return
+		}
+	}
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, ChannelId: channelID, ChannelBaseUrl: baseURL, ApiKey: key, HeadersOverride: headers}})
 	response, err := adaptor.ExecuteNativeRequest(
 		c.Request.Context(),
 		requestContext,
 		modelName,
 		modelName,
-		channelModel.GetBaseURL(),
+		baseURL,
 		key,
-		channelModel.Type,
-		channelModel.GetSetting().Proxy,
+		channelType,
+		proxy,
 		resourceTask,
 	)
 	if err != nil {
@@ -188,6 +204,8 @@ func renderTaskPluginNativeList(
 		respondTaskPluginNativeActionError(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	filter.Platforms = pinned.Platforms()
+	filter.ExcludeNativeDeleted = true
 	page, pageSize := 0, 0
 	// 原生列表可声明自己的官方分页和时间窗口，宿主再次验证边界；旧插件保留原来的默认限制。
 	if raw, present := intent["listOptions"]; present {
@@ -351,6 +369,10 @@ func taskPluginNativeListFilter(meta pluginruntime.Meta, query map[string][]stri
 		filter.ExcludeExpired = true
 	case "cancelled":
 		filter.CancelledOnly = true
+	case "expired":
+		filter.Statuses = []model.TaskStatus{model.TaskStatusFailure}
+		filter.ExcludeCancelled = true
+		filter.ExpiredOnly = true
 	default:
 		return model.TaskPluginTaskFilter{}, fmt.Errorf("filter.status is invalid")
 	}
@@ -588,7 +610,13 @@ func executeTaskPluginNativeDelete(
 		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_lookup_failed", "Failed to query task")
 		return
 	}
-	if !exists || task == nil || !taskPluginNativeTaskOwned(pinned.Plugin.Meta, task) {
+	if exists && task != nil {
+		if selected, found := pinned.ForPlatform(task.Platform); found {
+			pinned = selected
+			c.Set(pluginruntime.ContextKeyPinnedRoute, pinned)
+		}
+	}
+	if !exists || task == nil || task.PrivateData.NativeDeleted || !taskPluginNativeTaskOwned(pinned.Plugin.Meta, task) {
 		respondTaskPluginNativeActionError(c, http.StatusNotFound, "task_not_found", "Task not found")
 		return
 	}
@@ -614,8 +642,12 @@ func executeTaskPluginNativeDelete(
 		return
 	}
 	adaptor := taskjsplugin.New(pinned.Plugin)
-	// 删除可能移除上游最终用量，必须先通过既有结算链同步本地状态。
-	actionContext, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	if !pinned.Plugin.Engine.HasExport("buildTaskActionRequest") {
+		respondTaskPluginNativeActionError(c, http.StatusNotImplemented, "task_action_not_supported", "Task action is not supported")
+		return
+	}
+	// 先同步最终用量，再为上游最多 60 秒的取消等待及本地确认留出时间。
+	actionContext, cancel := context.WithTimeout(c.Request.Context(), taskPluginNativeActionTimeout)
 	defer cancel()
 	task, err = service.RefreshTaskForManagement(actionContext, adaptor, channelModel, task)
 	if err != nil {
@@ -623,6 +655,10 @@ func executeTaskPluginNativeDelete(
 		return
 	}
 	baseURL := channelModel.GetBaseURL()
+	proxy := channelModel.GetSetting().Proxy
+	if task.PrivateData.TransportSaved {
+		baseURL, proxy = task.PrivateData.BaseURL, task.PrivateData.Proxy
+	}
 	key := channelModel.Key
 	if task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
@@ -632,7 +668,7 @@ func executeTaskPluginNativeDelete(
 		respondTaskPluginNativeActionError(c, http.StatusNotImplemented, "task_action_not_supported", "Task action is not supported")
 		return
 	}
-	response, err := responseProvider.ExecuteTaskAction(actionContext, "delete", task, baseURL, key, channelModel.GetSetting().Proxy)
+	response, err := responseProvider.ExecuteTaskAction(actionContext, "delete", task, baseURL, key, proxy)
 	if err != nil {
 		respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_action_failed", "Task action failed")
 		return
@@ -641,7 +677,9 @@ func executeTaskPluginNativeDelete(
 		respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_action_failed", "Task action returned an empty response")
 		return
 	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+	alreadyDeleted := (response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusGone) &&
+		(task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure)
+	if (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) && !alreadyDeleted {
 		respondTaskPluginUpstreamActionError(c, task, response, key)
 		return
 	}
@@ -650,7 +688,10 @@ func executeTaskPluginNativeDelete(
 		Action string `json:"action"`
 		Status string `json:"status"`
 	}
-	if response.Action != "" {
+	if alreadyDeleted {
+		payload.TaskID = task.GetUpstreamTaskID()
+		payload.Action, payload.Status = "deleted", "deleted"
+	} else if response.Action != "" {
 		payload.TaskID = task.GetUpstreamTaskID()
 		payload.Action, payload.Status = response.Action, response.Action
 	} else if err = common.Unmarshal(response.Body, &payload); err != nil {
@@ -659,7 +700,7 @@ func executeTaskPluginNativeDelete(
 	}
 	if payload.Action == "unknown" {
 		// 空响应无法区分排队取消和刚完成后删除，直接查询上游验证；不得走会把 404 当失败退款的轮询入口。
-		confirmation, fetchErr := adaptor.FetchTaskWithContext(actionContext, baseURL, key, task, channelModel.GetSetting().Proxy)
+		confirmation, fetchErr := adaptor.FetchTaskWithContext(actionContext, baseURL, key, task, proxy)
 		if fetchErr != nil {
 			respondTaskPluginNativeActionError(c, http.StatusBadGateway, "task_cancel_pending", "Task operation succeeded; cancellation confirmation is pending")
 			return
@@ -702,6 +743,16 @@ func executeTaskPluginNativeDelete(
 	if action == "cancelled" {
 		if !markTaskPluginTaskCancelled(c, task) {
 			respondTaskPluginNativeActionError(c, http.StatusServiceUnavailable, "task_cancel_pending", "Upstream task was cancelled; local settlement is pending")
+			return
+		}
+	}
+	if action == "deleted" {
+		// 上游已执行删除，客户端断开不能撤销本地可见性更新。
+		persistContext, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+		err := model.MarkTaskPluginNativeDeleted(persistContext, task)
+		cancel()
+		if err != nil {
+			respondTaskPluginNativeActionError(c, http.StatusServiceUnavailable, "task_delete_pending", "Upstream task was deleted; local deletion is pending, retry the deletion")
 			return
 		}
 	}
@@ -815,6 +866,7 @@ func respondTaskPluginUpstreamActionError(c *gin.Context, task *model.Task, resp
 		c.Header("X-Upstream-Request-Id", requestID)
 	}
 	logger.LogWarn(c, fmt.Sprintf("task_plugin action=delete task=%s channel_id=%d upstream_status=%d upstream_code=%q upstream_request_id=%q message=%q", task.TaskID, task.ChannelId, response.StatusCode, code, requestID, message))
+	message = service.PublicTaskModelText(message, task.Properties.OriginModelName, task.Properties.UpstreamModelName)
 	taskErr := &dto.TaskError{
 		Code: code, Message: message, StatusCode: status,
 		UpstreamError: &dto.TaskPluginError{Code: code, Message: message},

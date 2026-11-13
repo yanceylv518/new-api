@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
+var expectedKeys = []string{"alibaba", "anyllm", "doubao", "google", "hailuo", "jimeng", "kling", "originocean", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -252,9 +252,9 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 			driver:           map[string]any{"action": "MUSIC", "model": "suno_music", "upstreamModel": "suno_music", "requestBody": map[string]any{"prompt": "a song"}},
 			vendorKey:        "vendor-key",
 			vendorAuthPrefix: "Bearer vendor-key",
-			vendorSubmit:     "/suno/submit/MUSIC",
+			vendorSubmit:     "/submit/MUSIC",
 			gatewaySubmit:    "/suno/submit/MUSIC",
-			vendorQuery:      "/suno/fetch",
+			vendorQuery:      "/fetch",
 			gatewayQuery:     "/suno/fetch",
 		},
 		{
@@ -280,15 +280,18 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 		},
 	}
 	variants := []struct {
-		name      string
-		upstream  map[string]any
-		gateway   bool
-		legacyKey bool
+		name             string
+		upstream         map[string]any
+		gateway          bool
+		legacyKey        bool
+		configuredPrefix bool
 	}{
-		{"vendor signal", map[string]any{"kind": "vendor"}, false, false},
-		{"no signal from an older host", nil, false, false},
-		{"new_api signal", map[string]any{"kind": "new_api"}, true, false},
-		{"legacy sk- key without a signal", nil, true, true},
+		{"vendor signal", map[string]any{"kind": "vendor"}, false, false, false},
+		{"no signal from an older host", nil, false, false, false},
+		{"new_api configured prefix", map[string]any{"kind": "new_api"}, true, false, true},
+		{"new_api preserves root", map[string]any{"kind": "new_api"}, true, false, false},
+		{"legacy sk- configured prefix", nil, true, true, true},
+		{"legacy sk- preserves root", nil, true, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key, func(t *testing.T) {
@@ -319,7 +322,11 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 					if variant.gateway && !variant.legacyKey {
 						authHeader = "Bearer " + apiKey
 					}
-					ctx := map[string]any{"baseUrl": base, "apiKey": apiKey, "authHeader": authHeader, "publicTaskId": "task_pub", "requestHeaders": map[string]any{}, "files": []any{}}
+					configuredBase := base
+					if variant.configuredPrefix {
+						configuredBase += strings.TrimSuffix(tc.gatewaySubmit, tc.vendorSubmit)
+					}
+					ctx := map[string]any{"baseUrl": configuredBase, "apiKey": apiKey, "authHeader": authHeader, "publicTaskId": "task_pub", "requestHeaders": map[string]any{}, "files": []any{}}
 					for key, value := range tc.driver {
 						ctx[key] = value
 					}
@@ -327,7 +334,7 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 						ctx["upstream"] = variant.upstream
 					}
 					wantSubmit, wantQuery := tc.vendorSubmit, tc.vendorQuery
-					if variant.gateway {
+					if variant.configuredPrefix {
 						wantSubmit, wantQuery = tc.gatewaySubmit, tc.gatewayQuery
 					}
 
@@ -341,7 +348,7 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 						assert.True(t, strings.HasPrefix(authorization, tc.vendorAuthPrefix), "vendor Authorization %q", authorization)
 					}
 
-					queryCtx := map[string]any{"taskId": "tid", "publicTaskId": "task_pub", "action": tc.driver["action"], "model": tc.driver["model"], "upstreamModel": tc.driver["upstreamModel"], "baseUrl": base, "apiKey": apiKey, "authHeader": authHeader, "data": nil, "state": nil}
+					queryCtx := map[string]any{"taskId": "tid", "publicTaskId": "task_pub", "action": tc.driver["action"], "model": tc.driver["model"], "upstreamModel": tc.driver["upstreamModel"], "baseUrl": configuredBase, "apiKey": apiKey, "authHeader": authHeader, "data": nil, "state": nil}
 					if variant.upstream != nil {
 						queryCtx["upstream"] = variant.upstream
 					}

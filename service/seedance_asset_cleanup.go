@@ -44,58 +44,38 @@ type seedanceAssetCleanupResult struct {
 	err            error
 }
 
-// NewSeedanceAssetDeleteCleanupJob 把本地素材快照转换为后台删除任务，确保外部删除完成后才移除映射。
+var seedanceAssetUpstreamDeleteSlots = make(chan struct{}, 64)
+
+// 用户删除的上游请求只作尽力清理，限流后不得占用本站清理工作线程。
+func deleteSeedanceAssetUpstreamBestEffort(client *SeedanceAssetClient, upstreamID string, group bool) {
+	select {
+	case seedanceAssetUpstreamDeleteSlots <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-seedanceAssetUpstreamDeleteSlots }()
+		ctx, cancel := context.WithTimeout(context.Background(), seedanceAssetCleanupOperationTimeout)
+		defer cancel()
+		if group {
+			_ = client.DeleteSeedanceAssetGroup(ctx, upstreamID)
+		} else {
+			_ = client.DeleteSeedanceAsset(ctx, upstreamID)
+		}
+	}()
+}
+
+// NewSeedanceAssetDeleteCleanupJob 保存本站删除所需快照；上游删除失败不阻塞本站资源清理。
 func NewSeedanceAssetDeleteCleanupJob(asset *model.SeedanceAsset) model.SeedanceAssetCleanupJob {
 	if asset == nil {
 		return model.SeedanceAssetCleanupJob{}
 	}
-	return model.SeedanceAssetCleanupJob{
-		Kind:           model.SeedanceAssetCleanupKindAssetDelete,
-		UserID:         asset.UserID,
-		LocalAssetID:   asset.ID,
-		ChannelID:      asset.ChannelID,
-		KeyFingerprint: asset.KeyFingerprint,
-		UpstreamID:     asset.AssetID,
-		UpstreamDoneAt: asset.UpstreamDeletedAt,
-		ObjectKey:      asset.ObjectKey,
-		Storage:        asset.Storage,
-		DedupKey: seedanceAssetCleanupDedupKey(
-			model.SeedanceAssetCleanupKindAssetDelete,
-			fmt.Sprintf("%d", asset.UserID),
-			fmt.Sprintf("%d", asset.ID),
-		),
-		Status:        model.SeedanceAssetCleanupStatusPending,
-		NextAttemptAt: common.GetTimestamp(),
-	}
+	return model.NewSeedanceAssetDeleteCleanupJobs(asset, nil)[0]
 }
 
 // NewSeedanceAssetDeleteCleanupJobs 为原素材和全部账号副本创建独立的删除任务。
 func NewSeedanceAssetDeleteCleanupJobs(asset *model.SeedanceAsset, replicas []model.SeedanceAssetReplica) []model.SeedanceAssetCleanupJob {
-	if asset == nil {
-		return nil
-	}
-	jobs := make([]model.SeedanceAssetCleanupJob, 0, len(replicas)+1)
-	jobs = append(jobs, NewSeedanceAssetDeleteCleanupJob(asset))
-	for _, replica := range replicas {
-		jobs = append(jobs, model.SeedanceAssetCleanupJob{
-			Kind:           model.SeedanceAssetCleanupKindReplicaDelete,
-			UserID:         replica.UserID,
-			LocalAssetID:   replica.LocalAssetID,
-			LocalMappingID: replica.ID,
-			ChannelID:      replica.ChannelID,
-			KeyFingerprint: replica.KeyFingerprint,
-			UpstreamID:     replica.UpstreamAssetID,
-			UpstreamDoneAt: replica.UpstreamDeletedAt,
-			DedupKey: seedanceAssetCleanupDedupKey(
-				model.SeedanceAssetCleanupKindReplicaDelete,
-				fmt.Sprintf("%d", replica.UserID),
-				fmt.Sprintf("%d", replica.ID),
-			),
-			Status:        model.SeedanceAssetCleanupStatusPending,
-			NextAttemptAt: common.GetTimestamp(),
-		})
-	}
-	return jobs
+	return model.NewSeedanceAssetDeleteCleanupJobs(asset, replicas)
 }
 
 // NewSeedanceAssetGroupDeleteCleanupJob 为素材组删除生成稳定的去重任务。
@@ -249,7 +229,7 @@ func RunSeedanceAssetCleanupOnce(ctx context.Context, report func(processed, tot
 	return summary, ctx.Err()
 }
 
-// processSeedanceAssetCleanupJob 先完成外部资源清理，再删除本地删除任务对应的素材映射。
+// processSeedanceAssetCleanupJob 处理删除阶段，本站数据库或 OSS 失败时保留任务重试。
 func processSeedanceAssetCleanupJob(ctx context.Context, job *model.SeedanceAssetCleanupJob) seedanceAssetCleanupResult {
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetCleanupLease/time.Second)
@@ -282,8 +262,7 @@ func processSeedanceAssetCleanupJob(ctx context.Context, job *model.SeedanceAsse
 	return result
 }
 
-// executeSeedanceAssetGroupCleanup 删除素材组的所有上游副本，再清理本地素材和 OSS。
-// 每个阶段都把完成状态写回数据库，失败重试时只会继续处理未完成的资源。
+// executeSeedanceAssetGroupCleanup 尽力删除上游副本，并独立清理本站素材和 OSS。
 func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAssetCleanupJob) error {
 	var group model.SeedanceAssetGroup
 	if err := model.DB.WithContext(ctx).
@@ -300,11 +279,11 @@ func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAs
 
 	if group.UpstreamDeletedAt == 0 && strings.TrimSpace(group.GroupID) != "" {
 		client, err := ResolveSeedanceAssetClient(ctx, group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := client.DeleteSeedanceAssetGroup(ctx, group.GroupID); err != nil {
-			return err
+		if err == nil {
+			deleteSeedanceAssetUpstreamBestEffort(client, group.GroupID, true)
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroup{}).
 			Where("id = ? AND user_id = ? AND status = ? AND upstream_deleted_at = 0", group.ID, group.UserID, "Deleting").
@@ -323,11 +302,11 @@ func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAs
 			continue
 		}
 		client, err := ResolveSeedanceAssetClient(ctx, replica.ChannelID, replica.KeyFingerprint, replica.AccountFingerprint)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := client.DeleteSeedanceAssetGroup(ctx, replica.UpstreamGroupID); err != nil {
-			return err
+		if err == nil {
+			deleteSeedanceAssetUpstreamBestEffort(client, replica.UpstreamGroupID, true)
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroupReplica{}).
 			Where("id = ? AND user_id = ? AND local_group_id = ? AND upstream_deleted_at = 0", replica.ID, replica.UserID, replica.LocalGroupID).
@@ -340,7 +319,7 @@ func executeSeedanceAssetGroupCleanup(ctx context.Context, job *model.SeedanceAs
 		return err
 	}
 	return model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("user_id = ? AND local_group_id = ? AND status = ?", group.UserID, group.ID, "Deleting").
+		if err := tx.Where("user_id = ? AND local_group_id = ?", group.UserID, group.ID).
 			Delete(&model.SeedanceAssetGroupReplica{}).Error; err != nil {
 			return err
 		}
@@ -440,26 +419,31 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 				}
 			}
 			client, err := ResolveSeedanceAssetClient(operationCtx, job.ChannelID, job.KeyFingerprint, accountFingerprint)
-			if err != nil {
+			localDelete := job.Kind == model.SeedanceAssetCleanupKindAssetDelete || job.Kind == model.SeedanceAssetCleanupKindReplicaDelete
+			if err == nil && !localDelete {
+				switch job.Kind {
+				case model.SeedanceAssetCleanupKindUpstreamGroup:
+					err = client.DeleteSeedanceAssetGroup(operationCtx, job.UpstreamID)
+				default:
+					err = client.DeleteSeedanceAsset(operationCtx, job.UpstreamID)
+				}
+			}
+			if err != nil && !localDelete && !errors.Is(err, errSeedanceAssetAccountMissing) {
 				return err
 			}
-			switch job.Kind {
-			case model.SeedanceAssetCleanupKindUpstreamGroup:
-				if err := client.DeleteSeedanceAssetGroup(operationCtx, job.UpstreamID); err != nil {
-					return err
-				}
-			default:
-				if err := client.DeleteSeedanceAsset(operationCtx, job.UpstreamID); err != nil {
-					return err
-				}
+			if err := operationCtx.Err(); err != nil {
+				return err
 			}
-			if job.Kind == model.SeedanceAssetCleanupKindAssetDelete || job.Kind == model.SeedanceAssetCleanupKindReplicaDelete {
+			if localDelete {
 				updated, err := model.MarkSeedanceAssetCleanupUpstreamDone(job.ID, job.LeaseUntil, common.GetTimestamp())
 				if err != nil {
 					return err
 				}
 				if !updated {
 					return errors.New("Seedance asset cleanup lease lost")
+				}
+				if err == nil && client != nil {
+					deleteSeedanceAssetUpstreamBestEffort(client, job.UpstreamID, false)
 				}
 			}
 		}
@@ -471,23 +455,17 @@ func executeSeedanceAssetCleanup(ctx context.Context, job *model.SeedanceAssetCl
 				return result.Error
 			}
 		}
-		if job.Kind == model.SeedanceAssetCleanupKindAssetDelete {
-			var replicaCount int64
-			if err := model.DB.WithContext(operationCtx).Model(&model.SeedanceAssetReplica{}).
-				Where("user_id = ? AND local_asset_id = ?", job.UserID, job.LocalAssetID).
-				Count(&replicaCount).Error; err != nil {
-				return err
-			}
-			if replicaCount > 0 {
-				return errors.New("Seedance asset account replicas are still being deleted")
-			}
-		}
 		if job.Kind == model.SeedanceAssetCleanupKindAssetDelete && strings.TrimSpace(job.ObjectKey) != "" {
 			if err := RemoveSeedanceAssetObject(operationCtx, job.ObjectKey, job.Storage); err != nil {
 				return err
 			}
 		}
 		if job.Kind == model.SeedanceAssetCleanupKindAssetDelete && job.LocalAssetID > 0 {
+			if err := model.DB.WithContext(operationCtx).
+				Where("user_id = ? AND local_asset_id = ?", job.UserID, job.LocalAssetID).
+				Delete(&model.SeedanceAssetReplica{}).Error; err != nil {
+				return err
+			}
 			if err := model.DeleteSeedanceAssetWithCount(operationCtx, job.UserID, job.LocalAssetID, "Deleting"); err != nil {
 				return err
 			}

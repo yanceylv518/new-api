@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/tidwall/sjson"
 )
 
 type RouteType string
@@ -24,6 +25,7 @@ const (
 )
 
 type Route struct {
+	Protocol    string    `json:"protocol,omitempty"`
 	Method      string    `json:"method"`
 	Path        string    `json:"path"`
 	Type        RouteType `json:"type"`
@@ -38,6 +40,15 @@ type Route struct {
 	RetainResult *bool `json:"retainResult,omitempty"`
 	// Models 限定可用模型：提交路由检查顶层 model，查询路由检查任务记录；非空列表必须是 meta.models 的子集。
 	Models []string `json:"models,omitempty"`
+}
+
+// CanShareWith 限定共享入口的完整操作契约，供注册表和 HTTP 路由准入共用。
+func (route Route) CanShareWith(other Route) bool {
+	return route.Protocol != "" && route.Protocol == other.Protocol &&
+		route.Method == other.Method && route.Path == other.Path &&
+		route.Type == other.Type && route.Action == other.Action && route.TaskIDParam == other.TaskIDParam &&
+		(route.Type != RouteTypeDynamic || route.Action == "list" || route.Action == "delete") &&
+		(route.RetainResult == nil || *route.RetainResult) == (other.RetainResult == nil || *other.RetainResult)
 }
 
 // ProtocolClaim is one entry of meta.protocols. Models narrows the protocol's
@@ -200,15 +211,18 @@ func LookupHostProtocolOperation(method, path string) (string, HostProtocolOpera
 }
 
 type RouteBinding struct {
-	Plugin *LoadedPlugin
-	Route  Route
+	Plugin        *LoadedPlugin
+	Route         Route
+	DeclaredModel string
+	ChannelIDs    []int
 }
 
 type ProtocolBinding struct {
-	Plugin    *LoadedPlugin
-	Protocol  string
-	Operation HostProtocolOperation
-	Model     string
+	Plugin     *LoadedPlugin
+	Protocol   string
+	Operation  HostProtocolOperation
+	Model      string
+	ChannelIDs []int
 }
 
 const (
@@ -216,6 +230,7 @@ const (
 	ContextKeyPinnedRoute        = "task_plugin_pinned_route"
 	ContextKeyPinnedEndpoint     = "task_plugin_pinned_endpoint"
 	ContextKeyRouteRequest       = "task_plugin_route_request"
+	ContextKeyClientRequestBody  = "task_plugin_client_request_body"
 	ContextKeyOriginResourceTask = "task_plugin_origin_resource_task"
 	ContextKeyProtocolRequest    = "task_plugin_protocol_request"
 	// ContextKeyRequestBodyText holds, for a plugin that preserves JSON
@@ -230,9 +245,58 @@ type PinnedPlugin struct {
 }
 
 type PinnedRoute struct {
-	Generation *RoutingGeneration
-	Plugin     *LoadedPlugin
-	Route      Route
+	Generation    *RoutingGeneration
+	Plugin        *LoadedPlugin
+	Route         Route
+	DeclaredModel string
+	Candidates    []RouteBinding
+}
+
+// Bindings 返回同一协议入口的候选；普通路由仍只属于原插件。
+func (p PinnedRoute) Bindings() []RouteBinding {
+	if len(p.Candidates) > 0 {
+		return p.Candidates
+	}
+	return []RouteBinding{{Plugin: p.Plugin, Route: p.Route}}
+}
+
+// Platforms 汇总同一入口允许查询的任务平台，不扩大用户归属范围。
+func (p PinnedRoute) Platforms() []constant.TaskPlatform {
+	var result []constant.TaskPlatform
+	for _, binding := range p.Bindings() {
+		if binding.Plugin == nil {
+			continue
+		}
+		platform := constant.TaskPlatform(binding.Plugin.Meta.Key)
+		if !slices.Contains(result, platform) {
+			result = append(result, platform)
+		}
+		for _, channelType := range binding.Plugin.Meta.ChannelTypes {
+			platform = constant.TaskPlatform(strconv.Itoa(channelType))
+			if channelType > 0 && channelType != constant.ChannelTypeTaskPlugin && !slices.Contains(result, platform) {
+				result = append(result, platform)
+			}
+		}
+	}
+	return result
+}
+
+// ForPlatform 让查询和管理操作沿用任务实际执行插件。
+func (p PinnedRoute) ForPlatform(platform constant.TaskPlatform) (PinnedRoute, bool) {
+	for _, binding := range p.Bindings() {
+		if binding.Plugin == nil {
+			continue
+		}
+		matched := string(platform) == binding.Plugin.Meta.Key
+		for _, channelType := range binding.Plugin.Meta.ChannelTypes {
+			matched = matched || channelType > 0 && string(platform) == strconv.Itoa(channelType)
+		}
+		if matched {
+			p.Plugin, p.Route = binding.Plugin, binding.Route
+			return p, true
+		}
+	}
+	return PinnedRoute{}, false
 }
 
 // PinnedEndpoint carries the exact generation and endpoint candidates selected
@@ -297,6 +361,66 @@ type RouteRequestContext struct {
 	// host reads. Body storage never changes these bytes, which the engine
 	// parses in place.
 	BodyText json.RawMessage `json:"-"`
+}
+
+// WithModel 为单次解码替换模型名，保留原始请求及有序 JSON。
+func (r RouteRequestContext) WithModel(alias, model string) (RouteRequestContext, error) {
+	body, ok := r.Body.(map[string]any)
+	if !ok {
+		return r, fmt.Errorf("task request body is unavailable")
+	}
+	copyBody := maps.Clone(body)
+	changed := false
+	if ASCIIFold(strings.TrimSpace(r.Params["model"])) == ASCIIFold(alias) && alias != "" {
+		r.Params = maps.Clone(r.Params)
+		r.Params["model"] = model
+		changed = true
+	}
+	switch body["kind"] {
+	case string(BodyJSON):
+		value, ok := body["value"].(map[string]any)
+		if !ok {
+			return r, fmt.Errorf("task request body must be an object")
+		}
+		copyValue := maps.Clone(value)
+		for _, field := range []string{"model", "model_name"} {
+			current, valid := value[field].(string)
+			if !valid || ASCIIFold(strings.TrimSpace(current)) != ASCIIFold(alias) {
+				continue
+			}
+			copyValue[field] = model
+			changed = true
+			if len(r.BodyText) > 0 {
+				text, err := sjson.SetBytes(r.BodyText, field, model)
+				if err != nil {
+					return r, err
+				}
+				r.BodyText = text
+			}
+		}
+		copyBody["value"] = copyValue
+	case string(BodyForm), string(BodyMultipart):
+		fields, ok := body["fields"].(map[string][]string)
+		if !ok {
+			return r, fmt.Errorf("task request fields are unavailable")
+		}
+		copyFields := maps.Clone(fields)
+		for _, field := range []string{"model", "model_name"} {
+			values := fields[field]
+			if len(values) == 1 && ASCIIFold(strings.TrimSpace(values[0])) == ASCIIFold(alias) {
+				copyFields[field] = []string{model}
+				changed = true
+			}
+		}
+		copyBody["fields"] = copyFields
+	default:
+		return r, fmt.Errorf("task request body does not contain a model")
+	}
+	if !changed {
+		return r, fmt.Errorf("task request model does not match the alias")
+	}
+	r.Body = copyBody
+	return r, nil
 }
 
 // JSValue shares the request with hooks without copying it: the engine never
@@ -380,6 +504,7 @@ type RoutingGeneration struct {
 	canonicalModelByFold map[string]string
 	byChannelType        map[int]*LoadedPlugin
 	routeIndex           map[string]RouteBinding
+	routeCandidates      map[string][]RouteBinding
 	protocolIndex        map[string][]ProtocolBinding
 	plugins              []*LoadedPlugin
 	routes               []RouteBinding
@@ -511,6 +636,18 @@ func (g *RoutingGeneration) LookupDeclaredRoute(method, path string) (RouteBindi
 	}
 	binding, ok := g.routeIndex[normalizedMethod+" "+shape]
 	return binding, ok
+}
+
+// LookupDeclaredRouteCandidates 只返回显式声明相同协议的共享入口。
+func (g *RoutingGeneration) LookupDeclaredRouteCandidates(method, path string) []RouteBinding {
+	if g == nil {
+		return nil
+	}
+	shape, err := routePathShape(path)
+	if err != nil {
+		return nil
+	}
+	return append([]RouteBinding(nil), g.routeCandidates[strings.ToUpper(method)+" "+shape]...)
 }
 
 func (g *RoutingGeneration) LookupEndpoint(method, path, model string) (ProtocolBinding, bool) {
@@ -927,6 +1064,7 @@ func buildRoutingGenerationFromPlugins(effective map[string]*LoadedPlugin, numbe
 		canonicalModelByFold: make(map[string]string),
 		byChannelType:        make(map[int]*LoadedPlugin),
 		routeIndex:           make(map[string]RouteBinding),
+		routeCandidates:      make(map[string][]RouteBinding),
 		protocolIndex:        make(map[string][]ProtocolBinding),
 		plugins:              make([]*LoadedPlugin, 0, len(effective)),
 	}
@@ -970,10 +1108,26 @@ func buildRoutingGenerationFromPlugins(effective map[string]*LoadedPlugin, numbe
 			}
 			indexKey := route.Method + " " + shape
 			if other, exists := generation.routeIndex[indexKey]; exists {
-				return nil, fmt.Errorf("plugin %s route %s %s conflicts with plugin %s route %s", plugin.Meta.Key, route.Method, route.Path, other.Plugin.Meta.Key, other.Route.Path)
+				if !route.CanShareWith(other.Route) {
+					return nil, fmt.Errorf("plugin %s route %s %s conflicts with plugin %s route %s", plugin.Meta.Key, route.Method, route.Path, other.Plugin.Meta.Key, other.Route.Path)
+				}
+				generation.routeCandidates[indexKey] = append(generation.routeCandidates[indexKey], RouteBinding{Plugin: plugin, Route: route})
+				if len(other.Plugin.Meta.ChannelTypes) == 0 && len(plugin.Meta.ChannelTypes) > 0 {
+					// 共享入口保留既有官方插件作为默认解码器，避免新增适配器收窄其他模型。
+					binding := RouteBinding{Plugin: plugin, Route: route}
+					generation.routeIndex[indexKey] = binding
+					for index, existing := range generation.routes {
+						if existing.Plugin == other.Plugin && existing.Route.Method == other.Route.Method && existing.Route.Path == other.Route.Path {
+							generation.routes[index] = binding
+							break
+						}
+					}
+				}
+				continue
 			}
 			binding := RouteBinding{Plugin: plugin, Route: route}
 			generation.routeIndex[indexKey] = binding
+			generation.routeCandidates[indexKey] = []RouteBinding{binding}
 			generation.routes = append(generation.routes, binding)
 		}
 

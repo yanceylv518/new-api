@@ -40,7 +40,10 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
-import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
+import {
+  readTaskExtendPluginKeys,
+  supportsSeedanceAssetURL,
+} from './channel-plugin-extensions'
 import { supportsResponsesWebSocket } from './responses-websocket'
 
 // ============================================================================
@@ -208,7 +211,31 @@ export const channelFormSchema = z
     type: z.number().min(0, ERROR_MESSAGES.REQUIRED_TYPE),
     base_url: z.string().optional(),
     task_plugin_key: z.string().optional(),
+    seedance_asset_url: z.string().optional(),
+    seedance_asset_share_group: z.string().optional(),
     task_extend_plugin_keys: z.array(z.string()).optional(),
+    video_routing_rules: z
+      .array(
+        z.object({
+          model: z.string().trim().min(1).max(256),
+          mode: z.enum(['allow', 'deny']),
+          resolutions: z
+            .array(z.enum(['480p', '720p', '1080p', '4k']))
+            .min(1)
+            .max(4),
+        })
+      )
+      .max(32)
+      .refine(
+        (rules) =>
+          new Set(rules.map((rule) => rule.model.toLowerCase())).size ===
+            rules.length &&
+          rules.every(
+            (rule) => new Set(rule.resolutions).size === rule.resolutions.length
+          ),
+        'Choose a model and resolution for each rule. Models must be unique.'
+      )
+      .optional(),
     key: z.string(),
     openai_organization: z.string().optional(),
     models: z.string().min(1, ERROR_MESSAGES.REQUIRED_MODELS),
@@ -294,6 +321,52 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    const assetURL = data.seedance_asset_url?.trim()
+    const assetShareGroup = data.seedance_asset_share_group?.trim()
+    if (
+      assetShareGroup &&
+      supportsSeedanceAssetURL(data.type, data.task_plugin_key)
+    ) {
+      if (!assetURL) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['seedance_asset_share_group'],
+          message: 'Enter an asset service URL before setting a sharing group',
+        })
+      } else if (
+        [...assetShareGroup].length > 64 ||
+        /\p{Cc}/u.test(assetShareGroup)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['seedance_asset_share_group'],
+          message: 'Use at most 64 characters without control characters',
+        })
+      }
+    }
+    if (assetURL && supportsSeedanceAssetURL(data.type, data.task_plugin_key)) {
+      let valid = false
+      try {
+        const url = new URL(assetURL)
+        valid =
+          assetURL.length <= 2048 &&
+          ['http:', 'https:'].includes(url.protocol) &&
+          !url.username &&
+          !url.password &&
+          !assetURL.includes('?') &&
+          !assetURL.includes('#')
+      } catch {
+        valid = false
+      }
+      if (!valid) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['seedance_asset_url'],
+          message:
+            'Enter a complete HTTP(S) URL without credentials, query, or fragment',
+        })
+      }
+    }
     if (
       [
         3,
@@ -431,7 +504,10 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   type: 1,
   base_url: '',
   task_plugin_key: '',
+  seedance_asset_url: '',
+  seedance_asset_share_group: '',
   task_extend_plugin_keys: [],
+  video_routing_rules: [],
   key: '',
   openai_organization: '',
   models: '',
@@ -498,7 +574,12 @@ export function transformChannelToFormDefaults(
   // Parse channel extra settings from setting field
   let extraSettings = {
     task_plugin_key: '',
+    seedance_asset_url: '',
+    seedance_asset_share_group: '',
     task_extend_plugin_keys: [] as string[],
+    video_routing_rules: [] as NonNullable<
+      ChannelFormValues['video_routing_rules']
+    >,
     force_format: false,
     thinking_to_content: false,
     proxy: '',
@@ -512,14 +593,27 @@ export function transformChannelToFormDefaults(
 
   if (channel.setting) {
     try {
-      const parsed = JSON.parse(channel.setting)
+      const parsed = JSON.parse(channel.setting) ?? {}
       const protocol = normalizeHttpProtocol(parsed.http_protocol)
       const shards = normalizeHttp2ConnectionShards(
         parsed.http2_connection_shards
       )
       extraSettings = {
         task_plugin_key: parsed.task_plugin_key || '',
+        seedance_asset_url: supportsSeedanceAssetURL(
+          channel.type,
+          parsed.task_plugin_key
+        )
+          ? parsed.seedance_asset_url || ''
+          : '',
+        seedance_asset_share_group: supportsSeedanceAssetURL(
+          channel.type,
+          parsed.task_plugin_key
+        )
+          ? parsed.seedance_asset_share_group || ''
+          : '',
         task_extend_plugin_keys: readTaskExtendPluginKeys(channel.type, parsed),
+        video_routing_rules: parsed.video_routing_rules ?? [],
         force_format: parsed.force_format || false,
         thinking_to_content: parsed.thinking_to_content || false,
         proxy: parsed.proxy || '',
@@ -558,7 +652,7 @@ export function transformChannelToFormDefaults(
 
   if (channel.settings) {
     try {
-      const parsed = JSON.parse(channel.settings)
+      const parsed = JSON.parse(channel.settings) ?? {}
       vertexKeyType = parsed.vertex_key_type || 'json'
       azureResponsesVersion = parsed.azure_responses_version || ''
       isEnterpriseAccount = parsed.openrouter_enterprise === true
@@ -643,7 +737,43 @@ export function transformChannelToFormDefaults(
  * Build the setting JSON string from form extra settings
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
+  const original = parseConfigurationObject(formData.setting)
+  // 已知字段由表单维护；不认识的字段保留，不影响新增版本的配置。
+  for (const key of [
+    'seedance_asset_url',
+    'seedance_asset_share_group',
+    'task_plugin_key',
+    'task_extend_plugin_keys',
+    'force_format',
+    'thinking_to_content',
+    'proxy',
+    'pass_through_body_enabled',
+    'responses_websocket_enabled',
+    'system_prompt',
+    'system_prompt_override',
+    'http_protocol',
+    'http2_connection_shards',
+    'video_routing_rules',
+  ]) {
+    delete original[key]
+  }
   const settingObj: Record<string, unknown> = {
+    ...original,
+    video_routing_rules: formData.video_routing_rules?.length
+      ? formData.video_routing_rules
+      : undefined,
+    seedance_asset_url: supportsSeedanceAssetURL(
+      formData.type,
+      formData.task_plugin_key
+    )
+      ? formData.seedance_asset_url?.trim() || undefined
+      : undefined,
+    seedance_asset_share_group: supportsSeedanceAssetURL(
+      formData.type,
+      formData.task_plugin_key
+    )
+      ? formData.seedance_asset_share_group?.trim() || undefined
+      : undefined,
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
         ? formData.task_plugin_key?.trim() || ''
@@ -686,17 +816,7 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
  * Build the settings JSON string (for type-specific config like vertex_key_type)
  */
 function buildSettingsJSON(formData: ChannelFormValues): string {
-  let settingsObj: Record<string, unknown> = {}
-
-  // Try to parse existing settings first
-  if (formData.settings && formData.settings !== '{}') {
-    try {
-      settingsObj = JSON.parse(formData.settings)
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error('Failed to parse existing settings:', error)
-    }
-  }
+  const settingsObj = parseConfigurationObject(formData.settings)
 
   // Add vertex_key_type for Vertex AI channels (type 41)
   if (formData.type === 41) {
@@ -889,9 +1009,10 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
  */
 export function transformFormDataToUpdatePayload(
   formData: ChannelFormValues,
-  channelId: number
-): Partial<Channel> {
-  const payload: Partial<Channel> = {
+  channelId: number,
+  original?: Channel
+): ChannelConfigurationUpdate {
+  const payload: ChannelConfigurationUpdate = {
     id: channelId,
     name: formData.name,
     type: formData.type,
@@ -937,7 +1058,76 @@ export function transformFormDataToUpdatePayload(
   payload.param_override = formData.param_override || ''
   payload.header_override = formData.header_override || ''
 
+  if (original) {
+    const baseline = transformChannelToFormDefaults(original)
+    const settingPatch = configurationChanges(
+      parseConfigurationObject(buildSettingJSON(baseline)),
+      parseConfigurationObject(buildSettingJSON(formData))
+    )
+    const settingsPatch = configurationChanges(
+      parseConfigurationObject(buildSettingsJSON(baseline)),
+      parseConfigurationObject(buildSettingsJSON(formData))
+    )
+    delete payload.setting
+    delete payload.settings
+    if (Object.keys(settingPatch).length) {
+      payload.setting_patch = settingPatch
+      payload.setting_base = original.setting || ''
+    }
+    if (Object.keys(settingsPatch).length) {
+      payload.settings_patch = settingsPatch
+      payload.settings_base = original.settings || ''
+    }
+  }
+
   return payload
+}
+
+export type ChannelConfigurationUpdate = Partial<Channel> & {
+  setting_patch?: Record<string, unknown>
+  settings_patch?: Record<string, unknown>
+  setting_base?: string
+  settings_base?: string
+}
+
+function parseConfigurationObject(
+  raw: string | null | undefined
+): Record<string, unknown> {
+  if (!raw?.trim()) return {}
+  const value: unknown = JSON.parse(raw)
+  if (value === null) return {}
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Channel settings must be a JSON object')
+  }
+  return value as Record<string, unknown>
+}
+
+function configurationChanges(
+  previous: Record<string, unknown>,
+  next: Record<string, unknown>
+): Record<string, unknown> {
+  const changes: Record<string, unknown> = {}
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    if (JSON.stringify(previous[key]) === JSON.stringify(next[key])) continue
+    const before = previous[key]
+    const after = next[key]
+    if (
+      before &&
+      after &&
+      typeof before === 'object' &&
+      typeof after === 'object' &&
+      !Array.isArray(before) &&
+      !Array.isArray(after)
+    ) {
+      changes[key] = configurationChanges(
+        before as Record<string, unknown>,
+        after as Record<string, unknown>
+      )
+    } else {
+      changes[key] = after === undefined ? null : after
+    }
+  }
+  return changes
 }
 
 // ============================================================================

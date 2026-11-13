@@ -12,15 +12,20 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	appI18n "github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayhelper "github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -35,6 +40,92 @@ export function parseSubmitResponse() { return {taskId: "one"}; }
 export function buildQueryRequest() { return {url: "https://example.com"}; }
 export function parseTaskResult() { return {status: "SUCCESS"}; }
 `
+
+func TestSeedanceNativeCompatibilityNormalizesBillingInput(t *testing.T) {
+	raw := `{"model":"doubao-seedance-2-0-260128","prompt":"cloud","duration":4,"resolution":"720p","opaque":18446744073709551615,"parameters":{"duration":8,"resolution":"480p","draft":false}}`
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", strings.NewReader(raw))
+	c.Request.Header.Set("Content-Type", "application/json")
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	request, err := buildTaskPluginRouteRequest(c)
+	require.NoError(t, err)
+	require.NoError(t, normalizeSeedanceNativeCompatibility(c, &request))
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	body, err := storage.Bytes()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"doubao-seedance-2-0-260128","content":[{"type":"text","text":"cloud"}],"duration":8,"resolution":"480p","opaque":18446744073709551615,"draft":false}`, string(body))
+	assert.Contains(t, string(body), `"opaque":18446744073709551615`)
+	assert.Equal(t, string(body), string(request.BodyText))
+	billingInput, err := relayhelper.ResolveIncomingBillingExprRequestInput(c, nil)
+	require.NoError(t, err)
+	billingInput.Usage = map[string]any{"seconds": 8.0}
+	expression := `param("duration") == 8 && param("resolution") == "480p" ? tier("matched", u("seconds") * 0.2) : tier("wrong", u("seconds") * 0.2)`
+	amount, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingInput)
+	require.NoError(t, err)
+	assert.InDelta(t, 1.6, amount, 0.000001)
+	assert.Equal(t, "matched", trace.MatchedTier)
+	settled, err := billingexpr.ComputeTieredQuotaWithRequest(&billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1,
+		QuotaPerUnit: common.QuotaPerUnit, ExprVersion: 1, TaskUsageBilling: true,
+	}, billingexpr.TokenParams{}, billingInput)
+	require.NoError(t, err)
+	assert.Equal(t, "matched", settled.MatchedTier)
+	assert.Equal(t, common.QuotaRound(amount*common.QuotaPerUnit), settled.ActualQuotaAfterGroup)
+}
+
+func TestSeedanceNativeCompatibilityKeepsOrdinaryRequest(t *testing.T) {
+	raw := `{"model":"doubao-seedance-2-0-260128","content":[{"type":"text","text":"cloud"}],"duration":4}`
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", strings.NewReader(raw))
+	c.Request.Header.Set("Content-Type", "application/json")
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	request, err := buildTaskPluginRouteRequest(c)
+	require.NoError(t, err)
+	require.NoError(t, normalizeSeedanceNativeCompatibility(c, &request))
+	assert.Equal(t, raw, string(request.BodyText))
+}
+
+func TestSeedanceNativeCompatibilityUsesEffectiveNestedModelAndMedia(t *testing.T) {
+	raw := `{"model":"ignored-model","prompt":"ignored prompt","content":[{"type":"image_url","image_url":{"url":"asset://ignored-asset"}}],"duration":4,"parameters":{"model":"doubao-seedance-2-0-260128","prompt":"effective prompt","content":[{"type":"image_url","role":"reference_image","image_url":{"url":"asset://effective-asset"}}],"duration":8,"generate_audio":false,"seed":0}}`
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", strings.NewReader(raw))
+	c.Request.Header.Set("Content-Type", "application/json")
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	request, err := buildTaskPluginRouteRequest(c)
+	require.NoError(t, err)
+	require.NoError(t, normalizeSeedanceNativeCompatibility(c, &request))
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	body, err := storage.Bytes()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","role":"reference_image","image_url":{"url":"asset://effective-asset"}},{"type":"text","text":"effective prompt"}],"duration":8,"generate_audio":false,"seed":0}`, string(body))
+	refs, err := extractSeedanceAssetIDsFromJSON(body)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"effective-asset"}, refs)
+	billingInput, err := relayhelper.ResolveIncomingBillingExprRequestInput(c, nil)
+	require.NoError(t, err)
+	billingInput.Usage = map[string]any{"seconds": 8.0}
+	amount, trace, err := billingexpr.RunExprWithRequest(`param("duration") == 8 && param("generate_audio") == false ? tier("effective", u("seconds") * 0.2) : tier("wrong", 0)`, billingexpr.TokenParams{}, billingInput)
+	require.NoError(t, err)
+	assert.Equal(t, "effective", trace.MatchedTier)
+	assert.InDelta(t, 1.6, amount, 0.000001)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "doubao-seedance-2-0-260128",
+		StartTime:       time.Unix(100, 0),
+		UserModelDiscountBPS: hosttypes.NewUserModelDiscountScheduleSnapshot(map[string]hosttypes.UserModelDiscountConfig{
+			"doubao-seedance-2-0-260128": {
+				Mode: hosttypes.UserModelPricingLayered,
+				Permanent: &hosttypes.UserModelDiscountWindow{DiscountBPS: 10000,
+					Expression: `param("duration") == 8 && param("generate_audio") == false ? 0.5 : 1`},
+			},
+		}),
+	}
+	require.NoError(t, relayhelper.PrepareUserModelDiscount(c, info, 0, 0, nil))
+	require.NotNil(t, info.UserModelDiscountEvaluation)
+	assert.Equal(t, 5000, info.UserModelDiscountEvaluation.DiscountBPS)
+}
 
 func TestPrepareTaskPluginSubmitRejectsMissingModel(t *testing.T) {
 	_, err := jsplugin.DefaultRegistry.Register(genericTaskPluginSource, jsplugin.Options{})
@@ -1865,8 +1956,8 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
 		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
 		{name: "both decoders accept", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-alpha", "decode-beta"}},
-		{name: "all decoders reject", alpha: `throw new Error("alpha rejects first")`, beta: `throw new Error("beta rejects second")`, wantError: "decode-alpha: alpha rejects first; decode-beta: beta rejects second"},
-		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
+		{name: "all decoders reject", alpha: `throw new Error("alpha rejects first")`, beta: `throw new Error("beta rejects second")`, wantError: "alpha rejects first; beta rejects second"},
+		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "unsupported resolution"},
 		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 	} {
@@ -1896,6 +1987,8 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 			if tc.wantError != "" {
 				assert.Equal(t, http.StatusBadRequest, recorder.Code)
 				assert.Contains(t, recorder.Body.String(), tc.wantError)
+				assert.NotContains(t, recorder.Body.String(), "decode-alpha")
+				assert.NotContains(t, recorder.Body.String(), "decode-beta")
 				assert.Empty(t, gotKeys)
 			} else {
 				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
@@ -1903,4 +1996,52 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrepareNativeRouteSelectsCandidateForExclusiveModel(t *testing.T) {
+	source := func(key, model string) string {
+		return fmt.Sprintf(`
+export const meta = {apiVersion:1,key:%q,name:%q,version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",requiredCapabilities:["shared-native-routes@1"],routes:[{method:"POST",path:"/vendor/shared",protocol:"shared",type:"submit",models:[%q],decode:"create",render:"created"}]};
+export const native = {create:function(ctx){if(ctx.body.value.model!==%q) throw new Error("unsupported model"); return {kind:"submit",model:ctx.body.value.model,requestBody:ctx.body.value};},created:function(){return {};}};
+export function buildSubmitRequest(){return {url:"https://example.com"};}
+export function parseSubmitResponse(){return {taskId:"one"};}
+export function buildQueryRequest(){return {url:"https://example.com"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+`, key, key, model, model, model)
+	}
+	first := compileTaskRoutePlugin(t, source("exclusive-alpha", "model-alpha"))
+	second := compileTaskRoutePlugin(t, source("exclusive-beta", "model-beta"))
+	candidates := []jsplugin.RouteBinding{{Plugin: first, Route: first.Meta.Routes[0]}, {Plugin: second, Route: second.Meta.Routes[0]}}
+	router := gin.New()
+	router.POST("/vendor/shared", func(c *gin.Context) {
+		c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: &jsplugin.RoutingGeneration{}, Plugin: first, Route: first.Meta.Routes[0], Candidates: candidates})
+	}, PrepareTaskPluginRoute(), func(c *gin.Context) {
+		pinned := c.MustGet(jsplugin.ContextKeyPinnedRoute).(jsplugin.PinnedRoute)
+		assert.Equal(t, "exclusive-beta", pinned.Plugin.Meta.Key)
+		require.Len(t, pinned.Candidates, 1)
+		assert.Equal(t, "exclusive-beta", pinned.Candidates[0].Plugin.Meta.Key)
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/vendor/shared", strings.NewReader(`{"model":"model-beta"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+
+	secondWithOrigin := compileTaskRoutePlugin(t, strings.Replace(source("origin-beta", "model-alpha"), `requestBody:ctx.body.value`, `requestBody:ctx.body.value,originTaskIds:["different-task"]`, 1))
+	candidates = []jsplugin.RouteBinding{{Plugin: first, Route: first.Meta.Routes[0]}, {Plugin: secondWithOrigin, Route: secondWithOrigin.Meta.Routes[0]}}
+	router = gin.New()
+	router.POST("/vendor/shared", func(c *gin.Context) {
+		c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: &jsplugin.RoutingGeneration{}, Plugin: first, Route: first.Meta.Routes[0], Candidates: candidates})
+	}, PrepareTaskPluginRoute(), func(c *gin.Context) {
+		pinned := c.MustGet(jsplugin.ContextKeyPinnedRoute).(jsplugin.PinnedRoute)
+		require.Len(t, pinned.Candidates, 1)
+		assert.Equal(t, "exclusive-alpha", pinned.Candidates[0].Plugin.Meta.Key)
+		c.Status(http.StatusNoContent)
+	})
+	request = httptest.NewRequest(http.MethodPost, "/vendor/shared", strings.NewReader(`{"model":"model-alpha"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 }

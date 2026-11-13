@@ -89,6 +89,23 @@ func TestGetTaskDoesNotProjectArtifacts(t *testing.T) {
 	assert.NotContains(t, recorder.Body.String(), "upstream.invalid")
 }
 
+func TestGetTaskHidesMappedModelInFailure(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	task.Status = model.TaskStatusFailure
+	task.FailReason = "upstream-model rejected the request"
+	task.Properties = model.Properties{OriginModelName: "public-model", UpstreamModelName: "upstream-model"}
+	require.NoError(t, model.DB.Save(task).Error)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Set("id", task.UserId)
+	c.Params = gin.Params{{Key: "key", Value: task.TaskID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+task.TaskID, nil)
+	GetTask(c)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "public-model rejected the request")
+	assert.NotContains(t, recorder.Body.String(), "upstream-model")
+}
+
 func TestGetTaskArtifactsReturnsEmptyForLegacyTask(t *testing.T) {
 	task := setupGenericTaskTest(t)
 	recorder := httptest.NewRecorder()
@@ -489,6 +506,39 @@ func TestProxyTaskMediaPassesThroughUnsatisfiedRange(t *testing.T) {
 	assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, recorder.Code)
 	assert.Equal(t, "bytes */10", recorder.Header().Get("Content-Range"))
 	assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+}
+
+func TestProxyTaskLastFrameDetectsActualImageType(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	allowPrivateTaskMediaTest(t)
+	for _, tc := range []struct {
+		name, mime string
+		body       []byte
+	}{
+		{"jpeg", "image/jpeg", []byte{0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{"png", "image/png", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write(tc.body)
+			}))
+			defer upstream.Close()
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Params = gin.Params{{Key: "artifact_key", Value: "last_frame"}}
+				c.Request = httptest.NewRequest(method, "/content", nil)
+				require.NoError(t, proxyTaskMedia(c, task, &relaychannel.TaskContentRequest{URL: upstream.URL, Method: http.MethodGet, Credentialless: true}))
+				assert.Equal(t, tc.mime, recorder.Header().Get("Content-Type"))
+				if method == http.MethodGet {
+					assert.Equal(t, tc.body, recorder.Body.Bytes())
+				} else {
+					assert.Empty(t, recorder.Body.Bytes())
+				}
+			}
+		})
+	}
 }
 
 func TestTaskMediaResponseHeaderTimeoutDoesNotTruncateBody(t *testing.T) {

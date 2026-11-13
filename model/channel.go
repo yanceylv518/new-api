@@ -591,6 +591,10 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update() error {
+	return channel.update(DB)
+}
+
+func (channel *Channel) update(tx *gorm.DB) error {
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
 		var keyStr string
@@ -598,7 +602,8 @@ func (channel *Channel) Update() error {
 			keyStr = channel.Key
 		} else {
 			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
+			var existing Channel
+			if err := tx.Select("key").First(&existing, channel.Id).Error; err == nil {
 				keyStr = existing.Key
 			}
 		}
@@ -630,12 +635,18 @@ func (channel *Channel) Update() error {
 		}
 	}
 	var err error
-	err = DB.Model(channel).Updates(channel).Error
+	err = tx.Model(channel).Updates(channel).Error
 	if err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
+	if err = tx.Model(channel).First(channel, "id = ?", channel.Id).Error; err != nil {
+		return err
+	}
+	abilitiesTx := tx
+	if tx == DB {
+		abilitiesTx = nil
+	}
+	err = channel.UpdateAbilities(abilitiesTx)
 	return err
 }
 
@@ -1026,7 +1037,7 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 func (channel *Channel) ValidateSettings() error {
 	channelParams := &dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
-		err := common.Unmarshal([]byte(*channel.Setting), channelParams)
+		err := decodeChannelConfiguration(*channel.Setting, channelParams)
 		if err != nil {
 			return err
 		}
@@ -1037,9 +1048,24 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelParams.ValidateHTTPTransport(); err != nil {
 		return err
 	}
+	if err := channelParams.ValidateVideoRoutingRules(); err != nil {
+		return err
+	}
+	if len(channelParams.VideoRoutingRules) > 0 && channel.Type != constant.ChannelTypeDoubaoVideo &&
+		!((channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI) &&
+			(channelParams.BindsTaskPlugin("doubao") || channelParams.BindsTaskPlugin("anyllm") || channelParams.BindsTaskPlugin("originocean"))) {
+		return errors.New("video routing rules are only supported by Seedance video plugins")
+	}
+	if err := channelParams.ValidateSeedanceAssetURL(); err != nil {
+		return err
+	}
+	if (channelParams.SeedanceAssetURL != "" || channelParams.SeedanceAssetShareGroup != "") && channel.Type != constant.ChannelTypeDoubaoVideo &&
+		!(channel.Type == constant.ChannelTypeTaskPlugin && (channelParams.TaskPluginKey == "doubao" || channelParams.TaskPluginKey == "anyllm" || channelParams.TaskPluginKey == "originocean")) {
+		return errors.New("seedance_asset_url is only supported by Seedance video plugins")
+	}
 	channelOtherSettings := &dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
-		err := common.UnmarshalJsonStr(channel.OtherSettings, channelOtherSettings)
+		err := decodeChannelConfiguration(channel.OtherSettings, channelOtherSettings)
 		if err != nil {
 			return err
 		}
@@ -1071,33 +1097,33 @@ func (channel *Channel) ValidateSettings() error {
 func (channel *Channel) GetSetting() dto.ChannelSettings {
 	setting := dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
-		err := common.Unmarshal([]byte(*channel.Setting), &setting)
+		err := decodeChannelConfiguration(*channel.Setting, &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
 		}
 	}
 	return setting
 }
 
-func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
-	settingBytes, err := common.Marshal(setting)
-	if err != nil {
-		common.SysLog(fmt.Sprintf("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))
-		return
+func (channel *Channel) SetSetting(setting dto.ChannelSettings) error {
+	raw := ""
+	if channel.Setting != nil {
+		raw = *channel.Setting
 	}
-	channel.Setting = common.GetPointer[string](string(settingBytes))
+	updated, err := updateTypedChannelConfiguration(raw, setting)
+	if err != nil {
+		return err
+	}
+	channel.Setting = &updated
+	return nil
 }
 
 func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 	setting := dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
-		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
+		err := decodeChannelConfiguration(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
 		}
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {
@@ -1106,13 +1132,13 @@ func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 	return setting
 }
 
-func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) {
-	settingBytes, err := common.Marshal(setting)
+func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) error {
+	updated, err := updateTypedChannelConfiguration(channel.OtherSettings, setting)
 	if err != nil {
-		common.SysLog(fmt.Sprintf("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))
-		return
+		return err
 	}
-	channel.OtherSettings = string(settingBytes)
+	channel.OtherSettings = updated
+	return nil
 }
 
 func (channel *Channel) GetParamOverride() map[string]any {

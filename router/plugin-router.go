@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -94,6 +95,7 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, bindi
 			Generation: pinnedGeneration,
 			Plugin:     binding.Plugin,
 			Route:      binding.Route,
+			Candidates: pinnedGeneration.LookupDeclaredRouteCandidates(binding.Route.Method, binding.Route.Path),
 		})
 		logger.LogDebug(
 			c,
@@ -265,8 +267,14 @@ func (b *pluginGenerationBuilder) validatePlugin(plugin *jsplugin.LoadedPlugin, 
 			continue
 		}
 		for _, route := range plugin.Meta.Routes {
+			shared := slices.ContainsFunc(other.Meta.Routes, route.CanShareWith)
 			for _, otherRoute := range other.Meta.Routes {
 				if routePatternsIntersect(route.Path, otherRoute.Path) {
+					// 同协议同路径允许增加独立方法；同方法共享仍须完整匹配操作契约。
+					if route.Protocol != "" && route.Protocol == otherRoute.Protocol && route.Path == otherRoute.Path &&
+						(route.Method != otherRoute.Method || shared) {
+						continue
+					}
 					return fmt.Errorf("route %s %s overlaps plugin %s route %s %s", route.Method, route.Path, other.Meta.Key, otherRoute.Method, otherRoute.Path)
 				}
 				if route.Method == otherRoute.Method && !routesGinCompatible(route.Path, otherRoute.Path) {
@@ -399,6 +407,16 @@ func (d *pluginRouteDispatcher) dispatch(c *gin.Context) {
 	c.Request = c.Request.WithContext(context.WithValue(originalContext, pluginDispatchStateKey{}, state))
 
 	generation.RuntimeHandler().ServeHTTP(gatedWriter, c.Request)
+	if !state.hit.Load() {
+		if path, ok := middleware.SeedanceCompatVideoPath(c.Request.URL.Path); ok {
+			request := c.Request.Clone(c.Request.Context())
+			request.URL.Path = path
+			request.URL.RawPath = ""
+			gatedWriter = newGatedResponseWriter(c.Writer)
+			state.writer = gatedWriter
+			generation.RuntimeHandler().ServeHTTP(gatedWriter, request)
+		}
+	}
 	if state.hit.Load() {
 		if !c.Writer.Written() {
 			c.Writer.WriteHeaderNow()

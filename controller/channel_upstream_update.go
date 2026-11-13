@@ -500,7 +500,9 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 }
 
 func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {
-	channel.SetOtherSettings(settings)
+	if err := channel.SetOtherSettings(settings); err != nil {
+		return err
+	}
 	updates := map[string]any{
 		"settings": channel.OtherSettings,
 	}

@@ -25,7 +25,7 @@ if previous>0 then return previous end
 local uq=redis.call('HGET',KEYS[1],'Quota') or redis.call('HGET',KEYS[3],'Quota')
 local tq=redis.call('HGET',KEYS[2],'RemainQuota') or redis.call('HGET',KEYS[4],'RemainQuota')
 local used=redis.call('HGET',KEYS[2],'UsedQuota') or redis.call('HGET',KEYS[4],'UsedQuota')
-redis.call('HSET',KEYS[3],'TaskID',ARGV[1],'Actual',ARGV[2],'Reserved',ARGV[3],'Wallet',ARGV[4],'TokenCacheKey',ARGV[5])
+redis.call('HSET',KEYS[3],'TaskID',ARGV[1],'Actual',ARGV[2],'Reserved',ARGV[3],'Wallet',ARGV[4],'TokenCacheKey',ARGV[5],'Kind',ARGV[7])
 if uq then redis.call('HSET',KEYS[3],'Quota',uq) end
 if redis.call('EXISTS',KEYS[1])==1 then redis.call('HSET',KEYS[1],'VideoQuotaPending',ARGV[1]) end
 if ARGV[5]~='' then
@@ -38,6 +38,7 @@ return 0`
 
 const finishVideoQuotaScript = `
 if redis.call('HGET',KEYS[3],'TaskID')~=ARGV[1] then return 0 end
+if (redis.call('HGET',KEYS[3],'Kind') or 'task')~=ARGV[5] then return 0 end
 local delta=tonumber(ARGV[2])
 local wallet=ARGV[3]=='1'
 local uq=redis.call('HGET',KEYS[3],'Quota')
@@ -71,6 +72,10 @@ var finishVideoQuota = redis.NewScript(finishVideoQuotaScript)
 
 // 调用方已持有用户行写锁，因此旧标记对应的事务必定已提交或回滚。
 func prepareVideoQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual int, wallet bool, tokenKey string) error {
+	return prepareQuotaCache(ctx, tx, task, actual, wallet, tokenKey, "task")
+}
+
+func prepareQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual int, wallet bool, tokenKey, kind string) error {
 	if !common.RedisEnabled {
 		return nil
 	}
@@ -85,7 +90,7 @@ func prepareVideoQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual
 		walletFlag = 1
 	}
 	for range 2 {
-		previous, err := prepareVideoQuota.Run(ctx, common.RDB, keys, task.ID, actual, task.Quota, walletFlag, cacheKey, task.UserId).Int64()
+		previous, err := prepareVideoQuota.Run(ctx, common.RDB, keys, task.ID, actual, task.Quota, walletFlag, cacheKey, task.UserId, kind).Int64()
 		if err != nil {
 			return fmt.Errorf("prepare video quota cache: %w", err)
 		}
@@ -99,7 +104,7 @@ func prepareVideoQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual
 	return ErrQuotaCachePending
 }
 
-// 根据主库终态判断是否应用差额，Lua以任务ID消费一次；重复恢复不会再次加减。
+// 根据主库已提交的任务状态判断是否应用差额，Lua以任务ID消费一次。
 func finishVideoQuotaCache(ctx context.Context, tx *gorm.DB, userID int) error {
 	values, err := common.RDB.HGetAll(ctx, videoUserQuotaKey(userID)).Result()
 	if err != nil {
@@ -120,22 +125,38 @@ func finishVideoQuotaCache(ctx context.Context, tx *gorm.DB, userID int) error {
 	if err != nil {
 		return ErrQuotaCachePending
 	}
-	var stored Task
-	err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&stored).Error
+	delta := 0
+	kind := values["Kind"]
+	if kind == "" {
+		kind = "task"
+	}
+	if kind == "refund" {
+		var refund BillingRefund
+		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&refund).Error
+		if err == nil && refund.Completed {
+			delta = reserved - actual
+		}
+	} else {
+		var stored Task
+		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&stored).Error
+		if err == nil && (stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure || stored.PrivateData.SubmissionFundsCommitted) && stored.Quota == actual {
+			delta = reserved - actual
+		}
+	}
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
-	delta := 0
-	if err == nil && (stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure) && stored.Quota == actual {
-		delta = reserved - actual
-	}
 	key := values["TokenCacheKey"]
-	return applyVideoQuotaCache(ctx, userID, taskID, delta, values["Wallet"], key)
+	return applyVideoQuotaCache(ctx, userID, taskID, delta, values["Wallet"], key, kind)
 }
 
 // 正常提交只消费自己的标记，不读取可能属于另一未提交事务的新标记。
-func applyVideoQuotaCache(ctx context.Context, userID int, taskID int64, delta int, wallet, key string) error {
-	return finishVideoQuota.Run(ctx, common.RDB, []string{getUserCacheKey(userID), key, videoUserQuotaKey(userID), "quota:video:" + key}, taskID, delta, wallet, key).Err()
+func applyVideoQuotaCache(ctx context.Context, userID int, taskID int64, delta int, wallet, key string, kinds ...string) error {
+	kind := "task"
+	if len(kinds) > 0 {
+		kind = kinds[0]
+	}
+	return finishVideoQuota.Run(ctx, common.RDB, []string{getUserCacheKey(userID), key, videoUserQuotaKey(userID), "quota:video:" + key}, taskID, delta, wallet, key, kind).Err()
 }
 
 // 热缓存通过内嵌标记触发恢复；冷缓存先检查标记，再持行锁读取，禁止旧快照晚回填。

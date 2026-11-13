@@ -36,6 +36,16 @@ func TestDiscountExpressionValues(t *testing.T) {
 	}
 }
 
+func TestDiscountDurationFactsUseProviderDuration(t *testing.T) {
+	for _, facts := range []map[string]any{{"duration": 5}, {"duration": float64(5)}, {"duration": 16, "seconds": 5}} {
+		context := Context{}
+		context.ApplyUsageFacts(facts)
+		bps, err := Evaluate("seconds <= 4 ? 0.5 : 1", context)
+		require.NoError(t, err)
+		require.Equal(t, 10000, bps)
+	}
+}
+
 func TestDiscountExpressionRejectsInvalidInputs(t *testing.T) {
 	for _, source := range []string{"", "0", "1.01", "true", "0.8 +", "param(\"secret\") == nil ? 0.5 : 1", "hour(\"Invalid/Zone\") > 1 ? 0.5 : 1", "[1, 2]", strings.Repeat("1+", 300) + "1", strings.Repeat(" ", 4097)} {
 		t.Run(source[:min(50, len(source))], func(t *testing.T) { require.Error(t, Validate(source)) })

@@ -136,6 +136,7 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.POST("/aff_transfer", middleware.UserCriticalRateLimit("aff-transfer"), controller.TransferAffQuota)
 				selfRoute.PUT("/setting", controller.UpdateUserSetting)
 				// 素材接口继承用户鉴权与禁用缓存，并按用户限制操作速率。
+				selfRoute.GET("/seedance/upload-limits", middleware.DisableCache(), controller.GetSeedanceAssetUploadLimits)
 				selfRoute.GET("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.ListSeedanceAssetGroups)
 				selfRoute.GET("/seedance/asset-groups/:id", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.GetSeedanceAssetGroup)
 				selfRoute.POST("/seedance/asset-groups", middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.CreateSeedanceAssetGroup)
@@ -303,6 +304,9 @@ func SetApiRouter(router *gin.Engine) {
 		handlePermissionRoute(apiRouter.Group("", middleware.AdminAuth()), http.MethodGet, "/task_plugin_options", authz.TaskPluginBind, controller.GetTaskPluginOptions)
 		registerChannelRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
+		apiRouter.GET("/token/aksk", middleware.TokenAuth(), middleware.TokenQueryRateLimit(), middleware.DisableCache(), controller.GetTokenSignatureCredential)
+		apiRouter.POST("/token/aksk", middleware.TokenAuth(), middleware.UserCriticalRateLimit("token-aksk"), middleware.DisableCache(), controller.IssueTokenSignatureCredential)
+		apiRouter.DELETE("/token/aksk", middleware.TokenAuth(), middleware.UserCriticalRateLimit("token-aksk"), middleware.DisableCache(), controller.RevokeTokenSignatureCredential)
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())
 		tokenRoute.Use(middleware.TokenOperationAudit())

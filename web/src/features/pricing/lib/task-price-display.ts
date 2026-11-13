@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import i18next from 'i18next'
+
 import {
   resolveLocalizedText,
   type LocalizedTextValue,
@@ -53,6 +55,9 @@ export function taskEnumLabel(
   value: string,
   language: string
 ): string {
+  if (definition?.type === 'boolean') {
+    return i18next.t(value === 'true' ? 'Yes' : 'No', { lng: language })
+  }
   return taskPriceLabel(definition?.enumLabels?.[value], value, language)
 }
 

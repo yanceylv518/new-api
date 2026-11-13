@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -18,8 +19,10 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -319,6 +322,89 @@ func TestListModelsIncludesTieredBillingModel(t *testing.T) {
 	require.True(t, ok)
 	require.Empty(t, missingExprPricing.BillingMode)
 	require.Empty(t, missingExprPricing.BillingExpr)
+}
+
+func TestListModelsUsesGroupScopedTaskAliasPricingMySQL(t *testing.T) {
+	dsn := os.Getenv("ORIGIN_GROUP_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("ORIGIN_GROUP_TEST_MYSQL_DSN is not configured")
+	}
+	parsed, err := driver.ParseDSN(dsn)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(parsed.DBName, "codex_origin_"))
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousMemory, previousRegistry := common.RedisEnabled, common.MemoryCacheEnabled, jsplugin.DefaultRegistry
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+		common.RedisEnabled, common.MemoryCacheEnabled, jsplugin.DefaultRegistry = previousRedis, previousMemory, previousRegistry
+		require.NoError(t, sqlDB.Close())
+	})
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
+	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	withSelfUseModeDisabled(t)
+	withTieredBillingConfig(t, map[string]string{"alias-target-priced": "tiered_expr", "alias-target-missing": "tiered_expr"}, map[string]string{"alias-target-priced": `tier("priced", 2)`})
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"alias-target-missing":1,"alias-target-fixed":3}`))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	registry := jsplugin.NewRegistry()
+	_, err = registry.RegisterFactory(`
+export const meta = {apiVersion:1,key:"alias-list",name:"Alias List",version:"1.0.0",author:{name:"Test"},models:["alias-target-priced","alias-target-unpriced","alias-target-missing","alias-target-fixed"],fetchMode:"per_task"};
+export function buildSubmitRequest(){return {url:"https://example.com"};}
+export function parseSubmitResponse(){return {taskId:"one"};}
+export function buildQueryRequest(){return {url:"https://example.com"};}
+export function parseTaskResult(){return {status:"SUCCESS"};}
+`, jsplugin.Options{Key: "alias-list"})
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = registry
+	require.NoError(t, db.Create(&model.User{Id: 6001, Username: "alias-list-user", Password: "fixture", AffCode: "aliaslist", Group: "list-vip", Status: common.UserStatusEnabled}).Error)
+	for _, tc := range []struct {
+		id                   int
+		group, alias, target string
+	}{{6101, "list-vip", "short-list", "alias-target-priced"}, {6102, "list-other", "short-list", "alias-target-unpriced"}, {6103, "list-missing", "short-list", "alias-target-missing"}, {6104, "list-vip", "short-fixed", "alias-target-fixed"}} {
+		mapping := fmt.Sprintf(`{"%s":"%s"}`, tc.alias, tc.target)
+		channel := &model.Channel{Id: tc.id, Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Status: common.ChannelStatusEnabled, Name: fmt.Sprintf("list%d", tc.id), Group: tc.group, Models: tc.alias, ModelMapping: &mapping}
+		channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "alias-list"})
+		require.NoError(t, channel.Insert())
+	}
+	model.InitChannelCache()
+	for _, tc := range []struct {
+		group   string
+		limited bool
+		want    bool
+	}{{"list-vip", false, true}, {"list-other", false, false}, {"list-missing", false, false}, {"list-vip", true, false}} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		ctx.Set("id", 6001)
+		common.SetContextKey(ctx, constant.ContextKeyUserGroup, "list-vip")
+		common.SetContextKey(ctx, constant.ContextKeyTokenGroup, tc.group)
+		if tc.limited {
+			common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, true)
+			common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, map[string]bool{"other-model": true})
+		}
+		ListModels(ctx, constant.ChannelTypeOpenAI)
+		ids := decodeListModelsResponse(t, recorder)
+		_, found := ids["short-list"]
+		assert.Equal(t, tc.want, found)
+	}
+	prices := pricingByModelName(model.GetPricing())
+	require.Contains(t, prices, "short-fixed")
+	assert.Equal(t, 1, prices["short-fixed"].QuotaType)
+	assert.Equal(t, float64(3), prices["short-fixed"].ModelPrice)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"alias-target-missing":1,"alias-target-fixed":3,"short-fixed":2}`))
+	model.InvalidatePricingCache()
+	prices = pricingByModelName(model.GetPricing())
+	assert.Equal(t, float64(2), prices["short-fixed"].ModelPrice)
 }
 
 func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T) {

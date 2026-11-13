@@ -47,11 +47,33 @@ func invalidateTokenCacheForMutation(key string) error {
 	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
 }
 
+// 额度编辑前保留缓存中的未刷盘用量，并与 fence、缓存失效一起原子完成。
+func invalidateTokenCacheForQuotaMutation(key string) error {
+	if !common.RedisEnabled || key == "" {
+		return nil
+	}
+	const script = `
+local remain = redis.call('HGET', KEYS[1], 'RemainQuota')
+local used = redis.call('HGET', KEYS[1], 'UsedQuota')
+local user = redis.call('HGET', KEYS[1], 'UserId')
+if remain and used and user then
+  redis.call('HSET', KEYS[3], 'RemainQuota', remain, 'UsedQuota', used, 'UserID', user)
+  if redis.call('HEXISTS', KEYS[3], 'TaskID') == 0 then redis.call('HSET', KEYS[3], 'TaskID', '0') end
+end
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
+redis.call('DEL', KEYS[1])
+return 1`
+	return common.RDB.Eval(context.Background(), script, []string{
+		getTokenCacheKey(key), getTokenCacheFenceKey(key), videoTokenQuotaKey(key),
+	}, tokenCacheFenceSeconds).Err()
+}
+
 // cacheInitToken publishes a database snapshot only when no mutation fence is
 // active and the hash is cold. An existing hash only gets its TTL refreshed:
 // its RemainQuota may already be ahead of this snapshot because atomic
 // pre-consume decrements Redis first, so a snapshot must never overwrite any
 // field of a live hash.
+// 冷填充用主库额度总量和影子已用量重算余额，保留未刷盘用量及管理员修改。
 // 返回值：0=被 fence 拦截，1=完成初始化，2=哈希已存在，仅刷新 TTL。
 func cacheInitToken(token Token) (int, error) {
 	if !common.RedisEnabled {
@@ -70,12 +92,28 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
   redis.call('EXPIRE', KEYS[1], ARGV[17])
   return 2
 end
+local used = redis.call('HGET', KEYS[3], 'UsedQuota')
+local shadowRemain = redis.call('HGET', KEYS[3], 'RemainQuota')
+local remain = ARGV[15]
+if used and shadowRemain then
+  local negativeUsed = used == '0' and '0' or '-' .. used
+  if string.sub(used, 1, 1) == '-' then negativeUsed = string.sub(used, 2) end
+  redis.call('HSET', KEYS[1], '_QuotaRebase', ARGV[16])
+  local result = redis.pcall('HINCRBY', KEYS[1], '_QuotaRebase', negativeUsed)
+  if type(result) == 'table' and result.err then redis.call('DEL', KEYS[1]); return result end
+  result = redis.pcall('HINCRBY', KEYS[1], '_QuotaRebase', ARGV[15])
+  if type(result) == 'table' and result.err then redis.call('DEL', KEYS[1]); return result end
+  remain = redis.call('HGET', KEYS[1], '_QuotaRebase')
+  redis.call('HDEL', KEYS[1], '_QuotaRebase')
+else
+  used = ARGV[16]
+end
 redis.call('HSET', KEYS[1],
   'Id', ARGV[1], 'UserId', ARGV[2], 'Status', ARGV[3], 'Name', ARGV[4],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', redis.call('HGET',KEYS[3],'RemainQuota') or ARGV[15], 'UsedQuota', redis.call('HGET',KEYS[3],'UsedQuota') or ARGV[16])
+  'AutoGroups', ARGV[14], 'RemainQuota', remain, 'UsedQuota', used or ARGV[16])
 redis.call('DEL',KEYS[3])
 redis.call('EXPIRE', KEYS[1], ARGV[17])
 return 1`

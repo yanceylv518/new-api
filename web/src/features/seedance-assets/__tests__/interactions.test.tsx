@@ -34,6 +34,7 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { listSeedanceAssets } from '../api'
+import { AssetGroupSidebar } from '../components/asset-group-sidebar'
 import { AssetPreview } from '../components/asset-preview'
 import { AssetUploadPanel } from '../components/asset-upload-panel'
 import { SeedanceAssets } from '../index'
@@ -83,7 +84,93 @@ const secondAsset = {
   preview_url: 'https://media.example/second.png?signature=old',
 }
 
+test('distinguishes and selects asset groups with the same name', () => {
+  const groups = [
+    { id: 11, group_id: 'group-a', name: 'References', group_type: 'AIGC' },
+    { id: 12, group_id: 'group-b', name: 'References', group_type: 'AIGC' },
+    { id: 13, group_id: 'group-c', name: 'Other', group_type: 'AIGC' },
+  ]
+  const onSelect = vi.fn()
+  render(
+    <AssetGroupSidebar
+      groups={groups}
+      groupCategory='AIGC'
+      selectedId='group-a'
+      isLoading={false}
+      isError={false}
+      isCreating={false}
+      onRetry={vi.fn()}
+      onGroupCategoryChange={vi.fn()}
+      onSelect={onSelect}
+      onCreate={async () => true}
+      onCreateVerified={vi.fn()}
+      onEdit={vi.fn()}
+      onDelete={vi.fn()}
+    />
+  )
+
+  const first = screen.getByRole('button', { name: 'References #11' })
+  const second = screen.getByRole('button', { name: 'References #12' })
+  expect(first).toHaveAttribute('aria-current', 'page')
+  expect(screen.getByRole('button', { name: 'Other' })).toBeInTheDocument()
+  fireEvent.click(second)
+  expect(onSelect).toHaveBeenCalledWith(groups[1])
+})
+
 // 分组增删改通过实际菜单和确认框完成，失败响应不会伪装成删除成功。
+test('shows a blocked group deletion and allows an explicit retry', async () => {
+  let retries = 0
+  api.defaults.adapter = async (config) => {
+    if (config.method === 'delete') retries += 1
+    return {
+      data: {
+        success: true,
+        data: config.url?.endsWith('asset-groups')
+          ? [
+              {
+                id: 1,
+                group_id: 'blocked-group',
+                name: 'Blocked group',
+                status: 'Deleting',
+                deletion_error: retries
+                  ? ''
+                  : 'Original account is unavailable',
+              },
+            ]
+          : [],
+        total: 0,
+        page: 1,
+        page_size: 24,
+        has_pending: false,
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  renderLibrary()
+  expect(
+    await screen.findByText('Original account is unavailable')
+  ).toBeVisible()
+  expect(screen.getByText('Deletion delayed')).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: 'Group actions' }))
+  await userEvent.click(
+    screen.getByRole('menuitem', { name: 'Retry deletion' })
+  )
+  const confirmation = await screen.findByRole('alertdialog')
+  await userEvent.click(
+    within(confirmation).getByRole('button', { name: 'Delete' })
+  )
+  await waitFor(() => expect(retries).toBe(1))
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Original account is unavailable')
+    ).not.toBeInTheDocument()
+  )
+  expect(screen.getByRole('button', { name: /Blocked group/ })).toBeVisible()
+})
+
 test('creates, renames, and deletes a group through the library controls', async () => {
   let groups: Array<{ id: number; group_id: string; name: string }> = []
   api.defaults.adapter = async (config) => {
@@ -204,6 +291,7 @@ test('keeps AIGC and human-verified groups in separate sidebar tabs', async () =
 
 test('completes verified human group setup and uploads its portrait for review', async () => {
   let sessionPolls = 0
+  let uploadAttempts = 0
   let validationRequest: Record<string, string> | null = null
   let uploadedGroupId = ''
   const uploadedAsset = {
@@ -223,6 +311,18 @@ test('completes verified human group setup and uploads its portrait for review',
     group_type: 'LivenessFace',
   }
   api.defaults.adapter = async (config) => {
+    if (config.url?.endsWith('/upload-limits')) {
+      return {
+        data: {
+          success: true,
+          data: { image_mib: 64, video_mib: 50, audio_mib: 15 },
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      }
+    }
     if (config.url?.includes('/validation-sessions')) {
       if (config.method === 'post') {
         validationRequest = JSON.parse(String(config.data))
@@ -253,13 +353,14 @@ test('completes verified human group setup and uploads its portrait for review',
           success: true,
           data: {
             id: 11,
-            status: sessionPolls > 1 ? 'Succeeded' : 'Pending',
+            status: sessionPolls > 2 ? 'Succeeded' : 'Pending',
+            status_check_retrying: sessionPolls === 1,
             name: 'Verified person',
             description: 'Approved portrait',
             tags: 'actor, verified',
             launch_url: 'https://verify.example/session-11',
-            group_id: 'group-human',
-            local_group_id: 22,
+            group_id: sessionPolls > 1 ? 'group-human' : '',
+            local_group_id: sessionPolls > 2 ? 22 : 0,
             expires_at: Math.floor(Date.now() / 1000) + 1800,
             created_at: 1,
             updated_at: 2,
@@ -272,7 +373,22 @@ test('completes verified human group setup and uploads its portrait for review',
       }
     }
     if (config.url?.endsWith('/assets/upload')) {
+      uploadAttempts += 1
+      if (uploadAttempts === 1) {
+        return {
+          data: {
+            success: false,
+            message:
+              'Asset service is temporarily unavailable. Please try again.',
+          },
+          status: 503,
+          statusText: 'Service Unavailable',
+          headers: {},
+          config,
+        }
+      }
       const form = config.data as FormData
+      expect((form.get('file') as File).name).toBe('portrait.jpg')
       uploadedGroupId = String(form.get('group_id'))
       return {
         data: { success: true, data: uploadedAsset },
@@ -339,10 +455,26 @@ test('completes verified human group setup and uploads its portrait for review',
     description: 'Approved portrait',
     tags: 'actor, verified',
   })
+  expect(
+    await within(dialog).findByText(
+      'Status check temporarily unavailable. Retrying automatically.'
+    )
+  ).toBeVisible()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Check status' })
+  )
+  await within(dialog).findByText('The verified group is not ready yet')
+  expect(
+    within(dialog).queryByRole('img', { name: 'Verification QR code' })
+  ).not.toBeInTheDocument()
+  expect(
+    within(dialog).queryByLabelText('Portrait image')
+  ).not.toBeInTheDocument()
   await userEvent.click(
     within(dialog).getByRole('button', { name: 'Check status' })
   )
   await within(dialog).findByText('Step 2 of 2: Upload portrait')
+  expect(await within(dialog).findByText(/Maximum 64\.0 MB/)).toBeVisible()
   const portrait = new File(['portrait'], 'portrait.jpg', {
     type: 'image/jpeg',
   })
@@ -354,6 +486,15 @@ test('completes verified human group setup and uploads its portrait for review',
     within(dialog).getByRole('button', { name: 'Upload and start review' })
   )
   expect(
+    await within(dialog).findByText(
+      'Asset service is temporarily unavailable. Please try again.'
+    )
+  ).toBeVisible()
+  expect(within(dialog).getByText('portrait.jpg')).toBeVisible()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Upload and start review' })
+  )
+  expect(
     await screen.findByRole('button', { name: 'Verified person' })
   ).toBeVisible()
   expect(await screen.findByRole('img', { name: 'portrait.jpg' })).toBeVisible()
@@ -361,6 +502,7 @@ test('completes verified human group setup and uploads its portrait for review',
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   )
   expect(uploadedGroupId).toBe('group-human')
+  expect(uploadAttempts).toBe(2)
   expect(localStorage.getItem('seedance-assets-human-session:7')).toBeNull()
 })
 
@@ -722,6 +864,11 @@ test('reloads the list after uploading and supports switching view with keyboard
         success: true,
         data: [{ id: 1, group_id: 'group-1', name: 'References' }],
       }
+    } else if (config.url?.endsWith('/upload-limits')) {
+      data = {
+        success: true,
+        data: { image_mib: 30, video_mib: 50, audio_mib: 15 },
+      }
     } else if (config.url?.endsWith('/upload')) {
       uploaded = true
       expect(config.data).toBeInstanceOf(FormData)
@@ -776,7 +923,11 @@ test('opens the floating upload queue and shows each transfer status', async () 
   clients.push(client)
   const view = render(
     <QueryClientProvider client={client}>
-      <AssetUploadPanel groupId='group-1' onUploaded={() => undefined}>
+      <AssetUploadPanel
+        groupId='group-1'
+        onUploaded={() => undefined}
+        getUploadLimits={async () => null}
+      >
         {() => null}
       </AssetUploadPanel>
     </QueryClientProvider>
@@ -819,7 +970,11 @@ test('shows failed transfers and retries them from the floating queue', async ()
   clients.push(client)
   const view = render(
     <QueryClientProvider client={client}>
-      <AssetUploadPanel groupId='group-1' onUploaded={() => undefined}>
+      <AssetUploadPanel
+        groupId='group-1'
+        onUploaded={() => undefined}
+        getUploadLimits={async () => null}
+      >
         {() => null}
       </AssetUploadPanel>
     </QueryClientProvider>
@@ -864,6 +1019,7 @@ test('keeps an active upload visible when switching asset groups', async () => {
       <AssetUploadPanel
         groupId={groupId}
         groupName={groupName}
+        getUploadLimits={async () => null}
         onUploaded={() => undefined}
       >
         {() => null}
@@ -936,7 +1092,11 @@ test('cancels an in-flight upload on unmount and never starts the remaining queu
   const uploaded = vi.fn()
   const view = render(
     <QueryClientProvider client={client}>
-      <AssetUploadPanel groupId='group-1' onUploaded={uploaded}>
+      <AssetUploadPanel
+        groupId='group-1'
+        onUploaded={uploaded}
+        getUploadLimits={async () => null}
+      >
         {() => null}
       </AssetUploadPanel>
     </QueryClientProvider>

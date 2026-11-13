@@ -30,6 +30,7 @@ func TaskExecutionSnapshotFromContext(ctx *gin.Context) *model.TaskExecutionSnap
 				generation = pinned.Generation.Number
 			}
 			meta := pinned.Plugin.Meta
+			snapshot.ResourcePaths = append([]string(nil), meta.ResourcePaths...)
 			snapshot.TaskPlugin = &model.TaskPluginSnapshot{
 				Key:     meta.Key,
 				Name:    meta.Name,

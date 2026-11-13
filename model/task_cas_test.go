@@ -51,14 +51,20 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&Task{},
+		&TaskResource{},
+		&TaskResourceIndexState{},
+		&VideoTaskPendingLog{},
+		&BillingRefund{},
 		&User{},
 		&UserModelPricing{},
 		&UserModelPricingRevision{},
+		&UserModelPricingHistory{},
 		&AccountingBatchReceipt{},
 		&UserSession{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},
 		&Token{},
+		&TokenSignatureCredential{},
 		&PasskeyCredential{},
 		&TwoFA{},
 		&TwoFABackupCode{},
@@ -87,18 +93,24 @@ func truncateTables(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
 		DB.Exec("DELETE FROM tasks")
+		DB.Exec("DELETE FROM task_resources")
+		DB.Exec("DELETE FROM task_resource_index_states")
+		DB.Exec("DELETE FROM video_task_pending_logs")
+		DB.Exec("DELETE FROM billing_refunds")
 		DB.Exec("DELETE FROM auth_flows")
 		DB.Exec("DELETE FROM external_identity_claims")
 		DB.Exec("DELETE FROM user_sessions")
 		DB.Exec("DELETE FROM passkey_credentials")
 		DB.Exec("DELETE FROM two_fa_backup_codes")
 		DB.Exec("DELETE FROM two_fas")
+		DB.Exec("DELETE FROM token_signature_credentials")
 		DB.Exec("DELETE FROM tokens")
 		DB.Exec("DELETE FROM user_access_tokens")
 		DB.Exec("DELETE FROM user_oauth_bindings")
 		DB.Exec("DELETE FROM users")
 		DB.Exec("DELETE FROM user_model_pricings")
 		DB.Exec("DELETE FROM user_model_pricing_revisions")
+		DB.Exec("DELETE FROM user_model_pricing_histories")
 		DB.Exec("DELETE FROM logs")
 		DB.Exec("DELETE FROM channels")
 		DB.Exec("DELETE FROM quota_data")

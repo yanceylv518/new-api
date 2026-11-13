@@ -20,9 +20,11 @@ For commercial licensing, please contact support@quantumnous.com
 package controller
 
 import (
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -90,25 +92,6 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 		writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "CreateVisualValidateSession", "CallbackURL is required")
 		return
 	}
-	if request.Name != "" {
-		duplicated, err := model.IsSeedanceAssetGroupNameDuplicated(0, c.GetInt("id"), request.Name)
-		if err != nil {
-			if official {
-				writeSeedanceAssetOfficialError(c, http.StatusInternalServerError, "CreateVisualValidateSession", err.Error())
-			} else {
-				common.ApiError(c, err)
-			}
-			return
-		}
-		if duplicated {
-			if official {
-				writeSeedanceAssetOfficialError(c, http.StatusConflict, "CreateVisualValidateSession", "validation group name already exists")
-			} else {
-				common.ApiErrorMsg(c, "asset group name already exists")
-			}
-			return
-		}
-	}
 	channels, err := selectSeedanceAssetValidationChannels(c, request.Model)
 	if err != nil {
 		if official {
@@ -126,9 +109,10 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 			Name:        request.Name,
 			Description: request.Description,
 			Tags:        request.Tags,
+			CallbackURL: callbackURL,
 		},
 		projectName,
-		callbackURL,
+		"",
 	)
 	if err != nil {
 		if official {
@@ -139,10 +123,14 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 		return
 	}
 	if official {
-		c.JSON(http.StatusOK, seedanceAssetOfficialResponse("CreateVisualValidateSession", gin.H{
+		result := gin.H{
 			"BytedToken": start.BytedToken,
 			"H5Link":     start.LaunchURL,
-		}))
+		}
+		if c.GetBool("seedance_compat_ark_action") {
+			result["CallbackURL"] = callbackURL
+		}
+		writeSeedanceAssetOfficialResponse(c, http.StatusOK, seedanceAssetOfficialResponse("CreateVisualValidateSession", result))
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{
@@ -184,12 +172,7 @@ func SeedanceAssetValidationCallback(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "validation session not found"})
 		return
 	}
-	state := strings.TrimSpace(c.Query("state"))
-	if state == "" {
-		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "validation session not found"})
-		return
-	}
-	stateHash, err := service.HashSeedanceAssetValidationState(state)
+	query, stateHash, err := parseSeedanceValidationCallback(c)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "validation session not found"})
 		return
@@ -199,12 +182,93 @@ func SeedanceAssetValidationCallback(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "validation session not found"})
 		return
 	}
+	if !seedanceValidationCallbackTokenMatches(query, session) {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "validation session not found"})
+		return
+	}
+	var redirect *url.URL
+	if session.CompatCallbackURL != "" {
+		callbackURL, openErr := common.OpenTaskSecret(session.CompatCallbackURL)
+		if openErr != nil || service.ValidateSeedanceAssetValidationCallbackURL(callbackURL) != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "validation callback is invalid"})
+			return
+		}
+		redirect, err = url.Parse(callbackURL)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "validation callback is invalid"})
+			return
+		}
+	}
 	refreshed, err := service.RefreshSeedanceAssetValidationSession(c.Request.Context(), session.UserID, session.ID)
+	if redirect != nil {
+		if err != nil {
+			common.SysError(fmt.Sprintf("Seedance validation callback refresh failed for session %d: %v", session.ID, err))
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "validation status is temporarily unavailable"})
+			return
+		}
+		if refreshed.Status == model.SeedanceAssetValidationStatusPending || refreshed.Status == model.SeedanceAssetValidationStatusCreating {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "validation is still pending"})
+			return
+		}
+		values := redirect.Query()
+		for key, incoming := range query {
+			if key == "state" {
+				continue
+			}
+			values.Del(key)
+			for _, value := range incoming {
+				values.Add(key, value)
+			}
+		}
+		setSeedanceValidationCallbackResult(values, refreshed)
+		redirect.RawQuery = values.Encode()
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Redirect(http.StatusFound, redirect.String())
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": service.BuildSeedanceAssetValidationSessionView(refreshed)})
+}
+
+func parseSeedanceValidationCallback(c *gin.Context) (url.Values, string, error) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil || len(query["state"]) != 1 || strings.TrimSpace(query.Get("state")) == "" {
+		return nil, "", model.ErrSeedanceAssetValidationSessionNotFound
+	}
+	stateHash, err := service.HashSeedanceAssetValidationState(query.Get("state"))
+	return query, stateHash, err
+}
+
+func seedanceValidationCallbackTokenMatches(query url.Values, session *model.SeedanceAssetValidationSession) bool {
+	// 部分渠道只回传 state；认证结果仍须向会话绑定的账号查询，不能信任回跳中的成功标记。
+	tokens, supplied := query["bytedToken"]
+	if !supplied {
+		return true
+	}
+	if len(tokens) != 1 || strings.TrimSpace(tokens[0]) == "" || session.BytedTokenHash == nil {
+		return false
+	}
+	tokenHash, err := service.HashSeedanceAssetValidationToken(tokens[0])
+	return err == nil && hmac.Equal([]byte(tokenHash), []byte(*session.BytedTokenHash))
+}
+
+func setSeedanceValidationCallbackResult(values url.Values, session *model.SeedanceAssetValidationSession) {
+	values.Set("session_id", fmt.Sprint(session.ID))
+	values.Del("GroupId")
+	values.Set("status", "failed")
+	if values.Get("resultCode") == "10000" {
+		values.Del("resultCode")
+	}
+	if session.Status == model.SeedanceAssetValidationStatusSucceeded {
+		values.Set("resultCode", "10000")
+		values.Set("status", "success")
+		values.Set("GroupId", session.UpstreamGroupID)
+	}
 }
 
 func seedanceAssetOfficialResponse(action string, result gin.H) gin.H {
@@ -233,7 +297,7 @@ func writeSeedanceAssetOfficialErrorWithCode(c *gin.Context, status int, action,
 	if message == "" {
 		message = "upstream validation operation failed"
 	}
-	c.JSON(status, gin.H{
+	writeSeedanceAssetOfficialResponse(c, status, gin.H{
 		"ResponseMetadata": gin.H{
 			"RequestId": common.NewRequestId(),
 			"Action":    action,
@@ -246,6 +310,25 @@ func writeSeedanceAssetOfficialErrorWithCode(c *gin.Context, status int, action,
 			},
 		},
 	})
+}
+
+// SeedanceCompatArkAssetAction 保留客户入口的可选 Version 约定。
+func SeedanceCompatArkAssetAction(c *gin.Context) {
+	c.Set("seedance_compat_ark_action", true)
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "", "invalid query string")
+		return
+	}
+	if len(query["Action"]) != 1 || len(query["Version"]) > 1 {
+		writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "", "Action must appear once; Version must appear at most once")
+		return
+	}
+	if !query.Has("Version") {
+		query.Set("Version", "2024-01-01")
+	}
+	c.Request.URL.RawQuery = query.Encode()
+	SeedanceAssetV2Action(c)
 }
 
 // SeedanceAssetV2Action 在同一入口分发素材管理和真人认证，资源归属由平台校验。
@@ -283,18 +366,40 @@ func SeedanceAssetV2Action(c *gin.Context) {
 			return
 		}
 		if session.Status != model.SeedanceAssetValidationStatusSucceeded || session.UpstreamGroupID == "" {
-			message := session.LastError
+			view := service.BuildSeedanceAssetValidationSessionView(session)
+			if view.StatusCheckRetrying {
+				c.Header("Retry-After", "5")
+				writeSeedanceAssetOfficialErrorWithCode(c, http.StatusServiceUnavailable, "GetVisualValidateResult", "ServiceUnavailable", service.ErrSeedanceAssetServiceTemporary.Error())
+				return
+			}
+			if (session.Status == model.SeedanceAssetValidationStatusPending || session.Status == model.SeedanceAssetValidationStatusCreating) && view.LastError == "" {
+				c.Header("Retry-After", "5")
+				writeSeedanceAssetOfficialErrorWithCode(c, http.StatusConflict, "GetVisualValidateResult", "ValidationPending", service.ErrSeedanceAssetValidationPending.Error())
+				return
+			}
+			message := view.LastError
 			if message == "" {
 				message = service.ErrSeedanceAssetValidationPending.Error()
 			}
 			if session.Status == model.SeedanceAssetValidationStatusExpired {
-				writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "GetVisualValidateResult", message)
+				writeSeedanceAssetOfficialErrorWithCode(c, http.StatusBadRequest, "GetVisualValidateResult", "ValidationExpired", service.ErrSeedanceAssetValidationExpired.Error())
+				return
+			}
+			if session.Status == model.SeedanceAssetValidationStatusFailed {
+				if view.LastError == "" {
+					message = service.ErrSeedanceAssetValidationFailed.Error()
+				}
+				writeSeedanceAssetOfficialErrorWithCode(c, http.StatusBadRequest, "GetVisualValidateResult", "ValidationFailed", message)
+				return
+			}
+			if session.Status == model.SeedanceAssetValidationStatusCancelled {
+				writeSeedanceAssetOfficialErrorWithCode(c, http.StatusBadRequest, "GetVisualValidateResult", "ValidationCancelled", "This verification session can no longer be continued.")
 				return
 			}
 			writeSeedanceAssetOfficialUpstreamError(c, http.StatusBadGateway, "GetVisualValidateResult", message)
 			return
 		}
-		c.JSON(http.StatusOK, seedanceAssetOfficialResponse("GetVisualValidateResult", gin.H{"GroupId": session.UpstreamGroupID}))
+		writeSeedanceAssetOfficialResponse(c, http.StatusOK, seedanceAssetOfficialResponse("GetVisualValidateResult", gin.H{"GroupId": session.UpstreamGroupID}))
 	default:
 		handleSeedanceAssetLibraryAction(c, action)
 	}

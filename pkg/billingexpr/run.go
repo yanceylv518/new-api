@@ -113,7 +113,13 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 		},
 		"param": func(path string) any {
 			path = strings.TrimSpace(path)
-			if path == "" || len(request.Body) == 0 {
+			if path == "" {
+				return nil
+			}
+			if request.Params != nil {
+				return request.Params[path]
+			}
+			if len(request.Body) == 0 {
 				return nil
 			}
 			result := gjson.GetBytes(request.Body, path)
@@ -134,11 +140,11 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 			}
 			return strings.Contains(fmt.Sprint(source), substr)
 		},
-		"hour":    func(tz string) int { return timeInZone(tz).Hour() },
-		"minute":  func(tz string) int { return timeInZone(tz).Minute() },
-		"weekday": func(tz string) int { return int(timeInZone(tz).Weekday()) },
-		"month":   func(tz string) int { return int(timeInZone(tz).Month()) },
-		"day":     func(tz string) int { return timeInZone(tz).Day() },
+		"hour":    func(tz string) int { return timeInZone(tz, request.At).Hour() },
+		"minute":  func(tz string) int { return timeInZone(tz, request.At).Minute() },
+		"weekday": func(tz string) int { return int(timeInZone(tz, request.At).Weekday()) },
+		"month":   func(tz string) int { return int(timeInZone(tz, request.At).Month()) },
+		"day":     func(tz string) int { return timeInZone(tz, request.At).Day() },
 		"max":     math.Max,
 		"min":     math.Min,
 		"abs":     math.Abs,
@@ -157,16 +163,20 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 	return f, trace, nil
 }
 
-func timeInZone(tz string) time.Time {
+func timeInZone(tz string, at int64) time.Time {
+	current := time.Now()
+	if at != 0 {
+		current = time.Unix(at, 0)
+	}
 	tz = strings.TrimSpace(tz)
 	if tz == "" {
-		return time.Now().UTC()
+		return current.UTC()
 	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		return time.Now().UTC()
+		return current.UTC()
 	}
-	return time.Now().In(loc)
+	return current.In(loc)
 }
 
 func normalizeHeaders(headers map[string]string) map[string]string {

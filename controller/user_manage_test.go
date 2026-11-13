@@ -68,7 +68,7 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 			}
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Task{}, &model.VideoTaskPendingLog{}, &model.BillingRefund{}))
 	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 	versionQuery := "SELECT version()"
 	if dialect == "sqlite" {
@@ -114,6 +114,7 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.Ability{}))
 	user := model.User{Username: "pricing-contract", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
 	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&model.User{Id: 9999, Username: "pricing-operator", AffCode: "pricing-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled}).Error)
 	require.NoError(t, db.Create(&[]model.Ability{
 		{Group: "default", Model: "pricing-public", ChannelId: 1, Enabled: true},
 		{Group: "private", Model: "pricing-private", ChannelId: 2, Enabled: true},
@@ -169,6 +170,74 @@ func TestUserModelPricingManagementContract(t *testing.T) {
 	assert.Contains(t, denied.Body.String(), `"success":false`)
 	assert.Contains(t, request(http.MethodGet, "").Body.String(), `"success":false`)
 	assert.Contains(t, request(http.MethodPut, `{"revision":2,"items":[]}`).Body.String(), `"success":false`)
+}
+
+func TestUserModelPricingOverviewAlwaysUsesBoundedSummary(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.UserModelPricingHistory{}, &model.Ability{}))
+	user := model.User{Username: "summary-owner", AffCode: "summary-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&model.User{Id: 9999, Username: "summary-operator", AffCode: "summary-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled}).Error)
+	for i := range 5 {
+		name := fmt.Sprintf("summary-model-%d", i)
+		require.NoError(t, db.Create(&model.Ability{Group: "default", Model: name, ChannelId: i + 1, Enabled: true}).Error)
+		require.NoError(t, db.Create(&model.UserModelPricing{UserId: user.Id, ModelName: name, DiscountBPS: 8000, Expression: "0.8"}).Error)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("id", 9999); c.Set("role", common.RoleRootUser) })
+	router.GET("/overview", GetUserModelPricingOverview)
+	router.GET("/rules/:id", GetUserModelPricingRulePage)
+	var expressionRows int64
+	const callback = "test:overview-expression-rows"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != db.NamingStrategy.TableName("user_model_pricings") {
+			return
+		}
+		selectClause, _, found := strings.Cut(strings.ToLower(tx.Statement.SQL.String()), " from ")
+		if found && (strings.Contains(selectClause, "expression") || strings.Contains(selectClause, "user_model_pricings.*")) {
+			expressionRows += tx.RowsAffected
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
+	for _, tc := range []struct{ name, query string }{{"omitted", ""}, {"true", "?summary=true"}, {"false", "?summary=false"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			expressionRows = 0
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/overview"+tc.query, nil))
+			var response struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Items      []model.UserModelPricingOverviewItem `json:"items"`
+					TotalRules int64                                `json:"total_rules"`
+				} `json:"data"`
+			}
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			require.Len(t, response.Data.Items, 1)
+			assert.EqualValues(t, 5, response.Data.TotalRules)
+			assert.Equal(t, 5, response.Data.Items[0].RuleCount)
+			assert.Empty(t, response.Data.Items[0].Rules)
+			assert.Len(t, response.Data.Items[0].PreviewRules, 3)
+			for _, preview := range response.Data.Items[0].PreviewRules {
+				assert.Equal(t, "0.8", preview.Expression)
+			}
+			assert.EqualValues(t, 3, expressionRows)
+		})
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/rules/%d", user.Id), nil))
+	var details struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items []model.UserModelPricingOverviewRule `json:"items"`
+			Total int64                                `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &details))
+	require.True(t, details.Success, recorder.Body.String())
+	assert.EqualValues(t, 5, details.Data.Total)
+	assert.Len(t, details.Data.Items, 5)
 }
 
 // manageUserProof signs the root operator in and issues a password-method proof

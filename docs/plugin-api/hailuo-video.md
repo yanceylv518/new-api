@@ -191,6 +191,8 @@ curl --request POST "$BASE_URL/hailuo/v2/h3_context_ir" \
 
 `source_task_id` 使用当前用户已有的网关公开任务 ID。网关会验证任务归属、
 插件平台、渠道、模型、成功状态和源分辨率，然后才调用 MiniMax 上游。
+源任务原渠道还必须在当前 API Key 的可用分组中启用并支持该模型，
+Key 的模型限制也必须允许该模型。
 
 ```bash
 curl --request POST "$BASE_URL/hailuo/v2/video_regeneration" \
@@ -487,4 +489,4 @@ u("operation") == "generation" && u("resolution") == "768P"
 | 404 `task_not_found` | 任务不存在、不属于当前用户或不属于当前插件 |
 | 502 `task_sync_failed` | 取消/删除前无法同步上游最终状态 |
 | 503 `task_cancel_pending` | 上游取消已提交，但尚未确认 |
-| 503 `task_settlement_unavailable` | 上游删除时最终用量尚未可用，预扣费等待对账 |
+| 503 `task_settlement_unavailable` | 上游删除时最终用量尚未确认，预扣费暂未结算 |

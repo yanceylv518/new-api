@@ -20,6 +20,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -485,15 +486,25 @@ func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *
 	t.Helper()
 	previousDB := model.DB
 	previousRedis, previousLogConsume := common.RedisEnabled, common.LogConsumeEnabled
-	common.RedisEnabled, common.LogConsumeEnabled = false, false
-	t.Cleanup(func() { common.RedisEnabled, common.LogConsumeEnabled = previousRedis, previousLogConsume })
+	if previousRedis {
+		common.RedisEnabled = false
+	}
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() {
+		if previousRedis {
+			common.RedisEnabled = true
+		}
+		common.LogConsumeEnabled = previousLogConsume
+	})
 	var models []any
 	if migrate {
-		models = append(models, &model.Task{})
+		models = append(models, &model.Task{}, &model.VideoTaskPendingLog{}, &model.User{}, &model.Channel{})
 	}
 	database, _ := openTaskDialectDatabase(t, models...)
-	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("test:task-submit-order", func(*gorm.DB) {
-		*events = append(*events, "insert")
+	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("test:task-submit-order", func(tx *gorm.DB) {
+		if tx.Statement.Table == database.NamingStrategy.TableName("tasks") {
+			*events = append(*events, "insert")
+		}
 	}))
 	model.DB = database
 	t.Cleanup(func() { model.DB = previousDB })
@@ -510,6 +521,7 @@ func taskSubmissionTestContext() *gin.Context {
 func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{
 		UserId:          1,
+		UserQuota:       common.MaxQuota,
 		UsingGroup:      "default",
 		OriginModelName: "plugin-model",
 		Billing:         billing,
@@ -532,6 +544,26 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 // runs leave a record.
 func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.DatabaseType) {
 	t.Helper()
+	var hasTask, hasPendingLogs, hasRefunds bool
+	for _, value := range models {
+		switch value.(type) {
+		case *model.Task:
+			hasTask = true
+		case *model.VideoTaskPendingLog:
+			hasPendingLogs = true
+		case *model.BillingRefund:
+			hasRefunds = true
+		}
+	}
+	if hasTask && !hasPendingLogs {
+		models = append(models, &model.VideoTaskPendingLog{})
+	}
+	if hasTask && !hasRefunds {
+		models = append(models, &model.BillingRefund{})
+	}
+	if hasTask {
+		models = append(models, &model.TaskResource{}, &model.TaskResourceIndexState{})
+	}
 	previous := common.CryptoSecret
 	common.CryptoSecret = "fixture-persistent-controller-task-secret"
 	if secret := os.Getenv("CRYPTO_SECRET"); secret != "" {
@@ -572,17 +604,27 @@ func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.Data
 }
 
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.VideoTaskPendingLog{}, &model.Log{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
 	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
 	model.DB, model.LOG_DB = db, db
 	common.SetDatabaseTypes(dialect, dialect)
-	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, false, true, false
+	if oldRedis {
+		common.RedisEnabled = false
+	}
+	common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, true, false
 	t.Cleanup(func() {
-		model.DB, model.LOG_DB = oldDB, oldLogDB
-		common.SetDatabaseTypes(oldMain, oldLog)
-		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldRedis, oldMemory, oldBatch, oldConsume, oldExport
+		defer func() {
+			model.DB, model.LOG_DB = oldDB, oldLogDB
+			common.SetDatabaseTypes(oldMain, oldLog)
+			if oldRedis {
+				common.RedisEnabled = true
+			}
+			common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldMemory, oldBatch, oldConsume, oldExport
+		}()
+		// 等终态性能统计退出后再恢复全局配置。
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
 	})
 
 	const expression = `u("units") == 7 ? tier("missing", u("missing") * 1.0) : u("units") == 8 ? tier("invalid", -1.0) : u("units") > 3 ? tier("bulk", u("units") * 0.01) : tier("small", u("units") * 0.01)`
@@ -693,9 +735,151 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 	}
 }
 
+func TestImmediateTaskFundingFailureRemainsRecoverable(t *testing.T) {
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.VideoTaskPendingLog{}, &model.Log{})
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldBatch, oldConsume := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(dialect, dialect)
+	if oldRedis {
+		common.RedisEnabled = false
+	}
+	common.BatchUpdateEnabled, common.LogConsumeEnabled = false, true
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMain, oldLog)
+		if oldRedis {
+			common.RedisEnabled = true
+		}
+		common.BatchUpdateEnabled, common.LogConsumeEnabled = oldBatch, oldConsume
+	})
+	require.NoError(t, db.Create(&model.User{Id: 901, Username: "terminal-owner", AffCode: "terminal-owner", Quota: 1000}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 901}).Error)
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(nil)
+	info.UserId, info.ChannelId, info.IsPlayground, info.ForcePreConsume = 901, 901, true, true
+	info.ChannelMeta.ChannelId = 901
+	info.LockedChannel = &model.Channel{Id: 901, Type: constant.ChannelTypeTaskPlugin}
+	info.PriceData.Quota = 100
+	info.UserSetting.BillingPreference = "wallet_only"
+	require.Nil(t, service.PreConsumeBilling(c, 100, info))
+	var callbackInstalled bool
+	t.Cleanup(func() {
+		if callbackInstalled {
+			assert.NoError(t, db.Callback().Update().Remove("immediate-funding-failure"))
+		}
+	})
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		start, ok := c.Get("task_submission_start")
+		require.True(t, ok)
+		require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register("immediate-funding-failure", func(tx *gorm.DB) {
+			if tx.Statement.Table == db.NamingStrategy.TableName("users") {
+				tx.AddError(errors.New("injected funding failure"))
+			}
+		}))
+		callbackInstalled = true
+		return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "upstream-terminal", Quota: 50, Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%"}}, nil
+	})
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	require.NoError(t, db.Callback().Update().Remove("immediate-funding-failure"))
+	callbackInstalled = false
+	var pending model.Task
+	require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&pending).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), pending.Status)
+	assert.True(t, pending.PrivateData.SubmissionPending)
+	assert.NotEmpty(t, pending.PrivateData.SubmissionResponse)
+	assert.Equal(t, 100, pending.Quota)
+	var user model.User
+	require.NoError(t, db.First(&user, 901).Error)
+	assert.Equal(t, 900, user.Quota)
+	require.NoError(t, service.RecoverTaskInitialAccounting(t.Context(), &pending))
+	pending.Status, pending.Progress = model.TaskStatusSuccess, "100%"
+	pending.PrivateData.SubmissionPending = false
+	won, err := model.FinalizeVideoTask(t.Context(), &pending, model.TaskStatusUnknown, 50)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&user, 901).Error)
+	assert.Equal(t, 950, user.Quota)
+	assert.Equal(t, 50, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+}
+
 func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	c := taskSubmissionTestContext()
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
+}
+
+func TestAsyncTaskFundingFailurePreservesReservation(t *testing.T) {
+	for _, failTable := range []string{"", "users", "tokens"} {
+		t.Run(failTable, func(t *testing.T) {
+			events := []string{}
+			db := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
+			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+			require.False(t, common.BatchUpdateEnabled)
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "async-funding", Quota: 1000}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "async-funding-test", RemainQuota: 1000}).Error)
+			c := taskSubmissionTestContext()
+			info := taskSubmissionRelayInfo(nil)
+			info.TokenId, info.TokenKey, info.ForcePreConsume = 1, "async-funding-test", true
+			info.PriceData.Quota = 100
+			info.UserSetting.BillingPreference, info.UserSetting.QuotaWarningThreshold = "wallet_only", 1
+			require.Nil(t, service.PreConsumeBilling(c, 100, info))
+			injected := errors.New("injected submission funding failure")
+			if failTable != "" {
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register("async-funding-failure", func(tx *gorm.DB) {
+					if values, ok := tx.Statement.Dest.(map[string]any); ok && tx.Statement.Table == db.NamingStrategy.TableName(failTable) {
+						_, wallet := values["quota"]
+						_, token := values["remain_quota"]
+						if wallet || token {
+							tx.AddError(injected)
+						}
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("async-funding-failure")) })
+			}
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				start, ok := c.Get("task_submission_start")
+				require.True(t, ok)
+				require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+				return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted-async", Quota: 50}, nil
+			})
+			if failTable == "" {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+			} else {
+				require.NotNil(t, taskErr)
+				assert.Nil(t, outcome)
+				require.NoError(t, db.Callback().Update().Remove("async-funding-failure"))
+			}
+			// 丢弃请求内会话，仅凭持久化任务恢复记账和最终结算。
+			var pending model.Task
+			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&pending).Error)
+			require.NoError(t, service.RecoverTaskInitialAccounting(t.Context(), &pending))
+			previous := pending.Status
+			pending.Status, pending.Progress = model.TaskStatusSuccess, "100%"
+			pending.PrivateData.SubmissionPending = false
+			won, err := model.FinalizeVideoTask(t.Context(), &pending, previous, 50)
+			require.NoError(t, err)
+			require.True(t, won)
+			won, err = model.FinalizeVideoTask(t.Context(), &pending, previous, 50)
+			require.NoError(t, err)
+			assert.False(t, won)
+			var user model.User
+			var token model.Token
+			require.NoError(t, db.First(&user, 1).Error)
+			require.NoError(t, db.First(&token, 1).Error)
+			assert.Equal(t, 950, user.Quota)
+			assert.Equal(t, 50, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			assert.Equal(t, 950, token.RemainQuota)
+			assert.Equal(t, 50, token.UsedQuota)
+		})
+	}
 }
 
 func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.T) {
@@ -741,6 +925,72 @@ func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.
 	assert.Equal(t, 1, user.RequestCount)
 }
 
+func TestSubmissionJournalDoesNotRepeatRecoveredAccounting(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(fmt.Sprintf("uncertain=%t", uncertain), func(t *testing.T) {
+			events := []string{}
+			db := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}, &model.Log{}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{}, &model.Log{}))
+			})
+			previousLogDB := model.LOG_DB
+			model.LOG_DB, common.LogConsumeEnabled = db, true
+			t.Cleanup(func() { model.LOG_DB = previousLogDB })
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "recovered-owner", Quota: 900}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+			billing := &taskSubmissionTestBilling{events: &events}
+			info := taskSubmissionRelayInfo(billing)
+			info.UserQuota, info.UserSetting.QuotaWarningThreshold = 900, 1
+			info.PriceData.Quota, info.PriceData.DiscountAmounts = 100, types.NewDiscountAmounts(200, 100)
+			c := taskSubmissionTestContext()
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				start, ok := c.Get("task_submission_start")
+				require.True(t, ok)
+				require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+				var pending model.Task
+				require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&pending).Error)
+				pending.PrivateData.SubmissionResponse = []byte(`{"parsed":{"taskId":"accepted-once"}}`)
+				won, err := model.PersistTaskSubmission(t.Context(), &pending, false)
+				require.NoError(t, err)
+				require.True(t, won)
+				// 固定后台先入账的顺序，前台交接会读到已清除的待记账标记。
+				require.NoError(t, service.RecoverTaskInitialAccounting(t.Context(), &pending))
+				require.False(t, pending.PrivateData.InitialAccountingPending)
+				if uncertain {
+					return nil, &dto.TaskError{Code: "plugin_submit_response_failed", StatusCode: 502, NoRetry: true}
+				}
+				return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted-once", Quota: 100}, nil
+			})
+			if uncertain {
+				require.NotNil(t, taskErr)
+				assert.Nil(t, outcome)
+			} else {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+			}
+			assert.Zero(t, billing.refunds)
+			var stored model.Task
+			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&stored).Error)
+			assert.False(t, stored.PrivateData.InitialAccountingPending)
+			assert.Equal(t, uncertain, stored.PrivateData.SubmissionPending)
+			require.NoError(t, service.RecoverTaskInitialAccounting(t.Context(), &stored))
+			var user model.User
+			var channel model.Channel
+			var logs []model.Log
+			require.NoError(t, db.First(&user, 1).Error)
+			require.NoError(t, db.First(&channel, 1).Error)
+			require.NoError(t, db.Find(&logs).Error)
+			assert.Equal(t, 900, user.Quota)
+			assert.Equal(t, 100, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			assert.EqualValues(t, 200, channel.UsedQuota)
+			require.Len(t, logs, 1)
+			assert.Equal(t, 100, logs[0].Quota)
+		})
+	}
+}
+
 // Local task rejections carry a message but no cause; the response and the
 // decision record must still be produced.
 func TestSubmissionJournalSurvivesClientDisconnectAndRejectionCleanupFailure(t *testing.T) {
@@ -760,7 +1010,11 @@ func TestSubmissionJournalSurvivesClientDisconnectAndRejectionCleanupFailure(t *
 			defer cancel()
 			c.Request = c.Request.WithContext(client)
 			if rejected {
-				require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("journal-delete-failure", func(tx *gorm.DB) { tx.AddError(errors.New("delete unavailable")) }))
+				require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("journal-delete-failure", func(tx *gorm.DB) {
+					if tx.Statement.Table == db.NamingStrategy.TableName("tasks") {
+						tx.AddError(errors.New("delete unavailable"))
+					}
+				}))
 				t.Cleanup(func() { require.NoError(t, db.Callback().Delete().Remove("journal-delete-failure")) })
 			}
 			attempts := 0

@@ -55,7 +55,7 @@ export const meta = {
     en: "Shengshu Vidu video generation and template workflows",
     zh: "生数 Vidu 视频生成及模板工作流",
   },
-  version: "1.1.2",
+  version: "1.1.4",
   author: { name: "QuantumNous" },
   channelTypes: [52],
   upstreams: ["vendor", "new_api"],
@@ -81,11 +81,32 @@ function viduRoutes() {
   return [
     { method: "POST", path: "/vidu/ent/v2/text2video", type: "submit", action: "text_to_video", decode: "createTextVideoTask", render: "viduTaskCreated" },
     { method: "POST", path: "/vidu/ent/v2/img2video", type: "submit", action: "image_to_video", decode: "createImageVideoTask", render: "viduTaskCreated" },
-    { method: "POST", path: "/vidu/ent/v2/reference2video", type: "submit", action: "reference_to_video", decode: "createReferenceVideoTask", render: "viduTaskCreated" },
-    { method: "POST", path: "/vidu/ent/v2/start-end2video", type: "submit", action: "first_tail_to_video", decode: "createFirstTailVideoTask", render: "viduTaskCreated" },
+    {
+      method: "POST",
+      path: "/vidu/ent/v2/reference2video",
+      type: "submit",
+      action: "reference_to_video",
+      decode: "createReferenceVideoTask",
+      render: "viduTaskCreated",
+    },
+    {
+      method: "POST",
+      path: "/vidu/ent/v2/start-end2video",
+      type: "submit",
+      action: "first_tail_to_video",
+      decode: "createFirstTailVideoTask",
+      render: "viduTaskCreated",
+    },
     { method: "POST", path: "/vidu/ent/v2/multiframe", type: "submit", action: "multiframe", decode: "createMultiframeTask", render: "viduTaskCreated" },
     { method: "POST", path: "/vidu/ent/v2/template", type: "submit", action: "template", decode: "createTemplateTask", render: "viduTaskCreated" },
-    { method: "POST", path: "/vidu/ent/v2/template-story", type: "submit", action: "template_story", decode: "createTemplateStoryTask", render: "viduTaskCreated" },
+    {
+      method: "POST",
+      path: "/vidu/ent/v2/template-story",
+      type: "submit",
+      action: "template_story",
+      decode: "createTemplateStoryTask",
+      render: "viduTaskCreated",
+    },
     { method: "GET", path: "/vidu/ent/v2/tasks", type: "dynamic", action: "list", decode: "decodeViduTaskList", render: "viduTaskList" },
   ];
 }
@@ -94,14 +115,8 @@ function trimmed(value) {
   return String(value || "").trim();
 }
 
-function viaGateway(ctx) {
-  return !!(ctx && ctx.upstream && ctx.upstream.kind === "new_api");
-}
-
 function apiRoot(ctx) {
-  const base = trimmed(ctx && ctx.baseUrl).replace(/\/+$/, "");
-  if (base.toLowerCase().endsWith("/vidu")) return base;
-  return base + (viaGateway(ctx) ? "/vidu" : "");
+  return trimmed(ctx && ctx.baseUrl).replace(/\/+$/, "");
 }
 
 function isQ2Model(model) {
@@ -148,7 +163,8 @@ function normalizeResolution(value, model) {
     if (width > 0 && height > 0) {
       const max = Math.max(width, height);
       const normalized = max >= 1920 ? "1080p" : max >= 1280 ? "720p" : max >= 960 ? "540p" : "360p";
-      if (supported.indexOf(normalized) < 0) throw new Error(model + " does not support " + normalized + " resolution; supported resolutions: " + supported.join(", "));
+      if (supported.indexOf(normalized) < 0)
+        throw new Error(model + " does not support " + normalized + " resolution; supported resolutions: " + supported.join(", "));
       return normalized;
     }
   }
@@ -156,9 +172,15 @@ function normalizeResolution(value, model) {
 }
 
 function outboundDuration(req, model) {
-  const n = Number(req && req.duration);
-  if (Number.isFinite(n) && n > 0) return n;
-  return defaultDuration(model);
+  if (!req || req.duration === undefined) return defaultDuration(model);
+  const n = Number(req.duration);
+  if (!Number.isInteger(n) || n <= 0 || n > 3600) throw new Error("seconds must be between 1 and 3600");
+  return n;
+}
+
+function effectiveRequest(req) {
+  const metadata = req && req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
+  return Object.assign({}, metadata, req || {});
 }
 
 function multiframeDuration(req) {
@@ -321,7 +343,7 @@ function pathFor(action) {
 }
 
 export function buildSubmitRequest(ctx) {
-  const req = ctx.requestBody && typeof ctx.requestBody === "object" && !Array.isArray(ctx.requestBody) ? ctx.requestBody : {};
+  const req = effectiveRequest(ctx.requestBody);
   const action = normalizedAction(req, ctx.action);
   const metadata = req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
   let model = ctx.upstreamModel || req.model || VIDU_DEFAULT_NATIVE_MODEL;
@@ -329,7 +351,7 @@ export function buildSubmitRequest(ctx) {
     const duration = req.duration === undefined ? undefined : Number(req.duration);
     validateViduCombo(model, duration, outboundResolution(req, model), action !== "text_to_video");
   }
-  const body = Object.assign({}, req, metadata);
+  const body = Object.assign({}, metadata, req);
   const images = Array.isArray(body.images) ? body.images.map(filePlaceholder) : null;
   if (images) body.images = images;
   delete body.metadata;
@@ -338,10 +360,10 @@ export function buildSubmitRequest(ctx) {
   else delete body.model;
   if (action !== "multiframe" && action !== "template" && action !== "template_story") {
     if (body.prompt === undefined && req.prompt !== undefined) body.prompt = req.prompt;
-    if (body.duration === undefined) body.duration = outboundDuration(req, model);
-    if (body.resolution === undefined) body.resolution = outboundResolution(req, model);
+    body.duration = outboundDuration(req, model);
+    body.resolution = outboundResolution(req, model);
     if (body.movement_amplitude === undefined) body.movement_amplitude = "auto";
-  } else if (action === "multiframe" && body.resolution === undefined) {
+  } else if (action === "multiframe") {
     body.resolution = outboundResolution(req, model);
   }
   return {
@@ -364,7 +386,7 @@ export function parseSubmitResponse(ctx, resp) {
 
 export function extractUsage(ctx) {
   if (ctx.usagePurpose === "billing_ratios") return null;
-  const req = ctx.requestBody || {};
+  const req = effectiveRequest(ctx.requestBody);
   const model = ctx.upstreamModel || req.model;
   const action = normalizedAction(req, ctx.action);
   return { duration: outboundDurationForAction(req, model, action), resolution: outboundResolution(req, model) };
@@ -409,9 +431,11 @@ function viduTaskRecords(body) {
 function viduTaskRecord(body, taskId) {
   const records = viduTaskRecords(body);
   const wanted = trimmed(taskId);
-  return records.find(function (record) {
-    return record && (trimmed(record.id) === wanted || trimmed(record.task_id) === wanted);
-  }) || (records.length === 1 ? records[0] : null);
+  return (
+    records.find(function (record) {
+      return record && (trimmed(record.id) === wanted || trimmed(record.task_id) === wanted);
+    }) || (records.length === 1 ? records[0] : null)
+  );
 }
 
 function viduCreationEntries(record) {
@@ -423,7 +447,7 @@ function viduCreationEntries(record) {
 
 export function parseTaskResult(ctx, body) {
   const error = viduErrorMessage(body);
-  if (error) return { status: "FAILURE", progress: "100%", reason: error };
+  if (error) throw new Error(error);
   const record = viduTaskRecord(body, ctx.taskId);
   if (!record) return { status: "UNKNOWN", reason: "task was not returned by the Vidu query endpoint" };
   const statuses = { created: "SUBMITTED", queueing: "SUBMITTED", processing: "IN_PROGRESS", success: "SUCCESS", failed: "FAILURE" };
@@ -447,8 +471,8 @@ function artifactData(ctx) {
   const upstreamTaskId = trimmed(ctx && ctx.upstreamTaskId);
   const record = viduTaskRecord(data, upstreamTaskId || (ctx && (ctx.taskId || ctx.task_id))) || data;
   // 单条结果的旧版回退也不能选中其他任务的制品。
-  if (upstreamTaskId && (trimmed(record.id) || trimmed(record.task_id)) &&
-      trimmed(record.id) !== upstreamTaskId && trimmed(record.task_id) !== upstreamTaskId) return {};
+  if (upstreamTaskId && (trimmed(record.id) || trimmed(record.task_id)) && trimmed(record.id) !== upstreamTaskId && trimmed(record.task_id) !== upstreamTaskId)
+    return {};
   return record;
 }
 
@@ -590,9 +614,13 @@ function createTemplateStoryTask(ctx) {
 function queryListValues(query, names) {
   for (const name of names) {
     const values = (query && query[name]) || [];
-    if (values.length > 1) return values.reduce(function (all, value) {
-      return all.concat(String(value).split(","));
-    }, []).map(trimmed).filter(Boolean);
+    if (values.length > 1)
+      return values
+        .reduce(function (all, value) {
+          return all.concat(String(value).split(","));
+        }, [])
+        .map(trimmed)
+        .filter(Boolean);
     if (values.length === 1 && trimmed(values[0])) return String(values[0]).split(",").map(trimmed).filter(Boolean);
   }
   return [];
@@ -622,9 +650,18 @@ function nativeViduModelVersions(versions) {
   const models = [];
   for (const version of versions) {
     let matches;
-    if (version === "q1") matches = VIDU_MODELS.filter(function (model) { return model.indexOf("viduq1") === 0; });
-    else if (version === "q2") matches = VIDU_MODELS.filter(function (model) { return model.indexOf("viduq2") === 0; });
-    else if (version === "q3") matches = VIDU_MODELS.filter(function (model) { return model.indexOf("viduq3") === 0; });
+    if (version === "q1")
+      matches = VIDU_MODELS.filter(function (model) {
+        return model.indexOf("viduq1") === 0;
+      });
+    else if (version === "q2")
+      matches = VIDU_MODELS.filter(function (model) {
+        return model.indexOf("viduq2") === 0;
+      });
+    else if (version === "q3")
+      matches = VIDU_MODELS.filter(function (model) {
+        return model.indexOf("viduq3") === 0;
+      });
     else if (version === "2.0") matches = ["vidu2.0"];
     else throw new Error("model_versions contains an invalid value");
     for (const model of matches) {

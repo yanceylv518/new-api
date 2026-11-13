@@ -70,6 +70,10 @@ var channelSensitiveFields = map[string]struct{}{
 	"setting":             {},
 	"other":               {},
 	"settings":            {},
+	"setting_patch":       {},
+	"settings_patch":      {},
+	"setting_base":        {},
+	"settings_base":       {},
 	"key_mode":            {},
 }
 

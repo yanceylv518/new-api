@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -257,7 +258,22 @@ func ListModels(c *gin.Context, modelType int) {
 			}
 		}
 		if !acceptUnsetRatioModel && !helper.HasModelBillingConfig(modelName) {
-			continue
+			priced := false
+			for _, target := range model.ResolveTaskModelAliasesForGroups(jsplugin.DefaultRegistry.Generation(), modelName, ownerGroups) {
+				priceModel := model.ResolveTaskPriceModel(target.PluginKey, modelName, target.Declared)
+				_, expression := billing_setting.ResolveTaskBillingExpr(target.PluginKey, priceModel, "")
+				if !expression && billing_setting.GetBillingMode(priceModel) == billing_setting.BillingModeTieredExpr {
+					continue
+				}
+				_, defaultPrice := ratio_setting.GetDefaultModelPriceMap()[priceModel]
+				if expression || defaultPrice || helper.HasModelBillingConfig(priceModel) {
+					priced = true
+					break
+				}
+			}
+			if !priced {
+				continue
+			}
 		}
 		userModelNames = append(userModelNames, modelName)
 	}

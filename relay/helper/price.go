@@ -44,7 +44,7 @@ func addUserModelDiscount(info *relaycommon.RelayInfo, priceData *hosttypes.Pric
 	if info == nil || priceData == nil || info.IsChannelTest {
 		return
 	}
-	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetBillingModelName()))
+	modelName := ratio_setting.FormatMatchingModelName(model.ResolveUserModelPricingName(info.GetDiscountModelName()))
 	discountBPS := info.UserModelDiscountBPS.DiscountBPSAt(modelName, info.StartTime.Unix())
 	if info.UserModelDiscountEvaluation != nil {
 		discountBPS = info.UserModelDiscountEvaluation.DiscountBPS
@@ -281,19 +281,20 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 	}
 	groupRatioInfo := HandleGroupRatio(c, info)
 
-	modelPrice, success := ratio_setting.GetModelPrice(info.OriginModelName, true)
+	priceModel := info.GetBillingModelName()
+	modelPrice, success := ratio_setting.GetModelPrice(priceModel, true)
 	usePrice := success
 	var modelRatio float64
 
 	if !success {
-		defaultPrice, ok := ratio_setting.GetDefaultModelPriceMap()[info.OriginModelName]
+		defaultPrice, ok := ratio_setting.GetDefaultModelPriceMap()[priceModel]
 		if ok {
 			modelPrice = defaultPrice
 			usePrice = true
 		} else {
 			var ratioSuccess bool
 			var matchName string
-			modelRatio, ratioSuccess, matchName = ratio_setting.GetModelRatio(info.OriginModelName)
+			modelRatio, ratioSuccess, matchName = ratio_setting.GetModelRatio(priceModel)
 			acceptUnsetRatio := false
 			if info.UserSetting.AcceptUnsetRatioModel {
 				acceptUnsetRatio = true

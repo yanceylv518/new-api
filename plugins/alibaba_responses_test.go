@@ -416,7 +416,7 @@ func TestAlibabaFaceDetectionAndTaskErrors(t *testing.T) {
 	assert.Equal(t, "https://dashscope.aliyuncs.com/api/v1/services/aigc/image2video/face-detect", directKeyBuilt["url"])
 
 	gatewayDescriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
-		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "provider-key", "baseUrl": "https://example.com", "upstream": map[string]any{"kind": "new_api"}, "requestBody": request,
+		"model": "wan2.2-s2v-detect", "upstreamModel": "wan2.2-s2v-detect", "apiKey": "provider-key", "baseUrl": "https://example.com/ali", "upstream": map[string]any{"kind": "new_api"}, "requestBody": request,
 	})
 	require.NoError(t, err)
 	gatewayBuilt := alibabaObject(t, gatewayDescriptor)
@@ -442,9 +442,8 @@ func TestAlibabaFaceDetectionAndTaskErrors(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]any{"image_count": float64(1)}, alibabaObject(t, facts))
 
-	missing, err := plugin.Engine.Call(t.Context(), "parseTaskResult", map[string]any{"model": "wan2.7-t2v", "upstreamModel": "wan2.7-t2v"}, map[string]any{"code": "task_not_exist", "message": "task_not_exist", "data": nil})
-	require.NoError(t, err)
-	assert.Equal(t, "FAILURE", alibabaObject(t, missing)["status"])
+	_, err = plugin.Engine.Call(t.Context(), "parseTaskResult", map[string]any{"model": "wan2.7-t2v", "upstreamModel": "wan2.7-t2v"}, map[string]any{"code": "task_not_exist", "message": "task_not_exist", "data": nil})
+	require.ErrorContains(t, err, "task_not_exist")
 
 	animateFacts, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"model": "wan2.2-animate-move", "upstreamModel": "wan2.2-animate-move"}, map[string]any{"status": "SUCCESS"}, map[string]any{"usage": map[string]any{"video_duration": 5.2, "video_ratio": "pro"}})
 	require.NoError(t, err)
@@ -831,6 +830,12 @@ func TestAlibabaWanCompletionFactsAndArtifacts(t *testing.T) {
 			})
 			require.NoError(t, err)
 			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, encoded)
+			switch tc.name {
+			case "oversized duration rejected by host", "negative input cannot reduce Wan3 charge", "negative output cannot reduce Wan3 charge", "non-numeric duration rejected by host", "unknown resolution rejected by host":
+				require.Error(t, err)
+				assert.Nil(t, result)
+				return
+			}
 			require.NoError(t, err)
 			assert.Equal(t, "SUCCESS", result.Status)
 			assert.Equal(t, "https://cdn.example/result.mp4", result.Url)
@@ -1083,9 +1088,8 @@ func TestAlibabaImageResults(t *testing.T) {
 			encoded, err := common.Marshal(map[string]any{"output": map[string]any{"task_status": "SUCCEEDED", "choices": []any{map[string]any{"message": map[string]any{"content": []any{map[string]any{"image": first}}}}}}, "usage": map[string]any{"image_count": count}})
 			require.NoError(t, err)
 			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK}, encoded)
-			require.NoError(t, err)
-			assert.Equal(t, "SUCCESS", result.Status)
-			assert.Nil(t, result.UsageFacts, "invalid count %v must not replace the reservation", count)
+			require.Error(t, err, "invalid count %v must leave settlement pending", count)
+			assert.Nil(t, result)
 		}
 	})
 

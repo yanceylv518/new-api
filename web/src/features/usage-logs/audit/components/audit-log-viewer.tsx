@@ -48,7 +48,9 @@ export function AuditLogViewer(props: {
 }) {
   const { t } = useTranslation()
   const userId = useAuthStore((state) => state.auth.user?.id)
-  const [defaultTimeRange, setDefaultTimeRange] = useState(getDefaultAuditTimeRange)
+  const [defaultTimeRange, setDefaultTimeRange] = useState(
+    getDefaultAuditTimeRange
+  )
   const [filters, setFilters] = useState<AuditFilters>(() => ({
     p: 1,
     page_size: 20,
@@ -117,6 +119,24 @@ export function AuditLogViewer(props: {
   })
   const update = (patch: Partial<AuditFilters>) =>
     setFilters((previous) => ({ ...previous, ...patch, p: 1 }))
+  const search = () => {
+    if (invalidRange || !canQuery) return
+    if (
+      filters.start_timestamp === defaultTimeRange.start_timestamp &&
+      filters.end_timestamp === defaultTimeRange.end_timestamp
+    ) {
+      const timeRange = getDefaultAuditTimeRange()
+      if (
+        timeRange.start_timestamp !== defaultTimeRange.start_timestamp ||
+        timeRange.end_timestamp !== defaultTimeRange.end_timestamp
+      ) {
+        setDefaultTimeRange(timeRange)
+        setFilters((previous) => ({ ...previous, ...timeRange }))
+        return
+      }
+    }
+    void query.refetch()
+  }
 
   return (
     <div className='flex h-full min-h-0 flex-col'>
@@ -151,9 +171,7 @@ export function AuditLogViewer(props: {
                 update({})
               }}
               isFetching={query.isFetching}
-              onSearch={() => {
-                if (!invalidRange && canQuery) void query.refetch()
-              }}
+              onSearch={search}
               onReset={() => {
                 const timeRange = getDefaultAuditTimeRange()
                 setDefaultTimeRange(timeRange)
@@ -176,11 +194,7 @@ export function AuditLogViewer(props: {
               <Alert variant='destructive'>
                 <AlertDescription className='flex items-center justify-between gap-2'>
                   <span>{t('Failed to load audit records')}</span>
-                  <Button
-                    size='sm'
-                    variant='outline'
-                    onClick={() => void query.refetch()}
-                  >
+                  <Button size='sm' variant='outline' onClick={search}>
                     {t('Retry')}
                   </Button>
                 </AlertDescription>

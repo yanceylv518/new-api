@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -207,7 +208,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := model.CacheGetChannel(task.ChannelId)
+	channel, err := model.GetTaskChannel(task)
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
@@ -215,6 +216,9 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	proxy := strings.TrimSpace(channel.GetSetting().Proxy)
+	if task.PrivateData.TransportSaved {
+		proxy = strings.TrimSpace(task.PrivateData.Proxy)
+	}
 	if err := validateTaskMediaURL(rawURL, proxy); err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusBadGateway, code: "artifact_request_rejected",
@@ -250,6 +254,12 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	clientHeaders := taskArtifactClientHeaders(c.Request.Header)
+	if len(descriptor.Base64ContentPaths) > 0 {
+		clientHeaders = nil
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}
 	for name, value := range clientHeaders {
 		req.Header.Set(name, value)
 	}
@@ -278,9 +288,64 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	defer resp.Body.Close()
+	if len(descriptor.Base64ContentPaths) > 0 {
+		if resp.StatusCode != http.StatusOK {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Artifact content query failed"}
+		}
+		body, releaseBody, err := service.ReadTaskResultBody(req.Context(), resp.Body)
+		if err != nil {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Invalid artifact content response", err: err}
+		}
+		defer releaseBody()
+		if len(body) > taskMediaDataURLMaxEncodedBytes || !gjson.ValidBytes(body) {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Invalid artifact content response", err: err}
+		}
+		var payload string
+		for _, path := range descriptor.Base64ContentPaths {
+			value := gjson.GetBytes(body, path)
+			if value.Type == gjson.String && value.Str != "" {
+				payload = value.Str
+				break
+			}
+		}
+		contentType := descriptor.ContentType
+		if strings.HasPrefix(payload, "data:") {
+			header, data, found := strings.Cut(payload, ",")
+			if !found || !strings.HasSuffix(header, ";base64") {
+				return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Invalid artifact content encoding"}
+			}
+			contentType, payload = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64"), data
+		}
+		data, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			data, err = base64.RawStdEncoding.DecodeString(payload)
+		}
+		if err != nil || len(data) == 0 || len(contentType) > 255 || !httpguts.ValidHeaderFieldValue(contentType) {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Invalid artifact video content", err: err}
+		}
+		c.Writer.Header().Set("Content-Type", contentType)
+		setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+		http.ServeContent(c.Writer, c.Request, "video", time.Time{}, bytes.NewReader(data))
+		return nil
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent, http.StatusNotModified, http.StatusRequestedRangeNotSatisfiable:
+		var body io.Reader = resp.Body
+		artifactKey := c.Param("artifact_key")
+		if (artifactKey == "last_frame" || artifactKey == "last-frame") && req.Method == http.MethodGet &&
+			(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent && strings.HasPrefix(resp.Header.Get("Content-Range"), "bytes 0-")) {
+			prefix := make([]byte, 12)
+			n, readErr := io.ReadFull(resp.Body, prefix)
+			if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+				return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Failed to read artifact content", err: readErr}
+			}
+			prefix = prefix[:n]
+			if detected := http.DetectContentType(prefix); detected == "image/jpeg" || detected == "image/png" || detected == "image/gif" || detected == "image/webp" {
+				resp.Header.Set("Content-Type", detected)
+			}
+			body = io.MultiReader(bytes.NewReader(prefix), resp.Body)
+		}
 		copyTaskMediaResponseHeaders(c.Writer.Header(), resp.Header)
 		setTaskMediaResponseSecurityHeaders(c.Writer.Header())
 		c.Status(resp.StatusCode)
@@ -288,7 +353,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		if c.Request.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified {
 			return nil
 		}
-		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
+		if _, err := io.Copy(c.Writer, body); err != nil {
 			logger.LogError(c.Request.Context(), fmt.Sprintf("Failed to stream task media: %v", err))
 		}
 		return nil

@@ -153,38 +153,85 @@ func userModelPricingOverviewQuery(tx *gorm.DB, keyword string, requesterRole in
 }
 
 // getUserModelPricingOverviewPreview 按模型排序取每个用户的前三个模型，每个模型优先生效段、最近待生效段、最后到期段。
-// 只读取当前页用户的已过滤规则，再在 Go 中截断；每用户规则上限为 1000，避免相关子查询重复扫描整张表。
+// 先用轻量字段选中预览，仅为选中行读取表达式，避免加载整页用户的全部表达式。
 func getUserModelPricingOverviewPreview(tx *gorm.DB, userIDs []int, keyword string, requesterRole int, filters UserModelPricingOverviewFilters) (map[int][]UserModelPricingOverviewRule, error) {
 	previewRules := make(map[int][]UserModelPricingOverviewRule, len(userIDs))
 	type previewRuleRow struct {
+		ID       int
 		UserID   int `gorm:"column:user_id"`
 		ModelKey string
 		UserModelPricingOverviewRule
 	}
-	var rows []previewRuleRow
 	query := userModelPricingOverviewQuery(tx, keyword, requesterRole, filters).
 		Where("user_model_pricings.user_id IN ?", userIDs)
-	if err := query.Select("user_model_pricings.*").
+	rows, err := query.Select("user_model_pricings.id, user_model_pricings.user_id, user_model_pricings.model_key, user_model_pricings.model_name, user_model_pricings.discount_bps, user_model_pricings.mode, user_model_pricings.slot, user_model_pricings.start_time, user_model_pricings.end_time").
 		Order("user_model_pricings.user_id ASC, user_model_pricings.model_name ASC, user_model_pricings.model_key ASC, user_model_pricings.slot ASC").
-		Find(&rows).Error; err != nil {
+		Rows()
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var previousUser int
 	var previousKey string
+	selected := make(map[int][]previewRuleRow, len(userIDs))
 	previewIndex := -1
-	for _, row := range rows {
+	for rows.Next() {
+		var row previewRuleRow
+		if err := tx.ScanRows(rows, &row); err != nil {
+			return nil, err
+		}
 		if row.UserID == previousUser && row.ModelKey == previousKey {
-			if previewIndex >= 0 && preferUserModelPricingPreview(row.UserModelPricingOverviewRule, previewRules[row.UserID][previewIndex], filters.At) {
-				previewRules[row.UserID][previewIndex] = row.UserModelPricingOverviewRule
+			if previewIndex >= 0 && preferUserModelPricingPreview(row.UserModelPricingOverviewRule, selected[row.UserID][previewIndex].UserModelPricingOverviewRule, filters.At) {
+				selected[row.UserID][previewIndex] = row
 			}
 			continue
 		}
 		previousUser, previousKey, previewIndex = row.UserID, row.ModelKey, -1
-		if len(previewRules[row.UserID]) >= userModelPricingOverviewPreviewRuleLimit {
+		if len(selected[row.UserID]) >= userModelPricingOverviewPreviewRuleLimit {
 			continue
 		}
-		previewIndex = len(previewRules[row.UserID])
-		previewRules[row.UserID] = append(previewRules[row.UserID], row.UserModelPricingOverviewRule)
+		previewIndex = len(selected[row.UserID])
+		selected[row.UserID] = append(selected[row.UserID], row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 释放游标后才能在同一事务连接上读取选中规则。
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(userIDs)*userModelPricingOverviewPreviewRuleLimit)
+	for _, previews := range selected {
+		for _, row := range previews {
+			ids = append(ids, row.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return previewRules, nil
+	}
+	var expressions []UserModelPricing
+	if err := tx.Select("id", "expression", "discount_bps", "mode", "slot", "start_time", "end_time").Where("id IN ?", ids).Find(&expressions).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[int]UserModelPricing, len(expressions))
+	for _, row := range expressions {
+		byID[row.Id] = row
+	}
+	for userID, previews := range selected {
+		for _, row := range previews {
+			stored, exists := byID[row.ID]
+			if !exists {
+				return nil, ErrUserModelPricingRevisionConflict
+			}
+			sameEnd := stored.EndTime == nil && row.EndTime == nil ||
+				stored.EndTime != nil && row.EndTime != nil && *stored.EndTime == *row.EndTime
+			if !sameEnd || stored.DiscountBPS != row.DiscountBPS || stored.Mode != row.Mode || stored.Slot != row.Slot || stored.StartTime != row.StartTime {
+				return nil, ErrUserModelPricingRevisionConflict
+			}
+			rule := row.UserModelPricingOverviewRule
+			rule.Expression = stored.Expression
+			previewRules[userID] = append(previewRules[userID], rule)
+		}
 	}
 	return previewRules, nil
 }

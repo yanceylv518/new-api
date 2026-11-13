@@ -12,6 +12,9 @@ import (
 // setSeedanceAssetValidationActionRoute 将素材管理和真人认证 Action 放入 Doubao 原生接口命名空间。
 func setSeedanceAssetValidationActionRoute(router *gin.Engine) {
 	router.POST("/doubao/v2/assets", middleware.RouteTag("relay"), middleware.TokenAuth(), middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.SeedanceAssetV2Action)
+	for _, path := range []string{"/doubao/api/ark/assets", "/doubao/v1/ark/asset", "/doubao/api/v3/asset", "/doubao", "/doubao/"} {
+		router.POST(path, middleware.RouteTag("relay"), middleware.TokenAuth(), middleware.SeedanceAssetRateLimit(), middleware.DisableCache(), controller.SeedanceCompatArkAssetAction)
+	}
 }
 
 // setSeedanceAssetAPIRoutes 将用户级素材管理暴露给 API Key；不进入视频分发、

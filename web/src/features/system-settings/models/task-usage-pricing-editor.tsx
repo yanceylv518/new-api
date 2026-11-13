@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { AlertTriangle } from 'lucide-react'
-import { memo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -165,9 +165,9 @@ function TaskBillingPreview(props: TaskBillingPreviewProps) {
             }))}
             value={
               props.usageExamples.find((example) =>
-                Object.entries(example.facts).every(
-                  ([field, value]) => props.sample[field] === value
-                )
+                Object.entries(
+                  normalizeTaskUsageSample(props.usageSchema, example.facts)
+                ).every(([field, value]) => props.sample[field] === value)
               )?.label ?? null
             }
             onValueChange={(label) => {
@@ -316,10 +316,19 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     return sample
   })
   // 从当前操作派生合法用量，无需 effect 追改选择器和隐藏输入。
-  const previewSample = normalizeTaskUsageSample(
-    props.usageSchema,
-    previewSampleState
+  const previewSample = useMemo(
+    () => normalizeTaskUsageSample(props.usageSchema, previewSampleState),
+    [props.usageSchema, previewSampleState]
   )
+  const simulationUsage = useMemo(() => {
+    const usage: Record<string, number | string | boolean> = {
+      ...previewSample,
+    }
+    for (const [field, definition] of Object.entries(props.usageSchema)) {
+      if (definition.type === 'boolean') usage[field] = usage[field] === 'true'
+    }
+    return usage
+  }, [previewSample, props.usageSchema])
   const enumFields = getTaskEnumFields(props.usageSchema)
   const numberFields = getTaskNumberFields(props.usageSchema)
   const combinations = getTaskEnumCombinations(props.usageSchema)
@@ -726,7 +735,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                 props.requestRuleExpr
               )
         }
-        usage={previewSample}
+        usage={simulationUsage}
         usageSchema={props.usageSchema}
         currency={props.currency}
         mode='task'

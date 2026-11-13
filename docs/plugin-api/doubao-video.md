@@ -1,6 +1,6 @@
 # Doubao Video 自定义接口文档
 
-本文档对应内置 Doubao Video 插件 **1.1.4** 的自定义路由。文档只描述
+本文档对应内置 Doubao Video 插件 **1.2.14** 的自定义路由。文档主要描述
 插件声明的 `/doubao/api/v3/...` 接口，不包含网关的 OpenAI 兼容接口、
 通用任务接口或宿主素材接口。
 
@@ -26,8 +26,19 @@ export API_KEY="sk-your-new-api-token"
 | `GET` | `/doubao/api/v3/contents/generations/tasks` | 查询当前用户任务列表 |
 | `DELETE` | `/doubao/api/v3/contents/generations/tasks/:task_id` | 取消排队任务或删除上游任务 |
 
+客户兼容入口还支持 `/doubao/contents/generations/tasks` 和
+`/doubao/v1/contents/generations/tasks`，与上表支持相同的方法和任务 ID。
+通过上述三个入口创建的任务统一返回本站生成的 `cgt-时间-后缀` 格式 ID，
+时间采用 14 位 UTC 时间，后缀为 5 位小写字母和数字。无论渠道返回何种任务 ID，
+本站都会保存对应关系，供后续查询和管理使用。
+该 ID 不是渠道或火山引擎的原始任务 ID。使用 AK/SK 时，签名中的路径必须是客户端实际请求的路径。
+原生和客户兼容入口的单任务查询均按火山响应示例的字段顺序返回。上游未返回的条件字段会省略；
+部分渠道仅返回火山官方字段，且 `content.last_frame_url` 为 `null` 时会省略该字段。
+其他可返回的上游扩展字段排在示例字段之后。`id` 使用本站任务 ID，`status` 反映本站任务状态。
+
 创建接口是异步接口，成功后返回的 `id` 是网关公开任务 ID。后续查询和删除
 都使用这个 ID。上游任务 ID只由网关内部保存和使用。
+已有的 `task_...` 任务 ID 继续用于查询和删除，不会因格式调整而重新生成。
 
 ## 通用请求约定
 
@@ -38,10 +49,13 @@ Authorization: Bearer <网关 API Token>
 Content-Type: application/json
 ```
 
+视频原生接口也支持与本站 API Key 绑定的 AK/SK 签名，签发、吊销和签名格式见
+[私域素材库 API](seedance-assets.md)。Bearer 和签名请求使用相同的账号权限与计费规则。
+
 示例：
 
 ```bash
-curl --request GET "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_gateway_doubao_01" \
+curl --request GET "$BASE_URL/doubao/api/v3/contents/generations/tasks/cgt-20261030100000-ab123" \
   --header "Authorization: Bearer $API_KEY"
 ```
 
@@ -69,7 +83,7 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
     ],
     "resolution": "1080p",
     "duration": 5,
-    "service_tier": "default"
+    "generate_audio": true
   }'
 ```
 
@@ -93,6 +107,10 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 
 请求字段：
 
+顶层 `prompt` 可替代 `content` 中的文本项。`parameters` 对象可包含 `model`、
+`prompt`、`content` 及文档支持的生成参数，同名字段以 `parameters` 内的值为准；
+本站在选路、素材引用检查和计费前统一处理这些值。
+
 | 字段 | 类型 | 必填 | 范围或取值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `model` | string | 是 | 当前插件声明的模型之一 | 模型名称会参与渠道选择 |
@@ -100,13 +118,14 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 | `resolution` | string | 否 | 由模型能力决定 | `480p`、`720p`、`1080p`、`4k` |
 | `duration` | integer | 否 | 2.0 标准版/Fast/Mini：`-1` 或 4 到 15 | `-1` 表示上游智能时长；其他模型以官方文档为准 |
 | `frames` | integer | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型沿用通用帧数边界和上游校验 |
-| `service_tier` | string | 否 | 2.0 标准版/Fast/Mini 不支持 | 其他模型以官方文档为准 |
+| `service_tier` | string | 否 | 2.0 标准版/Fast/Mini 兼容 `default`，不支持 `flex` | 默认值会省略后发往上游 |
 | `ratio` | string | 否 | `adaptive`、`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16` | 2.0 系列支持以上取值 |
 | `generate_audio` | boolean | 否 | 2.0 系列支持 | `false` 用于请求无声视频；显式布尔值会保留并透传 |
 | `priority` | integer | 否 | 0 到 9 | 任务优先级，需使用支持该字段的模型 |
-| `camera_fixed` | boolean | 否 | 2.0 标准版/Fast/Mini 不支持 | 在网关校验时拒绝，避免无效预扣 |
+| `camera_fixed` | boolean | 否 | 2.0 标准版/Fast/Mini 兼容 `false`，不支持 `true` | `false` 会省略后发往上游 |
 | `output_format` | string | 否 | 2.0 标准版/Fast/Mini 只接受 `mp4` | `mov` 会在网关校验时拒绝 |
-| `callback_url` | string | 否 | 上游可访问地址 | 作为官方字段透传 |
+| `callback_url` | string | 否 | 公网 HTTPS 域名地址，最长 4096 字节 | 本站转发通知并转换为本站任务 ID |
+| `moderation_options` | object | 否 | 内容审核选项 | 原生、视频兼容与 Responses 入口均保留，具体选项由上游校验 |
 | `safety_identifier` | string | 否 | 不超过64字符的英文字符串 | 建议使用终端用户标识的哈希，不传入个人信息 |
 | 其他官方字段 | 对应官方类型 | 否 | 以渠道和上游接口为准 | 未被插件改写的字段会随请求体透传 |
 
@@ -135,12 +154,29 @@ curl --request POST "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 `draft_task`，其 `draft_task.id` 应是网关公开任务 ID；
 网关会在发送给上游前将其替换为已验证的上游任务 ID。这样可以安全地使用
 已有任务作为视频生视频或参考任务输入。
+源任务原渠道必须在当前 API Key 的可用分组中启用并支持所请求的模型；
+Key 的模型限制也必须允许该模型，否则请求会被拒绝。
 
 2.0 标准版/Fast/Mini 不支持 `draft_task` 和 `draft: true`。
+
+2.5 支持 `draft: true` 样片生成和单独的 `draft_task` 引用。样片生成须指定
+`resolution: "480p"`，不能使用 `service_tier: "flex"` 或请求尾帧；引用时使用本站公开任务 ID。
+2.5 不支持 `frames` 或 `service_tier: "flex"`。成片计价沿用样片是否含参考视频的类型；
+历史样片缺少可核实的输入记录时，引用会被拒绝，避免使用错误的计价档位。
+支持范围见[官方创建视频任务文档](https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh)。
+
+2.5 固定时长为 4～30 秒，也支持省略时长或传 `-1`。最多接受 30 张参考图片、
+10 段参考视频和 10 段参考音频；支持单独使用参考音频。首尾帧要求 `ratio=adaptive`；编辑和延长同样
+要求自适应比例及参考视频，编辑使用自动时长，延长最多 3 段参考视频。
 
 `duration: -1` 是智能时长控制值；OpenAI 兼容接口的 `seconds: -1` 具有相同含义。
 宿主仅对 Doubao 请求中的这两个控制字段放行 `-1`，计费预估仍使用正数时长，
 完成用量仍必须非负。渠道模型别名不会导致该控制值被误判为负计费用量。
+参考视频按允许的输入时长上限预扣，成功后使用上游实际用量结算。
+
+按秒计价或使用 `seconds` 条件折扣时，结算只采用成功查询响应中有效的 `duration`，
+支持小数秒。缺少实际时长时保留预扣并等待有效用量，不以请求时长、智能时长预算或
+`0` 代替；不依赖秒数的计价与折扣不受影响。
 
 ### 临时媒体地址与回调
 
@@ -155,14 +191,25 @@ API Key 上传和管理私域素材请参见[私域素材库 API](seedance-asset
 返回任务 ID 不表示回调验证成功或通知已送达。客户端必须处理乱序、重复事件，
 防止较早状态覆盖运行中或终态，并通过任务查询确认最终结果。
 
+回调使用上游的方舟 JSON 格式，任务 ID 和已映射模型名转换为本站公开值。
+需配置公网 HTTPS 的任务公开地址和持久加密密钥；回调能力地址有效期为 4 天。
+投递限制为公网 HTTPS、不跟随重定向，单次最多等待 10 秒。客户服务返回 2xx 后
+才确认送达；任务尚未落库或投递失败时返回 503，由上游按其策略重试。本站不另建
+回调投递队列，不能以回调替代轮询；回调本身不修改本站任务状态或触发扣费退款。
+`X-Seedance-Event-ID` 用于重复通知识别；改写响应后不转发上游签名。
+
+原生查询保留上游实际返回的可选参数；`/v1/videos` 也在上游提供时返回
+`duration`、`resolution`、`ratio`、`output_format`、`service_tier`、`draft`、
+`execution_expires_after` 和 `usage`，不伪造上游缺失值。
+
 ### 分辨率能力
 
 | 模型 | 当前插件声明的可用分辨率 |
 | --- | --- |
-| `doubao-seedance-2-0-260128` | `480p`、`720p`、`1080p`、`4k` |
-| `doubao-seedance-2-5-260628` | `480p`、`720p`、`1080p` |
-| `doubao-seedance-2-0-fast-260128` | `480p`、`720p` |
-| `doubao-seedance-2-0-mini-260615` | `480p`、`720p` |
+| `doubao-seedance-2-0-260128`、`doubao-seedance-2-0` | `480p`、`720p`、`1080p`、`4k` |
+| `doubao-seedance-2-5-260628`、`doubao-seedance-2-5` | `480p`、`720p`、`1080p` |
+| `doubao-seedance-2-0-fast-260128`、`doubao-seedance-2-0-fast` | `480p`、`720p` |
+| `doubao-seedance-2-0-mini-260615`、`doubao-seedance-2-0-mini` | `480p`、`720p` |
 | `doubao-seedance-1-0-pro-250528`、`doubao-seedance-1-0-lite-t2v`、`doubao-seedance-1-0-lite-i2v`、`doubao-seedance-1-5-pro-251215` | `480p`、`720p`、`1080p` |
 
 2.5 模型不接受 `4k` 或等价的 `3840x2160` 高分辨率尺寸；Fast 和 Mini
@@ -177,9 +224,13 @@ doubao-seedance-1-0-lite-t2v
 doubao-seedance-1-0-lite-i2v
 doubao-seedance-1-5-pro-251215
 doubao-seedance-2-0-260128
+doubao-seedance-2-0
 doubao-seedance-2-0-fast-260128
+doubao-seedance-2-0-fast
 doubao-seedance-2-0-mini-260615
+doubao-seedance-2-0-mini
 doubao-seedance-2-5-260628
+doubao-seedance-2-5
 ```
 
 ### 成功响应
@@ -188,7 +239,7 @@ doubao-seedance-2-5-260628
 
 ```json
 {
-  "id": "task_gateway_doubao_01"
+  "id": "cgt-20261030100000-ab123"
 }
 ```
 
@@ -199,7 +250,7 @@ GET /doubao/api/v3/contents/generations/tasks/:task_id
 ```
 
 ```bash
-curl --request GET "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_gateway_doubao_01" \
+curl --request GET "$BASE_URL/doubao/api/v3/contents/generations/tasks/cgt-20261030100000-ab123" \
   --header "Authorization: Bearer $API_KEY"
 ```
 
@@ -207,7 +258,7 @@ curl --request GET "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_gate
 
 ```json
 {
-  "id": "task_gateway_doubao_01",
+  "id": "cgt-20261030100000-ab123",
   "model": "doubao-seedance-2-0-260128",
   "status": "succeeded",
   "resolution": "1080p",
@@ -267,7 +318,7 @@ curl --get "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 {
   "items": [
     {
-      "id": "task_gateway_doubao_01",
+      "id": "cgt-20261030100000-ab123",
       "model": "doubao-seedance-2-0-fast-260128",
       "status": "succeeded",
       "content": {"video_url": "https://provider.example/video.mp4"}
@@ -282,8 +333,8 @@ curl --get "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
 ```bash
 curl --get "$BASE_URL/doubao/api/v3/contents/generations/tasks" \
   --header "Authorization: Bearer $API_KEY" \
-  --data-urlencode "filter.task_ids=task_gateway_doubao_01" \
-  --data-urlencode "filter.task_ids=task_gateway_doubao_02"
+  --data-urlencode "filter.task_ids=cgt-20261030100000-ab123" \
+  --data-urlencode "filter.task_ids=cgt-20261030100000-ab124"
 ```
 
 ## 取消或删除任务
@@ -293,14 +344,14 @@ DELETE /doubao/api/v3/contents/generations/tasks/:task_id
 ```
 
 ```bash
-curl --request DELETE "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_gateway_doubao_01" \
+curl --request DELETE "$BASE_URL/doubao/api/v3/contents/generations/tasks/cgt-20261030100000-ab123" \
   --header "Authorization: Bearer $API_KEY"
 ```
 
 网关会先同步任务最终状态，再执行上游 DELETE：
 
 - 排队任务需要上游确认取消，成功后本地状态为 `cancelled`。
-- 已成功或已失败任务执行上游删除，但网关保留本地任务和计费历史。
+- 已成功或已失败任务执行上游删除，确认删除后原生单任务查询返回 404，原生列表不再包含该任务；网关保留本地任务和计费历史。
 - 上游空成功响应无法区分取消和删除时，网关会再次查询确认。
 - 无法确认最终状态时返回错误，不会把未确认操作当成成功退款。
 
@@ -312,6 +363,10 @@ curl --request DELETE "$BASE_URL/doubao/api/v3/contents/generations/tasks/task_g
 
 如果上游取消已提交但本地尚未完成确认，接口会返回网关错误并保留任务的
 可恢复状态。
+管理操作的总等待预算为 90 秒，覆盖上游最多 60 秒的取消等待及前后状态确认；
+客户端需允许足够的请求等待时间。
+如果上游已删除但本地删除标记未能保存，返回 503；重试 DELETE 可完成本地同步，
+即使上游此时返回 404 或 410。已完成任务的删除不会退款。
 
 ## 上游请求映射
 
@@ -371,7 +426,9 @@ Doubao 自定义路由的插件错误通常使用：
 | 400 `duration must be -1 or an integer between 2 and 30` | 时长不是合法整数或超出范围 |
 | 400 `frames must be an integer between 29 and 289...` | 帧数超界或不满足 25+4n |
 | 400 `filter.status is invalid` | 列表状态过滤值不受支持 |
-| 404 `task_not_found` | 任务不存在、不属于当前用户或不属于当前插件 |
+| GET 404 `task_not_exist` | 任务不存在、已删除、不属于当前用户或不属于当前插件；响应为 `{"code":"task_not_exist","message":"task_not_exist","data":null}` |
+| DELETE 404 `task_not_found` | 任务不存在、已删除或不属于当前用户；使用 `error` 对象响应 |
 | 502 `task_sync_failed` | 取消/删除前无法同步上游最终状态 |
 | 503 `task_cancel_pending` | 上游取消已提交但尚未确认 |
-| 503 `task_settlement_unavailable` | 上游删除时最终用量尚未可用，预扣费等待对账 |
+| 503 `task_settlement_unavailable` | 上游删除时最终用量尚未确认，预扣费暂未结算 |
+| 503 本地删除同步失败 | 上游已删除但本地保存失败，可重试 DELETE 完成本地同步 |

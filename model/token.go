@@ -296,10 +296,10 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		}
 		// 令牌行锁保护冷快照；视频恢复在锁外执行，遵守用户到令牌的锁顺序。
 		err = DB.Transaction(func(tx *gorm.DB) error {
-			if err := lockSQLiteQuotaCache(tx.Model(&Token{}).Where(commonKeyCol+" = ?", key)); err != nil {
+			if err := lockSQLiteQuotaCache(tx.Model(&Token{}).Where(map[string]any{"key": key})); err != nil {
 				return err
 			}
-			if err := lockForUpdate(tx).Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+			if err := lockForUpdate(tx).Where(map[string]any{"key": key}).First(token).Error; err != nil {
 				return err
 			}
 			result, err := cacheInitToken(*token)
@@ -322,7 +322,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		})
 		return token, err
 	}
-	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+	if err = DB.Where(map[string]any{"key": key}).First(token).Error; err != nil {
 		return nil, err
 	}
 	return token, nil
@@ -336,9 +336,9 @@ func (token *Token) Insert() error {
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before update: " + cacheErr.Error())
+	// 写库前保存未刷盘用量并失效缓存，避免额度编辑覆盖并发预扣。
+	if cacheErr := invalidateTokenCacheForQuotaMutation(token.Key); cacheErr != nil {
+		return fmt.Errorf("invalidate token cache before update: %w", cacheErr)
 	}
 	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups").Updates(token).Error
@@ -356,7 +356,16 @@ func (token *Token) Delete() (err error) {
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
 		common.SysLog("failed to invalidate token cache before delete: " + cacheErr.Error())
 	}
-	return DB.Delete(token).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var locked Token
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", token.Id, token.UserId).First(&locked).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("token_id = ?", token.Id).Delete(&TokenSignatureCredential{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&locked).Error
+	})
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -478,12 +487,22 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	tx := DB.Begin()
 
 	var tokens []Token
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
+	if err := lockForUpdate(tx).Where("user_id = ? AND id IN (?)", userId, ids).Order("id asc").Find(&tokens).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
 	if err := invalidateTokensCache(tokens); err != nil {
 		common.SysLog("failed to invalidate token cache before batch delete: " + err.Error())
+	}
+	ownedIDs := make([]int, 0, len(tokens))
+	for _, token := range tokens {
+		ownedIDs = append(ownedIDs, token.Id)
+	}
+	if len(ownedIDs) > 0 {
+		if err := tx.Where("token_id IN ?", ownedIDs).Delete(&TokenSignatureCredential{}).Error; err != nil {
+			tx.Rollback()
+			return 0, err
+		}
 	}
 
 	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {

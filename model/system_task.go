@@ -16,13 +16,17 @@ const (
 	SystemTaskStatusSucceeded SystemTaskStatus = "succeeded"
 	SystemTaskStatusFailed    SystemTaskStatus = "failed"
 
-	SystemTaskTypeLogCleanup           = "log_cleanup"
-	SystemTaskTypeChannelTest          = "channel_test"
-	SystemTaskTypeModelUpdate          = "model_update"
-	SystemTaskTypeMidjourneyPoll       = "midjourney_poll"
-	SystemTaskTypeAsyncTaskPoll        = "async_task_poll"
-	SystemTaskTypeSeedanceAssetPoll    = "seedance_asset_poll"
-	SystemTaskTypeSeedanceAssetCleanup = "seedance_asset_cleanup"
+	SystemTaskTypeLogCleanup             = "log_cleanup"
+	SystemTaskTypeChannelTest            = "channel_test"
+	SystemTaskTypeModelUpdate            = "model_update"
+	SystemTaskTypeMidjourneyPoll         = "midjourney_poll"
+	SystemTaskTypeAsyncTaskPoll          = "async_task_poll"
+	SystemTaskTypeBillingRefund          = "billing_refund"
+	SystemTaskTypeTaskResourceIndex      = "task_resource_index"
+	SystemTaskTypeSeedanceAssetPoll      = "seedance_asset_poll"
+	SystemTaskTypeSeedanceAssetSync      = "seedance_asset_sync"
+	SystemTaskTypeSeedanceValidationPoll = "seedance_validation_poll"
+	SystemTaskTypeSeedanceAssetCleanup   = "seedance_asset_cleanup"
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")

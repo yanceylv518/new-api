@@ -25,7 +25,7 @@ type seedanceAssetOSSStorageCache struct {
 	storages map[model.SeedanceAssetStorage]*PrivateAssetOSSStorage
 }
 
-func (cache *seedanceAssetOSSStorageCache) upstreamURL(ctx context.Context, asset *model.SeedanceAsset) (string, error) {
+func (cache *seedanceAssetOSSStorageCache) upstreamURL(ctx context.Context, asset *model.SeedanceAsset, videoInput bool) (string, error) {
 	cache.mu.Lock()
 	storage, exists := cache.storages[asset.Storage]
 	if !exists {
@@ -38,6 +38,9 @@ func (cache *seedanceAssetOSSStorageCache) upstreamURL(ctx context.Context, asse
 		cache.storages[asset.Storage] = storage
 	}
 	cache.mu.Unlock()
+	if videoInput {
+		return storage.PrivateAssetVideoInputURL(ctx, asset.ObjectKey)
+	}
 	return storage.PrivateAssetUpstreamURL(ctx, asset.ObjectKey)
 }
 
@@ -47,12 +50,28 @@ type seedanceAssetMappingResult struct {
 	err        error
 }
 
-// MapSeedanceAssetsToAccount 确保当前用户引用的素材在选中账号中都有可用的上游 ID。
+// MapSeedanceAssetsToAccount 将用户素材映射到账号；纯本地链接不依赖素材服务。
 func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *SeedanceAssetClient, assetIDs []string) (map[string]string, error) {
+	return mapSeedanceAssetsToAccount(ctx, userID, client, assetIDs, false)
+}
+
+// MapSeedanceAssetsToModelAccount 保留真人认证绑定，同时为 AIGC 使用模型范围。
+func MapSeedanceAssetsToModelAccount(ctx context.Context, userID int, client *SeedanceAssetClient, channel *model.Channel, modelName string, assetIDs []string) (map[string]string, error) {
+	if client == nil {
+		return mapSeedanceAssetsToAccount(ctx, userID, nil, assetIDs, false)
+	}
+	scoped := client.ForSeedanceModel(channel, modelName)
+	if scoped.AccountFingerprint == "" {
+		return nil, errors.New("selected Seedance model account is unavailable")
+	}
+	return mapSeedanceAssetsToAccount(ctx, userID, client, assetIDs, false, scoped)
+}
+
+func mapSeedanceAssetsToAccount(ctx context.Context, userID int, client *SeedanceAssetClient, assetIDs []string, synchronize bool, scopedClients ...*SeedanceAssetClient) (map[string]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if client == nil || client.AccountFingerprint == "" {
+	if client != nil && client.AccountFingerprint == "" {
 		return nil, errors.New("selected Seedance account is unavailable")
 	}
 	assets, err := model.FindSeedanceAssetsForUser(ctx, userID, assetIDs)
@@ -76,13 +95,29 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 	if len(groups) != len(groupIDs) {
 		return nil, model.ErrSeedanceAssetUnavailable
 	}
+	if client == nil {
+		mapped := make(map[string]string, len(assets))
+		storages := &seedanceAssetOSSStorageCache{storages: make(map[model.SeedanceAssetStorage]*PrivateAssetOSSStorage)}
+		for index := range assets {
+			asset := &assets[index]
+			if asset.LocalOnly == nil || !*asset.LocalOnly {
+				return nil, errors.New("selected Seedance account is unavailable")
+			}
+			value, _, err := ensureSeedanceAssetReplica(ctx, nil, nil, asset, "", nil, storages)
+			if err != nil {
+				return nil, err
+			}
+			mapped[asset.AssetID] = value
+		}
+		return mapped, nil
+	}
 	localGroupIDs := make([]uint, 0, len(groups))
 	groupsByUpstreamID := make(map[string]*model.SeedanceAssetGroup, len(groups))
 	for index := range groups {
 		localGroupIDs = append(localGroupIDs, groups[index].ID)
 		groupsByUpstreamID[groups[index].GroupID] = &groups[index]
 	}
-	groupReplicas, err := model.FindSeedanceAssetGroupReplicasForAccount(ctx, userID, localGroupIDs, client.AccountFingerprint)
+	groupReplicas, err := model.FindSeedanceAssetGroupReplicasForAccount(ctx, userID, localGroupIDs, client.AccountFingerprint, client.accountFingerprints...)
 	if err != nil {
 		return nil, err
 	}
@@ -90,9 +125,44 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 	for index := range assets {
 		localAssetIDs = append(localAssetIDs, assets[index].ID)
 	}
-	assetReplicas, err := model.FindSeedanceAssetReplicasForAccount(ctx, userID, localAssetIDs, client.AccountFingerprint)
+	assetReplicas, err := model.FindSeedanceAssetReplicasForAccount(ctx, userID, localAssetIDs, client.AccountFingerprint, client.accountFingerprints...)
 	if err != nil {
 		return nil, err
+	}
+	aigcClient := client
+	if len(scopedClients) > 0 && scopedClients[0] != nil {
+		aigcClient = scopedClients[0]
+	}
+	if aigcClient.AccountFingerprint != client.AccountFingerprint {
+		aigcGroups, err := model.FindSeedanceAssetGroupReplicasForAccount(ctx, userID, localGroupIDs, aigcClient.AccountFingerprint, aigcClient.accountFingerprints...)
+		if err != nil {
+			return nil, err
+		}
+		aigcAssets, err := model.FindSeedanceAssetReplicasForAccount(ctx, userID, localAssetIDs, aigcClient.AccountFingerprint, aigcClient.accountFingerprints...)
+		if err != nil {
+			return nil, err
+		}
+		for _, group := range groups {
+			if !strings.EqualFold(group.GroupType, "LivenessFace") {
+				groupReplicas[group.ID] = aigcGroups[group.ID]
+			}
+		}
+		for _, asset := range assets {
+			if !strings.EqualFold(groupsByUpstreamID[asset.GroupID].GroupType, "LivenessFace") {
+				assetReplicas[asset.ID] = aigcAssets[asset.ID]
+			}
+		}
+	}
+	if !synchronize {
+		for _, replica := range assetReplicas {
+			if replica != nil && replica.Status == "Pending" && replica.ProvisionStatus != model.SeedanceAssetReplicaReady && replica.NextPollAt > 0 {
+				// 已有主动同步任务时，生成请求只等待结果，不接管慢导入。
+				if _, _, err := EnqueueSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil); err != nil {
+					common.SysError("failed to wake Seedance asset synchronization: " + err.Error())
+				}
+				return nil, ErrSeedanceAssetMappingPending
+			}
+		}
 	}
 	ossStorages := &seedanceAssetOSSStorageCache{storages: make(map[model.SeedanceAssetStorage]*PrivateAssetOSSStorage)}
 	pollNeeded := false
@@ -108,16 +178,23 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 	upstreamGroups := make(map[string]string, len(groups))
 	for index := range assets {
 		asset := &assets[index]
+		if asset.LocalOnly != nil && *asset.LocalOnly {
+			continue
+		}
 		if _, exists := upstreamGroups[asset.GroupID]; exists {
 			continue
 		}
 		group := groupsByUpstreamID[asset.GroupID]
+		groupClient := client
+		if !strings.EqualFold(group.GroupType, "LivenessFace") {
+			groupClient = aigcClient
+		}
 		select {
 		case seedanceAssetMappingSlots <- struct{}{}:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		upstreamGroupID, ensureErr := ensureSeedanceAssetGroupReplica(ctx, client, group, groupReplicas[group.ID])
+		upstreamGroupID, ensureErr := ensureSeedanceAssetGroupReplica(ctx, groupClient, group, groupReplicas[group.ID])
 		<-seedanceAssetMappingSlots
 		if ensureErr != nil {
 			return nil, ensureErr
@@ -133,7 +210,11 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 		}
 		asset := &assets[0]
 		group := groupsByUpstreamID[asset.GroupID]
-		upstreamID, needsPoll, ensureErr := ensureSeedanceAssetReplica(ctx, client, group, asset, upstreamGroups[asset.GroupID], assetReplicas[asset.ID], ossStorages)
+		assetClient := client
+		if !strings.EqualFold(group.GroupType, "LivenessFace") {
+			assetClient = aigcClient
+		}
+		upstreamID, needsPoll, ensureErr := ensureSeedanceAssetReplica(ctx, assetClient, group, asset, upstreamGroups[asset.GroupID], assetReplicas[asset.ID], ossStorages)
 		<-seedanceAssetMappingSlots
 		results[0] = seedanceAssetMappingResult{upstreamID: upstreamID, needsPoll: needsPoll, err: ensureErr}
 	} else {
@@ -155,7 +236,11 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 					}
 					asset := &assets[index]
 					group := groupsByUpstreamID[asset.GroupID]
-					upstreamID, needsPoll, ensureErr := ensureSeedanceAssetReplica(ctx, client, group, asset, upstreamGroups[asset.GroupID], assetReplicas[asset.ID], ossStorages)
+					assetClient := client
+					if !strings.EqualFold(group.GroupType, "LivenessFace") {
+						assetClient = aigcClient
+					}
+					upstreamID, needsPoll, ensureErr := ensureSeedanceAssetReplica(ctx, assetClient, group, asset, upstreamGroups[asset.GroupID], assetReplicas[asset.ID], ossStorages)
 					<-seedanceAssetMappingSlots
 					results[index] = seedanceAssetMappingResult{upstreamID: upstreamID, needsPoll: needsPoll, err: ensureErr}
 				}
@@ -175,6 +260,21 @@ func MapSeedanceAssetsToAccount(ctx context.Context, userID int, client *Seedanc
 	return upstreamIDs, nil
 }
 
+func EnsureSeedanceAssetGroupForAccount(ctx context.Context, userID int, groupID string, client *SeedanceAssetClient) (string, error) {
+	if client == nil || userID <= 0 {
+		return "", model.ErrSeedanceAssetUnavailable
+	}
+	var group model.SeedanceAssetGroup
+	if err := model.DB.WithContext(ctx).Where("user_id = ? AND group_id = ? AND status <> ?", userID, groupID, "Deleting").First(&group).Error; err != nil {
+		return "", err
+	}
+	replicas, err := model.FindSeedanceAssetGroupReplicasForAccount(ctx, userID, []uint{group.ID}, client.AccountFingerprint, client.accountFingerprints...)
+	if err != nil {
+		return "", err
+	}
+	return ensureSeedanceAssetGroupReplica(ctx, client, &group, replicas[group.ID])
+}
+
 func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetClient, group *model.SeedanceAssetGroup, snapshot *model.SeedanceAssetGroupReplica) (string, error) {
 	originFingerprint := group.AccountFingerprint
 	if originFingerprint == "" {
@@ -186,9 +286,10 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 			originFingerprint = client.AccountFingerprint
 		}
 	}
-	if originFingerprint != "" && originFingerprint == client.AccountFingerprint ||
+	if client.matchesAccountFingerprint(originFingerprint) ||
 		originFingerprint == "" && group.ChannelID == client.ChannelID && group.KeyFingerprint == client.KeyFingerprint {
-		if group.ChannelID != client.ChannelID || group.KeyFingerprint != client.KeyFingerprint || group.AccountFingerprint != client.AccountFingerprint {
+		if group.AccountFingerprint != client.AccountFingerprint ||
+			(!client.sharedAccount && (group.ChannelID != client.ChannelID || group.KeyFingerprint != client.KeyFingerprint)) {
 			result := model.DB.WithContext(ctx).Model(&model.SeedanceAssetGroup{}).
 				Where("id = ? AND user_id = ? AND status <> ?", group.ID, group.UserID, "Deleting").
 				Updates(map[string]any{
@@ -214,7 +315,11 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 	}
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetPollLease.Seconds())
-	replica, claimed, err := model.ClaimSeedanceAssetGroupReplicaWithSnapshot(ctx, group.UserID, group.ID, client.ChannelID, client.AccountFingerprint, client.KeyFingerprint, group.Name, now, leaseUntil, snapshot)
+	accountFingerprint := client.AccountFingerprint
+	if snapshot != nil && client.matchesAccountFingerprint(snapshot.AccountFingerprint) {
+		accountFingerprint = snapshot.AccountFingerprint
+	}
+	replica, claimed, err := model.ClaimSeedanceAssetGroupReplicaWithSnapshot(ctx, group.UserID, group.ID, client.ChannelID, accountFingerprint, client.KeyFingerprint, group.Name, now, leaseUntil, snapshot)
 	if err != nil {
 		return "", err
 	}
@@ -223,12 +328,13 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 			return "", ErrSeedanceAssetMappingPending
 		}
 		if replica.Status == model.SeedanceAssetReplicaReady && replica.UpstreamGroupID != "" {
-			if replica.GroupName != group.Name {
+			if replica.GroupName != group.Name && client.SupportsGroupRename() {
 				if err := client.UpdateSeedanceAssetGroup(ctx, replica.UpstreamGroupID, group.Name, &struct{}{}); err != nil {
 					return "", fmt.Errorf("failed to update the selected account's asset group: %w", err)
 				}
 			}
-			if replica.GroupName != group.Name || replica.ChannelID != client.ChannelID || replica.KeyFingerprint != client.KeyFingerprint {
+			if replica.GroupName != group.Name ||
+				(!client.sharedAccount && (replica.ChannelID != client.ChannelID || replica.KeyFingerprint != client.KeyFingerprint)) {
 				result := model.DB.WithContext(ctx).Model(replica).
 					Where("id = ? AND status = ?", replica.ID, model.SeedanceAssetReplicaReady).
 					Updates(map[string]any{
@@ -274,6 +380,23 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 }
 
 func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient, group *model.SeedanceAssetGroup, asset *model.SeedanceAsset, upstreamGroupID string, snapshot *model.SeedanceAssetReplica, ossStorages *seedanceAssetOSSStorageCache) (string, bool, error) {
+	if asset.LocalOnly != nil && *asset.LocalOnly {
+		if normalizeSeedanceAssetStatus(asset.Status) != "active" {
+			return "", false, model.ErrSeedanceAssetUnavailable
+		}
+		sourceURL := strings.TrimSpace(asset.SourceURL)
+		var err error
+		if strings.TrimSpace(asset.ObjectKey) != "" {
+			sourceURL, err = ossStorages.upstreamURL(ctx, asset, true)
+			if err != nil {
+				return "", false, err
+			}
+		}
+		if err := ValidateSeedanceAssetSourceURL(sourceURL); err != nil {
+			return "", false, errors.New("private asset source is unavailable")
+		}
+		return sourceURL, false, nil
+	}
 	originFingerprint := asset.AccountFingerprint
 	if originFingerprint == "" {
 		originFingerprint = group.AccountFingerprint
@@ -287,9 +410,10 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 			originFingerprint = client.AccountFingerprint
 		}
 	}
-	if originFingerprint != "" && originFingerprint == client.AccountFingerprint ||
-		originFingerprint == "" && asset.ChannelID == client.ChannelID && asset.KeyFingerprint == client.KeyFingerprint {
-		if asset.ChannelID != client.ChannelID || asset.KeyFingerprint != client.KeyFingerprint || asset.AccountFingerprint != client.AccountFingerprint {
+	if asset.UpstreamAssetID() != "" && (client.matchesAccountFingerprint(originFingerprint) ||
+		originFingerprint == "" && asset.ChannelID == client.ChannelID && asset.KeyFingerprint == client.KeyFingerprint) {
+		if asset.AccountFingerprint != client.AccountFingerprint ||
+			(!client.sharedAccount && (asset.ChannelID != client.ChannelID || asset.KeyFingerprint != client.KeyFingerprint)) {
 			result := model.DB.WithContext(ctx).Model(&model.SeedanceAsset{}).
 				Where("id = ? AND user_id = ? AND status <> ?", asset.ID, asset.UserID, "Deleting").
 				Updates(map[string]any{
@@ -314,18 +438,29 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 				return "", true, fmt.Errorf("%w: %v", ErrSeedanceAssetMappingPending, err)
 			}
 			if status != "active" {
+				if status == model.SeedanceAssetReviewTimeoutCode {
+					return "", false, errors.New("private asset review timed out; retry later")
+				}
 				if status == "failed" {
 					return "", false, errors.New("private asset was rejected by the selected upstream account")
 				}
 				return "", true, ErrSeedanceAssetMappingPending
 			}
 		}
-		return asset.AssetID, false, nil
+		return asset.UpstreamAssetID(), false, nil
 	}
 
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetPollLease.Seconds())
-	replica, claimed, err := model.ClaimSeedanceAssetReplicaWithSnapshot(ctx, asset, group.ID, client.ChannelID, client.AccountFingerprint, client.KeyFingerprint, now, leaseUntil, snapshot)
+	if client.jsonAction || client.originREST {
+		// 导入可能同步等待十分钟，租约必须覆盖请求期限，避免并发请求重复导入。
+		leaseUntil = now + int64((seedanceAssetJSONImportTimeout + seedanceAssetRequestTimeout).Seconds())
+	}
+	accountFingerprint := client.AccountFingerprint
+	if snapshot != nil && client.matchesAccountFingerprint(snapshot.AccountFingerprint) {
+		accountFingerprint = snapshot.AccountFingerprint
+	}
+	replica, claimed, err := model.ClaimSeedanceAssetReplicaWithSnapshot(ctx, asset, group.ID, client.ChannelID, accountFingerprint, client.KeyFingerprint, now, leaseUntil, snapshot)
 	if err != nil {
 		return "", false, err
 	}
@@ -343,6 +478,9 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 				return "", true, fmt.Errorf("%w: %v", ErrSeedanceAssetMappingPending, refreshErr)
 			}
 			status = normalizeSeedanceAssetStatus(refreshed.Status)
+			if refreshed.LastError == model.SeedanceAssetReviewTimeoutCode && refreshed.PollAttempts >= model.SeedanceAssetSyncMaxAttempts {
+				return "", false, errors.New("private asset review timed out; retry later")
+			}
 		}
 		if status == "failed" {
 			return "", false, errors.New("private asset was rejected by the selected upstream account")
@@ -355,7 +493,7 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 
 	sourceURL := strings.TrimSpace(asset.SourceURL)
 	if strings.TrimSpace(asset.ObjectKey) != "" {
-		sourceURL, err = ossStorages.upstreamURL(ctx, asset)
+		sourceURL, err = ossStorages.upstreamURL(ctx, asset, false)
 		if err != nil {
 			_ = model.FailSeedanceAssetReplica(replica.ID, leaseUntil, err.Error())
 			return "", false, err
@@ -397,6 +535,14 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 	return refreshed.UpstreamAssetID, false, nil
 }
 
+func seedanceAssetPrimaryMappingStatus(asset *model.SeedanceAsset) string {
+	status := normalizeSeedanceAssetStatus(asset.Status)
+	if status == "failed" && asset.FailureCode == model.SeedanceAssetReviewTimeoutCode {
+		return model.SeedanceAssetReviewTimeoutCode
+	}
+	return status
+}
+
 func refreshSeedancePrimaryAsset(ctx context.Context, client *SeedanceAssetClient, asset *model.SeedanceAsset) (string, error) {
 	var current model.SeedanceAsset
 	if err := model.DB.WithContext(ctx).First(&current, asset.ID).Error; err != nil {
@@ -412,25 +558,29 @@ func refreshSeedancePrimaryAsset(ctx context.Context, client *SeedanceAssetClien
 		if err := model.DB.WithContext(ctx).First(&current, asset.ID).Error; err != nil {
 			return "", err
 		}
-		return normalizeSeedanceAssetStatus(current.Status), nil
+		return seedanceAssetPrimaryMappingStatus(&current), nil
 	}
-	status, previewURL, err := client.GetSeedanceAsset(ctx, current.AssetID)
+	var details SeedanceAssetDetails
+	if current.LocalOnly != nil && !*current.LocalOnly {
+		details, err = client.GetCheckedSeedanceAssetDetails(ctx, current.UpstreamAssetID())
+	} else {
+		details, err = client.GetSeedanceAssetDetails(ctx, current.UpstreamAssetID())
+	}
 	if err != nil {
-		_, scheduleErr := model.UpdateSeedanceAssetPollState(current.ID, leaseUntil, map[string]any{"poll_lease_until": int64(0)})
-		return "", errors.Join(err, scheduleErr)
+		result := scheduleSeedanceAssetRetry(seedanceAssetPollResult{claimed: true}, &current, leaseUntil, err)
+		if result.err != nil {
+			return "", result.err
+		}
+		return "", err
 	}
-	attempts, nextPollAt := SeedanceAssetPollSchedule(status, current.PollAttempts, common.GetTimestamp())
-	updates := map[string]any{"status": status, "poll_attempts": attempts, "next_poll_at": nextPollAt, "poll_lease_until": int64(0)}
-	if previewURL != "" {
-		updates["preview_url"] = previewURL
-	}
+	updates := SeedanceAssetPrimaryReviewUpdates(&current, details, common.GetTimestamp())
 	if _, err := model.UpdateSeedanceAssetPollState(current.ID, leaseUntil, updates); err != nil {
 		return "", err
 	}
 	if err := model.DB.WithContext(ctx).First(&current, asset.ID).Error; err != nil {
 		return "", err
 	}
-	return normalizeSeedanceAssetStatus(current.Status), nil
+	return seedanceAssetPrimaryMappingStatus(&current), nil
 }
 
 func refreshSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient, replica *model.SeedanceAssetReplica) (*model.SeedanceAssetReplica, error) {
@@ -450,26 +600,19 @@ func refreshSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClien
 		}
 		return &current, nil
 	}
-	status, previewURL, err := client.GetSeedanceAsset(ctx, current.UpstreamAssetID)
+	details, err := client.GetCheckedSeedanceAssetDetails(ctx, current.UpstreamAssetID)
 	if err != nil {
-		attempts, nextPollAt := SeedanceAssetPollSchedule(current.Status, current.PollAttempts, common.GetTimestamp())
-		_, scheduleErr := model.UpdateSeedanceAssetReplicaPollState(current.ID, leaseUntil, map[string]any{
-			"poll_attempts": attempts, "next_poll_at": nextPollAt, "poll_lease_until": int64(0), "last_error": truncateSeedanceAssetMappingError(err.Error()),
-		})
-		if scheduleErr != nil {
-			return nil, errors.Join(err, scheduleErr)
+		result := scheduleSeedanceAssetReplicaRetry(ctx, seedanceAssetPollResult{claimed: true}, &current, leaseUntil, err)
+		if result.err != nil {
+			return nil, result.err
 		}
 		return nil, err
 	}
-	attempts, nextPollAt := SeedanceAssetPollSchedule(status, current.PollAttempts, common.GetTimestamp())
-	updates := map[string]any{
-		"status": status, "poll_attempts": attempts, "next_poll_at": nextPollAt,
-		"poll_lease_until": int64(0), "last_error": "",
-	}
-	if previewURL != "" {
-		updates["preview_url"] = previewURL
-	}
+	updates := seedanceAssetReplicaReviewUpdates(&current, details, common.GetTimestamp())
 	if _, err := model.UpdateSeedanceAssetReplicaPollState(current.ID, leaseUntil, updates); err != nil {
+		return nil, err
+	}
+	if err := model.RefreshReplicaManagedSeedanceAsset(ctx, current.UserID, current.LocalAssetID); err != nil {
 		return nil, err
 	}
 	if err := model.DB.WithContext(ctx).First(&current, replica.ID).Error; err != nil {

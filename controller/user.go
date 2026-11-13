@@ -1067,6 +1067,10 @@ func DeleteSelf(c *gin.Context) {
 	identity, _ := middleware.GetStepUpIdentity(c)
 	var err error
 	if revokedAccessTokens, err = model.DeleteUserForSession(identity); err != nil {
+		if errors.Is(err, model.ErrUserTaskBillingPending) {
+			common.ApiError(c, err)
+			return
+		}
 		if errors.Is(err, model.ErrCannotDeleteRootUser) {
 			common.ApiErrorI18n(c, i18n.MsgUserCannotDeleteRootUser)
 			return

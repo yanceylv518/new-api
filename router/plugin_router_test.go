@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -515,6 +517,97 @@ func TestPluginPathOwnershipIsExclusiveAcrossMethods(t *testing.T) {
 	postResponse := performPluginRequest(outer, http.MethodPost, "/shared/jobs/task-1")
 	assert.Equal(t, http.StatusMethodNotAllowed, postResponse.Code)
 	assert.Contains(t, registry.RoutingErrors()["beta-owner"], "overlaps plugin alpha-owner")
+}
+
+func TestSeedancePluginsShareProductionRouterAndSurviveOverrideSync(t *testing.T) {
+	loaded := make([]*jsplugin.LoadedPlugin, 0, 2)
+	for _, key := range []string{"anyllm", "doubao"} {
+		source, err := plugins.Source(key)
+		require.NoError(t, err)
+		plugin, err := jsplugin.CompilePlugin(source, jsplugin.Options{Key: key})
+		require.NoError(t, err)
+		loaded = append(loaded, plugin)
+	}
+	handlers := func(generation *jsplugin.RoutingGeneration, binding jsplugin.RouteBinding) []gin.HandlerFunc {
+		production := productionPluginRouteHandlers(generation, binding)
+		return []gin.HandlerFunc{production[0], func(c *gin.Context) {
+			pinned := c.MustGet(jsplugin.ContextKeyPinnedRoute).(jsplugin.PinnedRoute)
+			if binding.Route.Protocol == "seedance-v3" {
+				keys := []string{"anyllm", "doubao"}
+				if binding.Route.Method == http.MethodDelete {
+					keys = []string{"doubao"}
+				}
+				require.Len(t, pinned.Bindings(), len(keys))
+				for _, key := range keys {
+					selected, ok := pinned.ForPlatform(constant.TaskPlatform(key))
+					require.True(t, ok)
+					require.Equal(t, key, selected.Plugin.Meta.Key)
+				}
+			}
+			c.String(http.StatusOK, pinned.Plugin.Meta.Key)
+		}}
+	}
+	outer, registry := newPluginRouterTest(t, loaded, handlers)
+	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
+	check := func() {
+		t.Helper()
+		require.Empty(t, registry.RoutingErrors())
+		for _, route := range []struct{ method, path string }{
+			{http.MethodPost, "/doubao/api/v3/contents/generations/tasks"},
+			{http.MethodGet, "/doubao/api/v3/contents/generations/tasks"},
+			{http.MethodGet, "/doubao/api/v3/contents/generations/tasks/task_fixture"},
+			{http.MethodDelete, "/doubao/api/v3/contents/generations/tasks/task_fixture"},
+			{http.MethodPost, "/doubao/contents/generations/tasks"},
+			{http.MethodGet, "/doubao/contents/generations/tasks/task_fixture"},
+			{http.MethodPost, "/doubao/v1/contents/generations/tasks"},
+			{http.MethodDelete, "/doubao/v1/contents/generations/tasks/task_fixture"},
+			{http.MethodPost, "/doubao/api/v3/images/generations"},
+		} {
+			response := performPluginRequest(outer, route.method, route.path)
+			require.Equal(t, http.StatusOK, response.Code, "%s %s", route.method, route.path)
+			require.Equal(t, "doubao", response.Body.String())
+		}
+		for _, path := range []string{"/v1/videos", "/v1/responses"} {
+			require.Len(t, registry.Generation().LookupEndpointCandidates(http.MethodPost, path, "doubao-seedance-2-0-260128"), 2)
+		}
+	}
+	check()
+	require.NoError(t, registry.ReplaceOverrides(loaded))
+	check()
+}
+
+func TestSeedanceVideoAliasPreservesDeclaredPluginRoute(t *testing.T) {
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	doubao, err := jsplugin.CompilePlugin(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	custom := compileRouterPlugin(t, "custom-alias", "1.0.0", `[
+		{method: "GET", path: "/doubao/contents/generations/tasks/:task_id", type: "query", render: "native"}
+	]`)
+	handlers := testPluginRouteHandlers(func(c *gin.Context, _ *jsplugin.RoutingGeneration, binding jsplugin.RouteBinding) {
+		if c.Request.Method == http.MethodPost {
+			body, readErr := io.ReadAll(c.Request.Body)
+			require.NoError(t, readErr)
+			c.String(http.StatusOK, string(body))
+			return
+		}
+		c.String(http.StatusOK, binding.Plugin.Meta.Key)
+	})
+	outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{doubao, custom}, handlers)
+	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
+
+	declared := performPluginRequest(outer, http.MethodGet, "/doubao/contents/generations/tasks/task-1")
+	assert.Equal(t, http.StatusOK, declared.Code)
+	assert.Equal(t, "custom-alias", declared.Body.String())
+	alias := performPluginRequest(outer, http.MethodGet, "/doubao/v1/contents/generations/tasks/task-1")
+	assert.Equal(t, http.StatusOK, alias.Code)
+	assert.Equal(t, "doubao", alias.Body.String())
+	body := `{"model":"example","parameters":{"duration":4}}`
+	request := httptest.NewRequest(http.MethodPost, "/doubao/v1/contents/generations/tasks", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	outer.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, body, response.Body.String())
 }
 
 func TestOnePluginMayOwnMultipleMethodsForSamePath(t *testing.T) {

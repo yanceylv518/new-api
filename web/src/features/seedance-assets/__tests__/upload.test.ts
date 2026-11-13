@@ -21,11 +21,12 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 
 import {
-  SEEDANCE_ASSET_MAX_BYTES,
   getSeedanceAssetType,
   validateSeedanceAssetFile,
   validateSeedancePortraitFile,
 } from '../lib/upload'
+
+const limits = { Image: 30, Video: 50, Audio: 15 }
 
 describe('Seedance asset upload validation', () => {
   test('detects media type from MIME and extension fallback', () => {
@@ -60,10 +61,10 @@ describe('Seedance asset upload validation', () => {
     const oversized = {
       name: 'clip.mp4',
       type: 'video/mp4',
-      size: SEEDANCE_ASSET_MAX_BYTES.Video + 1,
+      size: limits.Video * 1024 * 1024 + 1,
     } as File
 
-    assert.deepEqual(validateSeedanceAssetFile(oversized), {
+    assert.deepEqual(validateSeedanceAssetFile(oversized, limits), {
       valid: false,
       errorKey: 'File exceeds {{limit}}',
       limit: '50.0 MB',
@@ -93,13 +94,27 @@ describe('Seedance asset upload validation', () => {
     const oversized = {
       name: 'portrait.jpg',
       type: 'image/jpeg',
-      size: SEEDANCE_ASSET_MAX_BYTES.Image + 1,
+      size: limits.Image * 1024 * 1024 + 1,
     } as File
 
-    assert.deepEqual(validateSeedancePortraitFile(oversized), {
+    assert.deepEqual(validateSeedancePortraitFile(oversized, limits), {
       valid: false,
       errorKey: 'File exceeds {{limit}}',
       limit: '30.0 MB',
     })
+  })
+
+  test('uses the updated image limit and leaves size validation to the server when unavailable', () => {
+    const image = {
+      name: 'portrait.jpg',
+      type: 'image/jpeg',
+      size: 40 * 1024 * 1024,
+    } as File
+    assert.equal(validateSeedancePortraitFile(image, limits).valid, false)
+    assert.equal(
+      validateSeedancePortraitFile(image, { ...limits, Image: 60 }).valid,
+      true
+    )
+    assert.equal(validateSeedancePortraitFile(image, null).valid, true)
   })
 })

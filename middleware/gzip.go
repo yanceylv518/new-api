@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
@@ -33,7 +34,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		if maxMB <= 0 {
 			maxMB = 32
 		}
-		maxBytes := int64(maxMB) << 20
+		maxBytes := common.RequestBodyLimitForPath(c.Request.Method, c.Request.URL.Path, int64(maxMB)<<20)
 
 		origBody := c.Request.Body
 		wrapMaxBytes := func(body io.ReadCloser) io.ReadCloser {

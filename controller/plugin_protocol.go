@@ -364,7 +364,7 @@ func serveTaskPluginProtocol(
 	if background {
 		outcome.Task.PrivateData.ResponsesBackground = true
 		if outcome.Task.ID != 0 {
-			if err := model.DB.Model(outcome.Task).Update("private_data", outcome.Task.PrivateData).Error; err != nil {
+			if err := outcome.Task.SetResponsesBackground(c.Request.Context()); err != nil {
 				logger.LogError(c, "persist task background flag failed: "+err.Error())
 			}
 		}
@@ -511,6 +511,9 @@ func streamTaskPluginProtocol(
 			logger.LogError(c, "build task protocol view failed: "+viewErr.Error())
 			writeTaskPluginProtocolFailure(c, machine, lastStatus)
 			return
+		}
+		if task.Status == model.TaskStatusSuccess {
+			machine.SetTaskUsage(task.Data)
 		}
 		viewValue, viewErr := taskPluginProtocolJSONValue(view)
 		if viewErr != nil {
@@ -853,6 +856,9 @@ func renderTaskPluginProtocolFinalResponse(
 	machine *relay.PluginResponsesMachine,
 	deps pluginProtocolBridgeDeps,
 ) (map[string]any, time.Duration, error) {
+	if task.Status == model.TaskStatusSuccess {
+		machine.SetTaskUsage(task.Data)
+	}
 	view, err := service.BuildTaskPluginView(task)
 	if err != nil {
 		return nil, 0, err
@@ -898,6 +904,9 @@ func renderTaskPluginProtocolEventsResponse(
 	machine *relay.PluginResponsesMachine,
 	deps pluginProtocolBridgeDeps,
 ) (map[string]any, time.Duration, error) {
+	if task.Status == model.TaskStatusSuccess {
+		machine.SetTaskUsage(task.Data)
+	}
 	view, err := service.BuildTaskPluginView(task)
 	if err != nil {
 		return nil, 0, err
@@ -1262,6 +1271,9 @@ func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStrea
 }
 
 func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError) {
+	if respondOriginOceanSubmissionError(c, taskErr) {
+		return
+	}
 	status := http.StatusInternalServerError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode

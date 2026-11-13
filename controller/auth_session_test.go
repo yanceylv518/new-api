@@ -73,7 +73,19 @@ func TestManagementRateLimitDatabase(t *testing.T) {
 	initialJSON, err := common.Marshal(common.DefaultManagementRateLimits())
 	require.NoError(t, err)
 	initialValue := string(initialJSON)
-	_, err = model.UpdateManagementRateLimits(initialValue, &initialValue)
+	var legacy map[string]any
+	require.NoError(t, common.Unmarshal(initialJSON, &legacy))
+	delete(legacy, "seedance_asset")
+	delete(legacy, "asset_upload")
+	delete(legacy, "asset_download")
+	delete(legacy, "asset_limits")
+	legacyJSON, err := common.Marshal(legacy)
+	require.NoError(t, err)
+	legacyValue := string(legacyJSON)
+	require.NoError(t, db.Create(&model.Option{Key: common.ManagementRateLimitsOptionKey, Value: legacyValue}).Error)
+	require.NoError(t, model.RefreshManagementRateLimits())
+	assert.Equal(t, common.DefaultManagementRateLimits(), common.GetManagementRateLimits())
+	_, err = model.UpdateManagementRateLimits(initialValue, &legacyValue)
 	require.NoError(t, err)
 	settings := common.DefaultManagementRateLimits()
 	settings.GlobalAPI.Enabled = false
@@ -155,6 +167,12 @@ func TestManagementRateLimitDatabase(t *testing.T) {
 	})
 	t.Run("only root can save and invalid updates preserve persisted settings", func(t *testing.T) {
 		settings.TokenQuery.Requests = 10
+		settings.SeedanceAsset.Requests = 120
+		settings.AssetUpload.WindowSeconds = 30
+		settings.AssetDownload.Enabled = false
+		settings.AssetLimits.ImageMiB = 45
+		settings.AssetLimits.UserMaxCount = 2000
+		settings.AssetLimits.UserStorageMiB = 2048
 		encoded, err := common.Marshal(settings)
 		require.NoError(t, err)
 		expectedValue := originalSettingsValue
@@ -172,6 +190,21 @@ func TestManagementRateLimitDatabase(t *testing.T) {
 		require.NoError(t, db.Where(&model.Option{Key: payload.Key}).First(&stored).Error)
 		assert.Equal(t, string(encoded), stored.Value)
 		expectedValue = string(encoded)
+		var oldPage map[string]any
+		require.NoError(t, common.Unmarshal(encoded, &oldPage))
+		for _, key := range []string{"seedance_asset", "asset_upload", "asset_download", "asset_limits"} {
+			delete(oldPage, key)
+		}
+		oldPageJSON, err := common.Marshal(oldPage)
+		require.NoError(t, err)
+		oldPagePayload := payload
+		oldPagePayload.Value = string(oldPageJSON)
+		response = request(http.MethodPut, "/api/option/", "192.0.2.1:1000", oldPagePayload, rootSession.AccessToken, "")
+		require.Equal(t, 200, response.Code)
+		assert.Contains(t, response.Body.String(), `"success":true`)
+		assert.Equal(t, settings, common.GetManagementRateLimits())
+		require.NoError(t, db.Where(&model.Option{Key: payload.Key}).First(&stored).Error)
+		assert.Equal(t, string(encoded), stored.Value)
 		response = request(http.MethodGet, "/api/usage/token/", "192.0.2.12:1000", nil, "sk-"+strings.Repeat("b", 32), "")
 		assert.Equal(t, 200, response.Code)
 		response = request(http.MethodGet, "/api/option/", "192.0.2.1:1000", nil, rootSession.AccessToken, "")

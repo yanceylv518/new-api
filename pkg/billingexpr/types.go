@@ -8,9 +8,12 @@ import (
 )
 
 type RequestInput struct {
-	Headers map[string]string
-	Body    []byte
-	Usage   map[string]any
+	Headers               map[string]string
+	Body                  []byte
+	Usage                 map[string]any
+	Params                map[string]any
+	At                    int64
+	NormalizeVideoScalars bool
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int
@@ -80,6 +83,7 @@ type BillingSnapshot struct {
 	ExprVersion               int            `json:"expr_version"`
 	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
 	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
+	EncryptedRequestContext   string         `json:"encrypted_request_context,omitempty"`
 }
 
 // TieredResult holds everything needed after running tiered settlement.

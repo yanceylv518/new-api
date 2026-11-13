@@ -36,8 +36,8 @@ func (c *Context) ApplyUsageFacts(facts map[string]any) {
 	applyUsageFact(&c.OutputTokens, facts, "output_tokens", "completion_tokens")
 	applyUsageFact(&c.TaskTokens, facts, "task_tokens", "tokens", "total_tokens")
 	applyUsageFact(&c.CacheReadTokens, facts, "cache_read_tokens")
-	applyUsageFact(&c.Seconds, facts, "seconds")
-	applyUsageFact(&c.Count, facts, "count", "clips")
+	applyUsageFact(&c.Seconds, facts, "seconds", "duration")
+	applyUsageFact(&c.Count, facts, "count", "clips", "image_count")
 	applyUsageFact(&c.Units, facts, "units")
 }
 
@@ -63,6 +63,7 @@ type compiled struct {
 	params             []string
 	timeDependent      bool
 	usageDependent     bool
+	usageVariables     map[string]bool
 	permanentDependent bool
 	locations          map[string]*time.Location
 }
@@ -79,6 +80,7 @@ type inspector struct {
 	timeDependent, usageDependent bool
 	permanentDependent            bool
 	locations                     map[string]*time.Location
+	usageVariables                map[string]bool
 }
 
 func (v *inspector) Visit(node *ast.Node) {
@@ -90,6 +92,7 @@ func (v *inspector) Visit(node *ast.Node) {
 		switch n.Value {
 		case "input_tokens", "output_tokens", "cache_read_tokens", "task_tokens", "seconds", "count", "units":
 			v.usageDependent = true
+			v.usageVariables[n.Value] = true
 		case "permanent_discount":
 			v.permanentDependent = true
 		}
@@ -184,7 +187,7 @@ func compile(source string) (*compiled, error) {
 		return entry, nil
 	}
 	cache.Unlock()
-	inspection := &inspector{locations: make(map[string]*time.Location)}
+	inspection := &inspector{locations: make(map[string]*time.Location), usageVariables: make(map[string]bool)}
 	program, err := expr.Compile(source, expr.Env(environment(Context{}, nil)), expr.AsFloat64(), expr.DisableAllBuiltins(), expr.MaxNodes(256), expr.Patch(inspection))
 	if err != nil {
 		return nil, fmt.Errorf("invalid discount expression: %w", err)
@@ -192,7 +195,7 @@ func compile(source string) (*compiled, error) {
 	if inspection.err != nil {
 		return nil, inspection.err
 	}
-	entry := &compiled{source: source, program: program, params: inspection.params, timeDependent: inspection.timeDependent, usageDependent: inspection.usageDependent, permanentDependent: inspection.permanentDependent, locations: inspection.locations}
+	entry := &compiled{source: source, program: program, params: inspection.params, timeDependent: inspection.timeDependent, usageDependent: inspection.usageDependent, usageVariables: inspection.usageVariables, permanentDependent: inspection.permanentDependent, locations: inspection.locations}
 	cache.Lock()
 	defer cache.Unlock()
 	if element := cache.entries[source]; element != nil {
@@ -230,6 +233,11 @@ func Parameters(source string) ([]string, error) {
 func DependsOnUsage(source string) bool {
 	entry, err := compile(source)
 	return err == nil && entry.usageDependent
+}
+
+func UsesUsageVariable(source, variable string) bool {
+	entry, err := compile(source)
+	return err == nil && entry.usageVariables[variable]
 }
 
 func DependsOnPermanent(source string) bool {

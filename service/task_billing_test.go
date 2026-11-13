@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -60,7 +63,10 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&model.Task{},
+		&model.TaskResource{},
+		&model.TaskResourceIndexState{},
 		&model.VideoTaskPendingLog{},
+		&model.BillingRefund{},
 		&model.User{},
 		&model.UserModelPricing{},
 		&model.UserModelPricingRevision{},
@@ -87,7 +93,10 @@ func TestMain(m *testing.M) {
 func truncate(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
+		model.DB.Exec("DELETE FROM billing_refunds")
 		model.DB.Exec("DELETE FROM tasks")
+		model.DB.Exec("DELETE FROM task_resources")
+		model.DB.Exec("DELETE FROM task_resource_index_states")
 		model.DB.Exec("DELETE FROM video_task_pending_logs")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
@@ -374,6 +383,53 @@ func TestLogTaskConsumptionIncludesTieredSnapshotUsageFacts(t *testing.T) {
 	assert.Contains(t, log.Content, "计算参数：")
 	assert.Contains(t, log.Content, "resolution: 720P")
 	assert.Contains(t, log.Content, "seconds: 5")
+}
+
+func TestInitialTaskAccountingLogRecovery(t *testing.T) {
+	for _, separate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("separate_log_%t", separate), func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 840, 10000)
+			seedChannel(t, 840)
+			task := makeTask(840, 840, 100, 0, BillingSourceWallet, 0)
+			task.PrivateData.InitialAccountingPending = true
+			require.NoError(t, model.DB.Create(task).Error)
+			previousLogDB := model.LOG_DB
+			if separate {
+				model.LOG_DB = model.DB.Session(&gorm.Session{NewDB: true})
+			}
+			t.Cleanup(func() { model.LOG_DB = previousLogDB })
+			info := &relaycommon.RelayInfo{UserId: 840, OriginModelName: "test-model", UsingGroup: "default", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 840}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "GENERATE"}, PriceData: types.PriceData{Quota: 100}}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register("initial-log-failure", func(tx *gorm.DB) {
+				if tx.Statement.Table == "logs" {
+					tx.AddError(errors.New("injected log failure"))
+				}
+			}))
+			LogTaskConsumption(c, info, task)
+			require.NoError(t, model.DB.Callback().Create().Remove("initial-log-failure"))
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			if separate {
+				assert.False(t, stored.PrivateData.InitialAccountingPending)
+				var pending model.VideoTaskPendingLog
+				require.NoError(t, model.DB.First(&pending, "task_id = ?", -task.ID).Error)
+				require.NoError(t, model.DB.Model(&pending).Update("claim_until", 0).Error)
+				require.NoError(t, model.DeliverVideoTaskLog(t.Context(), -task.ID))
+			} else {
+				assert.True(t, stored.PrivateData.InitialAccountingPending)
+				require.NoError(t, RecoverTaskInitialAccounting(t.Context(), &stored))
+			}
+			assert.Equal(t, int64(1), countLogs(t))
+			var user model.User
+			require.NoError(t, model.DB.First(&user, 840).Error)
+			assert.Equal(t, 100, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			require.NoError(t, RecoverTaskInitialAccounting(t.Context(), &stored))
+			assert.Equal(t, int64(1), countLogs(t))
+		})
+	}
 }
 
 func TestLogTaskConsumptionWithoutSnapshotKeepsRatioMode(t *testing.T) {
@@ -767,16 +823,14 @@ func TestSettleMidjourneyTaskBillingFundingFailureClearsMarkers(t *testing.T) {
 	require.True(t, prepared)
 	require.NoError(t, task.Insert())
 
-	require.NoError(t, model.DB.Exec(`
-		CREATE TRIGGER fail_midjourney_user_update
-		BEFORE UPDATE ON users
-		WHEN OLD.id = 52
-		BEGIN
-			SELECT RAISE(ABORT, 'forced user quota failure');
-		END;
-	`).Error)
+	const callback = "test:midjourney-funding-failure"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.ModelType == reflect.TypeFor[model.User]() {
+			tx.AddError(errors.New("forced user quota failure"))
+		}
+	}))
 	t.Cleanup(func() {
-		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_user_update")
+		require.NoError(t, model.DB.Callback().Update().Remove(callback))
 	})
 
 	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
@@ -821,16 +875,14 @@ func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testin
 	require.True(t, prepared)
 	require.NoError(t, task.Insert())
 
-	require.NoError(t, model.DB.Exec(`
-		CREATE TRIGGER fail_midjourney_token_update
-		BEFORE UPDATE ON tokens
-		WHEN OLD.id = 53
-		BEGIN
-			SELECT RAISE(ABORT, 'forced token quota failure');
-		END;
-	`).Error)
+	const callback = "test:midjourney-token-failure"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.ModelType == reflect.TypeFor[model.Token]() {
+			tx.AddError(errors.New("forced token quota failure"))
+		}
+	}))
 	t.Cleanup(func() {
-		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_token_update")
+		require.NoError(t, model.DB.Callback().Update().Remove(callback))
 	})
 
 	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)

@@ -3,11 +3,15 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/discountexpr"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/shopspring/decimal"
@@ -85,6 +89,93 @@ func atomicVideoSettlementEnabled(adaptor TaskPollingAdaptor) bool {
 	return adaptor != nil
 }
 
+func requireMeasuredVideoUsage(task *model.Task, result *relaycommon.TaskInfo) error {
+	bc := task.PrivateData.BillingContext
+	if bc == nil || result == nil {
+		return nil
+	}
+	var keys map[string]bool
+	if bc.TieredSnapshot != nil {
+		keys = billingexpr.UsedUsageKeys(bc.TieredSnapshot.ExprString)
+	}
+	discountUses := func(variable string) bool {
+		return bc.UserDiscount != nil && bc.UserDiscount.Rule.Expression != "" && discountexpr.UsesUsageVariable(bc.UserDiscount.Rule.Expression, variable)
+	}
+	plugin := string(task.Platform)
+	if task.PrivateData.Execution != nil && task.PrivateData.Execution.TaskPlugin != nil {
+		plugin = task.PrivateData.Execution.TaskPlugin.Key
+	}
+	upstreamModel := strings.ToLower(strings.TrimSpace(task.Properties.UpstreamModelName))
+	originModel := strings.ToLower(strings.TrimSpace(task.Properties.OriginModelName))
+	if originModel == "" {
+		originModel = strings.ToLower(strings.TrimSpace(bc.OriginModelName))
+	}
+	modelName := upstreamModel
+	if modelName == "" {
+		modelName = originModel
+	}
+	// 未声明的上游接入点按提交模型识别；明确的图片模型不继承视频要求。
+	seedance := strings.HasPrefix(upstreamModel, "doubao-seedance-") ||
+		(plugin == "originocean" && upstreamModel == "maas-doubao-seedance-2.0") ||
+		(!strings.HasPrefix(upstreamModel, "doubao-seedream-") && strings.HasPrefix(originModel, "doubao-seedance-"))
+	required := []string{}
+	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean") && seedance {
+		if keys["tokens"] || discountUses("task_tokens") {
+			required = append(required, "tokens")
+		}
+		if keys["seconds"] || discountUses("seconds") {
+			required = append(required, "seconds")
+		}
+	}
+	if plugin == "hailuo" && modelName == "minimax-h3" {
+		operation := task.Action
+		if bc.TieredSnapshot != nil {
+			if value, ok := bc.TieredSnapshot.UsageFacts["operation"].(string); ok && value != "" {
+				operation = value
+			}
+		}
+		if value, ok := result.UsageFacts["operation"].(string); ok && value != "" {
+			operation = value
+		}
+		if operation == "context_ir" {
+			for _, field := range []struct{ key, discountVariable string }{{"prompt_tokens", "input_tokens"}, {"completion_tokens", "output_tokens"}, {"tokens", "task_tokens"}} {
+				if keys[field.key] || discountUses(field.discountVariable) {
+					required = append(required, field.key)
+				}
+			}
+		} else {
+			if keys["seconds"] || discountUses("seconds") {
+				required = append(required, "seconds")
+			}
+			if keys["input_video_seconds"] && bc.TieredSnapshot != nil && positiveTaskUsage(bc.TieredSnapshot.UsageFacts["input_video_seconds"]) {
+				required = append(required, "input_video_seconds")
+			}
+			if operation == "regeneration" && keys["input_images"] && bc.TieredSnapshot != nil && positiveTaskUsage(bc.TieredSnapshot.UsageFacts["input_images"]) {
+				required = append(required, "input_images")
+			}
+		}
+	}
+	for _, key := range required {
+		if _, present := result.UsageFacts[key]; !present {
+			return fmt.Errorf("task measured usage %s is unavailable", key)
+		}
+	}
+	return nil
+}
+
+func positiveTaskUsage(value any) bool {
+	switch number := value.(type) {
+	case int:
+		return number > 0
+	case int64:
+		return number > 0
+	case float64:
+		return number > 0
+	default:
+		return false
+	}
+}
+
 // settleAtomicVideoTask 在写终态前计算金额，表达式错误保留预扣；主库失败则由下一轮重试。
 func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, previous model.TaskStatus, result *relaycommon.TaskInfo) (err error) {
 	original := *task
@@ -92,6 +183,17 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 		if err != nil {
 			*task = original
 			task.Status = previous
+			task.FinishTime = 0
+			switch previous {
+			case model.TaskStatusSubmitted:
+				task.Progress = taskcommon.ProgressSubmitted
+			case model.TaskStatusQueued:
+				task.Progress = taskcommon.ProgressQueued
+			case model.TaskStatusInProgress:
+				task.Progress = taskcommon.ProgressInProgress
+			default:
+				task.Progress = "0%"
+			}
 			task.PrivateData.ReconciliationRequired = true
 			task.PrivateData.ReconciliationReason = "task settlement is pending; reserved quota retained"
 			task.PrivateData.NextPollAt = time.Now().Unix() + 30
@@ -105,6 +207,9 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 	var amounts *hosttypes.DiscountAmounts
 	bc := task.PrivateData.BillingContext
 	if task.Status != model.TaskStatusFailure {
+		if err := requireMeasuredVideoUsage(task, result); err != nil {
+			return err
+		}
 		price, evaluation, discountErr := taskUserModelDiscount(task, result)
 		if discountErr != nil {
 			return discountErr

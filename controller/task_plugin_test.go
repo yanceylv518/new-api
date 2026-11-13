@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -366,6 +368,94 @@ func TestTaskPluginSourceAboveMySQLTextLimitRoundTrips(t *testing.T) {
 	loaded, err := model.GetTaskPluginSource(snapshot.Plugins[0].Id)
 	require.NoError(t, err)
 	assert.Equal(t, source, string(loaded))
+}
+
+func TestMarketplacePluginReleasesUpgradeInstalledVersions(t *testing.T) {
+	database, dialect := openTaskDialectDatabase(t, &model.TaskPlugin{})
+	previousDB := model.DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB = database
+	common.SetDatabaseTypes(dialect, dialect)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+
+	var catalog struct {
+		Plugins []struct {
+			Key      string `json:"key"`
+			Latest   string `json:"latest"`
+			Versions []struct {
+				Version string `json:"version"`
+				Path    string `json:"path"`
+				SHA256  string `json:"sha256"`
+			} `json:"versions"`
+		} `json:"plugins"`
+	}
+	content, err := os.ReadFile(filepath.Join("..", "marketplace", "catalog.json"))
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(content, &catalog))
+
+	for _, tc := range []struct {
+		key, previousVersion string
+	}{{"kling", "1.3.5"}, {"anyllm", "1.2.2"}} {
+		t.Run(tc.key, func(t *testing.T) {
+			source, err := plugins.Source(tc.key)
+			require.NoError(t, err)
+			compiled, err := jsplugin.CompilePlugin(source, jsplugin.Options{Key: tc.key})
+			require.NoError(t, err)
+			require.NotEqual(t, tc.previousVersion, compiled.Meta.Version)
+			var catalogIndex = -1
+			for i := range catalog.Plugins {
+				if catalog.Plugins[i].Key == tc.key {
+					catalogIndex = i
+					break
+				}
+			}
+			require.NotEqual(t, -1, catalogIndex)
+			entry := catalog.Plugins[catalogIndex]
+			require.Equal(t, compiled.Meta.Version, entry.Latest)
+			var versionIndex, previousIndex = -1, -1
+			for i := range entry.Versions {
+				if entry.Versions[i].Version == entry.Latest {
+					versionIndex = i
+				}
+				if entry.Versions[i].Version == tc.previousVersion {
+					previousIndex = i
+				}
+			}
+			require.NotEqual(t, -1, versionIndex)
+			require.NotEqual(t, -1, previousIndex)
+			version := entry.Versions[versionIndex]
+			require.Equal(t, "/plugins/"+tc.key+"/"+entry.Latest+"/plugin.js", version.Path)
+			release, err := os.ReadFile(filepath.Join("..", "marketplace", "releases", "plugins", tc.key, entry.Latest, "plugin.js"))
+			require.NoError(t, err)
+			assert.Equal(t, source, string(release))
+			digest := fmt.Sprintf("%x", sha256.Sum256(release))
+			assert.Equal(t, digest, version.SHA256)
+			previous, err := os.ReadFile(filepath.Join("..", "marketplace", "releases", "plugins", tc.key, tc.previousVersion, "plugin.js"))
+			require.NoError(t, err)
+			previousPlugin, err := jsplugin.CompilePlugin(string(previous), jsplugin.Options{Key: tc.key})
+			require.NoError(t, err)
+			require.Equal(t, tc.previousVersion, previousPlugin.Meta.Version)
+			previousHash := fmt.Sprintf("%x", sha256.Sum256(previous))
+			require.NotEqual(t, previousHash, digest)
+			assert.Equal(t, "/plugins/"+tc.key+"/"+tc.previousVersion+"/plugin.js", entry.Versions[previousIndex].Path)
+			assert.Equal(t, previousHash, entry.Versions[previousIndex].SHA256)
+			old := model.TaskPlugin{Key: tc.key, APIVersion: 1, Version: tc.previousVersion, Source: model.LongText(previous), SourceHash: previousHash, Enabled: true}
+			current := model.TaskPlugin{Key: tc.key, APIVersion: 1, Version: entry.Latest, Source: model.LongText(release), SourceHash: digest, Enabled: true}
+			require.NoError(t, model.SaveTaskPlugin(&old))
+			require.NoError(t, model.SaveTaskPlugin(&current))
+			tampered := current
+			tampered.SourceHash = "different-source"
+			require.ErrorContains(t, model.SaveTaskPlugin(&tampered), "different source")
+			require.NoError(t, model.ActivateTaskPlugin(tc.key, entry.Latest))
+			active, err := model.GetTaskPluginVersion(tc.key, "")
+			require.NoError(t, err)
+			assert.Equal(t, entry.Latest, active.Version)
+			assert.Equal(t, source, string(active.Source))
+		})
+	}
 }
 
 func TestUploadTaskPluginAcceptsSourcesUpToEightMiB(t *testing.T) {

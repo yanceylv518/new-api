@@ -209,12 +209,7 @@ function wanVideoUsageSchema(resolutions, audio) {
 
 const WAN_AUDIO_VIDEO_MODELS = ["wan2.6-i2v-flash", "wan2.6-r2v-flash"];
 // Dated snapshots share the undated model's capabilities through modelKey.
-const WAN_VIDEO_SNAPSHOTS = [
-  "wan2.7-t2v-2026-04-25",
-  "wan2.7-t2v-2026-06-12",
-  "wan2.7-i2v-2026-04-25",
-  "wan2.7-r2v-2026-06-12",
-];
+const WAN_VIDEO_SNAPSHOTS = ["wan2.7-t2v-2026-04-25", "wan2.7-t2v-2026-06-12", "wan2.7-i2v-2026-04-25", "wan2.7-r2v-2026-06-12"];
 const WAN_VIDEO_RESOLUTIONS = ["480P", "720P", "1080P"];
 const WAN_ANIMATE_MODELS = ["wan2.2-animate-move", "wan2.2-animate-mix"];
 const WAN_FACE_DETECT_MODELS = ["wan2.2-s2v-detect"];
@@ -288,7 +283,7 @@ export const meta = {
     en: "Alibaba Cloud Bailian image and video generation (Wan, Qwen-Image, Z-Image)",
     zh: "阿里云百炼图片与视频生成（万相、千问图像、Z-Image）",
   },
-  version: "1.5.0",
+  version: "1.5.2",
   author: { name: "QuantumNous" },
   channelTypes: [17],
   // Literal metadata also supports the dashboard's static script preview.
@@ -434,12 +429,9 @@ function viaGateway(ctx) {
   return !!(ctx && ctx.upstream && ctx.upstream.kind === "new_api");
 }
 
-// Another New API gateway serves the DashScope wire format only on this
-// plugin's /ali native routes; DashScope itself serves the unprefixed paths.
+// 服务前缀由管理员在渠道 BaseURL 中配置。
 function apiRoot(ctx) {
-  const base = trimmed(ctx && ctx.baseUrl).replace(/\/+$/, "");
-  if (base.toLowerCase().endsWith("/ali")) return base;
-  return base + (viaGateway(ctx) ? "/ali" : "");
+  return trimmed(ctx && ctx.baseUrl).replace(/\/+$/, "");
 }
 
 function firstImage(req) {
@@ -903,7 +895,10 @@ function normalizeVaceInput(input, parameters) {
   if (operation === "video_repainting") {
     if (!["posebodyface", "posebody", "depth", "scribble"].includes(parameters.control_condition))
       throw new Error("video_repainting requires a valid control_condition");
-    if (parameters.strength !== undefined && (typeof parameters.strength !== "number" || !Number.isFinite(parameters.strength) || parameters.strength < 0 || parameters.strength > 1))
+    if (
+      parameters.strength !== undefined &&
+      (typeof parameters.strength !== "number" || !Number.isFinite(parameters.strength) || parameters.strength < 0 || parameters.strength > 1)
+    )
       throw new Error("strength must be between 0 and 1");
   }
 
@@ -915,10 +910,14 @@ function normalizeVaceInput(input, parameters) {
     if (parameters.control_condition !== undefined && !["posebodyface", "depth"].includes(parameters.control_condition))
       throw new Error("control_condition is invalid for video_edit");
     if (parameters.mask_type !== undefined && !["tracking", "fixed"].includes(parameters.mask_type)) throw new Error("mask_type is invalid");
-    if (parameters.expand_ratio !== undefined && (typeof parameters.expand_ratio !== "number" || !Number.isFinite(parameters.expand_ratio) || parameters.expand_ratio < 0 || parameters.expand_ratio > 1))
+    if (
+      parameters.expand_ratio !== undefined &&
+      (typeof parameters.expand_ratio !== "number" || !Number.isFinite(parameters.expand_ratio) || parameters.expand_ratio < 0 || parameters.expand_ratio > 1)
+    )
       throw new Error("expand_ratio must be between 0 and 1");
     if (parameters.expand_mode !== undefined && !["hull", "bbox", "original"].includes(parameters.expand_mode)) throw new Error("expand_mode is invalid");
-    if (input.mask_frame_id !== undefined && (!Number.isInteger(input.mask_frame_id) || input.mask_frame_id < 1)) throw new Error("mask_frame_id must be a positive integer");
+    if (input.mask_frame_id !== undefined && (!Number.isInteger(input.mask_frame_id) || input.mask_frame_id < 1))
+      throw new Error("mask_frame_id must be a positive integer");
   }
 
   if (operation === "video_extension") {
@@ -1011,7 +1010,12 @@ function convert(ctx) {
     if (!ratios.includes(ratio)) throw new Error(upstreamModel + " ratio must be one of " + ratios.join(", "));
   }
   if (profile.kind === "reference_legacy") {
-    if (!Array.isArray(input.reference_urls) || input.reference_urls.length < 1 || input.reference_urls.length > 5 || input.reference_urls.some((url) => !/^https?:\/\//i.test(trimmed(url))))
+    if (
+      !Array.isArray(input.reference_urls) ||
+      input.reference_urls.length < 1 ||
+      input.reference_urls.length > 5 ||
+      input.reference_urls.some((url) => !/^https?:\/\//i.test(trimmed(url)))
+    )
       throw new Error(upstreamModel + " requires 1 to 5 HTTP(S) reference_urls");
     const legacySize = sizeValue == null || sizeValue === "" ? LEGACY_SIZES["1080P"]["16:9"] : trimmed(sizeValue).replace(/x/i, "*");
     if (!/^\d+\*\d+$/.test(legacySize)) {
@@ -1054,12 +1058,13 @@ function convert(ctx) {
 
   const rawDuration =
     profile.kind === "videoedit"
-      ? nativeParameters.duration ?? req.duration
-      : nativeParameters.duration ?? (req.auto_duration === true ? -1 : (req.duration ?? req.seconds));
+      ? (nativeParameters.duration ?? req.duration)
+      : (nativeParameters.duration ?? (req.auto_duration === true ? -1 : (req.duration ?? req.seconds)));
   if (rawDuration != null && ((typeof rawDuration !== "number" && typeof rawDuration !== "string") || String(rawDuration).trim() === ""))
     throw new Error("duration must be a number");
   const duration = rawDuration == null ? (profile.kind === "videoedit" ? 0 : 5) : Number(rawDuration);
-  const hasReferenceVideo = profile.kind === "reference" && Array.isArray(input.media) && input.media.some((media) => media && media.type === "reference_video");
+  const hasReferenceVideo =
+    profile.kind === "reference" && Array.isArray(input.media) && input.media.some((media) => media && media.type === "reference_video");
   if (duration === -1 && profile.kind !== "all") throw new Error("duration -1 (smart duration) is only supported by wan3.0 models");
   if (profile.kind === "speech") {
     if (rawDuration != null && (!Number.isFinite(duration) || duration <= 0 || duration >= 20))
@@ -1088,7 +1093,8 @@ function convert(ctx) {
     if (!Array.isArray(input.media) || input.media.length < 1 || input.media.length > 5) throw new Error("wan2.7-r2v requires 1 to 5 input.media entries");
     const counts = {};
     for (const media of input.media) {
-      if (!media || !["reference_image", "reference_video", "first_frame"].includes(media.type) || !trimmed(media.url)) throw new Error("invalid wan2.7-r2v input.media entry");
+      if (!media || !["reference_image", "reference_video", "first_frame"].includes(media.type) || !trimmed(media.url))
+        throw new Error("invalid wan2.7-r2v input.media entry");
       if (media.type === "reference_video" && !httpURL(media.url)) throw new Error("wan2.7-r2v reference_video requires an HTTP(S) URL");
       counts[media.type] = (counts[media.type] || 0) + 1;
       if (counts[media.type] > (media.type === "first_frame" ? 1 : 5)) throw new Error("too many wan2.7-r2v input.media entries");
@@ -1100,11 +1106,13 @@ function convert(ctx) {
     if (!Array.isArray(input.media) || input.media.length < 1 || input.media.length > 5) throw new Error("wan2.7-videoedit requires input.media");
     const counts = {};
     for (const media of input.media) {
-      if (!media || !["video", "reference_image"].includes(media.type) || !/^https?:\/\//i.test(trimmed(media.url))) throw new Error("invalid wan2.7-videoedit input.media entry");
+      if (!media || !["video", "reference_image"].includes(media.type) || !/^https?:\/\//i.test(trimmed(media.url)))
+        throw new Error("invalid wan2.7-videoedit input.media entry");
       counts[media.type] = (counts[media.type] || 0) + 1;
     }
     if (counts.video !== 1 || (counts.reference_image || 0) > 4) throw new Error("wan2.7-videoedit requires one video and at most four reference images");
-    if (parameters.audio_setting !== undefined && !["auto", "origin"].includes(parameters.audio_setting)) throw new Error("audio_setting must be auto or origin");
+    if (parameters.audio_setting !== undefined && !["auto", "origin"].includes(parameters.audio_setting))
+      throw new Error("audio_setting must be auto or origin");
   } else if (profile.kind === "vace") {
     normalizeVaceInput(input, parameters);
   } else if (profile.kind === "media" || profile.kind === "all") {
@@ -1343,8 +1351,7 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
 export function parseSubmitResponse(ctx, resp) {
   const body = resp.body || {};
   if (faceDetectModel(ctx)) {
-    if (!body.output || typeof body.output !== "object" || typeof body.output.check_pass !== "boolean")
-      throw new Error("face detection response is invalid");
+    if (!body.output || typeof body.output !== "object" || typeof body.output.check_pass !== "boolean") throw new Error("face detection response is invalid");
     return {
       taskId: ctx.publicTaskId || body.request_id || utils.uuid(),
       taskData: body,
@@ -1472,7 +1479,7 @@ export function buildQueryRequest(ctx) {
 
 export function parseTaskResult(ctx, body) {
   if (body && body.code) {
-    return { status: "FAILURE", reason: body.message || String(body.code) };
+    throw new Error(body.message || String(body.code));
   }
   const output = body.output || {};
   if (output.task_status === "PENDING") return { status: "QUEUED" };
@@ -1491,14 +1498,15 @@ export function parseTaskResult(ctx, body) {
           })
         )
           return { status: "SUCCESS" };
-        return { status: "FAILURE", reason: "image task succeeded without any images" };
+        throw new Error("image task succeeded without any images");
       }
       return { status: "SUCCESS", url: images[0].image };
     }
     const url = videoURL(body);
-    return url ? { status: "SUCCESS", url: url } : { status: "FAILURE", reason: "video task succeeded without a video URL" };
+    if (!url) throw new Error("video task succeeded without a video URL");
+    return { status: "SUCCESS", url: url };
   }
-  if (["FAILED", "CANCELED", "UNKNOWN"].includes(output.task_status)) {
+  if (["FAILED", "CANCELED"].includes(output.task_status)) {
     let reason = body.message || "";
     if (!reason && output.message) reason = "task failed, code: " + (output.code || "") + " , message: " + output.message;
     if (!reason) reason = "task failed";

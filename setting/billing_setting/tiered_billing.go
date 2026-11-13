@@ -133,7 +133,7 @@ func TaskExprCompatible(expression string, schema map[string]jsplugin.UsageField
 	if strings.TrimSpace(expression) == "" {
 		return false
 	}
-	if _, err := billingexpr.CompileFromCache(expression); err != nil {
+	if _, err := billingexpr.PlanTaskRequest(expression); err != nil {
 		return false
 	}
 	for key := range billingexpr.UsedUsageKeys(expression) {
@@ -232,7 +232,7 @@ func smokeTestExpr(exprStr string) error {
 // declared by its plugin. Literal u() keys must be declared; dynamic calls are
 // still exercised by the generated runtime vectors when possible.
 func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
-	if _, err := billingexpr.CompileFromCache(exprStr); err != nil {
+	if _, err := billingexpr.PlanTaskRequest(exprStr); err != nil {
 		return err
 	}
 	if billingexpr.UsesFixedPricing(exprStr) {

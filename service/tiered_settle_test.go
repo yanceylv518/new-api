@@ -569,6 +569,30 @@ func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
 	assert.Equal(t, 450_000, userQuota)
 }
 
+func TestTaskRetryReservationKeepsRefundAndRejectsDebt(t *testing.T) {
+	truncate(t)
+	const userID = 703
+	seedUser(t, userID, 300_000)
+	funding := &WalletFunding{userId: userID}
+	require.NoError(t, funding.PreConsume(50_000))
+	info := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true, ForcePreConsume: true}
+	session := &BillingSession{relayInfo: info, funding: funding, preConsumedQuota: 50_000}
+	require.NoError(t, session.ReserveBeforeTaskSubmit(100_000))
+	require.NoError(t, session.ReserveBeforeTaskSubmit(150_000))
+	require.NoError(t, session.ReserveBeforeTaskSubmit(75_000))
+	assert.Equal(t, 150_000, funding.consumed)
+	assert.Equal(t, 150_000, session.GetPreConsumedQuota())
+	require.Error(t, session.ReserveBeforeTaskSubmit(350_000))
+	assert.Equal(t, 150_000, session.GetPreConsumedQuota())
+	quota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Equal(t, 150_000, quota)
+	require.NoError(t, funding.Refund())
+	quota, err = model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Equal(t, 300_000, quota)
+}
+
 func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {
 	const expr = `tier("base", p)`
 	tests := []struct {

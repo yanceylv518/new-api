@@ -430,6 +430,27 @@ completion hook retain their submission values. The same expression is then
 evaluated again; a changed fact can therefore produce a settlement delta and a
 different matched tier. Evaluation failure keeps the pre-consumed charge.
 
+Task expressions also freeze the values referenced by literal `param("...")`
+and `header("...")` calls, together with the submission time used by time
+functions. Only referenced values are saved, encrypted in the task billing
+snapshot; the complete request body is not copied. The encoded values are
+limited to 16 KiB. Dynamic arguments to `param` or `header` are rejected
+at configuration and submission because their later values cannot be frozen
+reliably. Request and time functions must be called directly; accessing them
+through function aliases or the expression environment is rejected. Multipart
+task requests use the supplied field names and the plugin's normalized field
+values, without adding fields inferred by the plugin.
+For `openai_video`, numeric strings in the `duration`, `seconds`, `frames`,
+`seed`, `priority`, and `execution_expires_after` fields are frozen as numbers
+after request validation, consistently with multipart inputs.
+Historical snapshots without these values retain their existing settlement
+behavior. New snapshots keep encrypted request values in the existing internal
+expression field so an older host's task writeback preserves them. Older hosts
+with atomic task settlement retain the reservation until an updated host can
+settle; hosts without atomic task settlement are not safe to roll back to while
+these tasks are in flight. A snapshot previously lost by an older writer cannot
+be reconstructed automatically.
+
 ---
 
 ## Architecture

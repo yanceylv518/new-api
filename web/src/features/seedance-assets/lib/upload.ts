@@ -20,13 +20,8 @@ export const SEEDANCE_ASSET_ACCEPT = 'image/*,video/*,audio/*'
 export const SEEDANCE_PORTRAIT_ACCEPT =
   '.jpg,.jpeg,.png,.webp,.gif,.heic,image/jpeg,image/png,image/webp,image/gif,image/heic'
 
-export const SEEDANCE_ASSET_MAX_BYTES = {
-  Image: 30 * 1024 * 1024,
-  Video: 50 * 1024 * 1024,
-  Audio: 15 * 1024 * 1024,
-} as const
-
-export type SeedanceAssetType = keyof typeof SEEDANCE_ASSET_MAX_BYTES
+export type SeedanceAssetType = 'Image' | 'Video' | 'Audio'
+export type SeedanceAssetUploadLimits = Record<SeedanceAssetType, number>
 
 const extensionTypeMap: Record<string, SeedanceAssetType> = {
   aac: 'Audio',
@@ -84,9 +79,10 @@ export function getSeedanceAssetType(file: File): SeedanceAssetType | null {
   return extensionTypeMap[extension] ?? null
 }
 
-// 上传前在浏览器侧提前阻止不支持或超过上游限制的文件，减少无效网络请求。
+// 使用服务端当前限制预先校验；配置暂不可用时由服务端负责大小校验。
 export function validateSeedanceAssetFile(
-  file: File
+  file: File,
+  limits?: SeedanceAssetUploadLimits | null
 ): SeedanceAssetFileValidation {
   const assetType = getSeedanceAssetType(file)
   if (!assetType) {
@@ -96,19 +92,20 @@ export function validateSeedanceAssetFile(
     return { valid: false, errorKey: 'File is empty' }
   }
 
-  const limit = SEEDANCE_ASSET_MAX_BYTES[assetType]
-  if (file.size > limit) {
+  const limit = limits?.[assetType]
+  if (limit !== undefined && file.size / (1024 * 1024) > limit) {
     return {
       valid: false,
       errorKey: 'File exceeds {{limit}}',
-      limit: formatSeedanceFileSize(limit),
+      limit: formatSeedanceFileSize(limit * 1024 * 1024),
     }
   }
   return { valid: true, assetType }
 }
 
 export function validateSeedancePortraitFile(
-  file: File
+  file: File,
+  limits?: SeedanceAssetUploadLimits | null
 ): SeedanceAssetFileValidation {
   const extension = file.name.toLowerCase().split('.').pop() ?? ''
   if (
@@ -117,7 +114,7 @@ export function validateSeedancePortraitFile(
   ) {
     return { valid: false, errorKey: 'Unsupported file type' }
   }
-  return validateSeedanceAssetFile(file)
+  return validateSeedanceAssetFile(file, limits)
 }
 
 export function formatSeedanceFileSize(bytes: number): string {

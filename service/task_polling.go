@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 // TaskPollingAdaptor 定义轮询所需的最小适配器接口，避免 service -> relay 的循环依赖
@@ -68,6 +70,32 @@ type BatchTaskResult struct {
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
 var taskPollingCursor atomic.Int64
+var taskTimeoutCursor atomic.Int64
+var taskPollSlots = make(chan struct{}, 32)
+var taskPollBodySlots = make(chan struct{}, 4)
+
+// 为兼容内联结果保留空间，同时限制单次上游响应占用。
+const maxTaskPollResponseBytes = 64 * 1024 * 1024
+
+// ReadTaskResultBody 为轮询和内联制品共用响应大小及并发内存限制。
+func ReadTaskResultBody(ctx context.Context, body io.Reader) ([]byte, func(), error) {
+	select {
+	case taskPollBodySlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	release := func() { <-taskPollBodySlots }
+	data, err := io.ReadAll(io.LimitReader(body, maxTaskPollResponseBytes+1))
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	if len(data) > maxTaskPollResponseBytes {
+		release()
+		return nil, nil, fmt.Errorf("task polling response exceeds size limit")
+	}
+	return data, release, nil
+}
 
 // RecordTaskPerformance 在任务终态已被当前轮询者确认后异步写入性能聚合。
 // 先复制必要的标量快照，避免后台写入读取会被下一轮轮询修改的 Task 指针；CAS 由调用方保证每个任务只进入一次。
@@ -96,16 +124,21 @@ func RecordTaskPerformance(task *model.Task) {
 
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
-// 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
+// 逐任务锁定或按状态更新，避免覆盖正常轮询已推进的任务。
 func sweepTimedOutTasks(ctx context.Context) {
 	if constant.TaskTimeoutMinutes <= 0 {
 		return
 	}
 	cutoff := time.Now().Unix() - int64(constant.TaskTimeoutMinutes)*60
-	tasks := model.GetTimedOutUnfinishedTasks(cutoff, 100)
+	tasks, err := model.GetTimedOutUnfinishedTasksAfter(cutoff, 100, taskTimeoutCursor.Load())
+	if err != nil {
+		logger.LogError(ctx, "load overdue tasks failed: "+err.Error())
+		return
+	}
 	if len(tasks) == 0 {
 		return
 	}
+	taskTimeoutCursor.Store(tasks[len(tasks)-1].ID)
 
 	reason := fmt.Sprintf("任务超时（%d分钟）", constant.TaskTimeoutMinutes)
 	legacyReason := "任务超时（旧系统遗留任务，不进行退款，请联系管理员）"
@@ -113,15 +146,16 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.PrivateDataReadError != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("skip unreadable overdue task task=%s id=%d: %v", task.TaskID, task.ID, task.PrivateDataReadError))
+			continue
+		}
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 		if !isLegacy {
 			if task.PrivateData.ReconciliationRequired {
 				continue
 			}
-			previous := task.Status
-			task.PrivateData.ReconciliationRequired = true
-			task.PrivateData.ReconciliationReason = reason + "; final upstream usage is unconfirmed; reserved quota retained"
-			if _, err := task.UpdateWithStatus(previous); err != nil {
+			if err := task.MarkReconciliation(ctx, task.Status, reason+"; final upstream usage is unconfirmed; reserved quota retained"); err != nil {
 				logger.LogError(ctx, "record overdue task failed: "+err.Error())
 			}
 			continue
@@ -175,9 +209,6 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	}
 
 	common.SysLog("任务进度轮询开始")
-	if err := model.RetryVideoTaskLogs(ctx); err != nil {
-		logger.LogWarn(ctx, "video billing log retry pending: "+err.Error())
-	}
 	sweepTimedOutTasks(ctx)
 	allTasks, err := model.GetUnfinishedSyncTasksAfter(constant.TaskQueryLimit, taskPollingCursor.Load())
 	if err != nil {
@@ -218,7 +249,8 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 			if task.PrivateData.NextPollAt > time.Now().Unix() {
 				continue
 			}
-			if task.PrivateData.InitialAccountingPending {
+			// 活跃提交尚无响应证据时不能提前入账，否则提交交接会重复统计。
+			if task.PrivateData.InitialAccountingPending && (!task.PrivateData.SubmissionPending || len(task.PrivateData.SubmissionResponse) > 0) {
 				if err := RecoverTaskInitialAccounting(ctx, task); err != nil {
 					logger.LogWarn(ctx, "task initial accounting recovery failed: "+err.Error())
 					continue
@@ -304,6 +336,20 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	}
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			for _, id := range taskIds {
+				if task := taskM[id]; task != nil {
+					channel, snapshotErr := model.TaskChannelFromSnapshot(task)
+					if snapshotErr != nil {
+						continue
+					}
+					if err := updateVideoSingleTask(ctx, adaptor, channel, id, taskM); err != nil {
+						logger.LogWarn(ctx, "deleted channel task refresh pending: "+err.Error())
+					}
+				}
+			}
+			return nil
+		}
 		return fmt.Errorf("polling channel unavailable: %w", err)
 	}
 	proxy := ch.GetSetting().Proxy
@@ -326,18 +372,35 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	if len(tasks) == 0 {
 		return nil
 	}
-	groups := make(map[string][]string)
+	type batchAccount struct {
+		key, baseURL, proxy, headers string
+		channelType                  int
+	}
+	groups := make(map[batchAccount][]string)
 	for _, task := range tasks {
 		id := fmt.Sprintf("task:%d", task.ID)
 		if taskM[id] != task {
 			id = task.GetUpstreamTaskID()
 		}
 		if !task.PrivateData.SubmissionPending {
+			headers, err := task.GetTransportHeaderOverride(ch)
+			if err != nil {
+				return err
+			}
+			encodedHeaders, err := common.Marshal(headers)
+			if err != nil {
+				return err
+			}
 			key := task.PrivateData.Key
 			if key == "" {
 				key = ch.Key
 			}
-			groups[key] = append(groups[key], id)
+			account := batchAccount{key: key, baseURL: baseURL, proxy: proxy, channelType: ch.Type, headers: string(encodedHeaders)}
+			if task.PrivateData.TransportSaved {
+				account.baseURL, account.proxy = task.PrivateData.BaseURL, task.PrivateData.Proxy
+				account.channelType = task.PrivateData.ChannelType
+			}
+			groups[account] = append(groups[account], id)
 		}
 	}
 	if len(groups) > 1 {
@@ -348,15 +411,21 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		return nil
 	}
-	key := tasks[0].PrivateData.Key
-	if key == "" {
-		key = ch.Key
+	var key string
+	var headers map[string]any
+	channelType := ch.Type
+	for account := range groups {
+		key, baseURL, proxy = account.key, account.baseURL, account.proxy
+		channelType = account.channelType
+		if err := common.UnmarshalJsonStr(account.headers, &headers); err != nil {
+			return err
+		}
 	}
 	// The channel type tells plugin adaptors whether the upstream is another
 	// New API gateway, the same signal submission derives from the request.
 	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: baseURL}
-	info.ApiKey = ch.Key
+	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: channelType, ChannelId: ch.Id, ChannelBaseUrl: baseURL, HeadersOverride: headers}
+	info.ApiKey = key
 	adaptor.Init(info)
 	resp, err := adaptor.FetchBatchTasks(baseURL, key, tasks, proxy)
 	if err != nil {
@@ -364,11 +433,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, releaseBody, err := ReadTaskResultBody(ctx, resp.Body)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Suno Task parse body error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, resp.StatusCode, err.Error())
 	}
+	defer releaseBody()
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassNotFound, resp.StatusCode, "upstream task lookup is unconfirmed")
@@ -377,6 +447,8 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassAuth, resp.StatusCode, "")
 	case pollClassTransient:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransient, resp.StatusCode, "")
+	case pollClassOtherClient:
+		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassUnrecognized, resp.StatusCode, "upstream rejected task query")
 	}
 	responseItems, err := adaptor.ParseBatchResult(tasks, resp, responseBody)
 	if err != nil {
@@ -408,11 +480,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			}
 			continue
 		}
-		if isNonTerminalPollStatus(parsedStatus) {
-			task.PrivateData.PollFailures = 0
-			task.PrivateData.NextPollAt = 0
-			task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
-		}
+		resetTaskPollingState(task, parsedStatus)
 		if len(responseItem.TaskInfo.PluginState) > 0 {
 			task.PrivateData.PluginState = responseItem.TaskInfo.PluginState
 		}
@@ -514,41 +582,78 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		return nil
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
-	if err != nil {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
-	adaptor := GetTaskAdaptorFunc(platform)
-	if adaptor == nil {
-		return fmt.Errorf("video adaptor not found")
+	if cacheGetChannel == nil {
+		hasSnapshot := false
+		for _, id := range taskIds {
+			if _, snapshotErr := model.TaskChannelFromSnapshot(taskM[id]); snapshotErr == nil {
+				hasSnapshot = true
+				break
+			}
+		}
+		if !hasSnapshot {
+			return fmt.Errorf("polling channel and task transport snapshot are unavailable: %w", err)
+		}
 	}
-	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{
-		ChannelType:    cacheGetChannel.Type,
-		ChannelId:      cacheGetChannel.Id,
-		ChannelBaseUrl: cacheGetChannel.GetBaseURL(),
+	disablePollingSleep := cacheGetChannel == nil || cacheGetChannel.GetOtherSettings().DisableTaskPollingSleep
+	workers := min(4, len(taskIds))
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for range workers {
+		adaptor := GetTaskAdaptorFunc(platform)
+		if adaptor == nil {
+			close(jobs)
+			wg.Wait()
+			return fmt.Errorf("video adaptor not found")
+		}
+		wg.Add(1)
+		gopool.Go(func() {
+			defer wg.Done()
+			for taskID := range jobs {
+				select {
+				case taskPollSlots <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				channel := cacheGetChannel
+				var err error
+				if channel == nil {
+					channel, err = model.TaskChannelFromSnapshot(taskM[taskID])
+				}
+				if err == nil {
+					err = updateVideoSingleTask(ctx, adaptor, channel, taskID, taskM)
+				}
+				<-taskPollSlots
+				if err != nil {
+					logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskID, err.Error()))
+				}
+			}
+		})
 	}
-	info.ApiKey = cacheGetChannel.Key
-	adaptor.Init(info)
-	disablePollingSleep := cacheGetChannel.GetOtherSettings().DisableTaskPollingSleep
-	for i, taskId := range taskIds {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	for index, taskID := range taskIds {
+		// 所有 worker 共用渠道间隔，避免每个 worker 的首个请求同时冲向同一账号。
+		if index > 0 && !disablePollingSleep {
+			select {
+			case <-ctx.Done():
+				close(jobs)
+				wg.Wait()
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
 		}
-		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
-			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
-		}
-		if disablePollingSleep || i == len(taskIds)-1 {
-			continue
-		}
-
-		// sleep 1 second between tasks for this channel only.
 		select {
+		case jobs <- taskID:
 		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
 			return ctx.Err()
-		case <-time.After(1 * time.Second):
 		}
 	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	return ctx.Err()
 }
 
 // RefreshTaskForManagement 在取消或删除前同步未完成任务，复用轮询的 CAS 和差额结算。
@@ -561,8 +666,21 @@ func RefreshTaskForManagement(ctx context.Context, adaptor TaskPollingAdaptor, c
 		return nil, err
 	}
 	// 终态同样需要渠道身份，后续删除仍会构建上游请求。
+	baseURL, key, channelType := ch.GetBaseURL(), ch.Key, ch.Type
+	setting := ch.GetSetting()
+	if task.PrivateData.Key != "" {
+		key = task.PrivateData.Key
+	}
+	if task.PrivateData.TransportSaved {
+		baseURL, setting.Proxy = task.PrivateData.BaseURL, task.PrivateData.Proxy
+		channelType = task.PrivateData.ChannelType
+	}
+	headers, err := task.GetTransportHeaderOverride(ch)
+	if err != nil {
+		return nil, err
+	}
 	adaptor.Init(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: ch.GetBaseURL(), ApiKey: ch.Key},
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, ChannelId: ch.Id, ChannelBaseUrl: baseURL, ApiKey: key, ChannelSetting: setting, HeadersOverride: headers},
 	})
 	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		return task, nil
@@ -609,6 +727,18 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if privateData.Key != "" {
 		key = privateData.Key
 	}
+	channelType := ch.Type
+	if privateData.TransportSaved {
+		baseURL, proxy = privateData.BaseURL, privateData.Proxy
+		channelType = privateData.ChannelType
+	}
+	setting := ch.GetSetting()
+	setting.Proxy = proxy
+	headers, err := task.GetTransportHeaderOverride(ch)
+	if err != nil {
+		return err
+	}
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, ChannelId: ch.Id, ChannelBaseUrl: baseURL, ApiKey: key, ChannelSetting: setting, HeadersOverride: headers}})
 	snap := task.Snapshot()
 	if privateData.SubmissionPending {
 		recovery, ok := adaptor.(interface {
@@ -619,10 +749,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 		result, err := recovery.RecoverSubmission(ctx, task, key, baseURL, proxy)
 		if err != nil {
-			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, 0, "submission response requires reconciliation")
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, 0, "submission response could not be recovered")
 		}
 		task.Status, task.Progress, task.FailReason = model.TaskStatus(result.Status), result.Progress, result.Reason
-		task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason, task.PrivateData.NextPollAt = false, "", 0
+		resetTaskPollingState(task, task.Status)
 		if result.Status == model.TaskStatusSuccess || result.Status == model.TaskStatusFailure {
 			task.FinishTime = time.Now().Unix()
 			task.PrivateData.ResultURL = result.Url
@@ -632,7 +762,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return err
 	}
 	var resp *http.Response
-	var err error
 	// 插件同步查询支持调用方取消；传统适配器继续使用既有接口。
 	if scoped, ok := adaptor.(interface {
 		FetchTaskWithContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
@@ -648,10 +777,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, releaseBody, err := ReadTaskResultBody(ctx, resp.Body)
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
 	}
+	defer releaseBody()
 
 	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
 
@@ -663,6 +793,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassAuth, resp.StatusCode, "")
 	case pollClassTransient:
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransient, resp.StatusCode, "")
+	case pollClassOtherClient:
+		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, "upstream rejected task query")
 	}
 
 	taskResult := &relaycommon.TaskInfo{}
@@ -676,7 +808,14 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Url = t.GetResultURL()
 		taskResult.Progress = t.Progress
 		taskResult.Reason = t.FailReason
-		task.Data = t.Data
+		taskResult.TaskData = t.Data
+		if extractor, ok := adaptor.(interface {
+			ExtractCompletionUsage(*model.Task, *relaycommon.TaskInfo, []byte) error
+		}); ok && t.Status == model.TaskStatusSuccess {
+			if err := extractor.ExtractCompletionUsage(task, taskResult, t.Data); err != nil {
+				return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+			}
+		}
 	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
 	}
@@ -691,15 +830,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
 	}
 
-	task.Data = redactVideoResponseBody(responseBody)
+	dataBody := responseBody
+	if len(taskResult.TaskData) > 0 {
+		dataBody = taskResult.TaskData
+	}
+	task.Data = redactVideoResponseBody(dataBody)
 	if len(taskResult.PluginState) > 0 {
 		task.PrivateData.PluginState = taskResult.PluginState
 	}
-	if isNonTerminalPollStatus(parsedStatus) {
-		task.PrivateData.PollFailures = 0
-		task.PrivateData.NextPollAt = 0
-		task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
-	}
+	resetTaskPollingState(task, parsedStatus)
 
 	now := time.Now().Unix()
 	shouldFinalizeBilling := false
@@ -810,6 +949,17 @@ func redactVideoResponseBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+func resetTaskPollingState(task *model.Task, status model.TaskStatus) {
+	task.PrivateData.PollFailures = 0
+	task.PrivateData.NextPollAt = 0
+	// 超时后的排队或运行回包不能证明最终用量，须保留未确认标记直到确认终态。
+	if isNonTerminalPollStatus(status) && constant.TaskTimeoutMinutes > 0 &&
+		task.SubmitTime < time.Now().Unix()-int64(constant.TaskTimeoutMinutes)*60 {
+		return
+	}
+	task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
 }
 
 func truncateBase64(s string) string {

@@ -165,6 +165,24 @@ export function parseTaskResult() { return {}; }
 	assert.Contains(t, string(encoded), `"base_url_source":"plugin_default"`)
 }
 
+func TestAddChannelImmediatelyRefreshesRoutingCache(t *testing.T) {
+	previousMemory := common.MemoryCacheEnabled
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemory
+		model.InitChannelCache()
+	})
+	setupTaskPluginBindChannelTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.TaskPlugin{}))
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+	response := postAddChannel(t, 1, common.RoleRootUser, `{"mode":"single","channel":{"type":1,"status":1,"name":"routing-cache-local","key":"local-fixture-no-paid-key","models":"routing-cache-model","group":"default","base_url":"http://127.0.0.1:9"}}`)
+	require.Contains(t, response.Body.String(), `"success":true`)
+	channel, err := model.GetRandomSatisfiedChannel("default", "routing-cache-model", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, channel)
+	assert.Equal(t, "routing-cache-local", channel.Name)
+}
+
 func putUpdateChannel(t *testing.T, userID, role int, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)

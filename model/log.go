@@ -116,6 +116,30 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
 		logs[i].ChannelName = ""
+		if logs[i].Type == LogTypeError {
+			var metadata struct {
+				UpstreamModelName string `json:"upstream_model_name"`
+				AdminInfo         struct {
+					UpstreamModelName string `json:"upstream_model_name"`
+					TaskPlugin        struct {
+						Key string `json:"key"`
+					} `json:"task_plugin"`
+				} `json:"admin_info"`
+			}
+			if common.UnmarshalJsonStr(logs[i].Other, &metadata) == nil {
+				if metadata.AdminInfo.TaskPlugin.Key == "anyllm" || metadata.AdminInfo.TaskPlugin.Key == "originocean" {
+					logs[i].Content = "Video request failed"
+				} else {
+					upstreamModel := metadata.AdminInfo.UpstreamModelName
+					if upstreamModel == "" {
+						upstreamModel = metadata.UpstreamModelName
+					}
+					if logs[i].ModelName != "" && upstreamModel != "" && upstreamModel != logs[i].ModelName {
+						logs[i].Content = strings.NewReplacer(logs[i].ModelName, logs[i].ModelName, upstreamModel, logs[i].ModelName).Replace(logs[i].Content)
+					}
+				}
+			}
+		}
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
 	}
 	assignDisplayLogIds(logs, startIdx)
@@ -341,6 +365,21 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		return
 	}
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
+	log := BuildConsumeLog(c, userId, params)
+	err := createLog(log)
+	if err != nil {
+		logger.LogError(c, "failed to record log: "+err.Error())
+	}
+	if common.DataExportEnabled {
+		LogQuotaData(QuotaDataLogParams{
+			UserID: userId, Username: log.Username, ModelName: params.ModelName, Quota: params.Quota,
+			CreatedAt: log.CreatedAt, TokenUsed: params.PromptTokens + params.CompletionTokens,
+			UseGroup: params.Group, TokenID: params.TokenId, ChannelID: params.ChannelId, NodeName: common.NodeName,
+		})
+	}
+}
+
+func BuildConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) *Log {
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)
@@ -353,7 +392,7 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 			needRecordIp = true
 		}
 	}
-	log := &Log{
+	return &Log{
 		UserId:           userId,
 		Username:         username,
 		CreatedAt:        createdAt,
@@ -378,24 +417,6 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		RequestId:         requestId,
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
-	}
-	err := createLog(log)
-	if err != nil {
-		logger.LogError(c, "failed to record log: "+err.Error())
-	}
-	if common.DataExportEnabled {
-		LogQuotaData(QuotaDataLogParams{
-			UserID:    userId,
-			Username:  username,
-			ModelName: params.ModelName,
-			Quota:     params.Quota,
-			CreatedAt: createdAt,
-			TokenUsed: params.PromptTokens + params.CompletionTokens,
-			UseGroup:  params.Group,
-			TokenID:   params.TokenId,
-			ChannelID: params.ChannelId,
-			NodeName:  common.NodeName,
-		})
 	}
 }
 

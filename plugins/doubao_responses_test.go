@@ -194,7 +194,7 @@ func TestDoubaoResolutionRequestContract(t *testing.T) {
 					if hook == "extractUsage" && tc.resolution == "" {
 						facts := value.(map[string]any)
 						assert.Equal(t, "720p", facts["resolution"])
-						assert.EqualValues(t, 108000, facts["tokens"])
+						assert.EqualValues(t, 134420, facts["tokens"])
 					}
 				}
 			})
@@ -205,7 +205,7 @@ func TestDoubaoResolutionRequestContract(t *testing.T) {
 		size, resolution string
 		tokens           int
 	}{
-		{"1920x1080", "1080p", 243000}, {"3840x2160", "4k", 972000},
+		{"1920x1080", "1080p", 291720}, {"3840x2160", "4k", 1158390},
 	} {
 		ctx := map[string]any{"upstreamModel": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"seconds": 5, "size": tc.size, "prompt": "test"}}
 		built, callErr := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
@@ -245,8 +245,9 @@ func TestDoubaoResponsesProtocol(t *testing.T) {
 				"resolution": "1080p",
 			},
 		},
-		wantUsageKeys:  []string{"resolution", "tokens", "video_input"},
-		wantVendorName: "doubao",
+		wantUsageKeys:       []string{"resolution", "tokens", "video_input"},
+		wantSubmitUsageKeys: []string{"resolution", "seconds", "tokens", "video_input"},
+		wantVendorName:      "doubao",
 	})
 }
 
@@ -341,6 +342,10 @@ func TestDoubaoModelCapabilityValidation(t *testing.T) {
 		{"2.0 rejects frames", "doubao-seedance-2-0-260128", map[string]any{"frames": 57}, false, "does not support frames"},
 		{"2.0 rejects flex", "doubao-seedance-2-0-260128", map[string]any{"service_tier": "flex"}, false, "does not support service_tier"},
 		{"2.0 rejects draft", "doubao-seedance-2-0-260128", map[string]any{"draft": true, "resolution": "480p"}, false, "does not support draft tasks"},
+		{"2.5 accepts draft", "doubao-seedance-2-5-260628", map[string]any{"draft": true, "resolution": "480p"}, true, ""},
+		{"2.5 draft rejects 720p", "doubao-seedance-2-5-260628", map[string]any{"draft": true, "resolution": "720p"}, false, "require 480p"},
+		{"2.5 draft rejects flex", "doubao-seedance-2-5-260628", map[string]any{"draft": true, "resolution": "480p", "service_tier": "flex"}, false, "do not support flex"},
+		{"2.5 draft rejects last frame", "doubao-seedance-2-5-260628", map[string]any{"draft": true, "resolution": "480p", "return_last_frame": true}, false, "do not support return_last_frame"},
 		{"invalid ratio", "doubao-seedance-2-0-260128", map[string]any{"ratio": "2:1"}, false, "ratio must be"},
 		{"priority upper bound", "doubao-seedance-2-0-260128", map[string]any{"priority": 10}, false, "priority must be"},
 		{"zero resolution is not default", "doubao-seedance-2-0-260128", map[string]any{"resolution": 0}, false, "must be a string"},
@@ -393,6 +398,8 @@ func TestDoubaoContentCapabilityValidation(t *testing.T) {
 	}{
 		{"reference video is valid on 2.0", "doubao-seedance-2-0-260128", "", []any{textItem, videoItem}, true},
 		{"audio requires visual input", "doubao-seedance-2-0-260128", "audio input requires", []any{textItem, audioItem}, false},
+		{"2.5 accepts text with audio only", "doubao-seedance-2-5-260628", "", []any{textItem, audioItem}, true},
+		{"2.5 accepts audio without text", "doubao-seedance-2-5-260628", "", []any{audioItem}, true},
 		{"frame and reference are exclusive", "doubao-seedance-2-0-260128", "cannot be mixed", []any{textItem, map[string]any{"type": "image_url", "role": "first_frame", "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}, imageItem}, false},
 		{"unknown image role is rejected", "doubao-seedance-2-0-260128", "image role is invalid", []any{textItem, map[string]any{"type": "image_url", "role": "middle_frame", "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}}, false},
 		{"zero image role is rejected", "doubao-seedance-2-0-260128", "role must be a string", []any{textItem, map[string]any{"type": "image_url", "role": 0, "image_url": map[string]any{"url": "https://cdn.example/frame.png"}}}, false},
@@ -406,6 +413,35 @@ func TestDoubaoContentCapabilityValidation(t *testing.T) {
 			}
 		})
 	}
+	model := "doubao-seedance-2-5-260628"
+	intent, err := plugin.Engine.CallMember(t.Context(), "native", "createTask", map[string]any{"body": map[string]any{"kind": "json", "value": map[string]any{
+		"model": model, "duration": 5, "resolution": "720p", "content": []any{audioItem},
+	}}})
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: model},
+		OriginModelName: model,
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "image_to_video"},
+	}
+	adaptor := taskplugin.New(plugin)
+	adaptor.Init(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", nil)
+	c.Set("task_request", intent.(map[string]any)["requestBody"])
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+	reader, err := adaptor.BuildRequestBody(c, info)
+	require.NoError(t, err)
+	encoded, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &body))
+	assert.Equal(t, []any{audioItem}, body["content"])
+	facts, err := adaptor.ExtractUsageFactsValidated(c, info)
+	require.NoError(t, err)
+	assert.EqualValues(t, 134420, facts["tokens"])
+	assert.EqualValues(t, 5, facts["seconds"])
+	assert.Equal(t, "720p", facts["resolution"])
+	assert.Equal(t, "none", facts["video_input"])
 }
 
 func newDoubaoPlugin(t *testing.T) (*jsplugin.Registry, *jsplugin.LoadedPlugin) {
@@ -645,9 +681,9 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 	}{
 		{[]string{pro10, "doubao-seedance-1-0-lite-t2v", "doubao-seedance-1-0-lite-i2v"}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens"}},
 		{[]string{pro15}, []string{"480p", "720p", "1080p"}, []string{"generate_audio", "resolution", "tokens"}},
-		{[]string{v20}, []string{"480p", "720p", "1080p", "4k"}, []string{"resolution", "tokens", "video_input"}},
-		{[]string{fast20, mini20}, []string{"480p", "720p"}, []string{"resolution", "tokens", "video_input"}},
-		{[]string{v25}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{v20, "doubao-seedance-2-0"}, []string{"480p", "720p", "1080p", "4k"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{fast20, "doubao-seedance-2-0-fast", mini20, "doubao-seedance-2-0-mini"}, []string{"480p", "720p"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{v25, "doubao-seedance-2-5"}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens", "video_input"}},
 	}
 	profiled := make([]string, 0, len(plugin.Meta.Models))
 	for _, family := range families {
@@ -691,17 +727,17 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		wantErr string
 	}{
 		{"1.5 pro defaults to audio", pro15, map[string]any{"metadata": map[string]any{"resolution": "720p"}},
-			map[string]any{"tokens": float64(108000), "resolution": "720p", "generate_audio": true, "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(134420), "seconds": float64(5), "resolution": "720p", "generate_audio": true, "video_input": "none"}, ""},
 		{"1.5 pro silent output", pro15, map[string]any{"metadata": map[string]any{"resolution": "720p", "generate_audio": false}},
-			map[string]any{"tokens": float64(108000), "resolution": "720p", "generate_audio": false, "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(134420), "seconds": float64(5), "resolution": "720p", "generate_audio": false, "video_input": "none"}, ""},
 		{"2.0 has no audio fact", v20, map[string]any{"metadata": map[string]any{"resolution": "720p", "generate_audio": false}},
-			map[string]any{"tokens": float64(108000), "resolution": "720p", "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(134420), "seconds": float64(5), "resolution": "720p", "video_input": "none"}, ""},
 		{"2.0 offers 4k", v20, map[string]any{"metadata": map[string]any{"resolution": "4k"}},
-			map[string]any{"tokens": float64(972000), "resolution": "4k", "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(1158390), "seconds": float64(5), "resolution": "4k", "video_input": "none"}, ""},
 		{"1.0 pro reports no reference video although its profile omits it", pro10, map[string]any{"metadata": map[string]any{"resolution": "1080p"}},
-			map[string]any{"tokens": float64(243000), "resolution": "1080p", "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(291720), "seconds": float64(5), "resolution": "1080p", "video_input": "none"}, ""},
 		{"mini reserves its highest tier when the resolution is left to Ark", mini20, map[string]any{},
-			map[string]any{"tokens": float64(108000), "resolution": "720p", "video_input": "none"}, ""},
+			map[string]any{"tokens": float64(134420), "seconds": float64(5), "resolution": "720p", "video_input": "none"}, ""},
 		{"mini rejects 1080p", mini20, map[string]any{"metadata": map[string]any{"resolution": "1080p"}}, nil, mini20 + " resolution must be one of 480p, 720p"},
 		{"mini rejects a 1080p size", mini20, map[string]any{"size": "1920x1080"}, nil, mini20 + " resolution must be one of 480p, 720p"},
 		{"fast rejects 4k", fast20, map[string]any{"metadata": map[string]any{"resolution": "4k"}}, nil, fast20 + " resolution must be one of 480p, 720p"},
@@ -978,9 +1014,9 @@ func TestDoubaoNativeContract(t *testing.T) {
 	assert.JSONEq(t, string(requestJSON), string(bodyJSON))
 	assert.Equal(t, "https://upstream.example/doubao/api/v3/contents/generations/tasks", built["url"])
 	usage := call("extractUsage", "", driverContext)
-	assert.EqualValues(t, 648000, usage["tokens"])
+	assert.EqualValues(t, 698420, usage["tokens"])
 	framesUsage := call("extractUsage", "", map[string]any{"requestBody": map[string]any{"duration": 10, "metadata": map[string]any{"frames": 57, "resolution": "720p"}}})
-	assert.EqualValues(t, 51300, framesUsage["tokens"])
+	assert.EqualValues(t, 53580, framesUsage["tokens"])
 
 	submitted := call("parseSubmitResponse", "", driverContext, map[string]any{"body": map[string]any{"id": "upstream-id"}})
 	assert.Equal(t, "default", submitted["taskData"].(map[string]any)["service_tier"])

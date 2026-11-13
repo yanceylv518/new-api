@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -116,27 +117,35 @@ func (m Properties) Value() (driver.Value, error) {
 
 type TaskPrivateData struct {
 	// 提交意图先落库；未确认响应的任务保留预扣，绝不当作生成失败退款。
-	SubmissionPending        bool            `json:"submission_pending,omitempty"`
-	InitialAccountingPending bool            `json:"initial_accounting_pending,omitempty"`
-	SubmissionResponse       json.RawMessage `json:"submission_response,omitempty"`
-	SubmissionContext        json.RawMessage `json:"submission_context,omitempty"`
-	ReconciliationRequired   bool            `json:"reconciliation_required,omitempty"`
-	ReconciliationReason     string          `json:"reconciliation_reason,omitempty"`
-	NextPollAt               int64           `json:"next_poll_at,omitempty"`
+	SubmissionPending        bool                   `json:"submission_pending,omitempty"`
+	InitialAccountingPending bool                   `json:"initial_accounting_pending,omitempty"`
+	SubmissionFundsCommitted bool                   `json:"submission_funds_committed,omitempty"`
+	SubmissionFunding        *TaskSubmissionFunding `json:"submission_funding,omitempty"`
+	SubmissionResponse       json.RawMessage        `json:"submission_response,omitempty"`
+	SubmissionContext        json.RawMessage        `json:"submission_context,omitempty"`
+	ReconciliationRequired   bool                   `json:"reconciliation_required,omitempty"`
+	ReconciliationReason     string                 `json:"reconciliation_reason,omitempty"`
+	NextPollAt               int64                  `json:"next_poll_at,omitempty"`
 	// 当前任务总费用，不是本次补扣或退款流水。
 	DiscountAmounts *hosttypes.DiscountAmounts `json:"discount_amounts,omitempty"`
 	Key             string                     `json:"key,omitempty"`
+	BaseURL         string                     `json:"base_url,omitempty"`
+	Proxy           string                     `json:"proxy,omitempty"`
+	ChannelType     int                        `json:"channel_type,omitempty"`
+	TransportSaved  bool                       `json:"transport_saved,omitempty"`
+	HeaderOverride  json.RawMessage            `json:"header_override,omitempty"`
 	UpstreamTaskID  string                     `json:"upstream_task_id,omitempty"` // 上游真实 task ID
 	ResultURL       string                     `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
-	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
-	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
-	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
-	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
-	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	BillingSource           string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
+	SubscriptionId          int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
+	SubscriptionPeriodStart int64               `json:"subscription_period_start,omitempty"`
+	TokenId                 int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
+	NodeName                string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
+	BillingContext          *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
 	// ResponsesBackground records that the openai_responses create request
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
@@ -152,13 +161,16 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+	// 原生删除仅隐藏原生查询；本地任务及账务历史继续保留。
+	NativeDeleted bool `json:"native_deleted,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
-	RequestID   string              `json:"request_id,omitempty"`
-	RequestPath string              `json:"request_path,omitempty"`
-	UseChannel  []string            `json:"use_channel,omitempty"`
-	TaskPlugin  *TaskPluginSnapshot `json:"task_plugin,omitempty"`
+	RequestID     string              `json:"request_id,omitempty"`
+	RequestPath   string              `json:"request_path,omitempty"`
+	UseChannel    []string            `json:"use_channel,omitempty"`
+	ResourcePaths []string            `json:"resource_paths,omitempty"`
+	TaskPlugin    *TaskPluginSnapshot `json:"task_plugin,omitempty"`
 }
 
 // TaskPluginSnapshot contains credential-free identity only. Plugin source,
@@ -220,6 +232,22 @@ func GenerateTaskID() string {
 	return "task_" + key
 }
 
+// PublicTaskPlatform 将内部协议适配器归入原模型平台，不向用户公开供应商身份。
+func PublicTaskPlatform(platform constant.TaskPlatform) constant.TaskPlatform {
+	if platform == "anyllm" || platform == "originocean" {
+		return "doubao"
+	}
+	return platform
+}
+
+// taskPlatformsForFilter 让公开平台筛选覆盖适配器任务，仍允许管理员指定内部平台。
+func taskPlatformsForFilter(platform constant.TaskPlatform) []constant.TaskPlatform {
+	if platform == "doubao" {
+		return []constant.TaskPlatform{"doubao", "anyllm", "originocean"}
+	}
+	return []constant.TaskPlatform{platform}
+}
+
 func (p *TaskPrivateData) Scan(val any) error {
 	bytesValue := jsonScanBytes(val)
 	if len(bytesValue) == 0 {
@@ -233,7 +261,13 @@ func (p *TaskPrivateData) Scan(val any) error {
 	if err != nil {
 		return err
 	}
-	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext} {
+	for _, field := range []*string{&p.BaseURL, &p.Proxy} {
+		*field, err = common.OpenTaskSecret(*field)
+		if err != nil {
+			return err
+		}
+	}
+	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext, &p.HeaderOverride} {
 		if len(*field) > 0 && (*field)[0] == '"' {
 			var sealed string
 			if err := common.Unmarshal(*field, &sealed); err != nil {
@@ -250,11 +284,11 @@ func (p *TaskPrivateData) Scan(val any) error {
 }
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
-	if p.DiscountAmounts == nil && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
-		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
+	if p.DiscountAmounts == nil && p.Key == "" && p.BaseURL == "" && p.Proxy == "" && !p.TransportSaved && p.UpstreamTaskID == "" && p.ResultURL == "" &&
+		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 && p.SubscriptionPeriodStart == 0 && len(p.HeaderOverride) == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded && !p.SubmissionPending && !p.InitialAccountingPending && len(p.SubmissionResponse) == 0 && len(p.SubmissionContext) == 0 && !p.ReconciliationRequired && p.ReconciliationReason == "" && p.NextPollAt == 0 {
+		!p.ResultDiscarded && !p.NativeDeleted && !p.SubmissionPending && !p.InitialAccountingPending && !p.SubmissionFundsCommitted && p.SubmissionFunding == nil && len(p.SubmissionResponse) == 0 && len(p.SubmissionContext) == 0 && !p.ReconciliationRequired && p.ReconciliationReason == "" && p.NextPollAt == 0 {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -263,7 +297,13 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext} {
+	for _, field := range []*string{&p.BaseURL, &p.Proxy} {
+		*field, err = common.SealTaskSecret(*field)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, field := range []*json.RawMessage{&p.SubmissionResponse, &p.SubmissionContext, &p.HeaderOverride} {
 		if len(*field) > 0 {
 			sealed, err := common.SealTaskSecret(string(*field))
 			if err != nil {
@@ -302,6 +342,16 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
 		// 任务属于提交时的上游账号，密钥轮换或重排不能切换查询账号。
 		privateData.Key = relayInfo.ChannelMeta.ApiKey
+		privateData.ChannelType = relayInfo.ChannelMeta.ChannelType
+		privateData.BaseURL = relayInfo.ChannelMeta.ChannelBaseUrl
+		if privateData.BaseURL == "" {
+			privateData.BaseURL = constant.GetChannelBaseURL(relayInfo.ChannelMeta.ChannelType)
+		}
+		privateData.Proxy = relayInfo.ChannelMeta.ChannelSetting.Proxy
+		if len(relayInfo.ChannelMeta.HeadersOverride) > 0 {
+			privateData.HeaderOverride, _ = common.Marshal(relayInfo.ChannelMeta.HeadersOverride)
+		}
+		privateData.TransportSaved = true
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName
 		}
@@ -334,6 +384,10 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 }
 
 func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQueryParams) []*Task {
+	// 普通用户仅使用公开平台名，不能借内部适配器名称探查任务来源。
+	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" {
+		return nil
+	}
 	var tasks []*Task
 	var err error
 
@@ -350,7 +404,7 @@ func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQ
 		query = query.Where("status = ?", queryParams.Status)
 	}
 	if queryParams.Platform != "" {
-		query = query.Where("platform = ?", queryParams.Platform)
+		query = query.Where("platform IN ?", taskPlatformsForFilter(queryParams.Platform))
 	}
 	if queryParams.StartTimestamp != 0 {
 		// 假设您已将前端传来的时间戳转换为数据库所需的时间格式，并处理了时间戳的验证和解析
@@ -383,7 +437,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 		query = query.Where("channel_id = ?", queryParams.ChannelID)
 	}
 	if queryParams.Platform != "" {
-		query = query.Where("platform = ?", queryParams.Platform)
+		query = query.Where("platform IN ?", taskPlatformsForFilter(queryParams.Platform))
 	}
 	if queryParams.UserID != "" {
 		query = query.Where("user_id = ?", queryParams.UserID)
@@ -418,8 +472,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
-		Where("status IN ?", unfinishedTaskStatuses()).
+	err := DB.Where("status IN ?", unfinishedTaskStatuses()).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
 		Limit(limit).
@@ -430,11 +483,32 @@ func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	return tasks
 }
 
+func GetTimedOutUnfinishedTasksAfter(cutoffUnix int64, limit int, after int64) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	query := func() *gorm.DB {
+		return DB.Where("status IN ?", unfinishedTaskStatuses()).Where("submit_time < ?", cutoffUnix)
+	}
+	tasks, err := findTaskPollingPage(query().Where("id > ?", after).Order("id").Limit(limit))
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) < limit && after > 0 {
+		wrapped, err := findTaskPollingPage(query().Where("id <= ?", after).Order("id").Limit(limit - len(tasks)))
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, wrapped...)
+	}
+	return tasks, nil
+}
+
 func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// 显式枚举仍可推进的状态，复用现有status索引，避免空队列扫描全部历史终态。
-	err = DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses()).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("status IN ?", unfinishedTaskStatuses()).Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -446,13 +520,13 @@ func GetUnfinishedSyncTasksAfter(limit int, after int64) ([]*Task, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	query := DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses())
+	query := DB.Where("status IN ?", unfinishedTaskStatuses())
 	tasks, err := findTaskPollingPage(query.Where("id > ?", after).Order("id").Limit(limit))
 	if err != nil {
 		return nil, err
 	}
 	if len(tasks) < limit && after > 0 {
-		wrapped, err := findTaskPollingPage(DB.Where("progress != ?", "100%").Where("status IN ?", unfinishedTaskStatuses()).Where("id <= ?", after).Order("id").Limit(limit - len(tasks)))
+		wrapped, err := findTaskPollingPage(DB.Where("status IN ?", unfinishedTaskStatuses()).Where("id <= ?", after).Order("id").Limit(limit - len(tasks)))
 		if err != nil {
 			return nil, err
 		}
@@ -494,14 +568,14 @@ func findTaskPollingPage(query *gorm.DB) ([]*Task, error) {
 func HasUnfinishedSyncTasks() bool {
 	var id int64
 	err := DB.Model(&Task{}).
-		Where("progress != ?", "100%").
 		Where("status IN ?", unfinishedTaskStatuses()).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
 }
 
-// 三种轮询查询共享状态集合；UNKNOWN保留重试机会，空状态兼容历史未初始化记录。
+// 状态是完成与否的唯一依据，兼容旧结算失败后进度已达 100% 的记录。
+// UNKNOWN 保留重试机会，空状态兼容历史未初始化记录。
 func unfinishedTaskStatuses() []TaskStatus {
 	return []TaskStatus{TaskStatusNotStart, TaskStatusSubmitted, TaskStatusQueued, TaskStatusInProgress, TaskStatusUnknown, ""}
 }
@@ -654,21 +728,94 @@ func (t *Task) UpdateQuota() error {
 	return DB.Model(t).Update("quota", t.Quota).Error
 }
 
-// UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
-// Returns (true, nil) if this caller won the update, (false, nil) if
-// another process already moved the task out of fromStatus. MySQL commonly
-// reports changed rows rather than matched rows, so a same-value no-op update
-// can also return false even when the status predicate still matched.
-//
-// Uses Model().Select("*").Updates() instead of Save() because GORM's Save
-// falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
-// zero rows, which silently bypasses the CAS guard.
-func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
-	if result.Error != nil {
-		return false, result.Error
+func lockTaskForUpdate(tx *gorm.DB, id int64) (*Task, error) {
+	if tx.Dialector.Name() == string(common.DatabaseTypeSQLite) {
+		if err := tx.Model(&Task{}).Where("id = ?", id).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+			return nil, err
+		}
 	}
-	return result.RowsAffected > 0, nil
+	var stored Task
+	if err := lockForUpdate(tx).First(&stored, id).Error; err != nil {
+		return nil, err
+	}
+	return &stored, nil
+}
+
+func (t *Task) updatePrivateData(ctx context.Context, update func(*Task) bool) error {
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		stored, err := lockTaskForUpdate(tx, t.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !update(stored) {
+			return nil
+		}
+		return tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error
+	})
+}
+
+// MarkReconciliation 仅修改仍处于原状态的任务，保留并发更新的账务和提交信息。
+func (t *Task) MarkReconciliation(ctx context.Context, fromStatus TaskStatus, reason string) error {
+	return t.updatePrivateData(ctx, func(stored *Task) bool {
+		if stored.Status != fromStatus || stored.PrivateData.ReconciliationRequired {
+			return false
+		}
+		stored.PrivateData.ReconciliationRequired = true
+		stored.PrivateData.ReconciliationReason = reason
+		return true
+	})
+}
+
+// SetResponsesBackground 保留并发轮询及记账写入的其他私有数据。
+func (t *Task) SetResponsesBackground(ctx context.Context) error {
+	return t.updatePrivateData(ctx, func(stored *Task) bool {
+		if stored.PrivateData.ResponsesBackground {
+			return false
+		}
+		stored.PrivateData.ResponsesBackground = true
+		return true
+	})
+}
+
+// UpdateWithStatus 锁定任务后按原状态更新，并保留并发写入的记账和后台标记。
+// 状态或提交证据已变化、任务不存在，以及 MySQL 同值更新均可能返回 false。
+// 使用 Updates 避免 Save 在条件不匹配时回退插入，绕过状态保护。
+func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
+	var final Task
+	var won bool
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		stored, err := lockTaskForUpdate(tx, t.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if stored.Status != fromStatus {
+			return nil
+		}
+		// 旧提交快照不能覆盖已恢复的提交结果或新保存的响应证据。
+		if t.PrivateData.SubmissionPending && (!stored.PrivateData.SubmissionPending ||
+			!bytes.Equal(t.PrivateData.SubmissionResponse, stored.PrivateData.SubmissionResponse) ||
+			!bytes.Equal(t.PrivateData.SubmissionContext, stored.PrivateData.SubmissionContext)) {
+			return nil
+		}
+		final = *t
+		final.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
+		final.PrivateData.SubmissionFundsCommitted = stored.PrivateData.SubmissionFundsCommitted
+		final.PrivateData.SubmissionFunding = stored.PrivateData.SubmissionFunding
+		final.PrivateData.ResponsesBackground = stored.PrivateData.ResponsesBackground || final.PrivateData.ResponsesBackground
+		result := tx.Model(&final).Where("status = ?", fromStatus).Select("*").Updates(&final)
+		won = result.RowsAffected > 0
+		return result.Error
+	})
+	if err == nil && won {
+		*t = final
+	}
+	return won && err == nil, err
 }
 
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
@@ -698,7 +845,7 @@ func TaskCountAllTasks(queryParams SyncTaskQueryParams) int64 {
 		query = query.Where("channel_id = ?", queryParams.ChannelID)
 	}
 	if queryParams.Platform != "" {
-		query = query.Where("platform = ?", queryParams.Platform)
+		query = query.Where("platform IN ?", taskPlatformsForFilter(queryParams.Platform))
 	}
 	if queryParams.UserID != "" {
 		query = query.Where("user_id = ?", queryParams.UserID)
@@ -727,6 +874,9 @@ func TaskCountAllTasks(queryParams SyncTaskQueryParams) int64 {
 
 // TaskCountAllUserTask returns total tasks for given user
 func TaskCountAllUserTask(userId int, queryParams SyncTaskQueryParams) int64 {
+	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" {
+		return 0
+	}
 	var total int64
 	query := DB.Model(&Task{}).Where("user_id = ?", userId)
 	if queryParams.TaskID != "" {
@@ -739,7 +889,7 @@ func TaskCountAllUserTask(userId int, queryParams SyncTaskQueryParams) int64 {
 		query = query.Where("status = ?", queryParams.Status)
 	}
 	if queryParams.Platform != "" {
-		query = query.Where("platform = ?", queryParams.Platform)
+		query = query.Where("platform IN ?", taskPlatformsForFilter(queryParams.Platform))
 	}
 	if queryParams.StartTimestamp != 0 {
 		query = query.Where("submit_time >= ?", queryParams.StartTimestamp)

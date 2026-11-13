@@ -1,6 +1,7 @@
 package model
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,80 @@ func TestCompleteSubscriptionOrder_RejectsMismatchedPaymentProvider(t *testing.T
 
 	topUp := GetTopUpByTradeNo("sub-guard-order")
 	assert.Nil(t, topUp)
+}
+
+func TestCompleteSubscriptionOrderConcurrentCallbacksPreservePaymentDetails(t *testing.T) {
+	truncateTables(t)
+	user := insertUserForPaymentGuardTest(t, 2120, 500)
+	plan := insertSubscriptionPlanForPaymentGuardTest(t, 2120)
+	const tradeNo = "subscription-concurrent-local"
+	insertSubscriptionOrderForPaymentGuardTest(t, tradeNo, user.Id, plan.Id, PaymentProviderEpay)
+	var workers sync.WaitGroup
+	results := make(chan error, 16)
+	for range 16 {
+		workers.Go(func() {
+			results <- CompleteSubscriptionOrder(tradeNo, `{"mock":true}`, PaymentProviderEpay, "alipay")
+		})
+	}
+	workers.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+	order := GetSubscriptionOrderByTradeNo(tradeNo)
+	require.NotNil(t, order)
+	assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+	assert.Equal(t, "alipay", order.PaymentMethod)
+	topUp := GetTopUpByTradeNo(tradeNo)
+	require.NotNil(t, topUp)
+	assert.Equal(t, "alipay", topUp.PaymentMethod)
+	assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, user.Id))
+	assert.Equal(t, 500, getUserQuotaForPaymentGuardTest(t, user.Id))
+	var logCount int64
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("user_id = ? AND type = ?", user.Id, LogTypeTopup).Count(&logCount).Error)
+	assert.EqualValues(t, 1, logCount)
+	require.NoError(t, ExpireSubscriptionOrder(tradeNo, PaymentProviderEpay))
+	assert.Equal(t, common.TopUpStatusSuccess, GetSubscriptionOrderByTradeNo(tradeNo).Status)
+}
+
+func TestExpiredSubscriptionOrderCannotCreateSubscription(t *testing.T) {
+	truncateTables(t)
+	user := insertUserForPaymentGuardTest(t, 2121, 500)
+	plan := insertSubscriptionPlanForPaymentGuardTest(t, 2121)
+	const tradeNo = "subscription-expired-local"
+	insertSubscriptionOrderForPaymentGuardTest(t, tradeNo, user.Id, plan.Id, PaymentProviderEpay)
+	require.NoError(t, ExpireSubscriptionOrder(tradeNo, PaymentProviderEpay))
+	require.ErrorIs(t, CompleteSubscriptionOrder(tradeNo, `{"mock":true}`, PaymentProviderEpay, "alipay"), ErrSubscriptionOrderStatusInvalid)
+	assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, user.Id))
+	assert.Nil(t, GetTopUpByTradeNo(tradeNo))
+	assert.Equal(t, 500, getUserQuotaForPaymentGuardTest(t, user.Id))
+}
+
+func TestCompletedSubscriptionResetsDuePeriodExactlyOnce(t *testing.T) {
+	truncateTables(t)
+	user := insertUserForPaymentGuardTest(t, 2122, 500)
+	plan := insertSubscriptionPlanForPaymentGuardTest(t, 2122)
+	plan.QuotaResetPeriod = SubscriptionResetDaily
+	require.NoError(t, DB.Save(plan).Error)
+	const tradeNo = "subscription-period-local"
+	insertSubscriptionOrderForPaymentGuardTest(t, tradeNo, user.Id, plan.Id, PaymentProviderEpay)
+	require.NoError(t, CompleteSubscriptionOrder(tradeNo, `{"mock":true}`, PaymentProviderEpay, "alipay"))
+	var subscription UserSubscription
+	require.NoError(t, DB.Where("user_id = ?", user.Id).First(&subscription).Error)
+	now := GetDBTimestamp()
+	require.NoError(t, DB.Model(&subscription).Updates(map[string]any{
+		"amount_used": 900, "last_reset_time": now - 172800, "next_reset_time": now - 86400,
+	}).Error)
+	count, err := ResetDueSubscriptions(200)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	require.NoError(t, DB.First(&subscription, subscription.Id).Error)
+	assert.Zero(t, subscription.AmountUsed)
+	assert.Greater(t, subscription.NextResetTime, now)
+	count, err = ResetDueSubscriptions(200)
+	require.NoError(t, err)
+	assert.Zero(t, count)
+	assert.Equal(t, 500, getUserQuotaForPaymentGuardTest(t, user.Id))
 }
 
 func TestExpireSubscriptionOrder_RejectsMismatchedPaymentProvider(t *testing.T) {

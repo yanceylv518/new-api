@@ -12,19 +12,24 @@ import (
 )
 
 const (
-	CapabilityJSONClone      = "json-clone@1"
-	CapabilitySubmitSSEDelta = "submit-sse-delta@1"
-	CapabilityJSONOrder      = "json-order@1"
-	CapabilityOwnedResources = "owned-resources@1"
-	MaxJSONToolBytes         = 1 << 20
-	maxJSONToolDepth         = 32
-	maxJSONToolNodes         = 32768
-	maxJSONChanges           = 256
+	CapabilityJSONClone            = "json-clone@1"
+	CapabilitySubmitSSEDelta       = "submit-sse-delta@1"
+	CapabilityJSONOrder            = "json-order@1"
+	CapabilityOwnedResources       = "owned-resources@1"
+	CapabilityOwnedSubmitResources = "owned-submit-resources@1"
+	CapabilitySharedNative         = "shared-native-routes@1"
+	CapabilityPollTaskData         = "poll-task-data@1"
+	CapabilityBase64Content        = "artifact-base64@1"
+	CapabilityTaskCallback         = "task-callback@1"
+	MaxJSONToolBytes               = 1 << 20
+	maxJSONToolDepth               = 32
+	maxJSONToolNodes               = 32768
+	maxJSONChanges                 = 256
 )
 
 // HasCapability describes host APIs independently of a plugin's mutable globals.
 func HasCapability(name string) bool {
-	return name == CapabilityJSONClone || name == CapabilitySubmitSSEDelta || name == CapabilityJSONOrder || name == CapabilityOwnedResources
+	return name == CapabilityJSONClone || name == CapabilitySubmitSSEDelta || name == CapabilityJSONOrder || name == CapabilityOwnedResources || name == CapabilityOwnedSubmitResources || name == CapabilitySharedNative || name == CapabilityPollTaskData || name == CapabilityBase64Content || name == CapabilityTaskCallback
 }
 
 // JSONState owns a request-local JSON result. Appended strings stay in Go and
