@@ -1347,9 +1347,18 @@ func (a *TaskAdaptor) RecoverSubmission(ctx context.Context, task *model.Task, k
 	task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext = nil, nil
 	result := &relaycommon.TaskInfo{TaskID: parsed.TaskID, Status: model.TaskStatusQueued, Progress: "10%"}
 	if parsed.Immediate != nil {
+		result.Code, result.TaskID, result.RemoteUrl = parsed.Immediate.Code, parsed.Immediate.TaskID, parsed.Immediate.RemoteURL
 		result.Status, result.Progress, result.Reason, result.Url = parsed.Immediate.Status, parsed.Immediate.Progress, parsed.Immediate.Reason, parsed.Immediate.URL
 		result.CompletionTokens, result.TotalTokens = positiveInt(parsed.Immediate.CompletionTokens), positiveInt(parsed.Immediate.TotalTokens)
 		if result.Status == model.TaskStatusSuccess && a.hasHook(ctx, "extractUsageOnComplete") {
+			requestBody, hasRequestBody := driver["requestBody"]
+			driver, err = a.queryContext(task, key, baseURL, proxy)
+			if err != nil {
+				return nil, err
+			}
+			if hasRequestBody {
+				driver["requestBody"] = requestBody
+			}
 			facts, err := a.plugin.Engine.Call(ctx, "extractUsageOnComplete", driver, jsonValue(result), parsed.TaskData)
 			if err != nil {
 				return nil, err
@@ -1357,6 +1366,13 @@ func (a *TaskAdaptor) RecoverSubmission(ctx context.Context, task *model.Task, k
 			if err := a.applyCompletionUsageFacts(result, facts, task.Properties.UpstreamModelName, task.Properties.OriginModelName); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if task.PrivateData.DiscardImmediateResult {
+		task.PrivateData.DiscardImmediateResult = false
+		if result.Status == model.TaskStatusSuccess || result.Status == model.TaskStatusFailure {
+			task.PrivateData.ResultDiscarded = true
+			task.Data = nil
 		}
 	}
 	*original = recovered

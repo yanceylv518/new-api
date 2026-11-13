@@ -40,20 +40,43 @@ type BillingSession struct {
 	refunded            bool // 退款已持久化交接
 	refundRequestID     string
 	reservationRefundID int64
+	ordinaryReservation bool
 	submissionTaskID    int64
 	mu                  sync.Mutex
 }
 
 // Settle 根据实际消耗额度进行结算。
-// 资金来源和令牌额度分两步提交：若资金来源已提交但令牌调整失败，
-// 会标记 fundingSettled 防止 Refund 对已提交的资金来源执行退款。
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
 		return nil
 	}
+	if s.refunded {
+		return model.ErrBillingRefundStateConflict
+	}
 	delta := actualQuota - s.preConsumedQuota
+	if s.ordinaryReservation {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		// 已知请求成功；即使终态写入失败，也不能把结果不明的预扣当作失败退款。
+		s.fundingSettled = true
+		if err := refundWithRetry(func() error {
+			return model.MarkBillingSettlementReady(ctx, s.reservationRefundID, s.relayInfo.UserId, s.preConsumedQuota, actualQuota)
+		}); err != nil {
+			return err
+		}
+		if err := refundWithRetry(func() error {
+			return model.SettleBillingReservation(ctx, s.reservationRefundID, s.relayInfo.UserId, s.preConsumedQuota, actualQuota)
+		}); err != nil {
+			return err
+		}
+		if s.funding.Source() == BillingSourceSubscription {
+			s.relayInfo.SubscriptionPostDelta += int64(delta)
+		}
+		s.settled = true
+		return nil
+	}
 	if delta == 0 {
 		s.settled = true
 		return nil
@@ -107,11 +130,24 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	if funding, ok := s.funding.(*SubscriptionFunding); ok {
 		refund.SubscriptionID, refund.PeriodStart = funding.subscriptionId, funding.periodStart
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
-	defer cancel()
-	if err := refundWithRetry(func() error { return model.QueueBillingRefund(ctx, refund) }); err != nil {
-		logger.LogError(c, "persist billing refund failed: "+err.Error())
-		return
+	if s.reservationRefundID > 0 {
+		// 已持久化的预扣只能按原 ID 恢复，不能在旧记录清理后重新创建退款。
+		refund.ID = s.reservationRefundID
+		if s.ordinaryReservation {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+			defer cancel()
+			if err := refundWithRetry(func() error { return model.MarkBillingRefundReady(ctx, refund.ID, s.relayInfo.UserId) }); err != nil {
+				logger.LogError(c, "persist billing refund decision failed: "+err.Error())
+				return
+			}
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+		defer cancel()
+		if err := refundWithRetry(func() error { return model.QueueBillingRefund(ctx, refund) }); err != nil {
+			logger.LogError(c, "persist billing refund failed: "+err.Error())
+			return
+		}
 	}
 	s.refunded = true
 	logger.LogInfo(c, fmt.Sprintf("用户 %d 请求失败, 退款已交接（refund_id=%d）", s.relayInfo.UserId, refund.ID))
@@ -135,6 +171,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 	if s.settled || s.refunded || s.fundingSettled {
 		// fundingSettled 时资金来源已提交结算，不能再退预扣费
 		return false
+	}
+	if s.ordinaryReservation && s.reservationRefundID > 0 {
+		return true
 	}
 	if s.tokenConsumed > 0 {
 		return true
@@ -164,7 +203,7 @@ func (s *BillingSession) CompleteTaskSubmission(actualQuota int) {
 	s.fundingSettled, s.settled = true, true
 }
 
-// CompleteImmediateTask 保持已有调用兼容。
+// CompleteImmediateTask 兼容原有即时任务结算调用。
 func (s *BillingSession) CompleteImmediateTask(actualQuota int) {
 	s.CompleteTaskSubmission(actualQuota)
 }
@@ -173,7 +212,7 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	return s.reserve(targetQuota, false)
 }
 
-// ReserveBeforeTaskSubmit 在重试发送前原子补足预留，不能先创建付费任务再发现余额不足。
+// ReserveBeforeTaskSubmit 在发送前原子补足预留。
 func (s *BillingSession) ReserveBeforeTaskSubmit(targetQuota int) error {
 	return s.reserve(targetQuota, true)
 }
@@ -250,14 +289,14 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveQuota(ctx context.Context, amount int, checkWallet, initial bool) error {
 	reservation := model.BillingQuotaReservation{UserID: s.relayInfo.UserId, TokenID: s.relayInfo.TokenId, TokenKey: s.relayInfo.TokenKey, Amount: amount, UpdateToken: !s.relayInfo.IsPlayground, TokenUnlimited: s.relayInfo.TokenUnlimited, CheckWallet: checkWallet}
 	reservation.TaskID = s.submissionTaskID
-	if initial && amount > 0 && s.relayInfo.TaskRelayInfo != nil && s.relayInfo.PublicTaskID != "" {
+	if s.reservationRefundID == 0 && s.submissionTaskID == 0 {
 		if s.refundRequestID == "" {
 			s.refundRequestID = s.relayInfo.RequestId
 			if s.refundRequestID == "" {
 				s.refundRequestID = model.GenerateTaskID()
 			}
 		}
-		reservation.Refund = &model.BillingRefund{RequestID: s.refundRequestID, NextAttemptAt: time.Now().Add(5 * time.Minute).Unix()}
+		reservation.Refund = &model.BillingRefund{RequestID: s.refundRequestID, NextAttemptAt: model.BillingRefundInFlight}
 	} else if s.reservationRefundID > 0 {
 		reservation.Refund = &model.BillingRefund{ID: s.reservationRefundID}
 	}
@@ -269,6 +308,7 @@ func (s *BillingSession) reserveQuota(ctx context.Context, amount int, checkWall
 		funding.consumed += amount
 		if reservation.Refund != nil {
 			s.reservationRefundID = reservation.Refund.ID
+			s.ordinaryReservation = reservation.Refund.NextAttemptAt == model.BillingRefundInFlight
 		}
 		return nil
 	case *SubscriptionFunding:
@@ -290,6 +330,7 @@ func (s *BillingSession) reserveQuota(ctx context.Context, amount int, checkWall
 		}
 		if reservation.Refund != nil {
 			s.reservationRefundID = reservation.Refund.ID
+			s.ordinaryReservation = reservation.Refund.NextAttemptAt == model.BillingRefundInFlight
 		}
 		return nil
 	default:
@@ -301,10 +342,14 @@ func (s *BillingSession) StageTaskSubmission(ctx context.Context, task *model.Ta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	task.PrivateData.SubmissionFunding = &model.TaskSubmissionFunding{ReservedQuota: s.preConsumedQuota, UpdateToken: !s.relayInfo.IsPlayground}
+	if funding, ok := s.funding.(*SubscriptionFunding); ok {
+		task.PrivateData.SubscriptionPeriodStart = funding.periodStart
+	}
 	if err := model.StageBillingTask(ctx, task, s.reservationRefundID); err != nil {
 		return err
 	}
 	s.reservationRefundID = 0
+	s.ordinaryReservation = false
 	s.submissionTaskID = task.ID
 	return nil
 }
@@ -348,7 +393,10 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	case BillingSourceWallet:
 		return float64(s.relayInfo.UserQuota) > trustQuota
 	case BillingSourceSubscription:
-		// 订阅必须创建预扣记录并锁定所属订阅，不能走零预扣旁路。
+		// 订阅不能启用信任旁路。原因：
+		// 1. PreConsumeUserSubscription 要求 amount>0 来创建预扣记录并锁定订阅
+		// 2. SubscriptionFunding.PreConsume 忽略参数，始终用 s.amount 预扣
+		// 3. 若信任旁路将 effectiveQuota 设为 0，会导致 preConsumedQuota 与实际订阅预扣不一致
 		return false
 	default:
 		return false

@@ -1731,6 +1731,70 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	assert.NotEmpty(t, task.PrivateData.SubmissionResponse)
 }
 
+func TestTaskAdaptorRecoversImmediateCompletionUsageContext(t *testing.T) {
+	const source = `
+export const meta={apiVersion:1,key:"recover-immediate",name:"Recovery",version:"1.0.0",author:{name:"Test"},models:["document"],fetchMode:"per_task",usageSchema:{units:{type:"number",unit:"count"}}};
+export function buildSubmitRequest(){throw new Error("must not resubmit")}
+export function parseSubmitResponse(ctx,response){return {taskId:"vendor-document",taskData:response.body,state:{revision:1},immediate:{code:7,taskId:"immediate-id",status:"SUCCESS",remoteUrl:"https://example.test/result"}}}
+export function buildQueryRequest(){return {url:"https://unused.example/query"}}
+export function parseTaskResult(){return {status:"SUCCESS"}}
+export function extractUsageOnComplete(ctx,result,body){
+  if(ctx.taskId!=="vendor-document" || ctx.publicTaskId!=="public-document" || ctx.model!=="alias" || ctx.upstreamModel!=="document" || ctx.state.revision!==1 || ctx.data.document!==body.document || result.code!==7 || result.task_id!=="immediate-id" || result.remote_url!=="https://example.test/result") throw new Error("incomplete recovery context");
+  return {units:body.units};
+}
+
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://unused.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}})
+	for _, evidence := range []string{
+		`{"body":{"document":"output","units":3}}`,
+		`{"parsed":{"taskId":"vendor-document","taskData":{"document":"output","units":3},"state":{"revision":1},"immediate":{"code":7,"taskId":"immediate-id","status":"SUCCESS","remoteUrl":"https://example.test/result"}}}`,
+	} {
+		task := &model.Task{TaskID: "public-document", Status: model.TaskStatusUnknown, Properties: model.Properties{OriginModelName: "alias", UpstreamModelName: "document"}, PrivateData: model.TaskPrivateData{SubmissionPending: true, SubmissionResponse: []byte(evidence)}}
+		result, err := adaptor.RecoverSubmission(t.Context(), task, "fixture-key", "https://unused.example", "")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"units": float64(3)}, result.UsageFacts)
+		assert.Equal(t, 7, result.Code)
+		assert.Equal(t, "immediate-id", result.TaskID)
+		assert.Equal(t, "https://example.test/result", result.RemoteUrl)
+		assert.Equal(t, "vendor-document", task.PrivateData.UpstreamTaskID)
+	}
+}
+
+func TestTaskAdaptorRecoveryHonorsImmediateDiscardPolicy(t *testing.T) {
+	const source = `
+export const meta={apiVersion:1,key:"recover-discard",name:"Recovery",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task",usageSchema:{units:{type:"number",unit:"count"}}};
+export function buildSubmitRequest(){throw new Error("must not resubmit")}
+export function parseSubmitResponse(ctx,response){return {taskId:"accepted",taskData:response.body,immediate:response.body.immediate ? {status:"SUCCESS"} : null}}
+export function buildQueryRequest(){return {url:"https://unused.example/query"}}
+export function parseTaskResult(){return {status:"SUCCESS"}}
+export function extractUsageOnComplete(ctx,result,body){if(ctx.data.units!==body.units) throw new Error("missing usage data"); return {units:body.units}}
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://unused.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}})
+	for _, immediate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("immediate=%t", immediate), func(t *testing.T) {
+			evidence, err := common.Marshal(map[string]any{"body": map[string]any{"units": 3, "immediate": immediate}})
+			require.NoError(t, err)
+			task := &model.Task{TaskID: "discard-recovery", Status: model.TaskStatusUnknown, PrivateData: model.TaskPrivateData{SubmissionPending: true, SubmissionResponse: evidence}}
+			require.NoError(t, common.Unmarshal([]byte(`{"discard_immediate_result":true}`), &task.PrivateData))
+			result, err := adaptor.RecoverSubmission(t.Context(), task, "fixture-key", "https://unused.example", "")
+			require.NoError(t, err)
+			assert.Equal(t, immediate, task.PrivateData.ResultDiscarded)
+			if immediate {
+				assert.Equal(t, map[string]any{"units": float64(3)}, result.UsageFacts)
+				assert.Empty(t, task.Data)
+			} else {
+				assert.NotEmpty(t, task.Data)
+			}
+		})
+	}
+}
+
 func TestTaskAdaptorBatchQueryReceivesTaskObjects(t *testing.T) {
 	service.InitHttpClient()
 	var captured map[string]any

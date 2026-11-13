@@ -1137,6 +1137,7 @@ type SubscriptionPreConsumeResult struct {
 	AmountTotal        int64
 	AmountUsedBefore   int64
 	AmountUsedAfter    int64
+	alreadyConsumed    bool
 }
 
 // ExpireDueSubscriptions marks expired subscriptions and handles group downgrade.
@@ -1338,6 +1339,7 @@ func preConsumeUserSubscriptionTx(tx *gorm.DB, requestId string, userId int, mod
 			returnValue.UserSubscriptionId = sub.Id
 			returnValue.PreConsumed = existing.PreConsumed
 			returnValue.PeriodStart = existing.CreatedAt
+			returnValue.alreadyConsumed = true
 			returnValue.AmountTotal = sub.AmountTotal
 			returnValue.AmountUsedBefore = sub.AmountUsed
 			returnValue.AmountUsedAfter = sub.AmountUsed
@@ -1386,6 +1388,7 @@ func preConsumeUserSubscriptionTx(tx *gorm.DB, requestId string, userId int, mod
 					returnValue.UserSubscriptionId = sub.Id
 					returnValue.PreConsumed = dup.PreConsumed
 					returnValue.PeriodStart = dup.CreatedAt
+					returnValue.alreadyConsumed = true
 					returnValue.AmountTotal = sub.AmountTotal
 					returnValue.AmountUsedBefore = sub.AmountUsed
 					returnValue.AmountUsedAfter = sub.AmountUsed
@@ -1538,7 +1541,7 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64, perio
 	})
 }
 
-// 旧周期的预扣差额不改变当前周期额度；结算统计仍由调用方记录。
+// 旧周期的预扣差额不改变当前周期额度。
 func postConsumeUserSubscriptionDeltaTx(tx *gorm.DB, subscriptionID int, delta, reservedAt int64, ownerID ...int) error {
 	var sub UserSubscription
 	query := lockForUpdate(tx).Where("id = ?", subscriptionID)

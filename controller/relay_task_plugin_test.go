@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -604,7 +605,7 @@ func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.Data
 }
 
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.VideoTaskPendingLog{}, &model.Log{})
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
 	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
@@ -812,15 +813,67 @@ func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
 }
 
+func TestTaskSubmissionHandoffDoesNotRefundAcceptedTask(t *testing.T) {
+	events := []string{}
+	db := setupTaskSubmissionDatabase(t, true, &events)
+	models := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}}
+	require.NoError(t, db.AutoMigrate(models...))
+	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(models...)) })
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldLogDB, oldMemory := model.LOG_DB, common.MemoryCacheEnabled
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
+	model.LOG_DB, common.MemoryCacheEnabled = db, false
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(oldMain, oldLog)
+		model.LOG_DB, common.MemoryCacheEnabled = oldLogDB, oldMemory
+	})
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "handoff-owner", AffCode: "handoff-owner", Status: common.UserStatusEnabled, Quota: 1000}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "handoff-token", RemainQuota: 1000}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(nil)
+	info.TokenId, info.TokenKey, info.ForcePreConsume = 1, "handoff-token", true
+	info.UserSetting.BillingPreference = "wallet_only"
+	info.PriceData.Quota, info.RequestId = 100, "accepted-task-handoff"
+	require.Nil(t, service.PreConsumeBilling(c, 100, info))
+	var before int64
+	require.NoError(t, db.Model(&model.BillingRefund{}).Where("request_id = ? AND completed = ?", info.RequestId, false).Count(&before).Error)
+	require.EqualValues(t, 1, before)
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		start, ok := c.Get("task_submission_start")
+		require.True(t, ok)
+		require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+		return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted-task", Quota: 100}, nil
+	})
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	var pending int64
+	require.NoError(t, db.Model(&model.BillingRefund{}).Where("request_id = ? AND completed = ?", info.RequestId, false).Count(&pending).Error)
+	assert.Zero(t, pending)
+	require.NoError(t, db.Model(&model.BillingRefund{}).Where("request_id = ?", info.RequestId).Update("next_attempt_at", 0).Error)
+	require.NoError(t, model.RetryBillingRefunds(t.Context()))
+	var user model.User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 900, user.Quota)
+	var token model.Token
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 900, token.RemainQuota)
+	assert.Equal(t, 100, token.UsedQuota)
+}
+
 func TestAsyncTaskFundingFailurePreservesReservation(t *testing.T) {
 	for _, failTable := range []string{"", "users", "tokens"} {
 		t.Run(failTable, func(t *testing.T) {
 			events := []string{}
 			db := setupTaskSubmissionDatabase(t, true, &events)
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
-			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+			models := []any{&model.User{}, &model.Channel{}, &model.Token{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}}
+			require.NoError(t, db.AutoMigrate(models...))
+			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(models...)) })
+			oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+			common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
+			t.Cleanup(func() { common.SetDatabaseTypes(oldMain, oldLog) })
 			require.False(t, common.BatchUpdateEnabled)
-			require.NoError(t, db.Create(&model.User{Id: 1, Username: "async-funding", Quota: 1000}).Error)
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "async-funding", Status: common.UserStatusEnabled, Quota: 1000}).Error)
 			require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
 			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "async-funding-test", RemainQuota: 1000}).Error)
 			c := taskSubmissionTestContext()
@@ -829,23 +882,24 @@ func TestAsyncTaskFundingFailurePreservesReservation(t *testing.T) {
 			info.PriceData.Quota = 100
 			info.UserSetting.BillingPreference, info.UserSetting.QuotaWarningThreshold = "wallet_only", 1
 			require.Nil(t, service.PreConsumeBilling(c, 100, info))
-			injected := errors.New("injected submission funding failure")
-			if failTable != "" {
-				require.NoError(t, db.Callback().Update().Before("gorm:update").Register("async-funding-failure", func(tx *gorm.DB) {
-					if values, ok := tx.Statement.Dest.(map[string]any); ok && tx.Statement.Table == db.NamingStrategy.TableName(failTable) {
-						_, wallet := values["quota"]
-						_, token := values["remain_quota"]
-						if wallet || token {
-							tx.AddError(injected)
-						}
-					}
-				}))
-				t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("async-funding-failure")) })
-			}
 			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 				start, ok := c.Get("task_submission_start")
 				require.True(t, ok)
 				require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+				session, ok := info.Billing.(*service.BillingSession)
+				require.True(t, ok)
+				require.NoError(t, session.ReserveBeforeTaskSubmit(150))
+				if failTable != "" {
+					require.NoError(t, db.Callback().Update().Before("gorm:update").Register("async-funding-failure", func(tx *gorm.DB) {
+						if values, ok := tx.Statement.Dest.(map[string]any); ok && tx.Statement.Table == db.NamingStrategy.TableName(failTable) {
+							_, wallet := values["quota"]
+							_, token := values["remain_quota"]
+							if wallet || token {
+								tx.AddError(errors.New("injected submission funding failure"))
+							}
+						}
+					}))
+				}
 				return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted-async", Quota: 50}, nil
 			})
 			if failTable == "" {
@@ -856,9 +910,20 @@ func TestAsyncTaskFundingFailurePreservesReservation(t *testing.T) {
 				assert.Nil(t, outcome)
 				require.NoError(t, db.Callback().Update().Remove("async-funding-failure"))
 			}
-			// 丢弃请求内会话，仅凭持久化任务恢复记账和最终结算。
 			var pending model.Task
 			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&pending).Error)
+			if failTable != "" {
+				require.NotNil(t, pending.PrivateData.SubmissionFunding)
+				assert.Equal(t, 150, pending.PrivateData.SubmissionFunding.ReservedQuota)
+				require.NotNil(t, pending.PrivateData.SubmissionQuote)
+				assert.Equal(t, 50, pending.PrivateData.SubmissionQuote.Quota)
+				var reservedUser model.User
+				var reservedToken model.Token
+				require.NoError(t, db.First(&reservedUser, 1).Error)
+				require.NoError(t, db.First(&reservedToken, 1).Error)
+				assert.Equal(t, 850, reservedUser.Quota)
+				assert.Equal(t, 850, reservedToken.RemainQuota)
+			}
 			require.NoError(t, service.RecoverTaskInitialAccounting(t.Context(), &pending))
 			previous := pending.Status
 			pending.Status, pending.Progress = model.TaskStatusSuccess, "100%"
@@ -882,11 +947,41 @@ func TestAsyncTaskFundingFailurePreservesReservation(t *testing.T) {
 	}
 }
 
+func TestPendingRefundBlocksUserDeletionUntilRecovered(t *testing.T) {
+	events := []string{}
+	db := setupTaskSubmissionDatabase(t, true, &events)
+	models := []any{&model.User{}, &model.Token{}, &model.UserAccessToken{}, &model.UserSession{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}}
+	require.NoError(t, db.AutoMigrate(models...))
+	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(models...)) })
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() { common.SetDatabaseTypes(oldMain, oldLog) })
+	user := &model.User{Id: 1, Username: "refund-owner", AffCode: "refund-owner", Status: common.UserStatusEnabled, Quota: 900}
+	require.NoError(t, db.Create(user).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "refund-owner-token", RemainQuota: 900, UsedQuota: 100}).Error)
+	refund := &model.BillingRefund{RequestID: "pending-before-user-delete", UserID: 1, TokenID: 1, Amount: 100, TokenAmount: 100}
+	require.NoError(t, model.QueueBillingRefund(t.Context(), refund))
+	_, err := user.Delete()
+	require.ErrorIs(t, err, model.ErrUserTaskBillingPending)
+	_, err = user.HardDelete()
+	require.ErrorIs(t, err, model.ErrUserTaskBillingPending)
+	var stored model.User
+	require.NoError(t, db.First(&stored, 1).Error)
+	assert.Equal(t, 900, stored.Quota)
+	require.NoError(t, model.CompleteBillingRefund(t.Context(), refund.ID))
+	require.NoError(t, db.First(&stored, 1).Error)
+	assert.Equal(t, 1000, stored.Quota)
+	_, err = user.Delete()
+	require.NoError(t, err)
+}
+
 func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.T) {
 	events := []string{}
 	db := setupTaskSubmissionDatabase(t, true, &events)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
-	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+	})
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "journal-owner", Quota: 900}).Error)
 	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
 	billing := &taskSubmissionTestBilling{events: &events}
@@ -896,7 +991,7 @@ func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.
 	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 		start, _ := c.Get("task_submission_start")
 		require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
-		return nil, &dto.TaskError{Code: "plugin_submit_response_failed", StatusCode: 502, NoRetry: true}
+		return nil, &dto.TaskError{Code: "fail_to_fetch_task", StatusCode: 503, NoRetry: true}
 	})
 	assert.Nil(t, outcome)
 	require.NotNil(t, taskErr)
@@ -906,6 +1001,7 @@ func TestSubmissionJournalPreservesUncertainWorkAndInitialAccounting(t *testing.
 	assert.Equal(t, 100, task.Quota)
 	assert.True(t, task.PrivateData.SubmissionPending)
 	assert.True(t, task.PrivateData.ReconciliationRequired)
+	assert.Empty(t, task.PrivateData.SubmissionResponse)
 	assert.False(t, task.PrivateData.InitialAccountingPending)
 	var user model.User
 	var channel model.Channel
@@ -998,8 +1094,10 @@ func TestSubmissionJournalSurvivesClientDisconnectAndRejectionCleanupFailure(t *
 		t.Run(fmt.Sprintf("rejected=%t", rejected), func(t *testing.T) {
 			events := []string{}
 			db := setupTaskSubmissionDatabase(t, true, &events)
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}))
-			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{})) })
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+			})
 			require.NoError(t, db.Create(&model.User{Id: 1, Username: "journal-owner", Quota: 900}).Error)
 			require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
 			billing := &taskSubmissionTestBilling{events: &events}
@@ -1081,4 +1179,91 @@ func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {
 	assert.Equal(t, []string{"reserve", "refund"}, events)
 	assert.Equal(t, 1, billing.refunds)
 	assert.False(t, c.Writer.Written())
+}
+
+func TestSubmissionJournalPreservesImmediateDiscardPolicy(t *testing.T) {
+	for _, protocol := range []bool{false, true} {
+		for _, parserFailure := range []bool{false, true} {
+			t.Run(fmt.Sprintf("protocol=%t/parser_failure=%t", protocol, parserFailure), func(t *testing.T) {
+				events := []string{}
+				db := setupTaskSubmissionDatabase(t, true, &events)
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+				t.Cleanup(func() {
+					require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+				})
+				require.NoError(t, db.Create(&model.User{Id: 1, Username: "discard-owner", Status: common.UserStatusEnabled, Quota: 900}).Error)
+				require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+				billing := &taskSubmissionTestBilling{events: &events, reserveErr: errors.New("injected reserve failure")}
+				info := taskSubmissionRelayInfo(billing)
+				c := taskSubmissionTestContext()
+				retain := false
+				if protocol {
+					c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Protocol: pluginruntime.ProtocolOpenAIImage})
+				} else {
+					c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Route: pluginruntime.Route{RetainResult: &retain}})
+				}
+				_, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					start, _ := c.Get("task_submission_start")
+					require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+					if parserFailure {
+						c.Set("task_submission_response", json.RawMessage(`{"body":{"image":"payload"}}`))
+						return nil, &dto.TaskError{Code: "parser_failure", StatusCode: http.StatusBadGateway, LocalError: true, NoRetry: true}
+					}
+					return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted", Quota: 100, TaskData: []byte(`{"image":"payload"}`), Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}}, nil
+				})
+				require.NotNil(t, taskErr)
+				var task model.Task
+				require.NoError(t, db.Where("task_id = ?", "task_public").First(&task).Error)
+				assert.True(t, task.PrivateData.SubmissionPending)
+				assert.NotEmpty(t, task.PrivateData.SubmissionResponse)
+				privateJSON, err := common.Marshal(task.PrivateData)
+				require.NoError(t, err)
+				var fields map[string]any
+				require.NoError(t, common.Unmarshal(privateJSON, &fields))
+				assert.Equal(t, true, fields["discard_immediate_result"])
+			})
+		}
+	}
+}
+
+func TestSubmissionRetryReplacesPreparedIntentBeforeSending(t *testing.T) {
+	events := []string{}
+	db := setupTaskSubmissionDatabase(t, true, &events)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Token{}, &model.VideoTaskPendingLog{}))
+	})
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "retry-owner", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+	previousRetries := common.RetryTimes
+	common.RetryTimes = 1
+	t.Cleanup(func() { common.RetryTimes = previousRetries })
+	info := taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &events})
+	info.LockedChannel.(*model.Channel).Key = "retry-fixture"
+	c := taskSubmissionTestContext()
+	attempts := 0
+	var firstAttempt string
+	_, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		attempts++
+		start, _ := c.Get("task_submission_start")
+		require.NoError(t, start.(func(constant.TaskPlatform) error)("plugin"))
+		var task model.Task
+		require.NoError(t, db.Where("task_id = ?", "task_public").First(&task).Error)
+		assert.False(t, task.PrivateData.SubmissionPrepared, "dispatch must be recorded before sending")
+		if attempts == 1 {
+			firstAttempt = task.PrivateData.SubmissionAttemptID
+			c.Set("task_submission_rejected", true)
+			return nil, &dto.TaskError{Code: "rejected", Message: "rejected", StatusCode: http.StatusTooManyRequests, LocalError: true}
+		}
+		assert.NotEqual(t, firstAttempt, task.PrivateData.SubmissionAttemptID)
+		return nil, &dto.TaskError{Code: "unknown", Message: "unknown", StatusCode: http.StatusServiceUnavailable, LocalError: true, NoRetry: true}
+	})
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 2, attempts)
+	var stored model.Task
+	require.NoError(t, db.Where("task_id = ?", "task_public").First(&stored).Error)
+	assert.True(t, stored.PrivateData.SubmissionPending)
+	assert.False(t, stored.PrivateData.SubmissionPrepared)
+	assert.True(t, stored.PrivateData.ReconciliationRequired)
+	assert.Empty(t, stored.PrivateData.SubmissionResponse)
 }

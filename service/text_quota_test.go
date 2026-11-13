@@ -157,6 +157,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			require.NoError(t, db.Create(&channel).Error)
 			t.Cleanup(func() {
 				require.NoError(t, logDB.Where("user_id = ?", user.Id).Delete(&model.Log{}).Error)
+				require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.BillingRefund{}).Error)
 				require.NoError(t, db.Unscoped().Delete(&token).Error)
 				require.NoError(t, db.Unscoped().Delete(&user).Error)
 				require.NoError(t, db.Unscoped().Delete(&channel).Error)

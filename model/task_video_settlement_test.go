@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -22,6 +23,121 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
+
+func TestVideoQuotaCacheLateCompletionKeepsNewOperation(t *testing.T) {
+	address := os.Getenv("TASK_VIDEO_TEST_REDIS_ADDR")
+	if address == "" {
+		t.Skip("TASK_VIDEO_TEST_REDIS_ADDR is not configured")
+	}
+	host, _, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	require.True(t, net.ParseIP(host).IsLoopback())
+	require.True(t, common.UsingMainDatabase(common.DatabaseTypeMySQL))
+
+	const userID = 974301
+	const tokenKey = "video-operation-fixture"
+	client := redis.NewClient(&redis.Options{Addr: address})
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	keys := []string{getUserCacheKey(userID), getTokenCacheKey(tokenKey), videoUserQuotaKey(userID), videoTokenQuotaKey(tokenKey)}
+	t.Cleanup(func() {
+		assert.NoError(t, client.Del(context.Background(), keys...).Err())
+		common.RDB, common.RedisEnabled = previousClient, previousEnabled
+		assert.NoError(t, client.Close())
+		assert.NoError(t, DB.Where("user_id = ?", userID).Delete(&Task{}).Error)
+		assert.NoError(t, DB.Unscoped().Where("user_id = ? AND `key` = ?", userID, tokenKey).Delete(&Token{}).Error)
+		assert.NoError(t, DB.Unscoped().Where("id = ?", userID).Delete(&User{}).Error)
+	})
+	require.NoError(t, client.Del(t.Context(), keys...).Err())
+	require.NoError(t, DB.Unscoped().Where("user_id = ? AND `key` = ?", userID, tokenKey).Delete(&Token{}).Error)
+	require.NoError(t, DB.Create(&User{Id: userID, Username: "video-operation-fixture", AffCode: "video-operation-fixture", Quota: 920}).Error)
+	require.NoError(t, DB.Create(&Token{UserId: userID, Key: tokenKey, RemainQuota: 920, UsedQuota: 80}).Error)
+	task := &Task{TaskID: "video-operation-fixture", UserId: userID, Quota: 80, Status: TaskStatusSubmitted, PrivateData: TaskPrivateData{SubmissionFundsCommitted: true}}
+	require.NoError(t, DB.Create(task).Error)
+	require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", 900).Err())
+	require.NoError(t, client.HSet(t.Context(), keys[1], "RemainQuota", 900, "UsedQuota", 100).Err())
+
+	first := *task
+	first.Quota = 100
+	firstKind, err := prepareVideoQuotaCache(t.Context(), DB, &first, 80, true, tokenKey)
+	require.NoError(t, err)
+	require.NoError(t, finishVideoQuotaCache(t.Context(), DB, userID))
+	require.Equal(t, "920", client.HGet(t.Context(), keys[0], "Quota").Val())
+
+	secondKind, err := prepareVideoQuotaCache(t.Context(), DB, task, 100, true, tokenKey)
+	require.NoError(t, err)
+	require.NotEqual(t, firstKind, secondKind)
+	require.NoError(t, DB.Model(task).Updates(map[string]any{"quota": 100, "status": TaskStatusSuccess}).Error)
+	late, err := finishVideoQuota.Run(t.Context(), client, keys, task.ID, 20, "1", keys[1], firstKind).Int()
+	require.NoError(t, err)
+	assert.Zero(t, late)
+	require.NoError(t, applyVideoQuotaCache(t.Context(), userID, task.ID, -20, "1", keys[1], secondKind))
+	assert.Equal(t, "900", client.HGet(t.Context(), keys[0], "Quota").Val())
+	assert.Equal(t, "900", client.HGet(t.Context(), keys[1], "RemainQuota").Val())
+	assert.Equal(t, "100", client.HGet(t.Context(), keys[1], "UsedQuota").Val())
+}
+
+func TestVideoSettlementUsesKnownChannelBaselineWithoutDiscountSnapshot(t *testing.T) {
+	require.True(t, common.UsingMainDatabase(common.DatabaseTypeMySQL))
+	const id = 974303
+	t.Cleanup(func() {
+		assert.NoError(t, DB.Where("user_id = ?", id).Delete(&Task{}).Error)
+		assert.NoError(t, DB.Unscoped().Where("id = ?", id).Delete(&User{}).Error)
+		assert.NoError(t, DB.Where("id = ?", id).Delete(&Channel{}).Error)
+	})
+	require.NoError(t, DB.Create(&User{Id: id, Username: "video-channel-baseline", AffCode: "video-channel-baseline", Quota: 900, UsedQuota: 100}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: id, UsedQuota: 100}).Error)
+	task := &Task{TaskID: "video-channel-baseline", UserId: id, ChannelId: id, Quota: 100, Status: TaskStatusQueued}
+	require.NoError(t, DB.Create(task).Error)
+	task.Status = TaskStatusSuccess
+	task.PrivateData.DiscountAmounts = types.NewDiscountAmounts(200, 100)
+	won, err := FinalizeVideoTask(t.Context(), task, TaskStatusQueued, 100)
+	require.NoError(t, err)
+	require.True(t, won)
+	var channel Channel
+	require.NoError(t, DB.First(&channel, id).Error)
+	assert.EqualValues(t, 200, channel.UsedQuota)
+}
+
+func TestVideoSettlementUsesFullSubscriptionReservation(t *testing.T) {
+	require.True(t, common.UsingMainDatabase(common.DatabaseTypeMySQL))
+	const id = 974304
+	t.Cleanup(func() {
+		assert.NoError(t, DB.Where("user_id = ?", id).Delete(&Task{}).Error)
+		assert.NoError(t, DB.Unscoped().Where("user_id = ?", id).Delete(&Token{}).Error)
+		assert.NoError(t, DB.Unscoped().Where("id = ?", id).Delete(&User{}).Error)
+		assert.NoError(t, DB.Where("id = ?", id).Delete(&Channel{}).Error)
+		assert.NoError(t, DB.Where("id = ?", id).Delete(&UserSubscription{}).Error)
+	})
+	require.NoError(t, DB.Create(&User{Id: id, Username: "video-subscription-reserve", AffCode: "video-subscription-reserve", Quota: 1000, UsedQuota: 100}).Error)
+	require.NoError(t, DB.Create(&Token{Id: id, UserId: id, Key: "video-subscription-reserve", RemainQuota: 850, UsedQuota: 150}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: id, UsedQuota: 200}).Error)
+	require.NoError(t, DB.Create(&UserSubscription{Id: id, UserId: id, AmountTotal: 1000, AmountUsed: 150, Status: "active"}).Error)
+	task := &Task{TaskID: "video-subscription-reserve", UserId: id, ChannelId: id, Quota: 100, Status: TaskStatusUnknown, PrivateData: TaskPrivateData{TokenId: id, BillingSource: "subscription", SubscriptionId: id, SubmissionFunding: &TaskSubmissionFunding{ReservedQuota: 150, UpdateToken: true}, DiscountAmounts: types.NewDiscountAmounts(200, 100)}}
+	require.NoError(t, DB.Create(task).Error)
+	task.Status = TaskStatusSuccess
+	task.PrivateData.DiscountAmounts = types.NewDiscountAmounts(100, 50)
+	won, err := FinalizeVideoTask(t.Context(), task, TaskStatusUnknown, 50)
+	require.NoError(t, err)
+	require.True(t, won)
+	won, err = FinalizeVideoTask(t.Context(), task, TaskStatusUnknown, 50)
+	require.NoError(t, err)
+	assert.False(t, won)
+	var user User
+	var token Token
+	var channel Channel
+	var subscription UserSubscription
+	require.NoError(t, DB.First(&user, id).Error)
+	require.NoError(t, DB.First(&token, id).Error)
+	require.NoError(t, DB.First(&channel, id).Error)
+	require.NoError(t, DB.First(&subscription, id).Error)
+	assert.Equal(t, 1000, user.Quota)
+	assert.Equal(t, 50, user.UsedQuota)
+	assert.Equal(t, 950, token.RemainQuota)
+	assert.Equal(t, 50, token.UsedQuota)
+	assert.EqualValues(t, 100, channel.UsedQuota)
+	assert.EqualValues(t, 50, subscription.AmountUsed)
+}
 
 func TestRetiredVideoAccountingMarkersAreClearedWithoutLosingLogs(t *testing.T) {
 	truncateTables(t)

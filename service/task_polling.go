@@ -256,6 +256,17 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 					continue
 				}
 			}
+			if task.PrivateData.SubmissionPrepared {
+				previous := task.Status
+				task.Status, task.Progress, task.FinishTime = model.TaskStatusFailure, "100%", time.Now().Unix()
+				task.FailReason = "submission did not start"
+				task.PrivateData.SubmissionPending = false
+				task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
+				if _, err := FinalizeVideoTaskBilling(ctx, task, previous, 0, task.FailReason, nil); err != nil {
+					logger.LogWarn(ctx, "unsubmitted task recovery failed: "+err.Error())
+				}
+				continue
+			}
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" && !task.PrivateData.SubmissionPending {
 				// 统计失败的未完成任务
@@ -954,7 +965,7 @@ func redactVideoResponseBody(body []byte) []byte {
 func resetTaskPollingState(task *model.Task, status model.TaskStatus) {
 	task.PrivateData.PollFailures = 0
 	task.PrivateData.NextPollAt = 0
-	// 超时后的排队或运行回包不能证明最终用量，须保留未确认标记直到确认终态。
+	// 超时后的排队或运行回包不能证明最终用量，须保留待对账标记直到确认终态。
 	if isNonTerminalPollStatus(status) && constant.TaskTimeoutMinutes > 0 &&
 		task.SubmitTime < time.Now().Unix()-int64(constant.TaskTimeoutMinutes)*60 {
 		return

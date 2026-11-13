@@ -2,11 +2,13 @@ package relay
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,11 +33,12 @@ import (
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
-	driver "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func setupRelayChannelDB(t *testing.T) *gorm.DB {
@@ -838,7 +841,13 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 		{status: http.StatusCreated},
 		{status: http.StatusAccepted},
 		{status: http.StatusBadRequest, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusRequestTimeout, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusTooManyRequests, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusInternalServerError, wantCode: "fail_to_fetch_task"},
 		{status: http.StatusBadGateway, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusServiceUnavailable, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusGatewayTimeout, wantCode: "fail_to_fetch_task"},
+		{status: 524, wantCode: "fail_to_fetch_task"},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			saveBillingConfig(t)
@@ -868,6 +877,9 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 				assert.Equal(t, tc.wantCode, taskErr.Code)
 				assert.Equal(t, tc.status, taskErr.StatusCode)
 				assert.Contains(t, taskErr.Message, "upstream body")
+				uncertain := tc.status/100 == 5 || tc.status == http.StatusRequestTimeout
+				assert.Equal(t, uncertain, taskErr.NoRetry)
+				assert.Equal(t, !uncertain, c.GetBool("task_submission_rejected"))
 				assert.Nil(t, result)
 				return
 			}
@@ -877,4 +889,84 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			assert.JSONEq(t, `{"status":`+strconv.Itoa(tc.status)+`}`, string(result.TaskData))
 		})
 	}
+}
+
+func TestRelayTaskRetryReservesBeforeSending(t *testing.T) {
+	dsn := os.Getenv("RELAY_TASK_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("RELAY_TASK_TEST_MYSQL_DSN is not configured")
+	}
+	configDSN, err := mysqldriver.ParseDSN(dsn)
+	require.NoError(t, err)
+	host, _, err := net.SplitHostPort(configDSN.Addr)
+	require.NoError(t, err)
+	require.Equal(t, "tcp", configDSN.Net)
+	require.True(t, net.ParseIP(host).IsLoopback())
+	require.True(t, strings.HasPrefix(configDSN.DBName, "codex_seedance_"))
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("retry_%d_", time.Now().UnixNano())}})
+	require.NoError(t, err)
+	conn, err := db.DB()
+	require.NoError(t, err)
+	models := []any{&model.User{}, &model.BillingRefund{}}
+	require.NoError(t, db.AutoMigrate(models...))
+	previousDB := model.DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousMemory := common.RedisEnabled, common.MemoryCacheEnabled
+	model.DB, common.RedisEnabled, common.MemoryCacheEnabled = db, false, false
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled, common.MemoryCacheEnabled = previousDB, previousRedis, previousMemory
+		common.SetDatabaseTypes(previousMain, previousLog)
+		require.NoError(t, db.Migrator().DropTable(models...))
+		require.NoError(t, conn.Close())
+	})
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "retry-reserve", AffCode: "retry-reserve", Status: common.UserStatusEnabled, Quota: 75}).Error)
+	saveBillingConfig(t)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"declared-model":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"declared-model":"tier(\"flat\", 0.0002)"}`,
+	}))
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"accepted"}`))
+	}))
+	t.Cleanup(server.Close)
+	service.InitHttpClient()
+	c, info := newTaskSubmitContext(t, "declared-model", "")
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+	c.Set("group", "default")
+	info.UserId, info.UserGroup, info.UsingGroup = 1, "default", "default"
+	info.OriginModelName, info.PublicTaskID = "declared-model", "retry-reserve-task"
+	info.RequestId, info.IsPlayground, info.ForcePreConsume = "retry-reserve-request", true, true
+	info.UserSetting.BillingPreference = "wallet_only"
+	require.Nil(t, service.PreConsumeBilling(c, 50, info))
+	pinMappingOrderPlugin(t, c, billingFallbackPlugin)
+	_, taskErr := RelayTaskSubmit(c, info)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, http.StatusForbidden, taskErr.StatusCode)
+	assert.Zero(t, requests.Load())
+	var user model.User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 25, user.Quota)
+
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "retry-funded", AffCode: "retry-funded", Status: common.UserStatusEnabled, Quota: 150}).Error)
+	fundedContext, fundedInfo := newTaskSubmitContext(t, "declared-model", "")
+	common.SetContextKey(fundedContext, constant.ContextKeyChannelBaseUrl, server.URL)
+	fundedContext.Set("group", "default")
+	fundedInfo.UserId, fundedInfo.UserGroup, fundedInfo.UsingGroup = 2, "default", "default"
+	fundedInfo.OriginModelName, fundedInfo.PublicTaskID = "declared-model", "retry-funded-task"
+	fundedInfo.RequestId, fundedInfo.IsPlayground, fundedInfo.ForcePreConsume = "retry-funded-request", true, true
+	fundedInfo.UserSetting.BillingPreference = "wallet_only"
+	require.Nil(t, service.PreConsumeBilling(fundedContext, 50, fundedInfo))
+	pinMappingOrderPlugin(t, fundedContext, billingFallbackPlugin)
+	result, taskErr := RelayTaskSubmit(fundedContext, fundedInfo)
+	require.Nil(t, taskErr)
+	require.NotNil(t, result)
+	assert.EqualValues(t, 1, requests.Load())
+	assert.Equal(t, 100, fundedInfo.Billing.GetPreConsumedQuota())
+	user = model.User{}
+	require.NoError(t, db.First(&user, 2).Error)
+	assert.Equal(t, 50, user.Quota)
 }

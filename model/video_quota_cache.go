@@ -2,9 +2,11 @@ package model
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -70,9 +72,82 @@ return 1`
 var prepareVideoQuota = redis.NewScript(prepareVideoQuotaScript)
 var finishVideoQuota = redis.NewScript(finishVideoQuotaScript)
 
+// 用户行锁隔离缓存标记，MySQL 使用当前读避免反向锁和旧事务快照。
+func quotaCacheTransaction(db *gorm.DB, fn func(*gorm.DB) error) error {
+	if common.RedisEnabled && db.Dialector.Name() == "mysql" {
+		return db.Transaction(fn, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	}
+	return db.Transaction(fn)
+}
+
+// 先冻结缓存并核验余额；数据库提交后根据持久记录决定是否扣减。
+const prepareBillingReservationScript = `
+if tonumber(redis.call('HGET',KEYS[3],'TaskID') or '0')>0 then return -1 end
+if tonumber(redis.call('HGET',KEYS[1],'Id') or '0')~=tonumber(ARGV[6]) or tonumber(redis.call('HGET',KEYS[1],'CacheSchema') or '0')~=tonumber(ARGV[8]) or redis.call('HEXISTS',KEYS[1],'Quota')==0 then return -1 end
+local amount=tonumber(ARGV[2])-tonumber(ARGV[3])
+local uq=redis.call('HGET',KEYS[1],'Quota')
+if ARGV[4]=='1' and ARGV[9]=='1' and tonumber(uq)<amount then return -3 end
+local tq,used
+if ARGV[5]~='' then
+ if tonumber(redis.call('HGET',KEYS[2],'Id') or '0')~=tonumber(ARGV[10]) or tonumber(redis.call('HGET',KEYS[2],'UserId') or '0')~=tonumber(ARGV[6]) then return -1 end
+ tq=redis.call('HGET',KEYS[2],'RemainQuota')
+ used=redis.call('HGET',KEYS[2],'UsedQuota')
+ if not tq or not used then return -1 end
+ if ARGV[11]~='1' and tonumber(tq)<amount then return -2 end
+end
+redis.call('HSET',KEYS[3],'TaskID',ARGV[1],'Actual',ARGV[2],'Reserved',ARGV[3],'Wallet',ARGV[4],'TokenCacheKey',ARGV[5],'Kind',ARGV[7],'Quota',uq)
+redis.call('HSET',KEYS[1],'VideoQuotaPending',ARGV[1])
+if ARGV[5]~='' then
+ redis.call('HSET',KEYS[4],'TaskID',ARGV[1],'UserID',ARGV[6],'RemainQuota',tq,'UsedQuota',used)
+ redis.call('HSET',KEYS[2],'VideoQuotaPending',ARGV[1])
+end
+return 0`
+
+var prepareBillingReservation = redis.NewScript(prepareBillingReservationScript)
+
+func prepareBillingReservationCache(ctx context.Context, task *Task, target int, wallet bool, tokenKey, kind string, tokenID int, checkWallet, unlimited bool) error {
+	walletFlag, checkFlag, unlimitedFlag := 0, 0, 0
+	if wallet {
+		walletFlag = 1
+	}
+	if checkWallet {
+		checkFlag = 1
+	}
+	if unlimited {
+		unlimitedFlag = 1
+	}
+	cacheKey := ""
+	if tokenKey != "" {
+		cacheKey = getTokenCacheKey(tokenKey)
+	}
+	keys := []string{getUserCacheKey(task.UserId), cacheKey, videoUserQuotaKey(task.UserId), "quota:video:" + cacheKey}
+	result, err := prepareBillingReservation.Run(ctx, common.RDB, keys, task.ID, target, task.Quota, walletFlag, cacheKey, task.UserId, kind, userCacheSchemaVersion, checkFlag, tokenID, unlimitedFlag).Int()
+	if err != nil {
+		return fmt.Errorf("prepare billing reservation cache: %w", err)
+	}
+	switch result {
+	case 0:
+		return nil
+	case -2:
+		return ErrInsufficientTokenQuota
+	case -3:
+		return ErrInsufficientWalletQuota
+	default:
+		return ErrQuotaCachePending
+	}
+}
+
 // 调用方已持有用户行写锁，因此旧标记对应的事务必定已提交或回滚。
-func prepareVideoQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual int, wallet bool, tokenKey string) error {
-	return prepareQuotaCache(ctx, tx, task, actual, wallet, tokenKey, "task")
+func prepareVideoQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual int, wallet bool, tokenKey string) (string, error) {
+	if !common.RedisEnabled {
+		return "", nil
+	}
+	operation, err := common.GenerateRandomCharsKey(24)
+	if err != nil {
+		return "", err
+	}
+	kind := "task:" + operation
+	return kind, prepareQuotaCache(ctx, tx, task, actual, wallet, tokenKey, kind)
 }
 
 func prepareQuotaCache(ctx context.Context, tx *gorm.DB, task *Task, actual int, wallet bool, tokenKey, kind string) error {
@@ -130,18 +205,32 @@ func finishVideoQuotaCache(ctx context.Context, tx *gorm.DB, userID int) error {
 	if kind == "" {
 		kind = "task"
 	}
-	if kind == "refund" {
+	if strings.HasPrefix(kind, "reserve_refund:") {
+		var refund BillingRefund
+		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&refund).Error
+		if err == nil && refund.Amount == actual && refund.ReserveOperation == strings.TrimPrefix(kind, "reserve_refund:") {
+			delta = reserved - actual
+		}
+	} else if strings.HasPrefix(kind, "reserve_task:") {
+		var stored Task
+		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&stored).Error
+		if err == nil && stored.PrivateData.SubmissionFunding != nil && stored.PrivateData.SubmissionFunding.ReservedQuota == actual && stored.PrivateData.SubmissionFunding.ReserveOperation == strings.TrimPrefix(kind, "reserve_task:") {
+			delta = reserved - actual
+		}
+	} else if kind == "refund" {
 		var refund BillingRefund
 		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&refund).Error
 		if err == nil && refund.Completed {
 			delta = reserved - actual
 		}
-	} else {
+	} else if kind == "task" || strings.HasPrefix(kind, "task:") {
 		var stored Task
 		err = tx.Where("id = ? AND user_id = ?", taskID, userID).First(&stored).Error
 		if err == nil && (stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure || stored.PrivateData.SubmissionFundsCommitted) && stored.Quota == actual {
 			delta = reserved - actual
 		}
+	} else {
+		return ErrQuotaCachePending
 	}
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
@@ -174,7 +263,7 @@ func recoverVideoQuotaCache(ctx context.Context, userID int) error {
 	if err != nil {
 		return err
 	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return quotaCacheTransaction(DB.WithContext(ctx), func(tx *gorm.DB) error {
 		if err := lockSQLiteQuotaCache(tx.Unscoped().Model(&User{}).Where("id = ?", userID)); err != nil {
 			return err
 		}

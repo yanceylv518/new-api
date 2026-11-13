@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -93,6 +95,25 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 		SetTaskRouter(engine)
 	})
 	return engine
+}
+
+func TestManualReconciliationEndpointsAndScopesAreRemoved(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetApiRouter(engine)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/api/task/task-id/reconcile"},
+		{http.MethodGet, "/api/billing/refunds/uncertain"},
+		{http.MethodPost, "/api/billing/refunds/1/reconcile"},
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
+		require.Equal(t, http.StatusNotFound, response.Code, tc.path)
+	}
+	for _, scope := range []string{"admin.task.reconcile", "admin.billing.reconcile"} {
+		_, err := service.BindVerificationOperation(service.VerificationOperation{Scope: scope, Context: []byte(`{}`)})
+		require.ErrorIs(t, err, service.ErrProofScope)
+	}
 }
 
 func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {

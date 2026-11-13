@@ -37,7 +37,11 @@ func FinalizeVideoTaskBilling(ctx context.Context, task *model.Task, previous mo
 		logType, quota = model.LogTypeRefund, -delta
 	}
 	other := taskBillingOther(task)
-	other.SetPublic("pre_consumed_quota", reserved)
+	preConsumed := reserved
+	if task.PrivateData.SubmissionFunding != nil {
+		preConsumed = task.PrivateData.SubmissionFunding.ReservedQuota
+	}
+	other.SetPublic("pre_consumed_quota", preConsumed)
 	other.SetPublic("actual_quota", actual)
 	other.SetPublic("reason", reason)
 	if task.PrivateData.DiscountAmounts != nil && actual > 0 {
@@ -183,21 +187,9 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 		if err != nil {
 			*task = original
 			task.Status = previous
-			task.FinishTime = 0
-			switch previous {
-			case model.TaskStatusSubmitted:
-				task.Progress = taskcommon.ProgressSubmitted
-			case model.TaskStatusQueued:
-				task.Progress = taskcommon.ProgressQueued
-			case model.TaskStatusInProgress:
-				task.Progress = taskcommon.ProgressInProgress
-			default:
-				task.Progress = "0%"
-			}
-			task.PrivateData.ReconciliationRequired = true
-			task.PrivateData.ReconciliationReason = "task settlement is pending; reserved quota retained"
-			task.PrivateData.NextPollAt = time.Now().Unix() + 30
-			if _, saveErr := task.UpdateWithStatus(previous); saveErr != nil {
+			saveContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if _, saveErr := model.MarkTaskSettlementPending(saveContext, task, previous, time.Now().Unix()+30); saveErr != nil {
 				logger.LogWarn(ctx, "persist pending settlement failed: "+saveErr.Error())
 			}
 		}
@@ -206,6 +198,17 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 	var clamp *common.QuotaClamp
 	var amounts *hosttypes.DiscountAmounts
 	bc := task.PrivateData.BillingContext
+	if quote := task.PrivateData.SubmissionQuote; quote != nil {
+		if quote.Quota < 0 || quote.Quota > common.MaxQuota || quote.DiscountAmounts != nil && !quote.DiscountAmounts.ValidFor(quote.Quota) {
+			return fmt.Errorf("task %s has an invalid submission quote", task.TaskID)
+		}
+		actual, amounts = quote.Quota, quote.DiscountAmounts
+		if quote.BillingContext != nil {
+			bc = quote.BillingContext
+			task.PrivateData.BillingContext = bc
+			original.PrivateData.BillingContext = bc
+		}
+	}
 	if task.Status != model.TaskStatusFailure {
 		if err := requireMeasuredVideoUsage(task, result); err != nil {
 			return err
@@ -254,12 +257,14 @@ func settleAtomicVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, task
 			task.PrivateData.BillingContext = &billing
 		}
 	case bc != nil && bc.PerCallBilling:
-		amounts = task.PrivateData.DiscountAmounts
+		if task.PrivateData.SubmissionQuote == nil {
+			amounts = task.PrivateData.DiscountAmounts
+		}
 		// 基础价格及倍率保持提交快照，仅允许最终用量改变所冻结表达式的折扣。
 		if bc.UserDiscount != nil && original.PrivateData.BillingContext != nil && original.PrivateData.BillingContext.UserDiscount != nil &&
 			bc.UserDiscount.DiscountBPS != original.PrivateData.BillingContext.UserDiscount.DiscountBPS {
-			before := task.Quota
-			if amounts.ValidFor(task.Quota) {
+			before := actual
+			if amounts.ValidFor(actual) {
 				before = amounts.Before
 			}
 			basis := decimal.NewFromInt(int64(before))

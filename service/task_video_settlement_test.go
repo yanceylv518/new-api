@@ -26,7 +26,6 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -439,6 +438,19 @@ func TestSeedanceSecondsDiscountWaitsForMeasuredUsage(t *testing.T) {
 }
 
 func (a *atomicVideoPollingFixture) TaskPluginKey() string { return a.key }
+
+type immediateRecoveryFixture struct {
+	atomicVideoPollingFixture
+	attempts int
+}
+
+func (a *immediateRecoveryFixture) RecoverSubmission(_ context.Context, task *model.Task, _, _, _ string) (*relaycommon.TaskInfo, error) {
+	a.attempts++
+	task.PrivateData.UpstreamTaskID = "recovered-upstream"
+	task.PrivateData.SubmissionPending = false
+	task.PrivateData.SubmissionResponse, task.PrivateData.SubmissionContext = nil, nil
+	return &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%"}, nil
+}
 
 // 成功/失败回包遇到主库故障时必须保持原状态；重试后再次投递不能重复记账或记录日志。
 func TestVideoPollingMockLoadDatabaseMatrix(t *testing.T) {
@@ -942,6 +954,48 @@ func TestVideoPollingAtomicSettlementRetry(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestImmediateRecoveryRetainsEvidenceWhenSettlementFails(t *testing.T) {
+	requireBillingRefundMySQL(t)
+	truncate(t)
+	const id = 941219
+	seedUser(t, id, 900)
+	seedChannel(t, id)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", id).Update("used_quota", 100).Error)
+	response := []byte(`{"parsed":{"taskId":"recovered-upstream"}}`)
+	request := []byte(`{"model":"fixture"}`)
+	task := &model.Task{TaskID: "immediate-recovery", UserId: id, ChannelId: id, Quota: 100, Status: model.TaskStatusUnknown, Progress: "10%", PrivateData: model.TaskPrivateData{SubmissionPending: true, SubmissionResponse: response, SubmissionContext: request, SubmissionFunding: &model.TaskSubmissionFunding{ReservedQuota: 100}}}
+	require.NoError(t, model.DB.Create(task).Error)
+	client := billingTestRedisClient(t)
+	unavailable := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1, DialTimeout: 100 * time.Millisecond})
+	previousClient, previousRedis := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = unavailable, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = previousClient, previousRedis
+		assert.NoError(t, unavailable.Close())
+		assert.NoError(t, client.Close())
+	})
+	adaptor := &immediateRecoveryFixture{}
+	channel := &model.Channel{Id: id}
+	err := updateVideoSingleTask(t.Context(), adaptor, channel, task.TaskID, map[string]*model.Task{task.TaskID: task})
+	require.Error(t, err)
+	var stored model.Task
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), stored.Status)
+	assert.Equal(t, "10%", stored.Progress)
+	assert.True(t, stored.PrivateData.SubmissionPending)
+	assert.JSONEq(t, string(response), string(stored.PrivateData.SubmissionResponse))
+	assert.JSONEq(t, string(request), string(stored.PrivateData.SubmissionContext))
+	assert.True(t, stored.PrivateData.ReconciliationRequired)
+	common.RDB = client
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, stored.TaskID, map[string]*model.Task{stored.TaskID: &stored}))
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), stored.Status)
+	assert.False(t, stored.PrivateData.SubmissionPending)
+	assert.Empty(t, stored.PrivateData.SubmissionResponse)
+	assert.Equal(t, 2, adaptor.attempts)
+	assert.Equal(t, 900, getUserQuota(t, id))
 }
 
 // 同一个用户的不同任务并发退款时日志按任务隔离，重复投递不能覆盖或额外记录旧快照。

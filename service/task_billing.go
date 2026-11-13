@@ -28,6 +28,12 @@ import (
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
 	tracked := task.PrivateData.InitialAccountingPending
+	if tracked && (info.ChannelId != task.ChannelId || info.UsingGroup != task.Group) {
+		if err := RecoverTaskInitialAccounting(c.Request.Context(), task); err != nil {
+			logger.LogWarn(c, "initial task accounting is pending: "+err.Error())
+		}
+		return
+	}
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费

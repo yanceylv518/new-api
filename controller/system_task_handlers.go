@@ -148,11 +148,15 @@ type asyncTaskPollHandler struct{}
 type billingRefundHandler struct{}
 
 func (billingRefundHandler) Type() string { return model.SystemTaskTypeBillingRefund }
+
 func (billingRefundHandler) Enabled() bool {
 	return model.HasPendingBillingRefunds() || model.HasExpiredBillingRefunds() || model.HasPendingVideoTaskLogs()
 }
+
 func (billingRefundHandler) Interval() time.Duration { return 15 * time.Second }
-func (billingRefundHandler) NewPayload() any         { return nil }
+
+func (billingRefundHandler) NewPayload() any { return nil }
+
 func (billingRefundHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	var runErr error
 	budgetExhausted := false
@@ -166,8 +170,9 @@ func (billingRefundHandler) Run(ctx context.Context, task *model.SystemTask, run
 	} {
 		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := retry(attempt)
+		timedOut := errors.Is(attempt.Err(), context.DeadlineExceeded)
 		cancel()
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		if timedOut && ctx.Err() == nil {
 			budgetExhausted = true
 		}
 		runErr = errors.Join(runErr, err)

@@ -524,12 +524,23 @@ func executeTaskSubmissionWith(
 			c.Request = clientRequest.Clone(ctx)
 		}
 		next := newSubmittedTask(c, relayInfo, &relay.TaskSubmitResult{Platform: platform, Quota: relayInfo.PriceData.Quota})
+		attemptID, err := common.GenerateRandomCharsKey(24)
+		if err != nil {
+			return err
+		}
+		next.PrivateData.SubmissionAttemptID = attemptID
+		if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok && pinned.Route.RetainResult != nil && !*pinned.Route.RetainResult {
+			next.PrivateData.DiscardImmediateResult = true
+		}
+		if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedEndpoint](c, pluginruntime.ContextKeyPinnedEndpoint); ok && pinned.Protocol == pluginruntime.ProtocolOpenAIImage {
+			next.PrivateData.DiscardImmediateResult = true
+		}
 		next.Status = model.TaskStatusUnknown
 		next.PrivateData.SubmissionPending = true
+		next.PrivateData.SubmissionPrepared = true
 		next.PrivateData.InitialAccountingPending = true
 		next.PrivateData.NextPollAt = time.Now().Add(5 * time.Minute).Unix()
 		next.FailReason = "submission result awaiting confirmation"
-		var err error
 		if staged != nil {
 			err = model.ReplaceTaskSubmissionIntent(c.Request.Context(), staged, next)
 		} else if owner, ok := relayInfo.Billing.(interface {
@@ -543,6 +554,9 @@ func executeTaskSubmissionWith(
 			return err
 		}
 		staged = next
+		if err := model.MarkTaskSubmissionDispatched(c.Request.Context(), staged); err != nil {
+			return err
+		}
 		c.Set("task_submission_rejected", false)
 		c.Set("task_submission_response", nil)
 		return nil
@@ -553,11 +567,15 @@ func executeTaskSubmissionWith(
 			staged.PrivateData.SubmissionResponse, _ = common.GetContextKeyType[json.RawMessage](c, "task_submission_response")
 			staged.PrivateData.SubmissionContext, _ = common.GetContextKeyType[json.RawMessage](c, "task_submission_context")
 			if result != nil {
+				quoted := newSubmittedTask(c, relayInfo, result)
+				staged.PrivateData.SubmissionQuote = &model.TaskSubmissionQuote{
+					Quota: result.Quota, DiscountAmounts: quoted.PrivateData.DiscountAmounts, BillingContext: quoted.PrivateData.BillingContext,
+				}
 				var data any
 				if len(result.TaskData) == 0 || common.Unmarshal(result.TaskData, &data) == nil {
 					parsed := map[string]any{"taskId": result.UpstreamTaskID, "taskData": data}
 					if immediate := result.Immediate; immediate != nil {
-						parsed["immediate"] = map[string]any{"status": immediate.Status, "progress": immediate.Progress, "reason": immediate.Reason, "url": immediate.Url, "completionTokens": immediate.CompletionTokens, "totalTokens": immediate.TotalTokens}
+						parsed["immediate"] = map[string]any{"code": immediate.Code, "taskId": immediate.TaskID, "status": immediate.Status, "progress": immediate.Progress, "reason": immediate.Reason, "url": immediate.Url, "remoteUrl": immediate.RemoteUrl, "completionTokens": immediate.CompletionTokens, "totalTokens": immediate.TotalTokens}
 					}
 					if len(result.PluginState) > 0 {
 						var state any
@@ -581,8 +599,8 @@ func executeTaskSubmissionWith(
 				logger.LogError(c, "persist submission recovery evidence failed: "+err.Error())
 			}
 			if billing, ok := relayInfo.Billing.(*service.BillingSession); ok {
-				// 差额已由持久化交接处理；失败时保留记录交给后台，不能再单独退款。
-				billing.CompleteTaskSubmission(staged.Quota)
+				// 交接结果不明时保留全部预扣，待任务结果确认后统一结算。
+				billing.CompleteTaskSubmission(billing.GetPreConsumedQuota())
 			} else if relayInfo.Billing != nil {
 				if err := service.SettleBilling(c, relayInfo, staged.Quota); err != nil {
 					logger.LogError(c, "retain submission reserve failed: "+err.Error())
@@ -663,6 +681,9 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil && taskErr.LocalError && taskErr.Code == "task_submission_intent_failed" {
+			taskErr.NoRetry = true
+		}
 		if taskErr != nil {
 			message := service.PublicTaskModelText(taskErr.Message, relayInfo.OriginModelName, relayInfo.UpstreamModelName)
 			if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok {
@@ -763,6 +784,7 @@ func executeTaskSubmissionWith(
 	task := newSubmittedTask(c, relayInfo, result)
 	if staged != nil {
 		task.ID, task.TaskID = staged.ID, staged.TaskID
+		task.PrivateData.SubmissionAttemptID = staged.PrivateData.SubmissionAttemptID
 		task.PrivateData.InitialAccountingPending = true
 	}
 	if requestValue, exists := c.Get("task_request"); exists {

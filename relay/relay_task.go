@@ -594,7 +594,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		noteTaskQuotaClamp(info, clamp)
 	}
 
-	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
+	// 7. 首次预扣；渠道重试的价格提高时，在提交前补足差额。
 	if info.ApiKey != "" && !common.HasPersistentTaskSecret() {
 		failure := service.TaskErrorWrapperLocal(errors.New("configure a persistent CRYPTO_SECRET or SESSION_SECRET before submitting tasks"), "task_encryption_not_configured", http.StatusServiceUnavailable)
 		failure.NoRetry = true
@@ -608,6 +608,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 	if session, ok := info.Billing.(*service.BillingSession); ok {
 		if reserveErr := session.ReserveBeforeTaskSubmit(info.PriceData.Quota); reserveErr != nil {
+			var apiErr *relaytypes.NewAPIError
+			if errors.As(reserveErr, &apiErr) {
+				return nil, service.TaskErrorFromAPIError(apiErr)
+			}
 			return nil, service.TaskErrorFromAPIError(relaytypes.NewError(reserveErr, relaytypes.ErrorCodeUpdateDataError, relaytypes.ErrOptionWithSkipRetry()))
 		}
 	}
@@ -641,9 +645,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
-		c.Set("task_submission_rejected", true)
 		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		failure := service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		if resp.StatusCode/100 == 5 || resp.StatusCode == http.StatusRequestTimeout {
+			failure.NoRetry = true
+		} else {
+			c.Set("task_submission_rejected", true)
+		}
+		return nil, failure
 	}
 
 	// 10. Parse only. The controller presents the response after the durable

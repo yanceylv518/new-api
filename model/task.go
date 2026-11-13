@@ -118,9 +118,13 @@ func (m Properties) Value() (driver.Value, error) {
 type TaskPrivateData struct {
 	// 提交意图先落库；未确认响应的任务保留预扣，绝不当作生成失败退款。
 	SubmissionPending        bool                   `json:"submission_pending,omitempty"`
+	SubmissionAttemptID      string                 `json:"submission_attempt_id,omitempty"`
+	SubmissionPrepared       bool                   `json:"submission_prepared,omitempty"`
+	DiscardImmediateResult   bool                   `json:"discard_immediate_result,omitempty"`
 	InitialAccountingPending bool                   `json:"initial_accounting_pending,omitempty"`
 	SubmissionFundsCommitted bool                   `json:"submission_funds_committed,omitempty"`
 	SubmissionFunding        *TaskSubmissionFunding `json:"submission_funding,omitempty"`
+	SubmissionQuote          *TaskSubmissionQuote   `json:"submission_quote,omitempty"`
 	SubmissionResponse       json.RawMessage        `json:"submission_response,omitempty"`
 	SubmissionContext        json.RawMessage        `json:"submission_context,omitempty"`
 	ReconciliationRequired   bool                   `json:"reconciliation_required,omitempty"`
@@ -163,6 +167,12 @@ type TaskPrivateData struct {
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
 	// 原生删除仅隐藏原生查询；本地任务及账务历史继续保留。
 	NativeDeleted bool `json:"native_deleted,omitempty"`
+}
+
+type TaskSubmissionQuote struct {
+	Quota           int                        `json:"quota"`
+	DiscountAmounts *hosttypes.DiscountAmounts `json:"discount_amounts,omitempty"`
+	BillingContext  *TaskBillingContext        `json:"billing_context,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -288,7 +298,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 && p.SubscriptionPeriodStart == 0 && len(p.HeaderOverride) == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded && !p.NativeDeleted && !p.SubmissionPending && !p.InitialAccountingPending && !p.SubmissionFundsCommitted && p.SubmissionFunding == nil && len(p.SubmissionResponse) == 0 && len(p.SubmissionContext) == 0 && !p.ReconciliationRequired && p.ReconciliationReason == "" && p.NextPollAt == 0 {
+		!p.ResultDiscarded && !p.NativeDeleted && !p.SubmissionPending && p.SubmissionAttemptID == "" && !p.SubmissionPrepared && !p.DiscardImmediateResult && !p.InitialAccountingPending && !p.SubmissionFundsCommitted && p.SubmissionFunding == nil && p.SubmissionQuote == nil && len(p.SubmissionResponse) == 0 && len(p.SubmissionContext) == 0 && !p.ReconciliationRequired && p.ReconciliationReason == "" && p.NextPollAt == 0 {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -729,7 +739,7 @@ func (t *Task) UpdateQuota() error {
 }
 
 func lockTaskForUpdate(tx *gorm.DB, id int64) (*Task, error) {
-	if tx.Dialector.Name() == string(common.DatabaseTypeSQLite) {
+	if tx.Dialector.Name() == "sqlite" {
 		if err := tx.Model(&Task{}).Where("id = ?", id).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
 			return nil, err
 		}
@@ -780,9 +790,7 @@ func (t *Task) SetResponsesBackground(ctx context.Context) error {
 	})
 }
 
-// UpdateWithStatus 锁定任务后按原状态更新，并保留并发写入的记账和后台标记。
-// 状态或提交证据已变化、任务不存在，以及 MySQL 同值更新均可能返回 false。
-// 使用 Updates 避免 Save 在条件不匹配时回退插入，绕过状态保护。
+// UpdateWithStatus 保留并发写入的提交和记账状态；状态变化或同值更新可能返回 false。
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 	var final Task
 	var won bool
@@ -794,19 +802,24 @@ func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 		if err != nil {
 			return err
 		}
-		if stored.Status != fromStatus {
+		if stored.Status != fromStatus || stored.PrivateData.SubmissionAttemptID != t.PrivateData.SubmissionAttemptID || stored.PrivateData.SubmissionPrepared != t.PrivateData.SubmissionPrepared {
 			return nil
 		}
-		// 旧提交快照不能覆盖已恢复的提交结果或新保存的响应证据。
 		if t.PrivateData.SubmissionPending && (!stored.PrivateData.SubmissionPending ||
 			!bytes.Equal(t.PrivateData.SubmissionResponse, stored.PrivateData.SubmissionResponse) ||
 			!bytes.Equal(t.PrivateData.SubmissionContext, stored.PrivateData.SubmissionContext)) {
 			return nil
 		}
 		final = *t
+		if final.PrivateData.SubmissionPending && stored.PrivateData.ReconciliationRequired {
+			final.PrivateData.ReconciliationRequired = true
+			final.PrivateData.ReconciliationReason = stored.PrivateData.ReconciliationReason
+		}
 		final.PrivateData.InitialAccountingPending = stored.PrivateData.InitialAccountingPending
 		final.PrivateData.SubmissionFundsCommitted = stored.PrivateData.SubmissionFundsCommitted
 		final.PrivateData.SubmissionFunding = stored.PrivateData.SubmissionFunding
+		final.PrivateData.SubscriptionPeriodStart = stored.PrivateData.SubscriptionPeriodStart
+		final.PrivateData.NativeDeleted = stored.PrivateData.NativeDeleted || final.PrivateData.NativeDeleted
 		final.PrivateData.ResponsesBackground = stored.PrivateData.ResponsesBackground || final.PrivateData.ResponsesBackground
 		result := tx.Model(&final).Where("status = ?", fromStatus).Select("*").Updates(&final)
 		won = result.RowsAffected > 0
@@ -816,6 +829,36 @@ func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 		*t = final
 	}
 	return won && err == nil, err
+}
+
+// MarkTaskSettlementPending 只更新待结算状态，保留主库中最新的提交证据和进度。
+func MarkTaskSettlementPending(ctx context.Context, task *Task, fromStatus TaskStatus, retryAt int64) (bool, error) {
+	var final Task
+	updated := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		stored, err := lockTaskForUpdate(tx, task.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if stored.UserId != task.UserId || stored.Status != fromStatus || stored.PrivateData.SubmissionAttemptID != task.PrivateData.SubmissionAttemptID || stored.PrivateData.SubmissionPrepared != task.PrivateData.SubmissionPrepared {
+			return nil
+		}
+		stored.PrivateData.ReconciliationRequired = true
+		stored.PrivateData.ReconciliationReason = "task settlement is pending; reserved quota retained"
+		stored.PrivateData.NextPollAt = retryAt
+		if err := tx.Model(stored).Update("private_data", stored.PrivateData).Error; err != nil {
+			return err
+		}
+		final, updated = *stored, true
+		return nil
+	})
+	if err == nil && updated {
+		*task = final
+	}
+	return updated, err
 }
 
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
