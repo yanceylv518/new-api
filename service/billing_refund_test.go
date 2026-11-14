@@ -230,6 +230,68 @@ func TestBillingTaskRefundSurvivesQueueFailure(t *testing.T) {
 	assert.Equal(t, 1000, getTokenRemainQuota(t, id))
 }
 
+func TestBillingTaskPreparationRecoveryMySQL(t *testing.T) {
+	requireBillingRefundMySQL(t)
+	for _, stage := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stage-%t", stage), func(t *testing.T) {
+			truncate(t)
+			const id = 941250
+			seedUser(t, id, 1000)
+			seedToken(t, id, id, "preparation-fixture", 1000)
+			info := &relaycommon.RelayInfo{UserId: id, UserQuota: 1000, TokenId: id, TokenKey: "preparation-fixture", RequestId: "preparation-request", ForcePreConsume: true, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "preparation-task"}}
+			session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: id}}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			require.Nil(t, session.preConsume(c, 100))
+			var refund model.BillingRefund
+			require.NoError(t, model.DB.Where("user_id = ?", id).First(&refund).Error)
+			assert.Equal(t, model.BillingRefundInFlight, refund.NextAttemptAt)
+			assert.Less(t, refund.SettlementRetryAt, int64(0))
+			require.NoError(t, model.RetryBillingRefunds(t.Context()))
+			assert.Equal(t, 900, getUserQuota(t, id))
+			task := &model.Task{TaskID: info.PublicTaskID, UserId: id, ChannelId: id, Quota: 100, Status: model.TaskStatusUnknown,
+				PrivateData: model.TaskPrivateData{TokenId: id, BillingSource: BillingSourceWallet, SubmissionPending: true, SubmissionPrepared: true, InitialAccountingPending: true, SubmissionAttemptID: "preparation-attempt"}}
+			if stage {
+				require.NoError(t, session.StageTaskSubmission(t.Context(), task))
+				require.NoError(t, model.MarkTaskSubmissionDispatched(t.Context(), task))
+				require.NoError(t, model.RetryBillingRefunds(t.Context()))
+				assert.Equal(t, 900, getUserQuota(t, id))
+				assert.Equal(t, 900, getTokenRemainQuota(t, id))
+				return
+			}
+			now, err := model.GetTaskSubmissionDatabaseTime(t.Context())
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&refund).Update("settlement_retry_at", -now).Error)
+			require.Error(t, session.ReserveBeforeTaskSubmit(150))
+			require.Error(t, session.StageTaskSubmission(t.Context(), task))
+			require.NoError(t, model.RetryBillingRefunds(t.Context()))
+			require.NoError(t, model.RetryBillingRefunds(t.Context()))
+			assert.Equal(t, 1000, getUserQuota(t, id))
+			assert.Equal(t, 1000, getTokenRemainQuota(t, id))
+			require.NoError(t, model.DB.First(&refund, refund.ID).Error)
+			assert.True(t, refund.Completed)
+		})
+	}
+}
+
+func TestBillingRefundCleanupDrainsExpiredBatchesMySQL(t *testing.T) {
+	requireBillingRefundMySQL(t)
+	truncate(t)
+	expiredAt := time.Now().Add(-8 * 24 * time.Hour).Unix()
+	refunds := make([]model.BillingRefund, 1001)
+	for i := range refunds {
+		refunds[i] = model.BillingRefund{RequestID: fmt.Sprintf("cleanup-batch-%d", i), UserID: 941251, Completed: true, CreatedAt: expiredAt, CompletedAt: expiredAt}
+	}
+	require.NoError(t, model.DB.CreateInBatches(&refunds, 500).Error)
+	pendingCache := &model.BillingRefund{RequestID: "cleanup-cache-pending", UserID: 941251, Completed: true, CachePending: true, CreatedAt: expiredAt, CompletedAt: expiredAt}
+	require.NoError(t, model.DB.Create(pendingCache).Error)
+	require.NoError(t, model.RetryBillingRefunds(t.Context()))
+	var count int64
+	require.NoError(t, model.DB.Model(&model.BillingRefund{}).Where("request_id LIKE ?", "cleanup-batch-%").Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, model.DB.First(pendingCache, pendingCache.ID).Error)
+}
+
 func TestBillingTaskRefundDoesNotRecreateExpiredReservation(t *testing.T) {
 	requireBillingRefundMySQL(t)
 	truncate(t)
@@ -1466,6 +1528,14 @@ func TestBillingTaskStageCommitAndConfirmationFailureRecoversUnsent(t *testing.T
 	})
 	RunTaskPollingOnce(t.Context(), nil)
 	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), stored.Status)
+	assert.True(t, stored.PrivateData.SubmissionPrepared)
+	assert.Equal(t, 900, getUserQuota(t, id))
+	assert.Equal(t, 900, getTokenRemainQuota(t, id))
+	stored.PrivateData.NextPollAt = 0
+	require.NoError(t, model.DB.Model(&stored).Update("private_data", stored.PrivateData).Error)
+	RunTaskPollingOnce(t.Context(), nil)
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
 	assert.False(t, stored.PrivateData.SubmissionPrepared)
 	assert.Equal(t, 1000, getUserQuota(t, id))
@@ -1857,6 +1927,10 @@ func TestBillingPreparedRecoveryAndDispatchAreExclusive(t *testing.T) {
 	require.NoError(t, model.DB.Create(task).Error)
 	stale := *task
 	require.NoError(t, model.MarkTaskSubmissionDispatched(t.Context(), task))
+	require.ErrorContains(t, model.MarkTaskSubmissionDispatched(t.Context(), &stale), "no longer dispatchable")
+	var dispatched model.Task
+	require.NoError(t, model.DB.First(&dispatched, task.ID).Error)
+	assert.False(t, dispatched.PrivateData.SubmissionPrepared)
 	_, err := model.CommitTaskInitialAccounting(t.Context(), &stale)
 	require.ErrorContains(t, err, "task submission attempt changed")
 	won, err := stale.UpdateWithStatus(model.TaskStatusUnknown)
@@ -1887,10 +1961,17 @@ func TestBillingRecoveredPreparedIntentBlocksDispatch(t *testing.T) {
 	staleDispatch := *task
 	won, err := model.CommitTaskInitialAccounting(t.Context(), task)
 	require.NoError(t, err)
-	require.True(t, won)
-	require.ErrorContains(t, model.MarkTaskSubmissionDispatched(t.Context(), &staleDispatch), "no longer dispatchable")
+	require.False(t, won)
+	assert.True(t, task.PrivateData.InitialAccountingPending)
+	used, count := getUserUsageAccounting(t, id)
+	assert.Zero(t, used)
+	assert.Zero(t, count)
 	task.PrivateData.NextPollAt = 0
 	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	won, err = model.CommitTaskInitialAccounting(t.Context(), task)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.ErrorContains(t, model.MarkTaskSubmissionDispatched(t.Context(), &staleDispatch), "no longer dispatchable")
 	task.Status, task.PrivateData.SubmissionPending = model.TaskStatusFailure, false
 	won, err = model.FinalizeVideoTask(t.Context(), task, model.TaskStatusUnknown, 0)
 	require.NoError(t, err)
@@ -1898,7 +1979,7 @@ func TestBillingRecoveredPreparedIntentBlocksDispatch(t *testing.T) {
 	won, err = model.FinalizeVideoTask(t.Context(), task, model.TaskStatusUnknown, 0)
 	require.NoError(t, err)
 	assert.False(t, won)
-	used, count := getUserUsageAccounting(t, id)
+	used, count = getUserUsageAccounting(t, id)
 	assert.Zero(t, used)
 	assert.Equal(t, 1, count)
 	assert.Equal(t, 1000, getUserQuota(t, id))
@@ -1978,13 +2059,14 @@ func TestBillingPreparedRecoveryRetriesAfterRedisFailure(t *testing.T) {
 	assert.Equal(t, 1, count)
 }
 
-func TestBillingDispatchCommitUncertaintyKeepsReserve(t *testing.T) {
+func TestBillingDispatchCommitUncertaintyRecoversUnsentReservation(t *testing.T) {
 	requireBillingRefundMySQL(t)
 	truncate(t)
 	const id = 941239
 	seedUser(t, id, 900)
 	seedToken(t, id, id, "dispatch-commit-fixture", 900)
 	seedChannel(t, id)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", id).Update("used_quota", 100).Error)
 	task := &model.Task{TaskID: "dispatch-commit", UserId: id, ChannelId: id, Quota: 100, Status: model.TaskStatusUnknown,
 		PrivateData: model.TaskPrivateData{TokenId: id, SubmissionPending: true, SubmissionPrepared: true, InitialAccountingPending: true, SubmissionAttemptID: "attempt", NextPollAt: time.Now().Add(time.Minute).Unix()}}
 	require.NoError(t, model.DB.Create(task).Error)
@@ -1999,18 +2081,28 @@ func TestBillingDispatchCommitUncertaintyKeepsReserve(t *testing.T) {
 	previousDB := model.DB
 	model.DB = db
 	t.Cleanup(func() { model.DB = previousDB; assert.NoError(t, connection.Close()) })
+	var recoveryReady atomic.Bool
+	var recoveryAttempts atomic.Int32
+	fault.afterCommit = func() { recoveryReady.Store(true) }
+	const callback = "dispatch-commit:transient-recovery"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if recoveryReady.Load() && tx.Statement.Table == "tasks" && recoveryAttempts.Add(1) <= 2 {
+			tx.AddError(&mysqldriver.MySQLError{Number: 1213, Message: "injected transient recovery failure"})
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
 	fault.fail.Store(true)
 	require.ErrorContains(t, model.MarkTaskSubmissionDispatched(t.Context(), task), "injected lost MySQL commit response")
+	assert.GreaterOrEqual(t, recoveryAttempts.Load(), int32(3))
 	var stored model.Task
 	require.NoError(t, model.DB.First(&stored, task.ID).Error)
-	assert.False(t, stored.PrivateData.SubmissionPrepared)
-	won, err := model.PersistTaskSubmission(t.Context(), task, false)
-	require.NoError(t, err)
-	assert.False(t, won)
-	task.Status = model.TaskStatusFailure
-	won, err = model.FinalizeVideoTask(t.Context(), task, model.TaskStatusUnknown, 0)
-	require.NoError(t, err)
-	assert.False(t, won)
-	assert.Equal(t, 900, getUserQuota(t, id))
-	assert.Equal(t, 900, getTokenRemainQuota(t, id))
+	assert.True(t, stored.PrivateData.SubmissionPrepared)
+	assert.Zero(t, stored.PrivateData.NextPollAt)
+	require.NoError(t, RecoverPreparedTaskSubmissions(t.Context()))
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
+	assert.Equal(t, 1000, getUserQuota(t, id))
+	assert.Equal(t, 1000, getTokenRemainQuota(t, id))
+	require.NoError(t, RecoverPreparedTaskSubmissions(t.Context()))
+	assert.Equal(t, 1000, getUserQuota(t, id))
 }

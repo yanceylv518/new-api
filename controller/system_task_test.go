@@ -547,13 +547,16 @@ func TestSeedanceAssetSyncDrainsManyUsersWithoutDuplicateCopies(t *testing.T) {
 }
 
 func TestBillingRefundSchedulerIgnoresVideoUpdateSwitch(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}, &model.SystemTask{}, &model.SystemTaskLock{})
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.Log{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}, &model.SystemTask{}, &model.SystemTaskLock{})
 	previousDB, previousUpdate, previousRedis := model.DB, constant.UpdateTask, common.RedisEnabled
+	previousLogDB, previousConsume, previousMemory := model.LOG_DB, common.LogConsumeEnabled, common.MemoryCacheEnabled
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	model.DB, constant.UpdateTask, common.RedisEnabled = db, false, false
+	model.LOG_DB, common.LogConsumeEnabled, common.MemoryCacheEnabled = db, true, false
 	common.SetDatabaseTypes(dialect, dialect)
 	t.Cleanup(func() {
 		model.DB, constant.UpdateTask, common.RedisEnabled = previousDB, previousUpdate, previousRedis
+		model.LOG_DB, common.LogConsumeEnabled, common.MemoryCacheEnabled = previousLogDB, previousConsume, previousMemory
 		common.SetDatabaseTypes(previousMain, previousLog)
 	})
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "refund-owner", Quota: 900}).Error)
@@ -569,6 +572,67 @@ func TestBillingRefundSchedulerIgnoresVideoUpdateSwitch(t *testing.T) {
 	var user model.User
 	require.NoError(t, db.First(&user, 1).Error)
 	assert.Equal(t, 1000, user.Quota)
+
+	require.NoError(t, db.Model(&model.User{}).Where("id = ?", 1).Update("quota", 900).Error)
+	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", 1).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "prepared-test"}).Error)
+	prepared := &model.Task{TaskID: "unsubmitted", UserId: 1, ChannelId: 1, Quota: 100, Status: model.TaskStatusUnknown,
+		PrivateData: model.TaskPrivateData{TokenId: 1, BillingSource: service.BillingSourceWallet, SubmissionPending: true,
+			SubmissionPrepared: true, InitialAccountingPending: true, SubmissionAttemptID: "attempt",
+			SubmissionFunding: &model.TaskSubmissionFunding{ReservedQuota: 100, UpdateToken: true}}}
+	require.NoError(t, db.Create(prepared).Error)
+	require.True(t, handler.Enabled())
+	run, err := model.CreateSystemTask(handler.Type(), nil, nil)
+	require.NoError(t, err)
+	claimed, ok, err := model.ClaimSystemTask(run.ID, run.Type, "prepared-recovery", time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	require.True(t, ok)
+	handler.Run(t.Context(), claimed, "prepared-recovery")
+	require.NoError(t, db.First(prepared, prepared.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), prepared.Status)
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 1000, user.Quota)
+	var token model.Token
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 1000, token.RemainQuota)
+	assert.False(t, handler.Enabled())
+}
+
+func TestBillingRefundHandlerRunsOnMySQL(t *testing.T) {
+	db := setupSeedanceSyncTestDB(t)
+	additional := []any{&model.Task{}, &model.TaskResource{}, &model.TaskResourceIndexState{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{}, &model.Log{}}
+	for _, value := range additional {
+		require.False(t, db.Migrator().HasTable(value))
+	}
+	require.NoError(t, db.AutoMigrate(additional...))
+	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(additional...)) })
+	previousUpdate, previousConsume := constant.UpdateTask, common.LogConsumeEnabled
+	constant.UpdateTask, common.LogConsumeEnabled = false, true
+	t.Cleanup(func() { constant.UpdateTask, common.LogConsumeEnabled = previousUpdate, previousConsume })
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "handler-owner", Quota: 900}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: "handler-token", RemainQuota: 900, UsedQuota: 100}).Error)
+	now, err := model.GetTaskSubmissionDatabaseTime(t.Context())
+	require.NoError(t, err)
+	refund := &model.BillingRefund{RequestID: "handler-preparation", UserID: 1, TokenID: 1, Amount: 100, TokenAmount: 100, NextAttemptAt: model.BillingRefundInFlight, SettlementRetryAt: -now}
+	require.NoError(t, model.QueueBillingRefund(t.Context(), refund))
+	handler := billingRefundHandler{}
+	require.True(t, handler.Enabled())
+	run, err := model.CreateSystemTask(handler.Type(), nil, nil)
+	require.NoError(t, err)
+	claimed, ok, err := model.ClaimSystemTask(run.ID, run.Type, "handler-recovery", now+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	handler.Run(t.Context(), claimed, "handler-recovery")
+	require.NoError(t, db.First(run, run.ID).Error)
+	assert.Equal(t, model.SystemTaskStatusSucceeded, run.Status)
+	require.NoError(t, db.First(refund, refund.ID).Error)
+	assert.True(t, refund.Completed)
+	var user model.User
+	var token model.Token
+	require.NoError(t, db.First(&user, 1).Error)
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 1000, user.Quota)
+	assert.Equal(t, 1000, token.RemainQuota)
 }
 
 func TestSystemTaskListFiltersAndPaginationResponse(t *testing.T) {

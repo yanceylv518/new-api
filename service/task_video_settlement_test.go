@@ -26,6 +26,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -104,6 +105,55 @@ func TestVideoRefundDoesNotReduceNewSubscriptionPeriod(t *testing.T) {
 	t.Cleanup(func() {
 		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
 	})
+}
+
+func TestPreparedTaskRecoveryWithoutPolling(t *testing.T) {
+	truncate(t)
+	const id = 941005
+	seedUser(t, id, 900)
+	seedToken(t, id, id, "prepared-recovery-token", 900)
+	seedChannel(t, id)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", id).Update("used_quota", 100).Error)
+	previousExport := common.DataExportEnabled
+	common.DataExportEnabled = true
+	model.CacheQuotaDataLock.Lock()
+	previousCache := model.CacheQuotaData
+	model.CacheQuotaData = make(map[string]*model.QuotaData)
+	model.CacheQuotaDataLock.Unlock()
+	t.Cleanup(func() {
+		common.DataExportEnabled = previousExport
+		model.CacheQuotaDataLock.Lock()
+		model.CacheQuotaData = previousCache
+		model.CacheQuotaDataLock.Unlock()
+	})
+	unrelated := &model.Task{TaskID: "other-pending-task", UserId: id, ChannelId: id, Status: model.TaskStatusUnknown,
+		PrivateData: model.TaskPrivateData{PluginState: []byte(`{"submission_prepared":true}`)}}
+	require.NoError(t, model.DB.Create(unrelated).Error)
+	assert.False(t, model.HasPreparedTaskSubmissions())
+	task := &model.Task{TaskID: "prepared-without-polling", UserId: id, ChannelId: id, Quota: 100, Status: model.TaskStatusUnknown,
+		PrivateData: model.TaskPrivateData{TokenId: id, BillingSource: BillingSourceWallet, SubmissionPending: true, SubmissionPrepared: true,
+			InitialAccountingPending: true, SubmissionAttemptID: "prepared", NextPollAt: time.Now().Add(24 * time.Hour).Unix(),
+			SubmissionFunding: &model.TaskSubmissionFunding{ReservedQuota: 100, UpdateToken: true}}}
+	now, err := model.GetTaskSubmissionDatabaseTime(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, model.StageBillingTask(t.Context(), task, 0))
+	assert.GreaterOrEqual(t, task.PrivateData.NextPollAt, now+300)
+	assert.Less(t, task.PrivateData.NextPollAt, now+600)
+	task.PrivateData.NextPollAt = 0
+	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	require.True(t, model.HasPreparedTaskSubmissions())
+	require.NoError(t, RecoverPreparedTaskSubmissions(t.Context()))
+	var stored model.Task
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
+	assert.Equal(t, 1000, getUserQuota(t, id))
+	assert.Equal(t, 1000, getTokenRemainQuota(t, id))
+	model.CacheQuotaDataLock.Lock()
+	assert.Empty(t, model.CacheQuotaData)
+	model.CacheQuotaDataLock.Unlock()
+	assert.False(t, model.HasPreparedTaskSubmissions())
+	require.NoError(t, RecoverPreparedTaskSubmissions(t.Context()))
+	assert.Equal(t, 1000, getUserQuota(t, id))
 }
 
 func TestSubmissionRefundSurvivesWalletDatabaseFailure(t *testing.T) {

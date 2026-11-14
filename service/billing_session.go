@@ -289,6 +289,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveQuota(ctx context.Context, amount int, checkWallet, initial bool) error {
 	reservation := model.BillingQuotaReservation{UserID: s.relayInfo.UserId, TokenID: s.relayInfo.TokenId, TokenKey: s.relayInfo.TokenKey, Amount: amount, UpdateToken: !s.relayInfo.IsPlayground, TokenUnlimited: s.relayInfo.TokenUnlimited, CheckWallet: checkWallet}
 	reservation.TaskID = s.submissionTaskID
+	reservation.TaskPreparation = s.funding.Source() == BillingSourceWallet && s.submissionTaskID == 0 && s.relayInfo.TaskRelayInfo != nil && s.relayInfo.PublicTaskID != ""
 	if s.reservationRefundID == 0 && s.submissionTaskID == 0 {
 		if s.refundRequestID == "" {
 			s.refundRequestID = s.relayInfo.RequestId

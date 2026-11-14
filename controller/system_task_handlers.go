@@ -150,7 +150,8 @@ type billingRefundHandler struct{}
 func (billingRefundHandler) Type() string { return model.SystemTaskTypeBillingRefund }
 
 func (billingRefundHandler) Enabled() bool {
-	return model.HasPendingBillingRefunds() || model.HasExpiredBillingRefunds() || model.HasPendingVideoTaskLogs()
+	return model.HasPendingBillingRefunds() || model.HasExpiredBillingRefunds() || model.HasPendingVideoTaskLogs() ||
+		(!constant.UpdateTask && model.HasPreparedTaskSubmissions())
 }
 
 func (billingRefundHandler) Interval() time.Duration { return 15 * time.Second }
@@ -163,6 +164,12 @@ func (billingRefundHandler) Run(ctx context.Context, task *model.SystemTask, run
 	// 各恢复队列使用独立预算，日志库故障不阻塞视频轮询或饿死退款清理。
 	for _, retry := range []func(context.Context) error{
 		model.RetryBillingRefunds,
+		func(ctx context.Context) error {
+			if constant.UpdateTask {
+				return nil
+			}
+			return service.RecoverPreparedTaskSubmissions(ctx)
+		},
 		func(ctx context.Context) error {
 			return model.RetryTaskInitialAccounting(ctx, service.RecoverTaskInitialAccounting)
 		},

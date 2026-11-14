@@ -545,6 +545,47 @@ func GetUnfinishedSyncTasksAfter(limit int, after int64) ([]*Task, error) {
 	return tasks, nil
 }
 
+func preparedTaskSubmissionQuery() *gorm.DB {
+	condition := "CASE WHEN json_valid(private_data) THEN json_extract(private_data, '$.submission_prepared') END = ?"
+	var prepared any = 1
+	switch DB.Dialector.Name() {
+	case "mysql":
+		condition = "JSON_UNQUOTE(JSON_EXTRACT(private_data, '$.submission_prepared')) = ?"
+		prepared = "true"
+	case "postgres":
+		condition = "private_data ->> 'submission_prepared' = ?"
+		prepared = "true"
+	}
+	return DB.Model(&Task{}).Where("status = ?", TaskStatusUnknown).
+		Where(condition, prepared)
+}
+
+// HasPreparedTaskSubmissions 用于在关闭任务轮询时恢复未发送的预扣。
+func HasPreparedTaskSubmissions() bool {
+	var id int64
+	err := preparedTaskSubmissionQuery().Limit(1).Pluck("id", &id).Error
+	return err == nil && id != 0
+}
+
+// GetPreparedTaskSubmissionsAfter 循环扫描提交意图，兼容已有待恢复任务。
+func GetPreparedTaskSubmissionsAfter(limit int, after int64) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	tasks, err := findTaskPollingPage(preparedTaskSubmissionQuery().Where("id > ?", after).Order("id").Limit(limit))
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) < limit && after > 0 {
+		wrapped, err := findTaskPollingPage(preparedTaskSubmissionQuery().Where("id <= ?", after).Order("id").Limit(limit - len(tasks)))
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, wrapped...)
+	}
+	return tasks, nil
+}
+
 // findTaskPollingPage 仅在整批解码失败时逐行读取，坏行仍推进游标，但不进入轮询或账务流程。
 func findTaskPollingPage(query *gorm.DB) ([]*Task, error) {
 	var tasks []*Task

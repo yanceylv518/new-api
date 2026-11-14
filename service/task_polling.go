@@ -71,6 +71,7 @@ var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
 var taskPollingCursor atomic.Int64
 var taskTimeoutCursor atomic.Int64
+var preparedTaskRecoveryCursor atomic.Int64
 var taskPollSlots = make(chan struct{}, 32)
 var taskPollBodySlots = make(chan struct{}, 4)
 
@@ -194,6 +195,54 @@ type TaskPollSummary struct {
 	NullTasksFailed  int `json:"null_tasks_failed"`
 }
 
+func recoverPreparedTask(ctx context.Context, task *model.Task) error {
+	if task.PrivateData.InitialAccountingPending {
+		if err := RecoverTaskInitialAccounting(ctx, task); err != nil {
+			return err
+		}
+	}
+	previous := task.Status
+	task.Status, task.Progress, task.FinishTime = model.TaskStatusFailure, "100%", time.Now().Unix()
+	task.FailReason = "submission did not start"
+	task.PrivateData.SubmissionPending = false
+	task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
+	_, err := FinalizeVideoTaskBilling(ctx, task, previous, 0, task.FailReason, nil)
+	return err
+}
+
+// RecoverPreparedTaskSubmissions 只恢复确定尚未发送的任务，不查询上游。
+func RecoverPreparedTaskSubmissions(ctx context.Context) error {
+	const batchSize = 100
+	tasks, err := model.GetPreparedTaskSubmissionsAfter(batchSize, preparedTaskRecoveryCursor.Load())
+	if err != nil || len(tasks) == 0 {
+		return err
+	}
+	now, err := model.GetTaskSubmissionDatabaseTime(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, task := range tasks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		preparedTaskRecoveryCursor.Store(task.ID)
+		if task.PrivateDataReadError != nil {
+			if firstErr == nil {
+				firstErr = task.PrivateDataReadError
+			}
+			continue
+		}
+		if !task.PrivateData.SubmissionPrepared || task.PrivateData.NextPollAt > now {
+			continue
+		}
+		if err := recoverPreparedTask(ctx, task); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // RunTaskPollingOnce performs one async-task (Suno/video) polling pass
 // synchronously. It honors ctx cancellation (the system-task runner cancels it
 // when the lease is lost) and, when report is non-nil, reports progress as
@@ -230,6 +279,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	totalPlatforms := len(platformTask)
 	processedPlatforms := 0
+	var submissionNow int64
+	var submissionTimeErr error
+	submissionTimeChecked := false
 	for platform, tasks := range platformTask {
 		if ctx.Err() != nil {
 			break
@@ -246,7 +298,24 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
-			if task.PrivateData.NextPollAt > time.Now().Unix() {
+			if task.PrivateData.SubmissionPrepared {
+				if !submissionTimeChecked {
+					submissionNow, submissionTimeErr = model.GetTaskSubmissionDatabaseTime(ctx)
+					submissionTimeChecked = true
+					if submissionTimeErr != nil {
+						logger.LogWarn(ctx, "load task submission time failed: "+submissionTimeErr.Error())
+					}
+				}
+				if submissionTimeErr != nil || task.PrivateData.NextPollAt > submissionNow {
+					continue
+				}
+			} else if task.PrivateData.NextPollAt > time.Now().Unix() {
+				continue
+			}
+			if task.PrivateData.SubmissionPrepared {
+				if err := recoverPreparedTask(ctx, task); err != nil {
+					logger.LogWarn(ctx, "unsubmitted task recovery failed: "+err.Error())
+				}
 				continue
 			}
 			// 活跃提交尚无响应证据时不能提前入账，否则提交交接会重复统计。
@@ -255,17 +324,6 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 					logger.LogWarn(ctx, "task initial accounting recovery failed: "+err.Error())
 					continue
 				}
-			}
-			if task.PrivateData.SubmissionPrepared {
-				previous := task.Status
-				task.Status, task.Progress, task.FinishTime = model.TaskStatusFailure, "100%", time.Now().Unix()
-				task.FailReason = "submission did not start"
-				task.PrivateData.SubmissionPending = false
-				task.PrivateData.ReconciliationRequired, task.PrivateData.ReconciliationReason = false, ""
-				if _, err := FinalizeVideoTaskBilling(ctx, task, previous, 0, task.FailReason, nil); err != nil {
-					logger.LogWarn(ctx, "unsubmitted task recovery failed: "+err.Error())
-				}
-				continue
 			}
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" && !task.PrivateData.SubmissionPending {

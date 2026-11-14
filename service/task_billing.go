@@ -126,7 +126,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 				logger.LogWarn(c, "initial task log delivery pending: "+err.Error())
 			}
 		}
-		if initialLog != nil && common.DataExportEnabled {
+		if initialLog != nil && common.DataExportEnabled && !task.PrivateData.SubmissionPrepared {
 			model.LogQuotaData(model.QuotaDataLogParams{UserID: info.UserId, Username: initialLog.Username, ModelName: params.ModelName, Quota: params.Quota, CreatedAt: initialLog.CreatedAt, UseGroup: params.Group, TokenID: params.TokenId, ChannelID: params.ChannelId, NodeName: common.NodeName})
 		}
 	} else {
@@ -139,7 +139,8 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 }
 
 func RecoverTaskInitialAccounting(ctx context.Context, task *model.Task) error {
-	if task.PrivateData.SubmissionFunding != nil {
+	// 尚未发送的任务没有上游结果，保留原预扣交给终态退款。
+	if task.PrivateData.SubmissionFunding != nil && !task.PrivateData.SubmissionPrepared {
 		won, err := model.PersistTaskSubmission(ctx, task, false)
 		if err != nil {
 			return err
@@ -177,7 +178,7 @@ func RecoverTaskInitialAccounting(ctx context.Context, task *model.Task) error {
 		return err
 	}
 	// 独立日志库由费用恢复任务投递，轮询只等待主库的原子记账。
-	if initialLog != nil && common.DataExportEnabled {
+	if initialLog != nil && common.DataExportEnabled && !task.PrivateData.SubmissionPrepared {
 		nodeName := task.PrivateData.NodeName
 		if nodeName == "" {
 			nodeName = common.NodeName

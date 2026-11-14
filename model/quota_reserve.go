@@ -26,6 +26,7 @@ type BillingQuotaReservation struct {
 	SubscriptionPeriodStart          int64
 	Refund                           *BillingRefund
 	TaskID                           int64
+	TaskPreparation                  bool
 }
 
 // ReserveBillingQuota 在同一事务预留资金和令牌，任一步失败都不留下部分数据库扣款。
@@ -93,8 +94,20 @@ func ReserveBillingQuota(ctx context.Context, reservation BillingQuotaReservatio
 			if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", reservation.Refund.ID, reservation.UserID).First(&pending).Error; err != nil {
 				return err
 			}
-			if pending.Completed || pending.SettlementPending || pending.NextAttemptAt != BillingRefundInFlight || pending.TokenID != reservation.TokenID || (pending.TokenTracked || pending.TokenAmount > 0) != reservation.UpdateToken || pending.SubscriptionID != reservation.SubscriptionID || pending.PeriodStart != reservation.SubscriptionPeriodStart || reservation.SubscriptionRequestID != "" || pending.Amount > common.MaxQuota-reservation.Amount {
+			if pending.Completed || pending.SettlementPending || pending.DecisionKnown || pending.TokenID != reservation.TokenID || (pending.TokenTracked || pending.TokenAmount > 0) != reservation.UpdateToken || pending.SubscriptionID != reservation.SubscriptionID || pending.PeriodStart != reservation.SubscriptionPeriodStart || reservation.SubscriptionRequestID != "" || pending.Amount > common.MaxQuota-reservation.Amount {
 				return errors.New("task reservation is no longer available")
+			}
+			if pending.NextAttemptAt != BillingRefundInFlight {
+				return errors.New("task reservation is no longer available")
+			}
+			if pending.SettlementRetryAt < 0 && reservation.TaskPreparation {
+				now, err := taskSubmissionDatabaseTime(tx)
+				if err != nil {
+					return err
+				}
+				if pending.SettlementRetryAt >= -now {
+					return errors.New("task reservation has expired")
+				}
 			}
 		}
 		if wallet && reservation.Amount > 0 {
@@ -153,6 +166,14 @@ func ReserveBillingQuota(ctx context.Context, reservation BillingQuotaReservatio
 				refund.UserID, refund.TokenID, refund.Amount = reservation.UserID, reservation.TokenID, reservation.Amount
 				refund.TokenTracked = reservation.UpdateToken
 				refund.ReserveOperation = operationID
+				if reservation.TaskPreparation {
+					now, err := taskSubmissionDatabaseTime(tx)
+					if err != nil {
+						return err
+					}
+					// 未结算时用负值记录任务准备租约，保持旧版调度器的处理中标记。
+					refund.SettlementRetryAt = -(now + taskSubmissionLeaseSeconds)
+				}
 				if reservation.UpdateToken {
 					refund.TokenAmount = reservation.Amount
 				}

@@ -539,7 +539,6 @@ func executeTaskSubmissionWith(
 		next.PrivateData.SubmissionPending = true
 		next.PrivateData.SubmissionPrepared = true
 		next.PrivateData.InitialAccountingPending = true
-		next.PrivateData.NextPollAt = time.Now().Add(5 * time.Minute).Unix()
 		next.FailReason = "submission result awaiting confirmation"
 		if staged != nil {
 			err = model.ReplaceTaskSubmissionIntent(c.Request.Context(), staged, next)

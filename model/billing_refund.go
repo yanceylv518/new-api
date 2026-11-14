@@ -38,11 +38,12 @@ type BillingRefund struct {
 	ReserveOperation  string `gorm:"type:varchar(32);not null;default:''"`
 	SubscriptionID    int
 	PeriodStart       int64
-	Completed         bool  `gorm:"index:idx_billing_refund_pending,priority:1;index:idx_billing_refund_cleanup,priority:1"`
-	DecisionKnown     bool  `gorm:"not null;default:false"`
-	Settled           bool  `gorm:"not null;default:false"`
-	SettledAmount     int   `gorm:"not null;default:0"`
-	SettlementPending bool  `gorm:"not null;default:false;index:idx_billing_settlement_due,priority:1"`
+	Completed         bool `gorm:"index:idx_billing_refund_pending,priority:1;index:idx_billing_refund_cleanup,priority:1"`
+	DecisionKnown     bool `gorm:"not null;default:false"`
+	Settled           bool `gorm:"not null;default:false"`
+	SettledAmount     int  `gorm:"not null;default:0"`
+	SettlementPending bool `gorm:"not null;default:false;index:idx_billing_settlement_due,priority:1"`
+	// 未进入结算时，负值表示尚未交接任务预扣的租约截止时间。
 	SettlementRetryAt int64 `gorm:"not null;default:0;index:idx_billing_settlement_due,priority:2"`
 	CachePending      bool  `gorm:"index:idx_billing_refund_cache,priority:1"`
 	NextAttemptAt     int64 `gorm:"not null;default:0;index:idx_billing_refund_pending,priority:2"`
@@ -92,8 +93,17 @@ func StageBillingTask(ctx context.Context, task *Task, refundID int64) error {
 			if task.PrivateData.SubmissionFunding != nil {
 				reserved = task.PrivateData.SubmissionFunding.ReservedQuota
 			}
-			if refund.Completed || refund.SettlementPending || refund.NextAttemptAt != BillingRefundInFlight || refund.Amount != reserved || refund.TokenID != task.PrivateData.TokenId || refund.SubscriptionID != task.PrivateData.SubscriptionId || refund.PeriodStart != task.PrivateData.SubscriptionPeriodStart || task.PrivateData.SubmissionFunding == nil || (refund.TokenTracked || refund.TokenAmount > 0) != task.PrivateData.SubmissionFunding.UpdateToken {
+			if refund.Completed || refund.SettlementPending || refund.DecisionKnown || refund.NextAttemptAt != BillingRefundInFlight || refund.Amount != reserved || refund.TokenID != task.PrivateData.TokenId || refund.SubscriptionID != task.PrivateData.SubscriptionId || refund.PeriodStart != task.PrivateData.SubscriptionPeriodStart || task.PrivateData.SubmissionFunding == nil || (refund.TokenTracked || refund.TokenAmount > 0) != task.PrivateData.SubmissionFunding.UpdateToken {
 				return errors.New("task reservation is no longer available")
+			}
+			if refund.SettlementRetryAt < 0 {
+				now, err := taskSubmissionDatabaseTime(tx)
+				if err != nil {
+					return err
+				}
+				if refund.SettlementRetryAt >= -now {
+					return errors.New("task reservation has expired")
+				}
 			}
 		}
 		var user User
@@ -112,6 +122,13 @@ func StageBillingTask(ctx context.Context, task *Task, refundID int64) error {
 			if err := tx.Delete(&refund).Error; err != nil {
 				return err
 			}
+		}
+		if task.PrivateData.SubmissionPrepared {
+			now, err := taskSubmissionDatabaseTime(tx)
+			if err != nil {
+				return err
+			}
+			task.PrivateData.NextPollAt = now + taskSubmissionLeaseSeconds
 		}
 		if err := tx.Create(task).Error; err != nil {
 			return err
@@ -296,8 +313,38 @@ func MarkBillingRefundReady(ctx context.Context, id int64, userID int) error {
 		if refund.SettlementPending {
 			return ErrBillingRefundStateConflict
 		}
-		return tx.Model(&refund).Updates(map[string]any{"decision_known": true, "next_attempt_at": common.GetTimestamp()}).Error
+		return tx.Model(&refund).Updates(map[string]any{"decision_known": true, "next_attempt_at": common.GetTimestamp(), "settlement_retry_at": 0}).Error
 	})
+}
+
+// markExpiredTaskReservation 只恢复租约到期且尚未交接的任务预扣。
+func markExpiredTaskReservation(ctx context.Context, id int64) (bool, error) {
+	ready := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var refund BillingRefund
+		if err := lockForUpdate(tx).Where("id = ?", id).First(&refund).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if refund.Completed || refund.SettlementPending || refund.DecisionKnown || refund.NextAttemptAt != BillingRefundInFlight || refund.SettlementRetryAt >= 0 {
+			return nil
+		}
+		now, err := taskSubmissionDatabaseTime(tx)
+		if err != nil {
+			return err
+		}
+		if refund.SettlementRetryAt < -now {
+			return nil
+		}
+		if err := tx.Model(&refund).Updates(map[string]any{"decision_known": true, "next_attempt_at": now, "settlement_retry_at": 0}).Error; err != nil {
+			return err
+		}
+		ready = true
+		return nil
+	})
+	return ready && err == nil, err
 }
 
 func CompleteBillingRefund(ctx context.Context, id int64) error {
@@ -403,10 +450,10 @@ func dueBillingRecords(ctx context.Context, condition string, args []any, cursor
 
 func RetryBillingRefunds(ctx context.Context) error {
 	now := common.GetTimestamp()
-	condition := "completed = ? AND settlement_pending = ? AND decision_known = ? AND next_attempt_at <= ?"
-	args := []any{false, false, true, now}
+	condition := "completed = ? AND settlement_pending = ? AND ((decision_known = ? AND next_attempt_at <= ?) OR (decision_known = ? AND next_attempt_at = ? AND settlement_retry_at < 0 AND settlement_retry_at >= ?))"
+	args := []any{false, false, true, now, false, BillingRefundInFlight, -now}
 	if common.RedisEnabled {
-		condition = "((completed = ? AND settlement_pending = ? AND decision_known = ? AND next_attempt_at <= ?) OR (completed = ? AND cache_pending = ? AND next_attempt_at <= ?))"
+		condition = "((completed = ? AND settlement_pending = ? AND ((decision_known = ? AND next_attempt_at <= ?) OR (decision_known = ? AND next_attempt_at = ? AND settlement_retry_at < 0 AND settlement_retry_at >= ?))) OR (completed = ? AND cache_pending = ? AND next_attempt_at <= ?))"
 		args = append(args, true, true, now)
 	}
 	pending, err := dueBillingRecords(ctx, condition, args, &billingRefundCursor)
@@ -420,13 +467,26 @@ func RetryBillingRefunds(ctx context.Context) error {
 	var result error
 	// 清理限时执行，既能定期处理到期流水，也不会阻塞后续退款。
 	cleanup, cancel := context.WithTimeout(ctx, billingRecoveryRecordTimeout)
-	var expired []int64
 	cutoff := time.Now().Add(-billingRefundRetention).Unix()
-	if err := DB.WithContext(cleanup).Model(&BillingRefund{}).Where("completed = ? AND cache_pending = ? AND ((completed_at > 0 AND completed_at < ?) OR (completed_at = 0 AND created_at < ?))", true, false, cutoff, cutoff).Order("created_at ASC, id ASC").Limit(billingRefundCleanupBatchSize).Pluck("id", &expired).Error; err != nil {
-		result = errors.Join(result, err)
-	} else if len(expired) > 0 {
+	for cleanup.Err() == nil {
+		var expired []int64
+		if err := DB.WithContext(cleanup).Model(&BillingRefund{}).Where("completed = ? AND cache_pending = ? AND ((completed_at > 0 AND completed_at < ?) OR (completed_at = 0 AND created_at < ?))", true, false, cutoff, cutoff).Order("created_at ASC, id ASC").Limit(billingRefundCleanupBatchSize).Pluck("id", &expired).Error; err != nil {
+			if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				result = errors.Join(result, err)
+			}
+			break
+		}
+		if len(expired) == 0 {
+			break
+		}
 		if err := DB.WithContext(cleanup).Where("id IN ? AND completed = ? AND cache_pending = ?", expired, true, false).Delete(&BillingRefund{}).Error; err != nil {
-			result = errors.Join(result, err)
+			if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				result = errors.Join(result, err)
+			}
+			break
+		}
+		if len(expired) < billingRefundCleanupBatchSize {
+			break
 		}
 	}
 	cancel()
@@ -437,17 +497,29 @@ func RetryBillingRefunds(ctx context.Context) error {
 		if i < len(pending) {
 			refund := pending[i]
 			billingRefundCursor.Store(refund.ID)
-			attempt, cancel := context.WithTimeout(ctx, billingRecoveryRecordTimeout)
-			err := CompleteBillingRefund(attempt, refund.ID)
-			cancel()
-			if err != nil {
-				result = errors.Join(result, fmt.Errorf("refund %d: %w", refund.ID, err))
-				delay := min(int64(15)<<min(refund.Attempts, 6), int64(900))
-				backoff, cancel := context.WithTimeout(ctx, billingRecoveryBackoffTimeout)
-				err := DB.WithContext(backoff).Model(&BillingRefund{}).Where("id = ? AND (completed = ? OR cache_pending = ?)", refund.ID, false, true).
-					Updates(map[string]any{"attempts": refund.Attempts + 1, "next_attempt_at": common.GetTimestamp() + delay + refund.ID%5}).Error
+			canRefund := true
+			if refund.NextAttemptAt == BillingRefundInFlight && refund.SettlementRetryAt < 0 && !refund.DecisionKnown {
+				attempt, cancel := context.WithTimeout(ctx, billingRecoveryRecordTimeout)
+				ready, err := markExpiredTaskReservation(attempt, refund.ID)
 				cancel()
-				result = errors.Join(result, err)
+				if err != nil {
+					result = errors.Join(result, fmt.Errorf("task reservation %d: %w", refund.ID, err))
+				}
+				canRefund = ready
+			}
+			if canRefund {
+				attempt, cancel := context.WithTimeout(ctx, billingRecoveryRecordTimeout)
+				err := CompleteBillingRefund(attempt, refund.ID)
+				cancel()
+				if err != nil {
+					result = errors.Join(result, fmt.Errorf("refund %d: %w", refund.ID, err))
+					delay := min(int64(15)<<min(refund.Attempts, 6), int64(900))
+					backoff, cancel := context.WithTimeout(ctx, billingRecoveryBackoffTimeout)
+					err := DB.WithContext(backoff).Model(&BillingRefund{}).Where("id = ? AND (completed = ? OR cache_pending = ?)", refund.ID, false, true).
+						Updates(map[string]any{"attempts": refund.Attempts + 1, "next_attempt_at": common.GetTimestamp() + delay + refund.ID%5}).Error
+					cancel()
+					result = errors.Join(result, err)
+				}
 			}
 		}
 		if i < len(settlements) && ctx.Err() == nil {
@@ -484,9 +556,9 @@ func HasExpiredBillingRefunds() bool {
 func HasPendingBillingRefunds() bool {
 	var id int64
 	now := common.GetTimestamp()
-	query := DB.Model(&BillingRefund{}).Where("completed = ? AND ((settlement_pending = ? AND settlement_retry_at <= ?) OR (settlement_pending = ? AND decision_known = ? AND next_attempt_at <= ?))", false, true, now, false, true, now)
+	query := DB.Model(&BillingRefund{}).Where("completed = ? AND ((settlement_pending = ? AND settlement_retry_at <= ?) OR (settlement_pending = ? AND ((decision_known = ? AND next_attempt_at <= ?) OR (decision_known = ? AND next_attempt_at = ? AND settlement_retry_at < 0 AND settlement_retry_at >= ?))))", false, true, now, false, true, now, false, BillingRefundInFlight, -now)
 	if common.RedisEnabled {
-		query = DB.Model(&BillingRefund{}).Where("(completed = ? AND ((settlement_pending = ? AND settlement_retry_at <= ?) OR (settlement_pending = ? AND decision_known = ? AND next_attempt_at <= ?))) OR (completed = ? AND cache_pending = ? AND next_attempt_at <= ?)", false, true, now, false, true, now, true, true, now)
+		query = DB.Model(&BillingRefund{}).Where("(completed = ? AND ((settlement_pending = ? AND settlement_retry_at <= ?) OR (settlement_pending = ? AND ((decision_known = ? AND next_attempt_at <= ?) OR (decision_known = ? AND next_attempt_at = ? AND settlement_retry_at < 0 AND settlement_retry_at >= ?))))) OR (completed = ? AND cache_pending = ? AND next_attempt_at <= ?)", false, true, now, false, true, now, false, BillingRefundInFlight, -now, true, true, now)
 	}
 	err := query.Limit(1).Pluck("id", &id).Error
 	return err == nil && id != 0

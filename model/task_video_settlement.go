@@ -2,11 +2,18 @@ package model
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"math/rand/v2"
+	"net"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -28,6 +35,11 @@ func taskSubmissionDatabaseTime(tx *gorm.DB) (int64, error) {
 		return 0, fmt.Errorf("task submission database time is unavailable")
 	}
 	return now, nil
+}
+
+// GetTaskSubmissionDatabaseTime 使用提交租约的数据库时钟。
+func GetTaskSubmissionDatabaseTime(ctx context.Context) (int64, error) {
+	return taskSubmissionDatabaseTime(DB.WithContext(ctx))
 }
 
 // FinalizeVideoTask 将任务终态、最终额度、钱包/订阅、令牌和用量统计作为一个事务提交。
@@ -230,6 +242,16 @@ func CommitTaskInitialAccounting(ctx context.Context, task *Task, initialLogs ..
 		if stored.PrivateData.SubmissionAttemptID != task.PrivateData.SubmissionAttemptID || stored.PrivateData.SubmissionPrepared != task.PrivateData.SubmissionPrepared {
 			return fmt.Errorf("task submission attempt changed")
 		}
+		// 用数据库时间判断租约，避免恢复提前阻断仍可发送的任务。
+		if stored.PrivateData.InitialAccountingPending && stored.PrivateData.SubmissionPrepared {
+			now, err := taskSubmissionDatabaseTime(tx)
+			if err != nil {
+				return err
+			}
+			if stored.PrivateData.NextPollAt > now {
+				return nil
+			}
+		}
 		if stored.PrivateData.InitialAccountingPending && (stored.Status == TaskStatusSuccess || stored.Status == TaskStatusFailure) && !stored.PrivateData.SubmissionFundsCommitted {
 			return fmt.Errorf("terminal task submission funding is unconfirmed")
 		}
@@ -331,6 +353,7 @@ func ReplaceTaskSubmissionIntent(ctx context.Context, previous, next *Task) erro
 // MarkTaskSubmissionDispatched 在发送前封闭未发送恢复路径；提交结果不明时不会发送。
 func MarkTaskSubmissionDispatched(ctx context.Context, task *Task) error {
 	var stored Task
+	ready := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
 			return err
@@ -343,9 +366,69 @@ func MarkTaskSubmissionDispatched(ctx context.Context, task *Task) error {
 			return fmt.Errorf("task submission is no longer dispatchable")
 		}
 		stored.PrivateData.SubmissionPrepared = false
-		return tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error
+		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error; err != nil {
+			return err
+		}
+		ready = true
+		return nil
 	})
 	if err == nil {
+		*task = stored
+		return nil
+	}
+	if !ready {
+		return err
+	}
+	recoveryContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var recoveryErr error
+	for attempt := 0; ; attempt++ {
+		recoveryErr = markTaskSubmissionUnsent(recoveryContext, task)
+		if recoveryErr == nil {
+			return err
+		}
+		var mysqlErr *mysqldriver.MySQLError
+		var networkErr net.Error
+		transient := errors.Is(recoveryErr, driver.ErrBadConn) || errors.Is(recoveryErr, sql.ErrConnDone) ||
+			errors.Is(recoveryErr, io.EOF) || errors.Is(recoveryErr, io.ErrUnexpectedEOF) ||
+			errors.As(recoveryErr, &networkErr) ||
+			(errors.As(recoveryErr, &mysqlErr) && (mysqlErr.Number == 1205 || mysqlErr.Number == 1213 || mysqlErr.Number == 2006 || mysqlErr.Number == 2013))
+		if !transient {
+			break
+		}
+		delay := time.Duration(1<<min(attempt, 4)) * 100 * time.Millisecond
+		delay += time.Duration(rand.Int64N(int64(delay)/4 + 1))
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-recoveryContext.Done():
+			timer.Stop()
+			return errors.Join(err, fmt.Errorf("record unsubmitted task: %w", recoveryErr))
+		}
+	}
+	return errors.Join(err, fmt.Errorf("record unsubmitted task: %w", recoveryErr))
+}
+
+// markTaskSubmissionUnsent 只在发送前标记返回错误时调用。
+func markTaskSubmissionUnsent(ctx context.Context, task *Task) error {
+	var stored Task
+	updated := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.ID, task.UserId).First(&stored).Error; err != nil {
+			return err
+		}
+		if stored.Status != TaskStatusUnknown || !stored.PrivateData.SubmissionPending || !stored.PrivateData.InitialAccountingPending || stored.PrivateData.SubmissionAttemptID != task.PrivateData.SubmissionAttemptID || len(stored.PrivateData.SubmissionResponse) != 0 {
+			return nil
+		}
+		stored.PrivateData.SubmissionPrepared = true
+		stored.PrivateData.NextPollAt = 0
+		if err := tx.Model(&Task{}).Where("id = ?", stored.ID).Update("private_data", stored.PrivateData).Error; err != nil {
+			return err
+		}
+		updated = true
+		return nil
+	})
+	if err == nil && updated {
 		*task = stored
 	}
 	return err
