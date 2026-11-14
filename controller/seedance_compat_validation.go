@@ -55,7 +55,7 @@ func CreateSeedanceCompatValidationSession(c *gin.Context) {
 		seedanceCompatError(c, http.StatusServiceUnavailable, "validation session creation failed")
 		return
 	}
-	choices, err := selectSeedanceAssetValidationChoices(c, request.Model, true)
+	choices, err := selectSeedanceAssetValidationCandidates(c, request.Model, true, true)
 	if err != nil {
 		if errors.Is(err, errSeedanceAssetModelNotPermitted) || errors.Is(err, errSeedanceAssetNoChannel) {
 			c.JSON(http.StatusForbidden, struct {
@@ -104,13 +104,11 @@ func CreateSeedanceCompatValidationSession(c *gin.Context) {
 		seedanceCompatError(c, http.StatusBadGateway, "validation session creation failed")
 		return
 	}
-	suggestedModel := request.Model
-	if suggestedModel == "" {
-		for _, choice := range choices {
-			if choice.channel.Id == started.Session.ChannelID {
-				suggestedModel = choice.model
-				break
-			}
+	suggestedModel := ""
+	for _, choice := range choices {
+		if choice.channel.Id == started.Session.ChannelID {
+			suggestedModel = choice.requestModel
+			break
 		}
 	}
 	if err := model.DB.WithContext(c.Request.Context()).Model(&model.SeedanceAssetValidationSession{}).

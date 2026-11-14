@@ -366,9 +366,13 @@ func ensureSeedanceAssetGroupReplica(ctx context.Context, client *SeedanceAssetC
 		_ = model.FailSeedanceAssetGroupReplica(replica.ID, leaseUntil, "upstream returned an empty group ID")
 		return "", errors.New("upstream returned an empty asset group ID")
 	}
-	completed, err := model.CompleteSeedanceAssetGroupReplica(ctx, replica.ID, leaseUntil, response.Result.ID, group.Name)
+	cleanup := model.SeedanceAssetCleanupJob{
+		Kind: model.SeedanceAssetCleanupKindUpstreamGroup, UserID: group.UserID, ChannelID: client.ChannelID,
+		KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, UpstreamID: response.Result.ID,
+	}
+	completed, err := model.CompleteSeedanceAssetGroupReplica(ctx, replica.ID, leaseUntil, response.Result.ID, group.Name, cleanup)
 	if err != nil || !completed {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			if rollbackErr := RollbackSeedanceAssetGroup(ctx, client, response.Result.ID); rollbackErr != nil {
 				common.SysError("failed to roll back an unrecorded Seedance asset group: " + rollbackErr.Error())
 			}
@@ -510,9 +514,13 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 		_ = model.FailSeedanceAssetReplica(replica.ID, leaseUntil, err.Error())
 		return "", false, err
 	}
-	completed, err := model.CompleteSeedanceAssetReplica(ctx, replica.ID, leaseUntil, upstreamGroupID, upstreamAssetID, common.GetTimestamp())
+	cleanup := model.SeedanceAssetCleanupJob{
+		Kind: model.SeedanceAssetCleanupKindUpstreamAsset, UserID: asset.UserID, ChannelID: client.ChannelID,
+		KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint, UpstreamID: upstreamAssetID,
+	}
+	completed, err := model.CompleteSeedanceAssetReplica(ctx, replica.ID, leaseUntil, upstreamGroupID, upstreamAssetID, common.GetTimestamp(), cleanup)
 	if err != nil || !completed {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			if rollbackErr := RollbackSeedanceAsset(ctx, client, upstreamAssetID, ""); rollbackErr != nil {
 				common.SysError("failed to roll back an unrecorded Seedance asset replica: " + rollbackErr.Error())
 			}

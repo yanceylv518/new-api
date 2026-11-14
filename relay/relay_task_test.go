@@ -116,7 +116,7 @@ func TestResolveOriginTaskTokenAuthorizationMySQL(t *testing.T) {
 	if dsn == "" {
 		t.Skip("ORIGIN_GROUP_TEST_MYSQL_DSN is not configured")
 	}
-	dsnConfig, err := driver.ParseDSN(dsn)
+	dsnConfig, err := mysqldriver.ParseDSN(dsn)
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(dsnConfig.DBName, "codex_origin_"))
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
@@ -144,7 +144,7 @@ func TestResolveOriginTaskTokenAuthorizationMySQL(t *testing.T) {
 	common.CryptoSecret = "fixture-origin-task-secret"
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitLogDB())
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Token{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Token{}, &model.UserModelPricing{}, &model.UserModelPricingRevision{}, &model.SeedanceCompatTaskIDSequence{}, &model.BillingRefund{}))
 	require.NoError(t, i18n.Init())
 	ratio_setting.GetGroupRatioSetting().GroupRatio.Set("aaa", 1)
 	ratio_setting.GetGroupRatioSetting().GroupRatio.Set("vip", 0.7)

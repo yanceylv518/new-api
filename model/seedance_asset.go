@@ -467,23 +467,39 @@ var ErrSeedanceAssetUnavailable = errors.New("private asset is unavailable")
 
 var ErrSeedanceAssetCommitUncertain = errors.New("asset changes could not be confirmed; check the asset library before retrying")
 
-// CreateSeedanceAssetGroup 在提交确认丢失时保留已创建的上游组。
+// CreateSeedanceAssetGroup 将上游组与其补偿清理责任原子交接。
 func CreateSeedanceAssetGroup(ctx context.Context, group *SeedanceAssetGroup) error {
+	jobs, err := prepareSeedanceAssetPublication(ctx, []SeedanceAssetCleanupJob{{
+		Kind: SeedanceAssetCleanupKindUpstreamGroup, UserID: group.UserID, ChannelID: group.ChannelID,
+		KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint, UpstreamID: group.GroupID,
+	}})
+	if err != nil {
+		return err
+	}
 	ready := false
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(group).Error; err != nil {
+			return err
+		}
+		if err := completeSeedanceAssetPublication(tx, jobs, false); err != nil {
 			return err
 		}
 		ready = true
 		return nil
 	})
-	if err == nil || !ready {
+	if err == nil {
+		return nil
+	}
+	if !ready {
+		if len(jobs) > 0 {
+			return seedanceAssetCleanupScheduledError{cause: err}
+		}
 		return err
 	}
 	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var stored SeedanceAssetGroup
-	if checkErr := DB.WithContext(checkCtx).Where("user_id = ? AND group_id = ? AND channel_id = ? AND account_fingerprint = ?", group.UserID, group.GroupID, group.ChannelID, group.AccountFingerprint).First(&stored).Error; checkErr == nil {
+	if checkErr := DB.WithContext(checkCtx).Where("id = ? AND user_id = ? AND group_id = ? AND channel_id = ? AND account_fingerprint = ? AND status <> ?", group.ID, group.UserID, group.GroupID, group.ChannelID, group.AccountFingerprint, "Deleting").First(&stored).Error; checkErr == nil {
 		*group = stored
 		return nil
 	}
@@ -491,10 +507,26 @@ func CreateSeedanceAssetGroup(ctx context.Context, group *SeedanceAssetGroup) er
 }
 
 // CreateSeedanceAssetInGroup 与分组删除共享数据库锁，仅允许仍可用的分组接收最终素材。
-// 外部上传不持有锁，失败由调用方补偿；锁只覆盖状态校验与本地落库。
+// 外部上传不持有锁；失败补偿与本地落库通过清理任务交接。
 func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset, syncTargets ...SeedanceAssetSyncTarget) error {
+	cleanup := make([]SeedanceAssetCleanupJob, 0, 2)
+	if upstreamID := asset.UpstreamAssetID(); upstreamID != "" {
+		cleanup = append(cleanup, SeedanceAssetCleanupJob{
+			Kind: SeedanceAssetCleanupKindUpstreamAsset, UserID: asset.UserID, ChannelID: asset.ChannelID,
+			KeyFingerprint: asset.KeyFingerprint, AccountFingerprint: asset.AccountFingerprint, UpstreamID: upstreamID,
+		})
+	}
+	if asset.ObjectKey != "" {
+		cleanup = append(cleanup, SeedanceAssetCleanupJob{
+			Kind: SeedanceAssetCleanupKindOSSObject, UserID: asset.UserID, ObjectKey: asset.ObjectKey, Storage: asset.Storage,
+		})
+	}
+	jobs, err := prepareSeedanceAssetPublication(ctx, cleanup)
+	if err != nil {
+		return err
+	}
 	ready := false
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// SQLite 无行锁，先执行无值变化的更新取得写锁，避免读快照升级写锁的竞态。
 		if tx.Dialector.Name() == "sqlite" {
 			if err := tx.Model(&SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", asset.UserID, asset.GroupID).
@@ -554,16 +586,25 @@ func CreateSeedanceAssetInGroup(ctx context.Context, asset *SeedanceAsset, syncT
 				return err
 			}
 		}
+		if err := completeSeedanceAssetPublication(tx, jobs, false); err != nil {
+			return err
+		}
 		ready = true
 		return nil
 	})
-	if err == nil || !ready {
+	if err == nil {
+		return nil
+	}
+	if !ready {
+		if len(jobs) > 0 {
+			return seedanceAssetCleanupScheduledError{cause: err}
+		}
 		return err
 	}
 	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var stored SeedanceAsset
-	if checkErr := DB.WithContext(checkCtx).Where("user_id = ? AND group_id = ? AND asset_id = ? AND object_key = ?", asset.UserID, asset.GroupID, asset.AssetID, asset.ObjectKey).First(&stored).Error; checkErr == nil {
+	if checkErr := DB.WithContext(checkCtx).Where("id = ? AND user_id = ? AND group_id = ? AND asset_id = ? AND object_key = ? AND status <> ?", asset.ID, asset.UserID, asset.GroupID, asset.AssetID, asset.ObjectKey, "Deleting").First(&stored).Error; checkErr == nil {
 		*asset = stored
 		return nil
 	}
@@ -876,55 +917,86 @@ func claimSeedanceAssetGroupReplica(ctx context.Context, userID int, localGroupI
 }
 
 // CompleteSeedanceAssetGroupReplica 仅在本地组仍可用且租约未被替换时发布新映射。
-func CompleteSeedanceAssetGroupReplica(ctx context.Context, id uint, leaseUntil int64, upstreamGroupID, groupName string) (bool, error) {
+func CompleteSeedanceAssetGroupReplica(ctx context.Context, id uint, leaseUntil int64, upstreamGroupID, groupName string, cleanup ...SeedanceAssetCleanupJob) (bool, error) {
 	if DB == nil || id == 0 || leaseUntil <= 0 || strings.TrimSpace(upstreamGroupID) == "" {
 		return false, errors.New("invalid Seedance group replica completion")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	updated := false
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var replica SeedanceAssetGroupReplica
-		if err := tx.First(&replica, id).Error; err != nil {
-			return err
-		}
-		if tx.Dialector.Name() == "sqlite" {
-			if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", replica.LocalGroupID, replica.UserID).
-				UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+	jobs, err := prepareSeedanceAssetPublication(ctx, cleanup)
+	if err != nil {
+		return false, err
+	}
+	complete := func(attemptCtx context.Context, afterCommitError bool) (bool, error) {
+		updated := false
+		err := DB.WithContext(attemptCtx).Transaction(func(tx *gorm.DB) error {
+			var replica SeedanceAssetGroupReplica
+			if err := tx.First(&replica, id).Error; err != nil {
 				return err
 			}
-		}
-		var group SeedanceAssetGroup
-		if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalGroupID, replica.UserID, "Deleting").First(&group).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+			if tx.Dialector.Name() == "sqlite" {
+				if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", replica.LocalGroupID, replica.UserID).
+					UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+					return err
+				}
+			}
+			var group SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalGroupID, replica.UserID, "Deleting").First(&group).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if err := lockForUpdate(tx).Where("id = ?", id).First(&replica).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if replica.Status == SeedanceAssetReplicaReady && replica.UpstreamGroupID == upstreamGroupID {
+				if err := completeSeedanceAssetPublication(tx, jobs, afterCommitError); err != nil {
+					return err
+				}
+				updated = true
 				return nil
 			}
-			return err
-		}
-		result := tx.Model(&replica).
-			Where("id = ? AND status = ? AND lease_until = ?", id, SeedanceAssetReplicaCreating, leaseUntil).
-			Updates(map[string]any{
-				"upstream_group_id": upstreamGroupID,
-				"group_name":        groupName,
-				"status":            SeedanceAssetReplicaReady,
-				"lease_until":       int64(0),
-				"last_error":        "",
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		updated = result.RowsAffected == 1
-		return nil
-	})
+			result := tx.Model(&replica).
+				Where("id = ? AND status = ? AND lease_until = ?", id, SeedanceAssetReplicaCreating, leaseUntil).
+				Updates(map[string]any{
+					"upstream_group_id": upstreamGroupID,
+					"group_name":        groupName,
+					"status":            SeedanceAssetReplicaReady,
+					"lease_until":       int64(0),
+					"last_error":        "",
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 1 {
+				if err := completeSeedanceAssetPublication(tx, jobs, false); err != nil {
+					return err
+				}
+				updated = true
+			}
+			return nil
+		})
+		return updated, err
+	}
+	updated, err := complete(ctx, false)
 	if err != nil && updated {
 		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		var stored SeedanceAssetGroupReplica
-		if checkErr := DB.WithContext(checkCtx).Where("id = ? AND upstream_group_id = ? AND status = ?", id, upstreamGroupID, SeedanceAssetReplicaReady).First(&stored).Error; checkErr == nil {
+		if recovered, retryErr := complete(checkCtx, true); retryErr == nil && recovered {
 			return true, nil
 		}
 		return false, ErrSeedanceAssetCommitUncertain
+	}
+	if len(jobs) > 0 && (err != nil || !updated) {
+		if err == nil {
+			err = ErrSeedanceAssetUnavailable
+		}
+		return false, seedanceAssetCleanupScheduledError{cause: err}
 	}
 	return updated, err
 }
@@ -1071,65 +1143,96 @@ func claimSeedanceAssetReplica(ctx context.Context, asset *SeedanceAsset, localG
 }
 
 // CompleteSeedanceAssetReplica 保存目标账号素材 ID，并立即安排审核状态轮询。
-func CompleteSeedanceAssetReplica(ctx context.Context, id uint, leaseUntil int64, upstreamGroupID, upstreamAssetID string, now int64) (bool, error) {
+func CompleteSeedanceAssetReplica(ctx context.Context, id uint, leaseUntil int64, upstreamGroupID, upstreamAssetID string, now int64, cleanup ...SeedanceAssetCleanupJob) (bool, error) {
 	if DB == nil || id == 0 || leaseUntil <= 0 || strings.TrimSpace(upstreamGroupID) == "" || strings.TrimSpace(upstreamAssetID) == "" {
 		return false, errors.New("invalid Seedance asset replica completion")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	updated := false
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var replica SeedanceAssetReplica
-		if err := tx.First(&replica, id).Error; err != nil {
-			return err
-		}
-		if tx.Dialector.Name() == "sqlite" {
-			if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", replica.LocalGroupID, replica.UserID).
-				UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+	jobs, err := prepareSeedanceAssetPublication(ctx, cleanup)
+	if err != nil {
+		return false, err
+	}
+	complete := func(attemptCtx context.Context, afterCommitError bool) (bool, error) {
+		updated := false
+		err := DB.WithContext(attemptCtx).Transaction(func(tx *gorm.DB) error {
+			var replica SeedanceAssetReplica
+			if err := tx.First(&replica, id).Error; err != nil {
 				return err
 			}
-		}
-		var group SeedanceAssetGroup
-		if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalGroupID, replica.UserID, "Deleting").First(&group).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+			if tx.Dialector.Name() == "sqlite" {
+				if err := tx.Model(&SeedanceAssetGroup{}).Where("id = ? AND user_id = ?", replica.LocalGroupID, replica.UserID).
+					UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
+					return err
+				}
+			}
+			var group SeedanceAssetGroup
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalGroupID, replica.UserID, "Deleting").First(&group).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			var asset SeedanceAsset
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalAssetID, replica.UserID, "Deleting").First(&asset).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if err := lockForUpdate(tx).Where("id = ?", id).First(&replica).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if replica.ProvisionStatus == SeedanceAssetReplicaReady && replica.UpstreamGroupID == upstreamGroupID && replica.UpstreamAssetID == upstreamAssetID {
+				if err := completeSeedanceAssetPublication(tx, jobs, afterCommitError); err != nil {
+					return err
+				}
+				updated = true
 				return nil
 			}
-			return err
-		}
-		var asset SeedanceAsset
-		if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND status <> ?", replica.LocalAssetID, replica.UserID, "Deleting").First(&asset).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
+			result := tx.Model(&replica).
+				Where("id = ? AND provision_status = ? AND poll_lease_until = ?", id, SeedanceAssetReplicaCreating, leaseUntil).
+				Updates(map[string]any{
+					"upstream_group_id": upstreamGroupID,
+					"upstream_asset_id": upstreamAssetID,
+					"provision_status":  SeedanceAssetReplicaReady,
+					"status":            "Processing",
+					"poll_attempts":     0,
+					"next_poll_at":      now,
+					"poll_lease_until":  int64(0),
+					"last_error":        "",
+				})
+			if result.Error != nil {
+				return result.Error
 			}
-			return err
-		}
-		result := tx.Model(&replica).
-			Where("id = ? AND provision_status = ? AND poll_lease_until = ?", id, SeedanceAssetReplicaCreating, leaseUntil).
-			Updates(map[string]any{
-				"upstream_group_id": upstreamGroupID,
-				"upstream_asset_id": upstreamAssetID,
-				"provision_status":  SeedanceAssetReplicaReady,
-				"status":            "Processing",
-				"poll_attempts":     0,
-				"next_poll_at":      now,
-				"poll_lease_until":  int64(0),
-				"last_error":        "",
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		updated = result.RowsAffected == 1
-		return nil
-	})
+			if result.RowsAffected == 1 {
+				if err := completeSeedanceAssetPublication(tx, jobs, false); err != nil {
+					return err
+				}
+				updated = true
+			}
+			return nil
+		})
+		return updated, err
+	}
+	updated, err := complete(ctx, false)
 	if err != nil && updated {
 		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		var stored SeedanceAssetReplica
-		if checkErr := DB.WithContext(checkCtx).Where("id = ? AND upstream_group_id = ? AND upstream_asset_id = ? AND provision_status = ?", id, upstreamGroupID, upstreamAssetID, SeedanceAssetReplicaReady).First(&stored).Error; checkErr == nil {
+		if recovered, retryErr := complete(checkCtx, true); retryErr == nil && recovered {
 			return true, nil
 		}
 		return false, ErrSeedanceAssetCommitUncertain
+	}
+	if len(jobs) > 0 && (err != nil || !updated) {
+		if err == nil {
+			err = ErrSeedanceAssetUnavailable
+		}
+		return false, seedanceAssetCleanupScheduledError{cause: err}
 	}
 	return updated, err
 }

@@ -361,7 +361,7 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		return
 	}
 	if err := model.CreateSeedanceAssetGroup(c.Request.Context(), group); err != nil {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetGroupAfterFailure(c.Request.Context(), client, group.GroupID)
 		}
 		seedanceAssetAPIError(c, err)
@@ -845,7 +845,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 	if client == nil {
 		asset, err := createStoredSeedanceAsset(c, &group, upload, name, "")
 		if err != nil {
-			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 				cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
 			}
 			common.ApiError(c, err)
@@ -883,7 +883,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if err := service.CreateSeedanceAssetWithSynchronization(c.Request.Context(), asset, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
 		}
 		common.ApiError(c, err)
@@ -941,7 +941,7 @@ func CreateSeedanceAsset(c *gin.Context) {
 	if client == nil {
 		asset, err := createStoredSeedanceAsset(c, &group, upload, strings.TrimSpace(req.Name), strings.TrimSpace(req.SourceURL))
 		if err != nil {
-			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 				cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
 			}
 			seedanceAssetAPIError(c, err)
@@ -969,7 +969,7 @@ func CreateSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if err := service.CreateSeedanceAssetWithSynchronization(c.Request.Context(), asset, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
 		}
 		seedanceAssetAPIError(c, err)

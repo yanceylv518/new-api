@@ -9,7 +9,6 @@ import (
 	"image/png"
 	"io"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -32,7 +31,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
-	driver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -42,49 +40,6 @@ import (
 
 // 测试专用 CA 只在显式 fallback 模式启用，仍执行证书验证，不修改系统信任库。
 var seedanceTestRootsOnce sync.Once
-
-const seedanceCompatMySQLDSN = "SEEDANCE_COMPAT_TEST_MYSQL_DSN"
-
-func seedanceCompatTestDSN(t *testing.T) string {
-	t.Helper()
-	dsn := os.Getenv(seedanceCompatMySQLDSN)
-	if dsn == "" {
-		t.Skip(seedanceCompatMySQLDSN + " is not configured")
-	}
-	config, err := driver.ParseDSN(dsn)
-	require.NoError(t, err)
-	require.Equal(t, "tcp", config.Net)
-	host, _, err := net.SplitHostPort(config.Addr)
-	require.NoError(t, err)
-	ip := net.ParseIP(host)
-	require.NotNil(t, ip)
-	require.True(t, ip.IsLoopback(), "test database must be on loopback")
-	require.True(t, strings.HasPrefix(config.DBName, "codex_seedance_id_"), "test database must be isolated")
-	return dsn
-}
-
-func isolatedSeedanceCompatTestDSN(t *testing.T, dsn string) string {
-	t.Helper()
-	config, err := driver.ParseDSN(dsn)
-	require.NoError(t, err)
-	suffix, err := common.GenerateRandomCharsKey(12)
-	require.NoError(t, err)
-	name := "codex_seedance_id_" + strings.ToLower(suffix)
-	admin, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
-	connection, err := admin.DB()
-	require.NoError(t, err)
-	if err := admin.Exec("CREATE DATABASE `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").Error; err != nil {
-		_ = connection.Close()
-		require.NoError(t, err)
-	}
-	t.Cleanup(func() {
-		assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
-		assert.NoError(t, connection.Close())
-	})
-	config.DBName = name
-	return config.FormatDSN()
-}
 
 func TestSeedanceAssetValidationActionUsesDoubaoNamespace(t *testing.T) {
 	router := gin.New()

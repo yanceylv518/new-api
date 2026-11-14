@@ -448,10 +448,11 @@ func TestSeedanceCompatVideoMySQL(t *testing.T) {
 		group := model.SeedanceAssetGroup{UserID: account.user.Id, ChannelID: account.channel.Id, GroupID: "group-ready-router", Name: "fixture", GroupType: "AIGC", Status: "Active", KeyFingerprint: key, AccountFingerprint: model.SeedanceAssetAccountFingerprint(&account.channel, key)}
 		require.NoError(t, db.Create(&group).Error)
 		localOnly := false
-		asset := model.SeedanceAsset{UserID: account.user.Id, ChannelID: account.channel.Id, GroupID: group.GroupID, AssetID: "asset-ready-router", PrimaryUpstreamID: "asset-ready-upstream", LocalOnly: &localOnly, Name: "fixture", AssetType: "Image", Status: "Active", KeyFingerprint: key, AccountFingerprint: group.AccountFingerprint}
+		asset := model.SeedanceAsset{UserID: account.user.Id, ChannelID: account.channel.Id, GroupID: group.GroupID, AssetID: "asset-ready-router", PrimaryUpstreamID: "asset-ready-upstream", LocalOnly: &localOnly, Name: "fixture", AssetType: "Image", Status: "Active", KeyFingerprint: key, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(&account.channel, modelName, key)}
 		require.NoError(t, db.Create(&asset).Error)
+		require.NoError(t, db.Create(&model.SeedanceAssetGroupReplica{UserID: account.user.Id, LocalGroupID: group.ID, ChannelID: account.channel.Id, AccountFingerprint: asset.AccountFingerprint, KeyFingerprint: key, UpstreamGroupID: group.GroupID, GroupName: group.Name, Status: model.SeedanceAssetReplicaReady}).Error)
 		highKey := fmt.Sprintf("%x", common.Sha256Raw([]byte(high.Key)))
-		require.NoError(t, db.Create(&model.SeedanceAssetReplica{UserID: account.user.Id, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: high.Id, AccountFingerprint: model.SeedanceAssetAccountFingerprint(&high, highKey), KeyFingerprint: highKey, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp() + 60}).Error)
+		require.NoError(t, db.Create(&model.SeedanceAssetReplica{UserID: account.user.Id, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: high.Id, AccountFingerprint: model.SeedanceAssetModelScopeFingerprint(&high, modelName, highKey), KeyFingerprint: highKey, ProvisionStatus: model.SeedanceAssetReplicaCreating, Status: "Pending", NextPollAt: common.GetTimestamp() + 60}).Error)
 		body := `{"model":"doubao-seedance-2-0-260128","content":[{"type":"text","text":"a fixed camera"},{"type":"image_url","image_url":{"url":"asset://asset-ready-router"},"role":"reference_image"}],"duration":5,"resolution":"480p","generate_audio":false}`
 		response := request(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", body, account, false)
 		require.Equal(t, http.StatusOK, response.Code, response.Body.String())

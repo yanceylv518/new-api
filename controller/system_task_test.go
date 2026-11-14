@@ -516,6 +516,9 @@ func TestSeedanceAssetSyncDrainsManyUsersWithoutDuplicateCopies(t *testing.T) {
 	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: channel.Models, ChannelId: channel.Id, Enabled: true}).Error)
 	client, err := service.NewSeedanceAssetClient(channel)
 	require.NoError(t, err)
+	client = client.ForSeedanceModel(channel, channel.Models)
+	scope, err := service.EncodeSeedanceAssetSyncScope([]string{"default"}, nil, 0)
+	require.NoError(t, err)
 	const users = 200
 	for index := range users {
 		id := index + 1
@@ -524,7 +527,7 @@ func TestSeedanceAssetSyncDrainsManyUsersWithoutDuplicateCopies(t *testing.T) {
 		require.NoError(t, db.Create(group).Error)
 		asset := &model.SeedanceAsset{UserID: id, ChannelID: 99, GroupID: group.GroupID, AssetID: fmt.Sprintf("source-asset-%d", id), Name: "source.png", AssetType: "Image", Status: "Active", SourceURL: "https://8.8.8.8/source.png", AccountFingerprint: "source"}
 		require.NoError(t, db.Create(asset).Error)
-		replica := &model.SeedanceAssetReplica{UserID: id, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: client.AccountFingerprint, KeyFingerprint: client.KeyFingerprint, Status: "Pending", ProvisionStatus: model.SeedanceAssetReplicaCreating, NextPollAt: common.GetTimestamp() - 1}
+		replica := &model.SeedanceAssetReplica{UserID: id, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: channel.Id, AccountFingerprint: client.AccountFingerprint, KeyFingerprint: client.KeyFingerprint, SyncScope: scope, Status: "Pending", ProvisionStatus: model.SeedanceAssetReplicaCreating, NextPollAt: common.GetTimestamp() - 1}
 		require.NoError(t, db.Create(replica).Error)
 	}
 	task, err := model.CreateSystemTask(model.SystemTaskTypeSeedanceAssetSync, nil, nil)

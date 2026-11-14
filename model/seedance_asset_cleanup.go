@@ -28,6 +28,85 @@ const (
 	SeedanceAssetCleanupStatusCompleted = "completed"
 )
 
+const seedanceAssetPublicationCleanupDelay = 5 * time.Minute
+
+var ErrSeedanceAssetCleanupScheduled = errors.New("asset cleanup has been scheduled")
+
+type seedanceAssetCleanupScheduledError struct{ cause error }
+
+func (err seedanceAssetCleanupScheduledError) Error() string { return err.cause.Error() }
+func (err seedanceAssetCleanupScheduledError) Unwrap() []error {
+	return []error{err.cause, ErrSeedanceAssetCleanupScheduled}
+}
+
+// prepareSeedanceAssetPublication 先登记补偿，避免本地提交回滚时遗失已创建的外部资源。
+func prepareSeedanceAssetPublication(ctx context.Context, jobs []SeedanceAssetCleanupJob) ([]SeedanceAssetCleanupJob, error) {
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+	for i := range jobs {
+		nonce, err := common.GenerateRandomCharsKey(32)
+		if err != nil {
+			return nil, err
+		}
+		hash := sha256.Sum256([]byte("asset-publication\x00" + nonce))
+		jobs[i].DedupKey = hex.EncodeToString(hash[:])
+		jobs[i].Status = SeedanceAssetCleanupStatusPending
+		jobs[i].NextAttemptAt = common.GetTimestamp() + int64(seedanceAssetPublicationCleanupDelay/time.Second)
+	}
+	keys := make([]string, len(jobs))
+	for i := range jobs {
+		keys[i] = jobs[i].DedupKey
+	}
+	// 单条批量写入由数据库原子提交；发布事务只负责消费这些清理任务。
+	err := DB.WithContext(ctx).Session(&gorm.Session{SkipDefaultTransaction: true}).Create(&jobs).Error
+	if err == nil {
+		var stored []SeedanceAssetCleanupJob
+		if lookupErr := DB.WithContext(ctx).Where("dedup_key IN ?", keys).Find(&stored).Error; lookupErr == nil && len(stored) == len(jobs) {
+			return stored, nil
+		}
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stored []SeedanceAssetCleanupJob
+	checkErr := DB.WithContext(checkCtx).Transaction(func(tx *gorm.DB) error {
+		return lockForUpdate(tx).Where("dedup_key IN ?", keys).Find(&stored).Error
+	})
+	if checkErr == nil && len(stored) == len(jobs) {
+		return stored, nil
+	}
+	if checkErr == nil && len(stored) == 0 && err != nil {
+		return nil, err
+	}
+	// 尚未进入发布事务，可以直接补偿；已登记的清理任务会幂等重试。
+	return nil, errors.Join(errors.New("asset cleanup reservation could not be confirmed"), err, checkErr)
+}
+
+// completeSeedanceAssetPublication 在资源落库事务内撤销补偿，防止清理任务删除已发布的资源。
+func completeSeedanceAssetPublication(tx *gorm.DB, jobs []SeedanceAssetCleanupJob, allowMissing bool) error {
+	for _, job := range jobs {
+		result := tx.Where("id = ? AND status = ? AND attempts = ? AND lease_until = ?", job.ID, SeedanceAssetCleanupStatusPending, 0, 0).
+			Delete(&SeedanceAssetCleanupJob{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			if allowMissing {
+				var stored SeedanceAssetCleanupJob
+				err := lockForUpdate(tx).Where("id = ?", job.ID).First(&stored).Error
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+			}
+			return errors.New("asset cleanup reservation is no longer available")
+		}
+	}
+	return nil
+}
+
 // SeedanceAssetCleanupJob 持久化上游素材、素材组和 OSS 对象的补偿清理。
 // 外部 API 与本地数据库无法共享事务，因此失败的清理必须拥有独立的重试记录。
 type SeedanceAssetCleanupJob struct {

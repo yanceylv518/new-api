@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,8 +16,9 @@ import (
 )
 
 type seedanceAssetChannelChoice struct {
-	channel *model.Channel
-	model   string
+	channel      *model.Channel
+	model        string
+	requestModel string
 }
 
 var errSeedanceAssetModelNotPermitted = errors.New("API key does not allow this model")
@@ -24,7 +26,7 @@ var errSeedanceAssetNoChannel = errors.New("no available Seedance asset channel 
 
 // selectSeedanceAssetValidationChannels 按优先级降序筛选允许访问的素材渠道，供认证回退和官方建组共用。
 func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]*model.Channel, error) {
-	choices, err := selectSeedanceAssetValidationChoices(c, modelName, false)
+	choices, err := selectSeedanceAssetValidationCandidates(c, modelName, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -36,6 +38,10 @@ func selectSeedanceAssetValidationChannels(c *gin.Context, modelName string) ([]
 }
 
 func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matchFamily bool) ([]seedanceAssetChannelChoice, error) {
+	return selectSeedanceAssetValidationCandidates(c, modelName, matchFamily, false)
+}
+
+func selectSeedanceAssetValidationCandidates(c *gin.Context, modelName string, matchFamily, includeFallback bool) ([]seedanceAssetChannelChoice, error) {
 	modelLimitsEnabled := c.GetBool("token_model_limit_enabled")
 	allowed := map[string]bool{}
 	var allowedModels []string
@@ -47,6 +53,7 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 			return nil, errors.New("API key model limits are invalid")
 		}
 		allowedModels = seedanceAssetSynchronizationModels(c)
+		slices.Sort(allowedModels)
 		if modelName != "" {
 			permitted := middleware.TokenModelLimitAllows(allowed, modelName)
 			for candidate, enabled := range allowed {
@@ -97,6 +104,7 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 	pin, pinned, _ := constraints.ResolvedPin()
 	filtered := make([]seedanceAssetChannelChoice, 0, len(channels))
 	fallback := make([]seedanceAssetChannelChoice, 0, len(channels))
+	candidates := make([]seedanceAssetChannelChoice, 0, len(channels))
 	for _, channel := range channels {
 		if pinned && channel.Id != pin.ChannelId {
 			continue
@@ -109,6 +117,22 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 			if modelLimitsEnabled && !service.SeedanceAssetModelAllowed(candidateModel, allowedModels) {
 				continue
 			}
+			requestModel := candidateModel
+			if modelName != "" && (candidateModel == modelName || candidateModel == ratio_setting.RoutingMatchModelName(modelName)) &&
+				(!modelLimitsEnabled || middleware.TokenModelLimitAllows(allowed, modelName)) {
+				requestModel = modelName
+			} else if modelLimitsEnabled && !middleware.TokenModelLimitAllows(allowed, requestModel) {
+				requestModel = ""
+				for _, allowedModel := range allowedModels {
+					if ratio_setting.RoutingMatchModelName(allowedModel) == candidateModel {
+						requestModel = allowedModel
+						break
+					}
+				}
+				if requestModel == "" {
+					continue
+				}
+			}
 			if ok, _ := model.ChannelSatisfiesFilters(channel, candidateModel, constraints.Filters); !ok {
 				continue
 			}
@@ -118,7 +142,7 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 				}
 				if model.IsChannelEnabledForGroupModel(candidateGroup, candidateModel, channel.Id) {
 					if selected.channel == nil || candidateModel == modelName {
-						selected = seedanceAssetChannelChoice{channel: channel, model: candidateModel}
+						selected = seedanceAssetChannelChoice{channel: channel, model: candidateModel, requestModel: requestModel}
 					}
 					break
 				}
@@ -128,6 +152,7 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 			}
 		}
 		if selected.channel != nil {
+			candidates = append(candidates, selected)
 			if modelName == "" || selected.model == modelName {
 				filtered = append(filtered, selected)
 			} else {
@@ -135,7 +160,9 @@ func selectSeedanceAssetValidationChoices(c *gin.Context, modelName string, matc
 			}
 		}
 	}
-	if len(filtered) == 0 {
+	if includeFallback {
+		filtered = candidates
+	} else if len(filtered) == 0 {
 		filtered = fallback
 	}
 	if len(filtered) == 0 {

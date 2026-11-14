@@ -63,6 +63,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 	for _, group := range groups {
 		groupsByID[group.GroupID] = group
 	}
+	humanAccount := common.GetContextKeyString(c, constant.ContextKeySeedanceAssetAccountFingerprint) != ""
 	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	requestGroups := []string{usingGroup}
 	if usingGroup == "auto" {
@@ -92,6 +93,9 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		channelGroups[ability.ChannelId][ability.Model][ability.Group] = struct{}{}
 	}
 	if len(channelIDs) == 0 {
+		if humanAccount {
+			return errSeedanceAssetAccountUnavailable
+		}
 		if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned {
 			return errSeedanceAssetChannelOutsideGroup
 		}
@@ -115,6 +119,9 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		return errSeedanceAssetChannelOutsideGroup
 	}
 	if len(candidates) == 0 {
+		if humanAccount {
+			return errSeedanceAssetAccountUnavailable
+		}
 		return errSeedanceAssetSynchronizationFailed
 	}
 	channelsByID := make(map[int]*model.Channel, len(candidates))
@@ -287,6 +294,9 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		}
 	}
 	if candidateAccounts == 0 {
+		if humanAccount {
+			return errSeedanceAssetAccountUnavailable
+		}
 		return errSeedanceAssetSynchronizationFailed
 	}
 	if needsAuthorization {

@@ -169,6 +169,9 @@ func TestSeedanceHumanRoutingPinsAccountAndEnabledKey(t *testing.T) {
 				w := httptest.NewRecorder()
 				router.ServeHTTP(w, req)
 				assert.Equal(t, tc.status, w.Code, w.Body.String())
+				if tc.status == http.StatusConflict {
+					assert.Contains(t, w.Body.String(), "real-person assets are unavailable")
+				}
 			})
 		}
 	}

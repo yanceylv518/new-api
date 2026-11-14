@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -103,6 +104,13 @@ func TestSeedanceModelModifierScopeAndExactPriority(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, choices, 1)
 	assert.Equal(t, exact.Id, choices[0].channel.Id)
+	candidates, err := selectSeedanceAssetValidationCandidates(c, permitted, true, true)
+	require.NoError(t, err)
+	require.Len(t, candidates, 2)
+	assert.Equal(t, base.Id, candidates[0].channel.Id)
+	assert.Equal(t, permitted, candidates[0].requestModel)
+	assert.Equal(t, exact.Id, candidates[1].channel.Id)
+	assert.Equal(t, permitted, candidates[1].requestModel)
 	_, err = selectSeedanceAssetValidationChoices(c, baseModel, false)
 	require.ErrorIs(t, err, errSeedanceAssetModelNotPermitted)
 	_, err = selectSeedanceAssetValidationChoices(c, baseModel+"@temperature:0.3", false)
@@ -112,6 +120,68 @@ func TestSeedanceModelModifierScopeAndExactPriority(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, choices, 1)
 	assert.Equal(t, base.Id, choices[0].channel.Id)
+}
+
+func TestSeedanceCompatValidationFallbackReturnsCallableModel(t *testing.T) {
+	db := setupSeedancePriorityRegression(t)
+	previousAddress := system_setting.TaskPublicAddress
+	system_setting.TaskPublicAddress = "https://gateway.example"
+	t.Cleanup(func() { system_setting.TaskPublicAddress = previousAddress })
+	var firstCalls, fallbackCalls, forbiddenCalls atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"code":"unsupported_action","message":"unsupported action"}`)
+	}))
+	defer first.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackCalls.Add(1)
+		_, _ = io.WriteString(w, `{"Result":{"BytedToken":"fixture-fallback-token","H5Link":"https://example.com/verify"}}`)
+	}))
+	defer fallback.Close()
+	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		forbiddenCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer forbidden.Close()
+	const family = "doubao-seedance-2-0"
+	const fallbackModel = family + "-fast-260128"
+	high, low, highest := int64(20), int64(10), int64(30)
+	channels := []*model.Channel{
+		{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "first-fixture", BaseURL: &first.URL, Priority: &high, Models: family, Group: "default"},
+		{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "fallback-fixture", BaseURL: &fallback.URL, Priority: &low, Models: fallbackModel, Group: "default"},
+		{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Key: "forbidden-fixture", BaseURL: &forbidden.URL, Priority: &highest, Models: fallbackModel, Group: "other"},
+	}
+	for _, channel := range channels {
+		configureSeedanceTestAssetURL(t, channel)
+		require.NoError(t, channel.Insert())
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/assets/liveness", strings.NewReader(`{"model":"`+family+`"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("id", 7)
+	c.Set("token_id", 1)
+	c.Set("token_model_limit_enabled", true)
+	c.Set("token_model_limit", map[string]bool{family: true, fallbackModel: true})
+	c.Set("group", "default")
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	CreateSeedanceCompatValidationSession(c)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var response struct {
+		Success bool                              `json:"success"`
+		Data    seedanceCompatValidationStartData `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.Equal(t, fallbackModel, response.Data.SuggestModel)
+	assert.EqualValues(t, 1, firstCalls.Load())
+	assert.EqualValues(t, 1, fallbackCalls.Load())
+	assert.Zero(t, forbiddenCalls.Load())
+	var session model.SeedanceAssetValidationSession
+	require.NoError(t, db.First(&session, response.Data.HistoryID).Error)
+	assert.Equal(t, channels[1].Id, session.ChannelID)
+	assert.Equal(t, fallbackModel, session.CompatModel)
 }
 
 func TestSeedanceValidationNotFoundWaitsWithoutErrorAndExpiresLocally(t *testing.T) {
@@ -158,7 +228,9 @@ func TestSeedanceValidationNotFoundWaitsWithoutErrorAndExpiresLocally(t *testing
 
 func TestSeedanceJSONValidationWaitsForReadyGroupAndGuardsOldUploads(t *testing.T) {
 	db := setupSeedancePriorityRegression(t)
-	require.NoError(t, db.AutoMigrate(&model.SeedanceAssetSize{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.SeedanceAssetSize{}))
+	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(&model.User{}, &model.SeedanceAssetSize{})) })
+	require.NoError(t, db.Create(&model.User{Id: 7, Username: "validation-owner", AffCode: "validation-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
 	groupStatus := "Processing"
 	var creates, uploads atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -182,8 +254,8 @@ func TestSeedanceJSONValidationWaitsForReadyGroupAndGuardsOldUploads(t *testing.
 	}))
 	defer upstream.Close()
 	settings := `{"task_plugin_key":"anyllm","seedance_asset_url":"` + upstream.URL + `"}`
-	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "fixture-json-key", BaseURL: &upstream.URL, Setting: &settings}
-	require.NoError(t, db.Create(channel).Error)
+	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "fixture-json-key", BaseURL: &upstream.URL, Setting: &settings, Models: "doubao-seedance-2-0-260128", Group: "default"}
+	require.NoError(t, channel.Insert())
 	started, err := service.StartSeedanceAssetValidationSession(t.Context(), 7, channel, service.SeedanceAssetValidationGroupDetails{Name: "ready-group"}, "", "https://example.com/callback")
 	require.NoError(t, err)
 	pending, err := service.RefreshSeedanceAssetValidationSession(t.Context(), 7, started.Session.ID)

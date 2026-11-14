@@ -123,7 +123,7 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 		if err == nil {
 			break
 		}
-		if errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if errors.Is(err, model.ErrSeedanceAssetCommitUncertain) || errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			break
 		}
 		var count int64
@@ -132,7 +132,7 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 		}
 	}
 	if err != nil {
-		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) {
+		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
 		}
 		seedanceCompatError(c, http.StatusBadGateway, "asset upload failed")

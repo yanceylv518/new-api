@@ -69,7 +69,7 @@ func TestSeedanceAssetCommitOutcomeRecoveryMySQL(t *testing.T) {
 	requireBillingRefundMySQL(t)
 	const userID = 974302
 	primary := model.DB
-	models := []any{&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetSize{}}
+	models := []any{&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetCleanupJob{}}
 	require.NoError(t, primary.AutoMigrate(models...))
 	t.Cleanup(func() {
 		for _, value := range models {
@@ -109,23 +109,104 @@ func TestSeedanceAssetCommitOutcomeRecoveryMySQL(t *testing.T) {
 	groupReplica := &model.SeedanceAssetGroupReplica{UserID: userID, LocalGroupID: group.ID, ChannelID: 2, AccountFingerprint: "replica-account", KeyFingerprint: "replica-key", Status: model.SeedanceAssetReplicaCreating, LeaseUntil: 100}
 	require.NoError(t, db.Create(groupReplica).Error)
 	fault.fail.Store(true)
-	won, err := model.CompleteSeedanceAssetGroupReplica(t.Context(), groupReplica.ID, 100, "upstream-group", "commit")
+	groupCleanup := model.SeedanceAssetCleanupJob{Kind: model.SeedanceAssetCleanupKindUpstreamGroup, UserID: userID, ChannelID: 2, KeyFingerprint: "replica-key", AccountFingerprint: "replica-account", UpstreamID: "upstream-group"}
+	won, err := model.CompleteSeedanceAssetGroupReplica(t.Context(), groupReplica.ID, 100, "upstream-group", "commit", groupCleanup)
 	require.NoError(t, err)
 	require.True(t, won)
 	replica := &model.SeedanceAssetReplica{UserID: userID, LocalGroupID: group.ID, LocalAssetID: asset.ID, ChannelID: 2, AccountFingerprint: "replica-account", KeyFingerprint: "replica-key", ProvisionStatus: model.SeedanceAssetReplicaCreating, PollLeaseUntil: 100}
 	require.NoError(t, db.Create(replica).Error)
 	fault.fail.Store(true)
-	won, err = model.CompleteSeedanceAssetReplica(t.Context(), replica.ID, 100, "upstream-group", "upstream-asset", time.Now().Unix())
+	assetCleanup := model.SeedanceAssetCleanupJob{Kind: model.SeedanceAssetCleanupKindUpstreamAsset, UserID: userID, ChannelID: 2, KeyFingerprint: "replica-key", AccountFingerprint: "replica-account", UpstreamID: "upstream-asset"}
+	won, err = model.CompleteSeedanceAssetReplica(t.Context(), replica.ID, 100, "upstream-group", "upstream-asset", time.Now().Unix(), assetCleanup)
 	require.NoError(t, err)
 	require.True(t, won)
+	var count int64
+	require.NoError(t, db.Model(&model.SeedanceAssetCleanupJob{}).Where("user_id = ?", userID).Count(&count).Error)
+	assert.Zero(t, count)
+
+	var deletedGroups atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("Action") == "DeleteAssetGroup" {
+			deletedGroups.Add(1)
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+	channel := seedanceAssetTestChannel(t, &model.Channel{Id: userID, Type: constant.ChannelTypeDoubaoVideo, Key: "cleanup-fixture", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled})
+	require.NoError(t, db.Create(channel).Error)
+	t.Cleanup(func() { assert.NoError(t, primary.Delete(channel).Error) })
+	client, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
 
 	fault.rollback = true
 	fault.fail.Store(true)
-	uncommitted := &model.SeedanceAssetGroup{UserID: userID, ChannelID: 1, GroupID: "rollback-group", Name: "rollback", KeyFingerprint: "key", AccountFingerprint: "account"}
+	uncommitted := &model.SeedanceAssetGroup{UserID: userID, ChannelID: channel.Id, GroupID: "rollback-group", Name: "rollback", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint}
 	require.ErrorIs(t, model.CreateSeedanceAssetGroup(t.Context(), uncommitted), model.ErrSeedanceAssetCommitUncertain)
-	var count int64
 	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", userID, uncommitted.GroupID).Count(&count).Error)
 	assert.Zero(t, count)
+	var orphan model.SeedanceAssetCleanupJob
+	require.NoError(t, db.Where("user_id = ? AND upstream_id = ?", userID, uncommitted.GroupID).First(&orphan).Error)
+	require.NoError(t, db.Model(&orphan).Update("next_attempt_at", 0).Error)
+	summary, err := RunSeedanceAssetCleanupOnce(t.Context(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
+	assert.EqualValues(t, 1, deletedGroups.Load())
+
+	const callback = "seedance-test:claim-cleanup-before-publish"
+	var cleanupClaimed bool
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != "seedance_asset_groups" {
+			return
+		}
+		var job model.SeedanceAssetCleanupJob
+		if err := db.Where("user_id = ? AND upstream_id = ?", userID, "claimed-group").First(&job).Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		if err := db.Model(&job).Update("next_attempt_at", 0).Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		if err := db.First(&job, job.ID).Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		now := common.GetTimestamp()
+		claimed, err := model.ClaimSeedanceAssetCleanupJob(job.ID, job.UpdatedAt, now, now+60)
+		if err != nil {
+			tx.AddError(err)
+		} else if !claimed {
+			tx.AddError(errors.New("cleanup job was not claimed"))
+		} else {
+			cleanupClaimed = true
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Create().Remove(callback)) })
+	claimedGroup := &model.SeedanceAssetGroup{UserID: userID, ChannelID: channel.Id, GroupID: "claimed-group", Name: "claimed", KeyFingerprint: client.KeyFingerprint, AccountFingerprint: client.AccountFingerprint}
+	require.ErrorIs(t, model.CreateSeedanceAssetGroup(t.Context(), claimedGroup), model.ErrSeedanceAssetCleanupScheduled)
+	require.True(t, cleanupClaimed)
+	require.NoError(t, db.Model(&model.SeedanceAssetGroup{}).Where("user_id = ? AND group_id = ?", userID, claimedGroup.GroupID).Count(&count).Error)
+	assert.Zero(t, count)
+	orphan = model.SeedanceAssetCleanupJob{}
+	require.NoError(t, db.Where("user_id = ? AND upstream_id = ?", userID, claimedGroup.GroupID).First(&orphan).Error)
+	assert.Greater(t, orphan.LeaseUntil, int64(0))
+	require.NoError(t, db.Model(&orphan).Updates(map[string]any{"next_attempt_at": 0, "lease_until": 0}).Error)
+	summary, err = RunSeedanceAssetCleanupOnce(t.Context(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
+	assert.EqualValues(t, 2, deletedGroups.Load())
+
+	ossClient := useFakePrivateAssetOSSStorage(t)
+	rollbackAsset := &model.SeedanceAsset{UserID: userID, ChannelID: group.ChannelID, GroupID: group.GroupID, AssetID: "rollback-asset", Name: "rollback", AssetType: "Image", Status: "Active", KeyFingerprint: "key", AccountFingerprint: "account", LocalOnly: &localOnly, ObjectKey: "private-assets/rollback.jpg"}
+	fault.fail.Store(true)
+	require.ErrorIs(t, model.CreateSeedanceAssetInGroup(t.Context(), rollbackAsset), model.ErrSeedanceAssetCommitUncertain)
+	orphan = model.SeedanceAssetCleanupJob{}
+	require.NoError(t, db.Where("user_id = ? AND object_key = ?", userID, rollbackAsset.ObjectKey).First(&orphan).Error)
+	require.NoError(t, db.Model(&orphan).Update("next_attempt_at", 0).Error)
+	summary, err = RunSeedanceAssetCleanupOnce(t.Context(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.Completed)
+	assert.Equal(t, rollbackAsset.ObjectKey, ossClient.deletedKey)
 }
 
 func seedanceAssetTestChannel(t *testing.T, channel *model.Channel) *model.Channel {
@@ -940,11 +1021,13 @@ func TestSeedanceValidationAllowsExistingGroupName(t *testing.T) {
 	sqlDB.SetMaxOpenConns(1)
 	var deleteCalls atomic.Int32
 	var validationCalls atomic.Int32
+	var resultCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("Action") {
 		case "CreateVisualValidateSession":
 			_, _ = fmt.Fprintf(w, `{"Result":{"BytedToken":"validation-token-%d","H5Link":"https://example.com/validate"}}`, validationCalls.Add(1))
 		case "GetVisualValidateResult":
+			resultCalls.Add(1)
 			_, _ = fmt.Fprintf(w, `{"Result":{"GroupId":"upstream-liveness-%d"}}`, validationCalls.Load())
 		case "GetAssetGroup":
 			_, _ = io.WriteString(w, `{"Result":{"Id":"upstream-liveness","GroupType":"LivenessFace","Status":"Active"}}`)
@@ -990,18 +1073,33 @@ func TestSeedanceValidationAllowsExistingGroupName(t *testing.T) {
 	failed, err := StartSeedanceAssetValidationSession(t.Context(), 9, channel, SeedanceAssetValidationGroupDetails{Name: "另一个素材组"}, "", "https://example.com/callback")
 	require.NoError(t, err)
 	const rejectPublish = "test:reject-validation-group-publish"
+	var rejectWrites atomic.Bool
+	var rejectedWrites atomic.Int32
+	rejectWrites.Store(true)
 	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(rejectPublish, func(tx *gorm.DB) {
-		if tx.Statement.Table == db.NamingStrategy.TableName("SeedanceAssetGroup") {
+		if rejectWrites.Load() && tx.Statement.Table == db.NamingStrategy.TableName("SeedanceAssetGroup") {
+			rejectedWrites.Add(1)
 			tx.AddError(errors.New("fixture group persistence failure"))
 		}
 	}))
 	t.Cleanup(func() { assert.NoError(t, db.Callback().Create().Remove(rejectPublish)) })
-	_, err = RefreshSeedanceAssetValidationSession(t.Context(), 9, failed.Session.ID)
-	require.ErrorContains(t, err, "fixture group persistence failure")
-	assert.EqualValues(t, 1, deleteCalls.Load())
-	var failedSession model.SeedanceAssetValidationSession
-	require.NoError(t, db.First(&failedSession, failed.Session.ID).Error)
-	assert.Equal(t, model.SeedanceAssetValidationStatusFailed, failedSession.Status)
+	pending, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, failed.Session.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rejectedWrites.Load())
+	assert.Equal(t, model.SeedanceAssetValidationStatusPending, pending.Status)
+	assert.Equal(t, "upstream-liveness-2", pending.UpstreamGroupID)
+	assert.True(t, BuildSeedanceAssetValidationSessionView(pending).StatusCheckRetrying)
+	assert.Zero(t, deleteCalls.Load())
+
+	rejectWrites.Store(false)
+	recovered, err := RefreshSeedanceAssetValidationSession(t.Context(), 9, failed.Session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.SeedanceAssetValidationStatusSucceeded, recovered.Status)
+	assert.Equal(t, "upstream-liveness-2", recovered.UpstreamGroupID)
+	assert.NotZero(t, recovered.LocalGroupID)
+	assert.Empty(t, recovered.BytedTokenCiphertext)
+	assert.EqualValues(t, 2, resultCalls.Load())
+	assert.Zero(t, deleteCalls.Load())
 }
 
 type seedanceDeadlineTransport struct {
