@@ -1576,6 +1576,11 @@ func renderTaskPluginQuery(
 		}
 		tasksByID[task.TaskID] = task
 	}
+	policies, err := service.LoadTaskMediaProxyPolicies(tasks)
+	if err != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
 	views := make([]dto.TaskView, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
 		task := tasksByID[taskID]
@@ -1591,7 +1596,7 @@ func renderTaskPluginQuery(
 			abortTaskPluginRouteError(c, http.StatusNotFound)
 			return
 		}
-		view, viewErr := service.BuildTaskPluginView(task)
+		view, viewErr := service.BuildTaskPluginViewWithMediaPolicies(task, policies)
 		if viewErr != nil {
 			abortTaskPluginRouteError(c, http.StatusInternalServerError)
 			return

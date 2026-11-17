@@ -1,14 +1,66 @@
 package service
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestForwardTaskCallbackUsesExistingMediaProxy(t *testing.T) {
+	setting := `{"task_media_proxy_enabled":true}`
+	channel := &model.Channel{Name: "callback-media-test", Key: "fixture-key", Setting: &setting}
+	require.NoError(t, model.DB.Create(channel).Error)
+	t.Cleanup(func() { assert.NoError(t, model.DB.Delete(channel).Error) })
+
+	previousAddress, previousClient := system_setting.TaskPublicAddress, taskCallbackHTTPClient
+	system_setting.TaskPublicAddress = "https://gateway.example"
+	t.Cleanup(func() {
+		system_setting.TaskPublicAddress, taskCallbackHTTPClient = previousAddress, previousClient
+	})
+	bodies := make(chan []byte, 1)
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		bodies <- body
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(destination.Close)
+	taskCallbackHTTPClient = destination.Client()
+	task := &model.Task{TaskID: "callback-task", UserId: 7, ChannelId: channel.Id, Status: model.TaskStatusQueued}
+	const source = "https://upstream.example/video.mp4?signature=private"
+	body := []byte(`{"id":"upstream-id","status":"succeeded","content":{"video_url":"` + source + `"}}`)
+	err := ForwardTaskCallback(context.Background(), &TaskCallbackTarget{URL: destination.URL}, task, body)
+	require.NoError(t, err)
+	var received struct {
+		Content struct {
+			VideoURL string `json:"video_url"`
+		} `json:"content"`
+	}
+	require.NoError(t, common.Unmarshal(<-bodies, &received))
+	assert.NotContains(t, received.Content.VideoURL, "upstream.example")
+	parsed, err := url.Parse(received.Content.VideoURL)
+	require.NoError(t, err)
+	assert.Equal(t, "gateway.example", parsed.Host)
+	access := parsed.Query().Get(TaskArtifactAccessQueryParameter)
+	assert.Len(t, access, 43)
+	assert.True(t, VerifyTaskArtifactAccess(access, task.TaskID, "response-media-video"))
+	assert.False(t, VerifyTaskArtifactAccess(access+"x", task.TaskID, "response-media-video"))
+	assert.False(t, VerifyTaskArtifactAccess(access, "other-task", "response-media-video"))
+	assert.False(t, VerifyTaskArtifactAccess(access, task.TaskID, "response-media-last-frame"))
+	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), task.Status)
+	assert.NotContains(t, received.Content.VideoURL, "signature=private")
+}
 
 func TestTaskArtifactAccessBindsTaskAndKey(t *testing.T) {
 	previousSecret := common.CryptoSecret

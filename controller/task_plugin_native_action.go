@@ -252,9 +252,14 @@ func renderTaskPluginNativeList(
 		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_list_failed", "Failed to query task list")
 		return
 	}
+	policies, err := service.LoadTaskMediaProxyPolicies(tasks)
+	if err != nil {
+		respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_list_failed", "Failed to query task list")
+		return
+	}
 	views := make([]any, 0, len(tasks))
 	for _, task := range tasks {
-		view, viewErr := service.BuildTaskPluginView(task)
+		view, viewErr := service.BuildTaskPluginViewWithMediaPolicies(task, policies)
 		if viewErr != nil {
 			respondTaskPluginNativeActionError(c, http.StatusInternalServerError, "task_list_failed", "Failed to build task list")
 			return

@@ -959,13 +959,18 @@ func tryRealtimeFetch(c *gin.Context, task *model.Task, isOpenAIVideoAPI bool) [
 
 	// 非 OpenAI Video API: 构建自定义格式响应
 	format := detectVideoFormat(task.Data)
+	resultURL, err := service.PublicTaskResultURL(task)
+	if err != nil {
+		logger.LogWarn(c, "realtime video result projection failed")
+		return nil
+	}
 	out := map[string]any{
 		"error":    nil,
 		"format":   format,
 		"metadata": nil,
 		"status":   mapTaskStatusToSimple(task.Status),
 		"task_id":  task.TaskID,
-		"url":      task.GetResultURL(),
+		"url":      resultURL,
 	}
 	respBody, _ := common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
@@ -1014,14 +1019,18 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 }
 
 func TaskModel2Dto(task *model.Task) *dto.TaskDto {
+	return TaskModel2DtoWithMediaPolicies(task, nil)
+}
+
+func TaskModel2DtoWithMediaPolicies(task *model.Task, policies service.TaskMediaProxyPolicies) *dto.TaskDto {
 	properties := task.Properties
 	properties.UpstreamModelName = ""
-	data, err := service.PublicTaskData(task)
+	data, err := service.PublicTaskDataWithMediaPolicies(task, policies)
 	if err != nil {
 		common.SysError(fmt.Sprintf("project public task model failed: task_id=%s: %v", task.TaskID, err))
 		data = nil
 	}
-	resultURL, err := service.PublicTaskResultURL(task)
+	resultURL, err := service.PublicTaskResultURLWithMediaPolicies(task, policies)
 	if err != nil {
 		common.SysError(fmt.Sprintf("project task result URL failed: task_id=%s: %v", task.TaskID, err))
 		resultURL = ""

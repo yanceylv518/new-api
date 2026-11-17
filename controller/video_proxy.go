@@ -24,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/http/httpguts"
+	"gorm.io/gorm"
 )
 
 var errTaskMediaRequestRejected = errors.New("task media request rejected")
@@ -209,13 +210,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	}
 
 	channel, err := model.GetTaskChannel(task)
-	if err != nil {
+	if err != nil && (!descriptor.Credentialless || !errors.Is(err, gorm.ErrRecordNotFound) || task.PrivateData.TransportSaved) {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
 			message: "Artifact channel is unavailable", err: err,
 		}
 	}
-	proxy := strings.TrimSpace(channel.GetSetting().Proxy)
+	proxy := ""
+	if channel != nil {
+		proxy = strings.TrimSpace(channel.GetSetting().Proxy)
+	}
 	if task.PrivateData.TransportSaved {
 		proxy = strings.TrimSpace(task.PrivateData.Proxy)
 	}
@@ -333,7 +337,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	case http.StatusOK, http.StatusPartialContent, http.StatusNotModified, http.StatusRequestedRangeNotSatisfiable:
 		var body io.Reader = resp.Body
 		artifactKey := c.Param("artifact_key")
-		if (artifactKey == "last_frame" || artifactKey == "last-frame" || artifactKey == "response-media-first-frame" || artifactKey == "response-media-last-frame" || artifactKey == "response-media-top-first-frame" || artifactKey == "response-media-top-last-frame") && req.Method == http.MethodGet &&
+		if (artifactKey == "last_frame" || artifactKey == "last-frame" || artifactKey == "response-media-first-frame" || artifactKey == "response-media-last-frame" || artifactKey == "response-media-top-first-frame" || artifactKey == "response-media-top-last-frame" || strings.HasPrefix(artifactKey, "response-media-frame-")) && req.Method == http.MethodGet &&
 			(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent && strings.HasPrefix(resp.Header.Get("Content-Range"), "bytes 0-")) {
 			prefix := make([]byte, 12)
 			n, readErr := io.ReadFull(resp.Body, prefix)

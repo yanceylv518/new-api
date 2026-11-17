@@ -13,6 +13,10 @@ import (
 // BuildTaskPluginView converts a persisted task into the deliberately narrow
 // public shape permitted at JavaScript plugin boundaries.
 func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
+	return BuildTaskPluginViewWithMediaPolicies(task, nil)
+}
+
+func BuildTaskPluginViewWithMediaPolicies(task *model.Task, policies TaskMediaProxyPolicies) (dto.TaskView, error) {
 	createdAt := task.CreatedAt
 	if createdAt == 0 {
 		createdAt = task.SubmitTime
@@ -29,7 +33,7 @@ func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
 		FinishedAt: task.FinishTime,
 	}
 	if len(task.Data) > 0 {
-		data, err := PublicTaskData(task)
+		data, err := PublicTaskDataWithMediaPolicies(task, policies)
 		if err != nil {
 			return dto.TaskView{}, err
 		}
@@ -51,11 +55,15 @@ func PublicTaskModelText(value, publicModel, upstreamModel string) string {
 
 // PublicTaskData 仅修改对外副本，不改变轮询与计费使用的任务快照。
 func PublicTaskData(task *model.Task) (json.RawMessage, error) {
+	return PublicTaskDataWithMediaPolicies(task, nil)
+}
+
+func PublicTaskDataWithMediaPolicies(task *model.Task, policies TaskMediaProxyPolicies) (json.RawMessage, error) {
 	data, err := taskDataWithoutMediaProxy(task)
 	if err != nil {
 		return nil, err
 	}
-	return ProjectTaskMediaData(task, data)
+	return ProjectTaskMediaDataWithPolicies(task, data, policies)
 }
 
 func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {

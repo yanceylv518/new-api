@@ -399,7 +399,7 @@ func TaskArtifactContent(c *gin.Context) {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 			return
 		}
-		descriptor := &relaychannel.TaskContentRequest{URL: source, Method: http.MethodGet, Credentialless: true}
+		descriptor := taskResponseMediaDescriptor(c, task, source)
 		if err := proxyTaskMedia(c, task, descriptor); err != nil {
 			writeTaskMediaProxyError(c, err)
 		}
@@ -466,6 +466,42 @@ func TaskArtifactContent(c *gin.Context) {
 	}
 }
 
+// taskResponseMediaDescriptor 优先沿用插件的认证和请求方式。
+func taskResponseMediaDescriptor(c *gin.Context, task *model.Task, source string) *relaychannel.TaskContentRequest {
+	if taskHasPluginExecution(task) {
+		artifacts, err := projectTaskArtifacts(task)
+		if err == nil {
+			adaptor, initErr := initTaskArtifactAdaptor(task)
+			if initErr == nil {
+				if provider, ok := adaptor.(relaychannel.TaskContentRequestProvider); ok {
+					request := relaychannel.TaskArtifactClientRequest{Method: c.Request.Method, Headers: taskArtifactClientHeaders(c.Request.Header)}
+					var videoFallback *relaychannel.TaskContentRequest
+					videoCount := 0
+					for _, artifact := range artifacts {
+						if artifact.Type == "video" {
+							videoCount++
+						}
+						descriptor, buildErr := provider.BuildContentRequest(task, artifact.Key, request)
+						if buildErr != nil || descriptor == nil {
+							continue
+						}
+						if strings.TrimSpace(descriptor.URL) == source {
+							return descriptor
+						}
+						if artifact.Type == "video" {
+							videoFallback = descriptor
+						}
+					}
+					if videoCount == 1 && videoFallback != nil && (source == strings.TrimSpace(task.GetResultURL()) || isTaskMediaFallbackLoop(source, task.TaskID)) {
+						return videoFallback
+					}
+				}
+			}
+		}
+	}
+	return &relaychannel.TaskContentRequest{URL: source, Method: c.Request.Method, Credentialless: true}
+}
+
 func taskArtifactClientHeaders(headers http.Header) map[string]string {
 	result := make(map[string]string, 4)
 	for _, name := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
@@ -487,8 +523,13 @@ func GetAllTask(c *gin.Context) {
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp, ChannelID: c.Query("channel_id")}
 	items := model.TaskGetAllTasks(pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
+	policies, err := service.LoadTaskMediaProxyPolicies(items)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	pageInfo.SetTotal(int(model.TaskCountAllTasks(queryParams)))
-	pageInfo.SetItems(tasksToDto(items, true, c.GetInt("role")))
+	pageInfo.SetItems(tasksToDtoWithPolicies(items, true, c.GetInt("role"), policies))
 	common.ApiSuccess(c, pageInfo)
 }
 
@@ -499,12 +540,26 @@ func GetUserTask(c *gin.Context) {
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp}
 	items := model.TaskGetAllUserTask(userID, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
+	policies, err := service.LoadTaskMediaProxyPolicies(items)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	pageInfo.SetTotal(int(model.TaskCountAllUserTask(userID, queryParams)))
-	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))
+	pageInfo.SetItems(tasksToDtoWithPolicies(items, false, common.RoleCommonUser, policies))
 	common.ApiSuccess(c, pageInfo)
 }
 
 func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskDto {
+	policies, err := service.LoadTaskMediaProxyPolicies(tasks)
+	if err != nil {
+		common.SysError(fmt.Sprintf("load task media policies failed: %v", err))
+		return nil
+	}
+	return tasksToDtoWithPolicies(tasks, fillUser, viewerRole, policies)
+}
+
+func tasksToDtoWithPolicies(tasks []*model.Task, fillUser bool, viewerRole int, policies service.TaskMediaProxyPolicies) []*dto.TaskDto {
 	var userIDMap map[int]*model.UserBase
 	if fillUser {
 		userIDMap = make(map[int]*model.UserBase)
@@ -525,17 +580,10 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 				task.Username = user.Username
 			}
 		}
-		projected := *task
-		if task.Status == model.TaskStatusSuccess {
-			projected.PrivateData.ResultURL = ""
-			if taskFailReasonIsLegacyResultURL(task.FailReason) {
-				projected.FailReason = ""
-			}
-		}
-		item := relay.TaskModel2Dto(&projected)
+		item := relay.TaskModel2DtoWithMediaPolicies(task, policies)
 		if viewerRole >= common.RoleAdminUser {
 			item.Properties, item.FailReason = task.Properties, task.FailReason
-			data, err := service.ProjectTaskMediaData(task, task.Data)
+			data, err := service.ProjectTaskMediaDataWithPolicies(task, task.Data, policies)
 			if err != nil {
 				common.SysError(fmt.Sprintf("project task media failed: task_id=%s: %v", task.TaskID, err))
 				data = nil

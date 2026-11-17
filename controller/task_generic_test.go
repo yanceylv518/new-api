@@ -75,8 +75,12 @@ func TestChannelVideoResultProxy(t *testing.T) {
 		common.MemoryCacheEnabled = oldMemory
 		system_setting.TaskPublicAddress = oldAddress
 	})
+	headRequests := make(chan struct{}, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Contains(t, []string{http.MethodGet, http.MethodHead}, r.Method)
+		if r.Method == http.MethodHead {
+			headRequests <- struct{}{}
+		}
 		assert.Empty(t, r.Header.Get("Authorization"))
 		if r.Header.Get("Range") != "" {
 			w.Header().Set("Content-Range", "bytes 0-3/4")
@@ -136,6 +140,10 @@ func TestChannelVideoResultProxy(t *testing.T) {
 	callbackJSON, err := common.Marshal(callbackView.Data)
 	require.NoError(t, err)
 	assert.NotContains(t, string(callbackJSON), upstream.URL)
+	var callbackOutput struct {
+		Content map[string]string `json:"content"`
+	}
+	require.NoError(t, common.Unmarshal(callbackJSON, &callbackOutput))
 	publicTask := relay.TaskModel2Dto(task)
 	assert.NotContains(t, publicTask.ResultURL, upstream.URL)
 	assert.NotContains(t, string(publicTask.Data), upstream.URL)
@@ -173,11 +181,110 @@ func TestChannelVideoResultProxy(t *testing.T) {
 	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, parsed.RequestURI(), nil))
 	assert.Equal(t, http.StatusOK, head.Code)
 	assert.Empty(t, head.Body.String())
+	select {
+	case <-headRequests:
+	default:
+		t.Error("expected a HEAD request to the media source")
+	}
 	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusQueued).Error)
 	pending := httptest.NewRecorder()
 	router.ServeHTTP(pending, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
 	require.Equal(t, http.StatusNotFound, pending.Code, pending.Body.String())
+	callbackLink, err := url.Parse(callbackOutput.Content["video_url"])
+	require.NoError(t, err)
+	callbackMedia := httptest.NewRecorder()
+	router.ServeHTTP(callbackMedia, httptest.NewRequest(http.MethodGet, callbackLink.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, callbackMedia.Code)
+	tampered := *callbackLink
+	tamperedValues := tampered.Query()
+	tamperedValues.Set("access", tamperedValues.Get("access")+"x")
+	tampered.RawQuery = tamperedValues.Encode()
+	for _, requestURI := range []string{
+		tampered.RequestURI(),
+		strings.Replace(callbackLink.RequestURI(), "response-media-video", "response-media-last-frame", 1),
+		strings.Replace(callbackLink.RequestURI(), task.TaskID, "foreign-task", 1),
+	} {
+		rejected := httptest.NewRecorder()
+		router.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, requestURI, nil))
+		assert.Equal(t, http.StatusNotFound, rejected.Code)
+	}
+	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusFailure).Error)
+	failedCallback := httptest.NewRecorder()
+	router.ServeHTTP(failedCallback, httptest.NewRequest(http.MethodGet, callbackLink.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, failedCallback.Code)
 	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusSuccess).Error)
+	completedCallback := httptest.NewRecorder()
+	router.ServeHTTP(completedCallback, httptest.NewRequest(http.MethodGet, callbackLink.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, completedCallback.Code)
+	assert.Equal(t, "vid1", completedCallback.Body.String())
+
+	nestedTask := *task
+	nestedTask.SetData(map[string]any{
+		"output":  map[string]any{"video_url": upstream.URL + "/video", "results": map[string]any{"video_url": upstream.URL + "/video", "last_frame_url": upstream.URL + "/last"}},
+		"data":    map[string]any{"video_url": upstream.URL + "/top-video"},
+		"video":   map[string]any{"url": upstream.URL + "/video"},
+		"outputs": []any{map[string]any{"type": "video", "url": upstream.URL + "/video"}, map[string]any{"type": "audio", "url": upstream.URL + "/audio"}},
+	})
+	require.NoError(t, model.DB.Save(&nestedTask).Error)
+	// 数据库设置应立即生效，不依赖当前节点的渠道内存缓存。
+	common.MemoryCacheEnabled = true
+	nestedData, err := service.PublicTaskData(&nestedTask)
+	common.MemoryCacheEnabled = false
+	require.NoError(t, err)
+	var nested struct {
+		Output struct {
+			VideoURL string `json:"video_url"`
+			Results  struct {
+				VideoURL     string `json:"video_url"`
+				LastFrameURL string `json:"last_frame_url"`
+			} `json:"results"`
+		} `json:"output"`
+		Data struct {
+			VideoURL string `json:"video_url"`
+		} `json:"data"`
+		Video struct {
+			URL string `json:"url"`
+		} `json:"video"`
+		Outputs []struct {
+			URL string `json:"url"`
+		} `json:"outputs"`
+	}
+	require.NoError(t, common.Unmarshal(nestedData, &nested))
+	require.Len(t, nested.Outputs, 2)
+	for _, result := range []struct{ link, body string }{
+		{nested.Output.VideoURL, "vid1"}, {nested.Output.Results.VideoURL, "vid1"},
+		{nested.Output.Results.LastFrameURL, "las1"}, {nested.Data.VideoURL, "vid2"},
+		{nested.Video.URL, "vid1"}, {nested.Outputs[0].URL, "vid1"},
+	} {
+		link, parseErr := url.Parse(result.link)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "site.example", link.Host)
+		media := httptest.NewRecorder()
+		router.ServeHTTP(media, httptest.NewRequest(http.MethodGet, link.RequestURI(), nil))
+		assert.Equal(t, http.StatusOK, media.Code)
+		assert.Equal(t, result.body, media.Body.String())
+	}
+	assert.Equal(t, upstream.URL+"/audio", nested.Outputs[1].URL)
+	longSource := upstream.URL + "/video?signature=" + strings.Repeat("a", 5000)
+	longTask := *task
+	longTask.SetData(map[string]any{"content": map[string]string{"video_url": longSource}})
+	require.NoError(t, model.DB.Save(&longTask).Error)
+	longData, err := service.PublicTaskData(&longTask)
+	require.NoError(t, err)
+	var longOutput struct {
+		Content map[string]string `json:"content"`
+	}
+	require.NoError(t, common.Unmarshal(longData, &longOutput))
+	longLink, err := url.Parse(longOutput.Content["video_url"])
+	require.NoError(t, err)
+	assert.Len(t, longLink.Query().Get("access"), 43)
+	assert.NotContains(t, longOutput.Content["video_url"], longSource)
+	longMedia := httptest.NewRecorder()
+	router.ServeHTTP(longMedia, httptest.NewRequest(http.MethodGet, longLink.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, longMedia.Code)
+	assert.Equal(t, "vid1", longMedia.Body.String())
+	require.NoError(t, model.DB.Save(task).Error)
+
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Update("status", common.UserStatusDisabled).Error)
 	disabled := httptest.NewRecorder()
 	router.ServeHTTP(disabled, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
@@ -224,8 +331,15 @@ func TestChannelVideoResultProxy(t *testing.T) {
 		assert.Equal(t, http.StatusOK, recorder.Code, field)
 	}
 	require.NoError(t, model.DB.Delete(&model.Channel{}, task.ChannelId).Error)
-	_, err = service.PublicTaskData(task)
-	assert.Error(t, err)
+	afterDelete, err := service.PublicTaskData(task)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(afterDelete, &output))
+	deletedLink, err := url.Parse(output.Content["video_url"])
+	require.NoError(t, err)
+	deletedMedia := httptest.NewRecorder()
+	router.ServeHTTP(deletedMedia, httptest.NewRequest(http.MethodGet, deletedLink.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, deletedMedia.Code)
+	assert.Equal(t, "vid1", deletedMedia.Body.String())
 }
 
 func TestGetTaskDoesNotProjectArtifacts(t *testing.T) {
@@ -535,8 +649,14 @@ func TestLegacyVideoArtifactContentUsesGetResultURL(t *testing.T) {
 
 func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 	task := setupGenericTaskTest(t)
+	headRequests := make(chan struct{}, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "provider-key", r.Header.Get("x-goog-api-key"))
+		if r.Method == http.MethodHead {
+			headRequests <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		assert.Equal(t, "bytes=0-13", r.Header.Get("Range"))
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Header().Set("Content-Range", "bytes 0-13/14")
@@ -582,6 +702,35 @@ func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 	assert.Equal(t, "artifact-bytes", recorder.Body.String())
 	assert.Equal(t, "video/mp4", recorder.Header().Get("Content-Type"))
 	assert.Equal(t, "bytes 0-13/14", recorder.Header().Get("Content-Range"))
+
+	previousAddress := system_setting.TaskPublicAddress
+	system_setting.TaskPublicAddress = "https://site.example"
+	t.Cleanup(func() { system_setting.TaskPublicAddress = previousAddress })
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).
+		Update("setting", `{"task_media_proxy_enabled":true}`).Error)
+	task.PrivateData.ResultURL = "https://site.example/v1/videos/" + task.TaskID + "/content"
+	require.NoError(t, model.DB.Save(task).Error)
+	resultURL, err := service.PublicTaskResultURL(task)
+	require.NoError(t, err)
+	parsed, err := url.Parse(resultURL)
+	require.NoError(t, err)
+	router := gin.New()
+	router.GET("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.HEAD("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	proxied := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	request.Header.Set("Range", "bytes=0-13")
+	router.ServeHTTP(proxied, request)
+	assert.Equal(t, http.StatusPartialContent, proxied.Code)
+	assert.Equal(t, "artifact-bytes", proxied.Body.String())
+	head := httptest.NewRecorder()
+	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, head.Code)
+	select {
+	case <-headRequests:
+	default:
+		t.Error("expected the plugin to send HEAD upstream")
+	}
 }
 
 func TestProjectedTaskArtifactValidationRejectsAmbiguousIdentity(t *testing.T) {
