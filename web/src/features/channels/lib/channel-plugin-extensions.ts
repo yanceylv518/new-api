@@ -41,7 +41,10 @@ export function supportsSeedanceAssetURL(
   pluginKey?: string
 ): boolean {
   return channelType === CHANNEL_TYPE_TASK_PLUGIN
-    ? pluginKey === 'doubao' || pluginKey === 'anyllm' || pluginKey === 'originocean'
+    ? pluginKey === 'doubao' ||
+      pluginKey === 'anyllm' ||
+      pluginKey === 'originocean' ||
+      pluginKey === 'qstart'
     : LEGACY_TASK_PLUGIN_KEYS[channelType] === 'doubao'
 }
 

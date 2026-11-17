@@ -68,7 +68,7 @@ func selectSeedanceAssetValidationCandidates(c *gin.Context, modelName string, m
 		}
 	}
 	constraints := service.GetChannelConstraints(c)
-	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean", "qstart"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	if group == "" {
 		group = c.GetString("group")
@@ -193,7 +193,7 @@ func selectSeedanceAssetGroupChannel(c *gin.Context, modelName string) (*model.C
 	}
 	constraints := service.GetChannelConstraints(c)
 	// 用素材插件身份约束模型，允许管理员配置的模型别名。
-	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
+	constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "doubao", TaskPluginKeys: []string{"anyllm", "originocean", "qstart"}, TaskPluginChannelTypes: []int{constant.ChannelTypeDoubaoVideo}})
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	if group == "" {
 		group = c.GetString("group")

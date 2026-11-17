@@ -1837,7 +1837,7 @@ func (a *TaskAdaptor) validateResolvedUsageValue(value any, usageSchema map[stri
 		for key, item := range typed {
 			// Doubao 的 -1 是智能时长控制值，不是负计费用量；仅在请求阶段放行两个已支持别名。
 			// 插件仍校验模型能力并生成正数预估，extractUsage 与完成用量继续执行非负校验。
-			if (a.plugin.Meta.Key == "doubao" || a.plugin.Meta.Key == "originocean") && (key == "duration" || key == "seconds") {
+			if (a.plugin.Meta.Key == "doubao" || a.plugin.Meta.Key == "originocean" || a.plugin.Meta.Key == "qstart") && (key == "duration" || key == "seconds") {
 				if number, ok := usageNumber(item, true); ok && number == -1 {
 					continue
 				}

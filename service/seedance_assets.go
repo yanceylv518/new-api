@@ -1556,7 +1556,7 @@ func isSeedanceAssetChannel(channel *model.Channel) bool {
 		return true
 	case constant.ChannelTypeTaskPlugin:
 		key := channel.GetSetting().TaskPluginKey
-		return key == "doubao" || key == "anyllm" || key == "originocean"
+		return key == "doubao" || key == "anyllm" || key == "originocean" || key == "qstart"
 	default:
 		return false
 	}

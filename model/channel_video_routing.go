@@ -12,7 +12,7 @@ func (channel *Channel) matchesVideoRouting(publicModel string, filter dto.Chann
 	settings := channel.GetSetting()
 	if channel.Type != constant.ChannelTypeDoubaoVideo &&
 		!((channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI) &&
-			(settings.BindsTaskPlugin("doubao") || settings.BindsTaskPlugin("anyllm") || settings.BindsTaskPlugin("originocean"))) {
+			(settings.BindsTaskPlugin("doubao") || settings.BindsTaskPlugin("anyllm") || settings.BindsTaskPlugin("originocean") || settings.BindsTaskPlugin("qstart"))) {
 		return true
 	}
 	if len(settings.VideoRoutingRules) == 0 {

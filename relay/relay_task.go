@@ -181,7 +181,7 @@ func ApplyChannelPin(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError
 			videoInput := ""
 			pinned, _ := c.Get(jsplugin.ContextKeyPinnedPlugin)
 			if plugin, ok := pinned.(jsplugin.PinnedPlugin); ok && plugin.Plugin != nil &&
-				(plugin.Plugin.Meta.Key == "doubao" || plugin.Plugin.Meta.Key == "originocean") {
+				(plugin.Plugin.Meta.Key == "doubao" || plugin.Plugin.Meta.Key == "originocean" || plugin.Plugin.Meta.Key == "qstart") {
 				videoInput = originTaskVideoInput(c, task)
 			}
 			refs = append(refs, relaycommon.OriginTaskRef{

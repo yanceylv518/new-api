@@ -122,7 +122,7 @@ func requireMeasuredVideoUsage(task *model.Task, result *relaycommon.TaskInfo) e
 		(plugin == "originocean" && upstreamModel == "maas-doubao-seedance-2.0") ||
 		(!strings.HasPrefix(upstreamModel, "doubao-seedream-") && strings.HasPrefix(originModel, "doubao-seedance-"))
 	required := []string{}
-	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean") && seedance {
+	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean" || plugin == "qstart") && seedance {
 		if keys["tokens"] || discountUses("task_tokens") {
 			required = append(required, "tokens")
 		}

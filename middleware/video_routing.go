@@ -20,11 +20,11 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 		return nil
 	}
 	// 共享别名可能被其他插件接受；只对本次解码通过的 Seedance 候选启用规则。
-	supported := pinned.Plugin != nil && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "anyllm" || pinned.Plugin.Meta.Key == "originocean")
+	supported := pinned.Plugin != nil && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "anyllm" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart")
 	if endpoint, exists := common.GetContextKeyType[jsplugin.PinnedEndpoint](c, jsplugin.ContextKeyPinnedEndpoint); exists && len(endpoint.Candidates) > 0 {
 		supported = false
 		for _, candidate := range endpoint.Candidates {
-			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean") {
+			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart") {
 				supported = true
 				break
 			}
@@ -33,7 +33,7 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 	if route, exists := common.GetContextKeyType[jsplugin.PinnedRoute](c, jsplugin.ContextKeyPinnedRoute); exists {
 		supported = false
 		for _, candidate := range route.Bindings() {
-			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean") {
+			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart") {
 				supported = true
 				break
 			}
@@ -58,7 +58,7 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 			video = true
 			continue
 		}
-		if (target.PluginKey == "doubao" || target.PluginKey == "anyllm" || target.PluginKey == "originocean") && strings.HasPrefix(strings.ToLower(target.Declared), "doubao-seedance-") {
+		if (target.PluginKey == "doubao" || target.PluginKey == "anyllm" || target.PluginKey == "originocean" || target.PluginKey == "qstart") && strings.HasPrefix(strings.ToLower(target.Declared), "doubao-seedance-") {
 			channelModels[target.ChannelID] = target.Declared
 			video = true
 		}

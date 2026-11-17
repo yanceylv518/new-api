@@ -127,7 +127,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 				} `json:"admin_info"`
 			}
 			if common.UnmarshalJsonStr(logs[i].Other, &metadata) == nil {
-				if metadata.AdminInfo.TaskPlugin.Key == "anyllm" || metadata.AdminInfo.TaskPlugin.Key == "originocean" {
+				if metadata.AdminInfo.TaskPlugin.Key == "anyllm" || metadata.AdminInfo.TaskPlugin.Key == "originocean" || metadata.AdminInfo.TaskPlugin.Key == "qstart" {
 					logs[i].Content = "Video request failed"
 				} else {
 					upstreamModel := metadata.AdminInfo.UpstreamModelName

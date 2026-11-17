@@ -58,7 +58,7 @@ func PublicTaskData(task *model.Task) (json.RawMessage, error) {
 	if len(data) == 0 {
 		return data, nil
 	}
-	if (task.Platform == "doubao" || task.Platform == "originocean") && common.GetJsonType(data) == "object" {
+	if (task.Platform == "doubao" || task.Platform == "originocean" || task.Platform == "qstart") && common.GetJsonType(data) == "object" {
 		var fields map[string]json.RawMessage
 		if err := common.Unmarshal(data, &fields); err != nil {
 			return nil, err

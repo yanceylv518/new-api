@@ -2235,7 +2235,11 @@ export function ChannelMutateDrawer({
       {(supportsSeedanceAssetURL(currentType, currentTaskPluginKey) ||
         (currentType === CHANNEL_TYPE_NEW_API &&
           currentTaskExtendPluginKeys?.some(
-            (key) => key === 'doubao' || key === 'anyllm' || key === 'originocean'
+            (key) =>
+              key === 'doubao' ||
+              key === 'anyllm' ||
+              key === 'originocean' ||
+              key === 'qstart'
           )) ||
         Boolean(formValues.video_routing_rules?.length)) && (
         <FormField

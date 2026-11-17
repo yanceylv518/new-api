@@ -177,7 +177,7 @@ func extractSeedanceAssetIDs(c *gin.Context) ([]string, error) {
 // prepareSeedanceAssetRouting 限制真人素材归属，并按请求范围筛选素材已就绪的账号。
 func prepareSeedanceAssetRouting(c *gin.Context, modelName string) error {
 	pluginKey := c.GetString("expected_task_plugin_key")
-	if pluginKey != "doubao" && pluginKey != "anyllm" && pluginKey != "originocean" {
+	if pluginKey != "doubao" && pluginKey != "anyllm" && pluginKey != "originocean" && pluginKey != "qstart" {
 		return nil
 	}
 	assetIDs, exists := common.GetContextKeyType[[]string](c, constant.ContextKeySeedanceAssetReferences)

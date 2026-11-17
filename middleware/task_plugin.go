@@ -1632,7 +1632,7 @@ func renderTaskPluginQuery(
 		time.Since(renderStarted).Milliseconds(),
 	)
 	path, compatible := SeedanceCompatVideoRequestPath(c.Request)
-	if (compatible || strings.HasPrefix(path, "/doubao/api/v3/contents/generations/tasks/")) && !multiple && pinned.Route.Protocol == "seedance-v3" && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "originocean") {
+	if (compatible || strings.HasPrefix(path, "/doubao/api/v3/contents/generations/tasks/")) && !multiple && pinned.Route.Protocol == "seedance-v3" && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart") {
 		rendered, ok := result.(map[string]any)
 		if !ok {
 			abortTaskPluginRouteError(c, http.StatusInternalServerError)
