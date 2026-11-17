@@ -196,16 +196,24 @@ func seedanceAssetRequestScopeError(c *gin.Context, err error) {
 	seedanceAssetAPIError(c, err)
 }
 
+func newSeedanceAssetPublicID() (string, error) {
+	suffix, err := common.GenerateRandomCharsKey(16)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("asset-%s-%s", time.Now().In(seedanceCompatTimeZone).Format("20060102150405"), strings.ToLower(suffix)), nil
+}
+
 // createStoredSeedanceAsset 将 OSS 素材和账号同步目标一起持久化。
 func createStoredSeedanceAsset(c *gin.Context, group *model.SeedanceAssetGroup, upload *service.SeedanceAssetUpload, name, sourceURL string) (*model.SeedanceAsset, error) {
-	suffix, err := common.GenerateRandomCharsKey(16)
+	publicID, err := newSeedanceAssetPublicID()
 	if err != nil {
 		return nil, err
 	}
 	localOnly := false
 	asset := &model.SeedanceAsset{
 		UserID: c.GetInt("id"), UploadBytes: upload.Size, ChannelID: group.ChannelID, GroupID: group.GroupID,
-		AssetID: fmt.Sprintf("asset-%s-%s", time.Now().In(seedanceCompatTimeZone).Format("20060102150405"), strings.ToLower(suffix)),
+		AssetID: publicID,
 		Name:    name, AssetType: upload.AssetType, SourceURL: sourceURL, ObjectKey: upload.ObjectKey, Storage: upload.Storage,
 		KeyFingerprint: group.KeyFingerprint, AccountFingerprint: group.AccountFingerprint,
 		LocalOnly: &localOnly, Status: "Processing",
@@ -860,12 +868,23 @@ func UploadSeedanceAsset(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	publicID, upstreamID := assetID, ""
+	if client.UsesLocalAssetID() {
+		publicID, err = newSeedanceAssetPublicID()
+		if err != nil {
+			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+			common.ApiError(c, err)
+			return
+		}
+		upstreamID = assetID
+	}
 	asset := &model.SeedanceAsset{
 		UserID:             c.GetInt("id"),
 		UploadBytes:        upload.Size,
 		ChannelID:          group.ChannelID,
 		GroupID:            group.GroupID,
-		AssetID:            assetID,
+		AssetID:            publicID,
+		PrimaryUpstreamID:  upstreamID,
 		Name:               name,
 		AssetType:          upload.AssetType,
 		ObjectKey:          upload.ObjectKey,
@@ -956,8 +975,18 @@ func CreateSeedanceAsset(c *gin.Context) {
 		seedanceAssetAPIError(c, err)
 		return
 	}
+	publicID, upstreamID := assetID, ""
+	if client.UsesLocalAssetID() {
+		publicID, err = newSeedanceAssetPublicID()
+		if err != nil {
+			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
+			seedanceAssetAPIError(c, err)
+			return
+		}
+		upstreamID = assetID
+	}
 	asset := &model.SeedanceAsset{
-		UserID: c.GetInt("id"), UploadBytes: upload.Size, ChannelID: group.ChannelID, GroupID: group.GroupID, AssetID: assetID,
+		UserID: c.GetInt("id"), UploadBytes: upload.Size, ChannelID: group.ChannelID, GroupID: group.GroupID, AssetID: publicID, PrimaryUpstreamID: upstreamID,
 		Name: strings.TrimSpace(req.Name), AssetType: req.AssetType, SourceURL: strings.TrimSpace(req.SourceURL), ObjectKey: upload.ObjectKey, Storage: upload.Storage,
 		AccountFingerprint: group.AccountFingerprint, PrimarySyncScope: primaryScope, Status: "Processing", NextPollAt: common.GetTimestamp(),
 	}

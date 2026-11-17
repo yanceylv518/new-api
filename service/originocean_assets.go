@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -37,7 +39,33 @@ type originValidationGroup struct {
 	Bound     *bool  `json:"bound"`
 }
 
-// 素材组由本站持久化；上游的默认素材库没有普通组创建接口。
+type originAssetUpstreamError struct {
+	upstream  *seedanceAssetUpstreamError
+	temporary bool
+}
+
+func (err *originAssetUpstreamError) Error() string { return err.upstream.message }
+func (err *originAssetUpstreamError) Unwrap() error { return err.upstream }
+func (err *originAssetUpstreamError) Is(target error) bool {
+	return err.temporary && target == ErrSeedanceAssetServiceTemporary
+}
+
+// OriginAssetPublicError 只返回已脱敏的渠道业务错误。
+func OriginAssetPublicError(err error) (string, bool) {
+	var upstream *originAssetUpstreamError
+	if !errors.As(err, &upstream) {
+		return "", false
+	}
+	return upstream.Error(), true
+}
+
+var (
+	originAssetBrandPattern  = regexp.MustCompile(`(?i)originocean(?:\.[a-z]+)?`)
+	originAssetKeyPattern    = regexp.MustCompile(`(?i)\b(?:bearer\s+|sk-)[^\s"',;<>]+`)
+	originAssetSecretPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|byted[_-]?token|token|authorization|credentials?|secret|password)["']?\s*[:=]\s*["']?[^\s"',;<>}]+`)
+)
+
+// 普通素材组由本站持久化，上传使用上游账号的当前素材库。
 func createOriginLocalAssetGroup(groupType string, response any) error {
 	if groupType != "" && !strings.EqualFold(groupType, "AIGC") {
 		return errors.New("real-person groups require a validation session")
@@ -103,18 +131,39 @@ func (client *SeedanceAssetClient) originAssetRequest(ctx context.Context, actio
 		return fmt.Errorf("%w: asset service response is too large", errSeedanceAssetResponse)
 	}
 	var envelope struct {
-		Success *bool  `json:"success"`
-		Message string `json:"message"`
-		Error   *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Success *bool           `json:"success"`
+		Message string          `json:"message"`
+		Detail  json.RawMessage `json:"detail"`
+		Error   json.RawMessage `json:"error"`
 	}
 	decodeErr := common.Unmarshal(raw, &envelope)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || envelope.Error != nil || envelope.Success != nil && !*envelope.Success {
+	hasError := len(envelope.Error) != 0 && strings.TrimSpace(string(envelope.Error)) != "null"
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || hasError || envelope.Success != nil && !*envelope.Success {
 		code, message := "", envelope.Message
-		if envelope.Error != nil {
-			code, message = envelope.Error.Code, envelope.Error.Message
+		if hasError {
+			var detail struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if common.Unmarshal(envelope.Error, &detail) == nil {
+				code, message = detail.Code, detail.Message
+			} else {
+				_ = common.Unmarshal(envelope.Error, &message)
+			}
+		}
+		if message == "" && len(envelope.Detail) != 0 {
+			if err := common.Unmarshal(envelope.Detail, &message); err != nil {
+				kind := common.GetJsonType(envelope.Detail)
+				if kind == "object" || kind == "array" {
+					message = string(envelope.Detail)
+				}
+			}
+		}
+		if message == "" {
+			message = code
+		}
+		if message == "" && decodeErr != nil && !strings.HasPrefix(strings.TrimSpace(string(raw)), "<") {
+			message = strings.TrimSpace(string(raw))
 		}
 		// 未完成认证时，服务把稳定错误码放在外层 message 的 JSON 中。
 		if action == "GetVisualValidateResult" && resp.StatusCode == http.StatusBadRequest {
@@ -127,14 +176,30 @@ func (client *SeedanceAssetClient) originAssetRequest(ctx context.Context, actio
 				}
 			}
 		}
-		upstream := &seedanceAssetUpstreamError{action: action, code: strings.TrimSpace(code), httpStatus: resp.StatusCode, message: "Asset service rejected " + action}
-		if resp.StatusCode == http.StatusNotFound && (action == "GetAsset" || action == "DeleteAsset") {
-			return errors.Join(ErrSeedanceAssetNotFound, upstream)
+		message = strings.TrimSpace(message)
+		if message == "" {
+			message = fmt.Sprintf("asset service returned status %d", resp.StatusCode)
 		}
-		if isSeedanceAssetServiceTemporary(upstream) {
-			return &seedanceAssetTemporaryError{cause: upstream}
+		if client.apiKey != "" {
+			message = strings.ReplaceAll(message, client.apiKey, "[redacted]")
 		}
-		return upstream
+		message = originAssetBrandPattern.ReplaceAllString(message, "[redacted]")
+		message = originAssetKeyPattern.ReplaceAllString(message, "[redacted]")
+		message = originAssetSecretPattern.ReplaceAllString(message, "[redacted]")
+		message = common.MaskSensitiveInfo(message)
+		if len(message) > seedanceAssetErrorPreviewLimit {
+			message = message[:seedanceAssetErrorPreviewLimit] + "..."
+		}
+		upstream := &seedanceAssetUpstreamError{action: action, code: strings.TrimSpace(code), httpStatus: resp.StatusCode, message: message}
+		publicErr := &originAssetUpstreamError{upstream: upstream, temporary: isSeedanceAssetServiceTemporary(upstream)}
+		if resp.StatusCode == http.StatusNotFound && (action == "GetAsset" || action == "DeleteAsset") &&
+			(isSeedanceAssetDeleteNotFoundError(upstream) || strings.EqualFold(strings.TrimSpace(code), "not_found")) {
+			return errors.Join(ErrSeedanceAssetNotFound, publicErr)
+		}
+		return publicErr
+	}
+	if result == nil && len(bytes.TrimSpace(raw)) == 0 {
+		return nil
 	}
 	if decodeErr != nil {
 		return fmt.Errorf("%w: asset service returned invalid JSON", errSeedanceAssetResponse)
@@ -266,18 +331,24 @@ func (client *SeedanceAssetClient) createOriginAsset(ctx context.Context, source
 	if err := client.originAssetRequest(ctx, "CreateAsset", http.MethodPost, "", writer.FormDataContentType(), body, int64(len(prefix))+size+int64(len(suffix)), &result); err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(result.ID) == "" {
-		return "", fmt.Errorf("%w: asset service returned no asset ID", errSeedanceAssetResponse)
+	id := strings.TrimSpace(result.ID)
+	if _, err := originAssetPathID(id); err != nil {
+		return "", fmt.Errorf("%w: asset service returned an invalid asset ID", errSeedanceAssetResponse)
 	}
-	return result.ID, nil
+	return id, nil
 }
 
 func (client *SeedanceAssetClient) getOriginAsset(ctx context.Context, assetID string) (SeedanceAssetDetails, error) {
-	var result originAssetResponse
-	if err := client.originAssetRequest(ctx, "GetAsset", http.MethodGet, "/"+url.PathEscape(assetID), "", nil, 0, &result); err != nil {
+	shortID, err := originAssetPathID(assetID)
+	if err != nil {
 		return SeedanceAssetDetails{}, err
 	}
-	if strings.TrimSpace(result.ID) != assetID || strings.TrimSpace(result.Status) == "" {
+	var result originAssetResponse
+	if err := client.originAssetRequest(ctx, "GetAsset", http.MethodGet, "/"+url.PathEscape(shortID), "", nil, 0, &result); err != nil {
+		return SeedanceAssetDetails{}, err
+	}
+	returnedID, err := originAssetPathID(result.ID)
+	if err != nil || returnedID != shortID || strings.TrimSpace(result.Status) == "" {
 		return SeedanceAssetDetails{}, fmt.Errorf("%w: asset service returned invalid asset details", errSeedanceAssetResponse)
 	}
 	kind := ""
@@ -289,12 +360,36 @@ func (client *SeedanceAssetClient) getOriginAsset(ctx context.Context, assetID s
 	case "audio":
 		kind = "Audio"
 	}
-	return SeedanceAssetDetails{ID: result.ID, Status: result.Status, AssetType: kind}, nil
+	status := strings.TrimSpace(result.Status)
+	if strings.EqualFold(status, "ready") {
+		status = "Active"
+	}
+	return SeedanceAssetDetails{ID: assetID, Status: status, AssetType: kind}, nil
+}
+
+func originAssetPathID(assetID string) (string, error) {
+	id := strings.TrimSpace(assetID)
+	if strings.HasPrefix(id, "asset://") {
+		parsed, err := url.Parse(id)
+		if err != nil || !strings.EqualFold(parsed.Host, "originocean") || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+			return "", errors.New("invalid asset service ID")
+		}
+		id = strings.TrimPrefix(parsed.Path, "/")
+	}
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\?#") ||
+		strings.IndexFunc(id, func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0 {
+		return "", errors.New("invalid asset service ID")
+	}
+	return id, nil
 }
 
 func (client *SeedanceAssetClient) deleteOriginAsset(ctx context.Context, assetID string) error {
-	err := client.originAssetRequest(ctx, "DeleteAsset", http.MethodDelete, "/"+url.PathEscape(assetID), "", nil, 0, nil)
-	if errors.Is(err, ErrSeedanceAssetNotFound) {
+	shortID, err := originAssetPathID(assetID)
+	if err != nil {
+		return err
+	}
+	err = client.originAssetRequest(ctx, "DeleteAsset", http.MethodDelete, "/"+url.PathEscape(shortID), "", nil, 0, nil)
+	if isSeedanceAssetDeleteNotFoundError(err) {
 		return nil
 	}
 	return err

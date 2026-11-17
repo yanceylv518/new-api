@@ -44,6 +44,11 @@ type SeedanceAssetClient struct {
 	originREST          bool
 }
 
+// UsesLocalAssetID 避免将上游素材 URI 作为本站公开 ID。
+func (client *SeedanceAssetClient) UsesLocalAssetID() bool {
+	return client != nil && client.originREST
+}
+
 // ForSeedanceModel 对未配置共享组的渠道区分模型及密钥。
 func (client *SeedanceAssetClient) ForSeedanceModel(channel *model.Channel, modelName string) *SeedanceAssetClient {
 	if client == nil {

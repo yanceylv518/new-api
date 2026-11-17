@@ -573,7 +573,8 @@ func rewriteSeedanceAssetReference(value string, previousMapping, newMapping map
 		return "", false, fmt.Errorf("%w: reference has no mapping for selected account", ErrInvalidSeedanceAssetRequest)
 	}
 	rewritten := remoteID
-	if !strings.HasPrefix(remoteID, "http://") && !strings.HasPrefix(remoteID, "https://") {
+	if !strings.HasPrefix(remoteID, "http://") && !strings.HasPrefix(remoteID, "https://") &&
+		!(len(remoteID) >= len(seedanceAssetReferencePrefix) && strings.EqualFold(remoteID[:len(seedanceAssetReferencePrefix)], seedanceAssetReferencePrefix)) {
 		rewritten = seedanceAssetReferencePrefix + remoteID
 	}
 	return rewritten, rewritten != value, nil

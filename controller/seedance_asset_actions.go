@@ -477,10 +477,14 @@ func seedanceAssetActionError(c *gin.Context, status int, code, message string) 
 func seedanceAssetAPIError(c *gin.Context, err error) {
 	if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
 		c.Header("Retry-After", "5")
+		message := service.ErrSeedanceAssetServiceTemporary.Error()
+		if upstream, ok := service.OriginAssetPublicError(err); ok {
+			message = upstream
+		}
 		if c.GetString(seedanceAssetActionContextKey) != "" {
-			seedanceAssetActionError(c, http.StatusServiceUnavailable, "ServiceUnavailable", service.ErrSeedanceAssetServiceTemporary.Error())
+			seedanceAssetActionError(c, http.StatusServiceUnavailable, "ServiceUnavailable", message)
 		} else {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": service.ErrSeedanceAssetServiceTemporary.Error(), "code": "asset_service_unavailable"})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": message, "code": "asset_service_unavailable"})
 		}
 		return
 	}
