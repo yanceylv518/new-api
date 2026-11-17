@@ -1,8 +1,13 @@
+const SEEDANCE_25_FLASH_MODELS = ["doubao-seedance-2-5-flash-261115", "doubao-seedance-2-5-flash"];
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5", ...SEEDANCE_25_FLASH_MODELS];
 const MODELS = {
   "doubao-seedance-2-0-260128": ["480p", "720p", "1080p", "4k"],
   "doubao-seedance-2-0-fast-260128": ["480p", "720p"],
   "doubao-seedance-2-0-mini-260615": ["480p", "720p"],
-  "doubao-seedance-2-5-260628": ["480p", "720p", "1080p"],
+  "doubao-seedance-2-5-260628": ["480p", "720p", "1080p", "4k"],
+  "doubao-seedance-2-5": ["480p", "720p", "1080p", "4k"],
+  "doubao-seedance-2-5-flash-261115": ["480p", "720p"],
+  "doubao-seedance-2-5-flash": ["480p", "720p"],
 };
 const IMAGE_MODELS = {
   "doubao-seedream-5-0-pro-260628": {
@@ -141,7 +146,7 @@ const VIDEO_RESERVE_EXTRA_FRAMES = VIDEO_FPS - 1;
 
 function schema(resolutions) {
   return {
-    tokens: { type: "number", unit: "token", description: { en: "Billing token unit price", zh: "计费 Token 单价" } },
+    tokens: { type: "number", unit: "token", description: { en: "Video generation token unit price", zh: "视频生成 Token 单价" } },
     resolution: { enum: resolutions, description: { en: "Output video resolution", zh: "输出视频分辨率" } },
     video_input: {
       enum: ["none", "video"],
@@ -163,7 +168,7 @@ export const meta = {
   key: "anyllm",
   name: "Doubao Video（AnyLLM）",
   icon: "text:SD",
-  version: "1.2.4",
+  version: "1.2.5",
   author: { name: "PinduCloud" },
   description: { en: "Seedance video generation, Seedream image generation and private assets", zh: "Seedance 视频生成、Seedream 图片生成与私域素材" },
   requiredCapabilities: ["shared-native-routes@1", "poll-task-data@1"],
@@ -542,7 +547,8 @@ function normalize(ctx, request, allowNumericStrings) {
   const fields = Object.assign({}, metadata, req);
   const model = modelProfile(ctx, req.model);
   const limits = MODELS[model];
-  const is25 = model === "doubao-seedance-2-5-260628";
+  const is25 = SEEDANCE_25_MODELS.includes(model);
+  const isFlash = SEEDANCE_25_FLASH_MODELS.includes(model);
   const maxDuration = is25 ? 30 : 15;
   if (allowNumericStrings) {
     for (const key of ["seconds", "duration", "seed", "priority", "execution_expires_after"]) {
@@ -629,10 +635,11 @@ function normalize(ctx, request, allowNumericStrings) {
   if (unlabeledImages > 0 && images !== 1) throw new Error("an image role is required when multiple images are provided");
   if (firstFrames > 1) throw new Error("content accepts at most one first_frame image");
   if (lastFrames > 1) throw new Error("content accepts at most one last_frame image");
-  if (!is25 && lastFrames > 0 && firstFrames === 0) throw new Error("last_frame requires first_frame");
+  if ((!is25 || isFlash) && lastFrames > 0 && firstFrames === 0) throw new Error("last_frame requires first_frame");
   if (firstFrames + lastFrames > 0 && references > 0) throw new Error("frame images cannot be mixed with reference media");
   if (!is25 && audios > 0 && images + videos === 0) throw new Error("audio input requires an image or video input");
-  if (images > (is25 ? 30 : 9) || audios > (is25 ? 10 : 3)) throw new Error("Too many reference media entries");
+  if (images > (isFlash ? 10 : is25 ? 30 : 9) || audios > (isFlash ? 5 : is25 ? 10 : 3)) throw new Error("Too many reference media entries");
+  if (isFlash && videos > 5) throw new Error("content accepts at most 5 reference videos");
   if (!is25 && videos > 3) throw new Error("content accepts at most 3 reference videos");
   const body = { model: text(ctx.model) || text(req.model), content, resolution };
   for (const key of OPTIONS) if (Object.prototype.hasOwnProperty.call(fields, key)) body[key] = fields[key];
@@ -676,7 +683,7 @@ function decode(ctx, req, allowNumericStrings) {
 function facts(ctx) {
   const req = object(ctx.requestBody, "request body");
   const model = modelProfile(ctx, req.model);
-  const maxDuration = model === "doubao-seedance-2-5-260628" ? 30 : 15;
+  const maxDuration = SEEDANCE_25_MODELS.includes(model) ? 30 : 15;
   const duration = req.automatic_duration || req.duration === undefined ? maxDuration : integer(req.duration, 4, maxDuration, "duration");
   const videoInput = req.content.some((item) => item.type === "video_url");
   // 提交仅作预算；参考视频按文档总时长上限预留，完成后使用媒体账单的 totalTokens。

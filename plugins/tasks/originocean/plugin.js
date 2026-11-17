@@ -8,7 +8,8 @@ const SEEDANCE_20_MODELS = [
   "doubao-seedance-2-0-mini-260615",
   "doubao-seedance-2-0-mini",
 ];
-const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5", "maas-doubao-seedance-2.5", "wb-seedance-2-5"];
+const SEEDANCE_25_FLASH_MODELS = ["doubao-seedance-2-5-flash-261115", "doubao-seedance-2-5-flash"];
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5", "maas-doubao-seedance-2.5", "wb-seedance-2-5", ...SEEDANCE_25_FLASH_MODELS];
 const DOUBAO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 const DOUBAO_COMPATIBILITY_FIELDS = [
   "content",
@@ -48,10 +49,12 @@ const VIDEO_MODELS = {
   "doubao-seedance-2-0-fast": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-0-mini-260615": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-0-mini": { resolutions: ["480p", "720p"], videoInput: true },
-  "doubao-seedance-2-5-260628": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
-  "doubao-seedance-2-5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
-  "maas-doubao-seedance-2.5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
-  "wb-seedance-2-5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
+  "doubao-seedance-2-5-260628": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "doubao-seedance-2-5": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "maas-doubao-seedance-2.5": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "wb-seedance-2-5": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "doubao-seedance-2-5-flash-261115": { resolutions: ["480p", "720p"], videoInput: true },
+  "doubao-seedance-2-5-flash": { resolutions: ["480p", "720p"], videoInput: true },
 };
 // Every Ark resolution tier; an endpoint ID reached through channel mapping
 // without a declared profile keeps them all.
@@ -344,7 +347,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.0.3",
+  version: "1.0.4",
   requiredCapabilities: ["task-callback@1", "shared-native-routes@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -489,23 +492,25 @@ function modelCapabilities(model) {
     };
   }
   if (SEEDANCE_25_MODELS.includes(name)) {
+    const isFlash = SEEDANCE_25_FLASH_MODELS.includes(name);
     return {
       minDuration: 4,
       maxDuration: 30,
       autoDuration: true,
       frames: false,
       serviceTier: false,
-      draft: true,
+      draft: !isFlash,
       framesInput: true,
       lastFrame: true,
       reference: true,
       adaptiveRatio: true,
       generateAudio: true,
       priority: true,
-      referenceImages: 30,
-      referenceVideos: 10,
-      referenceAudios: 10,
+      referenceImages: isFlash ? 10 : 30,
+      referenceVideos: isFlash ? 5 : 10,
+      referenceAudios: isFlash ? 5 : 10,
       audioOnly: true,
+      lastFrameRequiresFirst: isFlash,
     };
   }
   return null;
@@ -875,7 +880,9 @@ function billingTokenCount(value) {
 
 function videoInputRatio(model, resolution, video) {
   const res = trimmed(resolution).toLowerCase();
+  if (SEEDANCE_25_FLASH_MODELS.includes(model)) return video ? 28 / 46 : 1;
   if (SEEDANCE_25_MODELS.includes(model)) {
+    if (res === "4k") return video ? 19 / 70 : 31 / 70;
     if (res === "1080p") return video ? 7.0 / 10.7 : 11.7 / 10.7;
     return video ? 42 / 70 : 1;
   }

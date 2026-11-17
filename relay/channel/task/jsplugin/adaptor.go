@@ -1851,7 +1851,14 @@ func (a *TaskAdaptor) validateResolvedUsageValue(value any, usageSchema map[stri
 				}
 			}
 			if schema, declared := usageSchema[key]; declared {
-				if _, err := validateUsageValue(item, schema, true); err != nil {
+				usageValue := item
+				// 这些插件支持分辨率的大小写和空格，宿主校验保持一致。
+				if key == "resolution" && (a.plugin.Meta.Key == "doubao" || a.plugin.Meta.Key == "originocean" || a.plugin.Meta.Key == "qstart") {
+					if resolution, ok := item.(string); ok {
+						usageValue = strings.ToLower(strings.TrimSpace(resolution))
+					}
+				}
+				if _, err := validateUsageValue(usageValue, schema, true); err != nil {
 					return err
 				}
 			} else if limit, canonical := canonicalUsageLimit(key); canonical {

@@ -25,28 +25,37 @@ import (
 
 // 插件元数据必须按模型限制价格行和示例，同时保留标准版的高分辨率。
 func TestDoubaoResolutionProfiles(t *testing.T) {
-	source, err := builtinplugins.Source("doubao")
-	require.NoError(t, err)
-	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
-	require.NoError(t, err)
-	for _, tc := range []struct {
-		model       string
-		resolutions []string
-	}{
-		{"doubao-seedance-2-0-260128", []string{"480p", "720p", "1080p", "4k"}},
-		{"doubao-seedance-2-0-fast-260128", []string{"480p", "720p"}},
-		{"doubao-seedance-2-0-mini-260615", []string{"480p", "720p"}},
-		{"doubao-seedance-2-5-260628", []string{"480p", "720p", "1080p"}},
-	} {
-		t.Run(tc.model, func(t *testing.T) {
-			schema, examples := plugin.Meta.UsageForModel(tc.model)
-			assert.Equal(t, tc.resolutions, schema["resolution"].Enum)
-			require.NotEmpty(t, examples)
-			for _, example := range examples {
-				assert.Contains(t, tc.resolutions, example.Facts["resolution"])
-			}
-		})
+	for _, key := range []string{"anyllm", "doubao", "originocean", "qstart"} {
+		source, err := builtinplugins.Source(key)
+		require.NoError(t, err)
+		plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: key})
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			model       string
+			resolutions []string
+		}{
+			{"doubao-seedance-2-0-260128", []string{"480p", "720p", "1080p", "4k"}},
+			{"doubao-seedance-2-0-fast-260128", []string{"480p", "720p"}},
+			{"doubao-seedance-2-0-mini-260615", []string{"480p", "720p"}},
+			{"doubao-seedance-2-5-260628", []string{"480p", "720p", "1080p", "4k"}},
+			{"doubao-seedance-2-5", []string{"480p", "720p", "1080p", "4k"}},
+			{"doubao-seedance-2-5-flash-261115", []string{"480p", "720p"}},
+			{"doubao-seedance-2-5-flash", []string{"480p", "720p"}},
+		} {
+			t.Run(key+"/"+tc.model, func(t *testing.T) {
+				schema, examples := plugin.Meta.UsageForModel(tc.model)
+				assert.Equal(t, tc.resolutions, schema["resolution"].Enum)
+				require.NotEmpty(t, examples)
+				for _, example := range examples {
+					assert.Contains(t, tc.resolutions, example.Facts["resolution"])
+				}
+			})
+		}
 	}
+	plugin, found := jsplugin.DefaultRegistry.Generation().GetByModel("doubao-seedance-2-5-260628")
+	require.True(t, found)
+	schema, _ := plugin.Meta.UsageForModel("doubao-seedance-2-5-260628")
+	assert.Contains(t, schema["resolution"].Enum, "4k")
 }
 
 func TestDoubaoOpenAIImageTransport(t *testing.T) {
@@ -683,7 +692,8 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		{[]string{pro15}, []string{"480p", "720p", "1080p"}, []string{"generate_audio", "resolution", "tokens"}},
 		{[]string{v20, "doubao-seedance-2-0"}, []string{"480p", "720p", "1080p", "4k"}, []string{"resolution", "tokens", "video_input"}},
 		{[]string{fast20, "doubao-seedance-2-0-fast", mini20, "doubao-seedance-2-0-mini"}, []string{"480p", "720p"}, []string{"resolution", "tokens", "video_input"}},
-		{[]string{v25, "doubao-seedance-2-5"}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{v25, "doubao-seedance-2-5"}, []string{"480p", "720p", "1080p", "4k"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{"doubao-seedance-2-5-flash-261115", "doubao-seedance-2-5-flash"}, []string{"480p", "720p"}, []string{"resolution", "tokens", "video_input"}},
 	}
 	profiled := make([]string, 0, len(plugin.Meta.Models))
 	for _, family := range families {
@@ -741,7 +751,8 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		{"mini rejects 1080p", mini20, map[string]any{"metadata": map[string]any{"resolution": "1080p"}}, nil, mini20 + " resolution must be one of 480p, 720p"},
 		{"mini rejects a 1080p size", mini20, map[string]any{"size": "1920x1080"}, nil, mini20 + " resolution must be one of 480p, 720p"},
 		{"fast rejects 4k", fast20, map[string]any{"metadata": map[string]any{"resolution": "4k"}}, nil, fast20 + " resolution must be one of 480p, 720p"},
-		{"2.5 rejects 4k", v25, map[string]any{"metadata": map[string]any{"resolution": "4K"}}, nil, v25 + " resolution must be one of 480p, 720p, 1080p"},
+		{"2.5 offers 4k", v25, map[string]any{"metadata": map[string]any{"resolution": "4K"}},
+			map[string]any{"tokens": float64(1158390), "seconds": float64(5), "resolution": "4k", "video_input": "none"}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := map[string]any{"model": tc.model, "prompt": "a cat", "seconds": float64(5)}
@@ -781,9 +792,9 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		})
 	}
 
-	// 上游渠道映射成未知 endpoint 时，不能让 2.5 回退到包含 4K 的默认 profile。
-	t.Run("mapped 2.5 keeps the declared resolution limit", func(t *testing.T) {
-		const model25 = "doubao-seedance-2-5-260628"
+	// 上游接入点 ID 不应使 Flash 回退到包含 4K 的默认 profile。
+	t.Run("mapped 2.5 flash keeps the declared resolution limit", func(t *testing.T) {
+		const model25 = "doubao-seedance-2-5-flash-261115"
 		request := map[string]any{
 			"model": model25, "prompt": "test", "seconds": float64(5),
 			"metadata": map[string]any{"resolution": "4k"},
@@ -813,7 +824,7 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 			want       map[string]any
 		}{
 			{mini20, "1080p", map[string]any{"tokens": float64(90000)}},
-			{v25, "4k", map[string]any{"tokens": float64(90000)}},
+			{v25, "4k", map[string]any{"tokens": float64(90000), "resolution": "4k"}},
 			{v20, "4k", map[string]any{"tokens": float64(90000), "resolution": "4k"}},
 		} {
 			queryContext := map[string]any{"model": tc.model, "upstreamModel": tc.model, "action": "text_to_video"}
