@@ -36,7 +36,7 @@ func TestSetTaskRouterRegistersWithoutConflict(t *testing.T) {
 	require.NotPanics(t, func() { SetTaskRouter(engine) })
 
 	routes := engine.Routes()
-	require.Len(t, routes, 5)
+	require.Len(t, routes, 8)
 	actual := make(map[string]struct{}, len(routes))
 	for _, route := range routes {
 		actual[route.Method+" "+route.Path] = struct{}{}
@@ -46,6 +46,9 @@ func TestSetTaskRouterRegistersWithoutConflict(t *testing.T) {
 	assert.Contains(t, actual, http.MethodGet+" /v1/tasks/:key/artifacts")
 	assert.Contains(t, actual, http.MethodGet+" /v1/tasks/:key/artifacts/:artifact_key/content")
 	assert.Contains(t, actual, http.MethodHead+" /v1/tasks/:key/artifacts/:artifact_key/content")
+	assert.Contains(t, actual, http.MethodPost+" /v1/tasks/:key/callback")
+	assert.Contains(t, actual, http.MethodGet+" /v1/media/:key/:artifact_key")
+	assert.Contains(t, actual, http.MethodHead+" /v1/media/:key/:artifact_key")
 	for route := range actual {
 		assert.NotContains(t, route, "/native/")
 	}

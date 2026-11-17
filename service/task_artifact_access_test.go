@@ -52,6 +52,7 @@ func TestForwardTaskCallbackUsesExistingMediaProxy(t *testing.T) {
 	parsed, err := url.Parse(received.Content.VideoURL)
 	require.NoError(t, err)
 	assert.Equal(t, "gateway.example", parsed.Host)
+	assert.Equal(t, "/v1/media/callback-task/video", parsed.Path)
 	access := parsed.Query().Get(TaskArtifactAccessQueryParameter)
 	assert.Len(t, access, 43)
 	assert.True(t, VerifyTaskArtifactAccess(access, task.TaskID, "response-media-video"))
@@ -104,6 +105,12 @@ func TestBuildTaskArtifactContentURLUsesConfiguredAddressAndPreservesPrefix(t *t
 		"task-public",
 		"video-main",
 	))
+	mediaURL, err := BuildTaskResponseMediaURL("task-public", "response-media-first-frame")
+	require.NoError(t, err)
+	media, err := url.Parse(mediaURL)
+	require.NoError(t, err)
+	assert.Equal(t, "/gateway/prefix/v1/media/task-public/first-frame", media.Path)
+	assert.True(t, VerifyTaskArtifactAccess(media.Query().Get(TaskArtifactAccessQueryParameter), "task-public", "response-media-first-frame"))
 }
 
 func TestBuildTaskArtifactContentURLFallsBackOnlyToServerAddress(t *testing.T) {

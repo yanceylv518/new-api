@@ -157,6 +157,13 @@ func TestChannelVideoResultProxy(t *testing.T) {
 	router := gin.New()
 	router.GET("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
 	router.HEAD("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.GET("/v1/media/:key/:artifact_key", middleware.TaskResponseMediaKey(), middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.HEAD("/v1/media/:key/:artifact_key", middleware.TaskResponseMediaKey(), middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	for field, suffix := range map[string]string{"video_url": "video", "first_frame_url": "first-frame", "last_frame_url": "last-frame"} {
+		link, parseErr := url.Parse(output.Content[field])
+		require.NoError(t, parseErr)
+		assert.Equal(t, "/v1/media/"+task.TaskID+"/"+suffix, link.Path)
+	}
 	for _, result := range []struct{ name, link, body string }{
 		{"video_url", output.Content["video_url"], "vid1"},
 		{"first_frame_url", output.Content["first_frame_url"], "fir1"},
@@ -177,6 +184,15 @@ func TestChannelVideoResultProxy(t *testing.T) {
 	}
 	parsed, err := url.Parse(output.Content["video_url"])
 	require.NoError(t, err)
+	oldLink, err := service.BuildTaskArtifactContentURL(task.TaskID, "response-media-video")
+	require.NoError(t, err)
+	oldURL, err := url.Parse(oldLink)
+	require.NoError(t, err)
+	assert.Equal(t, parsed.Query().Get("access"), oldURL.Query().Get("access"))
+	oldMedia := httptest.NewRecorder()
+	router.ServeHTTP(oldMedia, httptest.NewRequest(http.MethodGet, oldURL.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, oldMedia.Code)
+	assert.Equal(t, "vid1", oldMedia.Body.String())
 	head := httptest.NewRecorder()
 	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, parsed.RequestURI(), nil))
 	assert.Equal(t, http.StatusOK, head.Code)
@@ -201,7 +217,7 @@ func TestChannelVideoResultProxy(t *testing.T) {
 	tampered.RawQuery = tamperedValues.Encode()
 	for _, requestURI := range []string{
 		tampered.RequestURI(),
-		strings.Replace(callbackLink.RequestURI(), "response-media-video", "response-media-last-frame", 1),
+		strings.Replace(callbackLink.RequestURI(), "/video?", "/last-frame?", 1),
 		strings.Replace(callbackLink.RequestURI(), task.TaskID, "foreign-task", 1),
 	} {
 		rejected := httptest.NewRecorder()
@@ -717,6 +733,8 @@ func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 	router := gin.New()
 	router.GET("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
 	router.HEAD("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.GET("/v1/media/:key/:artifact_key", middleware.TaskResponseMediaKey(), middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.HEAD("/v1/media/:key/:artifact_key", middleware.TaskResponseMediaKey(), middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
 	proxied := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
 	request.Header.Set("Range", "bytes=0-13")
@@ -1016,4 +1034,9 @@ func TestSelfTaskMediaURLGuard(t *testing.T) {
 	assert.False(t, isSelfTaskMediaURL(c, remoteURL))
 	assert.True(t, isTaskMediaFallbackLoop(remoteURL.String(), "task-1"))
 	assert.False(t, isTaskMediaFallbackLoop(remoteURL.String(), "task-2"))
+	mediaURL, err := url.Parse("https://gateway.example/v1/media/task-1/video")
+	require.NoError(t, err)
+	assert.True(t, isSelfTaskMediaURL(c, mediaURL))
+	assert.True(t, isTaskMediaFallbackLoop(mediaURL.String(), "task-1"))
+	assert.False(t, isTaskMediaFallbackLoop(mediaURL.String(), "task-2"))
 }

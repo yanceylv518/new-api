@@ -96,6 +96,19 @@ func ValidateTaskArtifactBaseURL(raw string) error {
 // TaskPublicAddress wins when configured; ServerAddress is the only fallback.
 // Request Host headers are intentionally not involved.
 func BuildTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
+	return buildTaskContentURL(taskID, artifactKey, false)
+}
+
+// BuildTaskResponseMediaURL 使用简短路径，签名仍绑定原任务产物标识。
+func BuildTaskResponseMediaURL(taskID, artifactKey string) (string, error) {
+	shortKey, ok := strings.CutPrefix(strings.TrimSpace(artifactKey), TaskResponseMediaKeyPrefix)
+	if !ok || shortKey == "" {
+		return "", ErrTaskArtifactAccessInvalid
+	}
+	return buildTaskContentURL(taskID, artifactKey, true)
+}
+
+func buildTaskContentURL(taskID, artifactKey string, responseMedia bool) (string, error) {
 	taskID = strings.TrimSpace(taskID)
 	artifactKey = strings.TrimSpace(artifactKey)
 	if taskID == "" || len(taskID) > maxTaskArtifactTaskIDLength ||
@@ -128,6 +141,11 @@ func BuildTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
 		url.PathEscape(taskID),
 		url.PathEscape(artifactKey),
 	)
+	if responseMedia {
+		shortKey, _ := strings.CutPrefix(artifactKey, TaskResponseMediaKeyPrefix)
+		suffixPath = fmt.Sprintf("/v1/media/%s/%s", taskID, shortKey)
+		escapedSuffixPath = fmt.Sprintf("/v1/media/%s/%s", url.PathEscape(taskID), url.PathEscape(shortKey))
+	}
 	baseURL.Path = basePath + suffixPath
 	baseURL.RawPath = escapedBasePath + escapedSuffixPath
 	query := baseURL.Query()

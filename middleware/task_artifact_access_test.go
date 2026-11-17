@@ -37,6 +37,18 @@ func TestTaskArtifactAccessIsRedactedAndVerifiedBeforeHandler(t *testing.T) {
 			c.Status(http.StatusNoContent)
 		},
 	)
+	mediaAccess, err := service.IssueTaskArtifactAccess("task-1", "response-media-video")
+	require.NoError(t, err)
+	router.GET(
+		"/v1/media/:key/:artifact_key",
+		TaskResponseMediaKey(),
+		TokenOrTaskArtifactAccessAuth("key", "artifact_key"),
+		func(c *gin.Context) {
+			assert.Equal(t, "response-media-video", c.Param("artifact_key"))
+			assert.NotContains(t, c.Request.URL.RawQuery, service.TaskArtifactAccessQueryParameter)
+			c.Status(http.StatusNoContent)
+		},
+	)
 	request := httptest.NewRequest(
 		http.MethodGet,
 		"/v1/tasks/task-1/artifacts/video-main/content?access="+urlQueryEscape(access)+"&keep=kept",
@@ -47,6 +59,11 @@ func TestTaskArtifactAccessIsRedactedAndVerifiedBeforeHandler(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
+	media := httptest.NewRequest(http.MethodGet, "/v1/media/task-1/video?access="+urlQueryEscape(mediaAccess), nil)
+	media.RemoteAddr = "192.0.2.1:1234"
+	mediaRecorder := httptest.NewRecorder()
+	router.ServeHTTP(mediaRecorder, media)
+	assert.Equal(t, http.StatusNoContent, mediaRecorder.Code)
 }
 
 func TestTaskArtifactAccessRejectsTamperedAndEmptyCapabilitiesAsNotFound(t *testing.T) {
@@ -150,6 +167,10 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), request)
 
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
+	router.GET("/v1/media/:key/:artifact_key", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	media := httptest.NewRequest(http.MethodGet, "/v1/media/task-1/video?access=media-secret&keep=ok", nil)
+	router.ServeHTTP(httptest.NewRecorder(), media)
+	assert.NotContains(t, output.String(), "media-secret")
 	router.GET("/v1/seedance/validation-sessions/:id/callback", func(c *gin.Context) {
 		assert.Equal(t, "callback-state", c.Query("state"))
 		assert.Equal(t, "callback-token", c.Query("bytedToken"))

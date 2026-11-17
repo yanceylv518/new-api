@@ -577,6 +577,9 @@ func isSelfTaskMediaURL(c *gin.Context, target *url.URL) bool {
 }
 
 func isTaskMediaProxyPath(path string) bool {
+	if strings.HasPrefix(path, "/v1/media/") {
+		return true
+	}
 	if strings.HasPrefix(path, "/v1/videos/") && strings.HasSuffix(path, "/content") {
 		return true
 	}
@@ -595,6 +598,9 @@ func isTaskMediaFallbackLoop(rawURL, taskID string) bool {
 		path = parsedURL.Path
 	}
 	if path == "/v1/videos/"+taskID+"/content" {
+		return true
+	}
+	if strings.HasPrefix(path, "/v1/media/"+taskID+"/") {
 		return true
 	}
 	artifactPrefix := "/v1/tasks/" + taskID + "/artifacts/"

@@ -11,6 +11,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 )
 
+const TaskResponseMediaKeyPrefix = "response-media-"
+
 var taskResponseMediaFields = map[string]string{
 	"video_url":       "response-media-video",
 	"first_frame_url": "response-media-first-frame",
@@ -107,9 +109,9 @@ func taskResponseMediaKey(path []any) (string, error) {
 		return "", err
 	}
 	digest := sha256.Sum256(encoded)
-	prefix := "response-media-path-"
+	prefix := TaskResponseMediaKeyPrefix + "path-"
 	if name == "first_frame_url" || name == "last_frame_url" {
-		prefix = "response-media-frame-"
+		prefix = TaskResponseMediaKeyPrefix + "frame-"
 	}
 	return prefix + base64.RawURLEncoding.EncodeToString(digest[:]), nil
 }
@@ -239,7 +241,7 @@ func ProjectTaskMediaDataWithPolicies(task *model.Task, data json.RawMessage, po
 		if !*enabled {
 			return source, nil
 		}
-		return BuildTaskArtifactContentURL(task.TaskID, key)
+		return BuildTaskResponseMediaURL(task.TaskID, key)
 	})
 	return projected, err
 }
@@ -249,7 +251,7 @@ func TaskResponseMediaSource(task *model.Task, artifactKey string) (string, bool
 	if artifactKey == "response-media-result" {
 		return strings.TrimSpace(task.GetResultURL()), true, nil
 	}
-	if !strings.HasPrefix(artifactKey, "response-media-") {
+	if !strings.HasPrefix(artifactKey, TaskResponseMediaKeyPrefix) {
 		return "", false, nil
 	}
 	data := task.Data
@@ -298,5 +300,5 @@ func publicTaskResultURL(task *model.Task, policies TaskMediaProxyPolicies) (str
 	if !enabled {
 		return source, nil
 	}
-	return BuildTaskArtifactContentURL(task.TaskID, "response-media-result")
+	return BuildTaskResponseMediaURL(task.TaskID, "response-media-result")
 }

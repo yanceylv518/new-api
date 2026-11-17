@@ -116,7 +116,8 @@ func redactTaskArtifactAccessQuery() gin.HandlerFunc {
 			strings.HasSuffix(path, "/content")
 		isLegacyVideoContent := strings.HasPrefix(path, "/v1/videos/") &&
 			strings.HasSuffix(path, "/content")
-		if !isArtifactContent && !isLegacyVideoContent {
+		isResponseMedia := strings.HasPrefix(path, "/v1/media/")
+		if !isArtifactContent && !isLegacyVideoContent && !isResponseMedia {
 			c.Next()
 			return
 		}
@@ -167,6 +168,19 @@ func popTaskArtifactAccessQuery(request *http.Request) (string, bool, bool) {
 	request.URL.RawQuery = strings.Join(kept, "&")
 	request.RequestURI = request.URL.RequestURI()
 	return rawAccess, true, invalid
+}
+
+// TaskResponseMediaKey 将短路径映射到现有任务产物标识，复用签名和取源。
+func TaskResponseMediaKey() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		for i := range c.Params {
+			if c.Params[i].Key == "artifact_key" {
+				c.Params[i].Value = service.TaskResponseMediaKeyPrefix + c.Params[i].Value
+				break
+			}
+		}
+		c.Next()
+	}
 }
 
 // TokenOrTaskArtifactAccessAuth accepts the normal relay API Bearer token or a
