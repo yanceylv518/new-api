@@ -119,7 +119,8 @@ func requireMeasuredVideoUsage(task *model.Task, result *relaycommon.TaskInfo) e
 	}
 	// 未声明的上游接入点按提交模型识别；明确的图片模型不继承视频要求。
 	seedance := strings.HasPrefix(upstreamModel, "doubao-seedance-") ||
-		(plugin == "originocean" && upstreamModel == "maas-doubao-seedance-2.0") ||
+		(plugin == "originocean" && (upstreamModel == "maas-doubao-seedance-2.0" || upstreamModel == "maas-doubao-seedance-2.5" || upstreamModel == "wb-seedance-2-5" ||
+			originModel == "maas-doubao-seedance-2.0" || originModel == "maas-doubao-seedance-2.5" || originModel == "wb-seedance-2-5")) ||
 		(!strings.HasPrefix(upstreamModel, "doubao-seedream-") && strings.HasPrefix(originModel, "doubao-seedance-"))
 	required := []string{}
 	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean" || plugin == "qstart") && seedance {

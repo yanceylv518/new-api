@@ -176,7 +176,8 @@ func SeedanceAssetModelAllowed(name string, allowedModels []string) bool {
 func seedanceAssetModelName(channel *model.Channel, name string) bool {
 	isSeedance := func(value string) bool {
 		value = strings.ToLower(value)
-		return strings.HasPrefix(value, "doubao-seedance-") || strings.HasPrefix(value, "maas-doubao-seedance-") || strings.HasPrefix(value, "seedance-")
+		return strings.HasPrefix(value, "doubao-seedance-") || strings.HasPrefix(value, "maas-doubao-seedance-") || strings.HasPrefix(value, "seedance-") ||
+			(channel.GetSetting().BindsTaskPlugin("originocean") && value == "wb-seedance-2-5")
 	}
 	if isSeedance(name) {
 		return true

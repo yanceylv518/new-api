@@ -46,6 +46,9 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 	if strings.EqualFold(logical, "maas-doubao-seedance-2.0") {
 		logical = "doubao-seedance-2-0-260128"
 	}
+	if strings.EqualFold(logical, "maas-doubao-seedance-2.5") || strings.EqualFold(logical, "wb-seedance-2-5") {
+		logical = "doubao-seedance-2-5-260628"
+	}
 	groups := []string{common.GetContextKeyString(c, constant.ContextKeyUsingGroup)}
 	if groups[0] == "auto" {
 		groups = service.GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
@@ -55,6 +58,11 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 	for _, target := range model.ResolveTaskModelAliasesForGroups(pinned.Generation, publicModel, groups) {
 		if target.PluginKey == "originocean" && strings.EqualFold(target.Declared, "maas-doubao-seedance-2.0") {
 			channelModels[target.ChannelID] = "doubao-seedance-2-0-260128"
+			video = true
+			continue
+		}
+		if target.PluginKey == "originocean" && (strings.EqualFold(target.Declared, "maas-doubao-seedance-2.5") || strings.EqualFold(target.Declared, "wb-seedance-2-5")) {
+			channelModels[target.ChannelID] = "doubao-seedance-2-5-260628"
 			video = true
 			continue
 		}

@@ -8,7 +8,7 @@ const SEEDANCE_20_MODELS = [
   "doubao-seedance-2-0-mini-260615",
   "doubao-seedance-2-0-mini",
 ];
-const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5"];
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5", "maas-doubao-seedance-2.5", "wb-seedance-2-5"];
 const DOUBAO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 const DOUBAO_COMPATIBILITY_FIELDS = [
   "content",
@@ -50,6 +50,8 @@ const VIDEO_MODELS = {
   "doubao-seedance-2-0-mini": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-5-260628": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
   "doubao-seedance-2-5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
+  "maas-doubao-seedance-2.5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
+  "wb-seedance-2-5": { resolutions: ["480p", "720p", "1080p"], videoInput: true },
 };
 // Every Ark resolution tier; an endpoint ID reached through channel mapping
 // without a declared profile keeps them all.
@@ -342,7 +344,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.0.1",
+  version: "1.0.2",
   requiredCapabilities: ["task-callback@1", "shared-native-routes@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
