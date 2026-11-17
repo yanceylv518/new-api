@@ -558,6 +558,9 @@ func executeTaskSubmissionWith(
 		}
 		c.Set("task_submission_rejected", false)
 		c.Set("task_submission_response", nil)
+		if route, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok && route.Route.Protocol == "seedance-v3" {
+			c.Set("task_submission_raw_response", nil)
+		}
 		return nil
 	})
 	defer func() {
@@ -680,6 +683,10 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil && ((!taskErr.LocalError && taskErr.Code == "fail_to_fetch_task") ||
+			taskErr.Code == "plugin_submit_response_failed" || taskErr.Code == "plugin_submit_response_invalid") {
+			c.Set(taskUpstreamErrorHeadersKey, relaycommon.GetEffectiveHeaderOverride(relayInfo))
+		}
 		if taskErr != nil && taskErr.LocalError && taskErr.Code == "task_submission_intent_failed" {
 			taskErr.NoRetry = true
 		}
@@ -725,6 +732,23 @@ func executeTaskSubmissionWith(
 		relayInfo.LastError = taskAPIError
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
+		if route, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok &&
+			route.Route.Protocol == "seedance-v3" && decision.Action == "retry" {
+			c.Set(taskUpstreamRetryErrorKey, nil)
+			if !taskErr.LocalError && taskErr.Code == "fail_to_fetch_task" && taskErr.Error != nil &&
+				taskErr.StatusCode >= http.StatusBadRequest && taskErr.StatusCode <= 599 {
+				raw := taskErr.Error.Error()
+				if strings.TrimSpace(raw) != "" {
+					if body, valid := sanitizeTaskUpstreamMessage(c, raw, taskUpstreamErrorContext{}); valid {
+						contentType := "text/plain; charset=utf-8"
+						if json.Valid([]byte(raw)) {
+							contentType = "application/json; charset=utf-8"
+						}
+						c.Set(taskUpstreamRetryErrorKey, taskUpstreamErrorSnapshot{status: taskErr.StatusCode, contentType: contentType, body: body})
+					}
+				}
+			}
+		}
 		if !taskErr.LocalError {
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
@@ -979,10 +1003,38 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	newTaskPluginSubmitDiagnostics(c).presentError(taskErr)
+	route, native := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute)
+	seedance := native && route.Route.Protocol == "seedance-v3"
+	if seedance {
+		if data, ok := taskErr.Data.(map[string]any); ok {
+			if taskID, ok := data["task_id"].(string); ok && taskID != "" {
+				c.Header("X-Task-ID", taskID)
+				c.Writer.Header().Add("Access-Control-Expose-Headers", "X-Task-ID")
+			}
+		}
+		if taskErr.Code == "get_channel_failed" || taskErr.Code == "setup_locked_channel_failed" {
+			if previous, ok := common.GetContextKeyType[taskUpstreamErrorSnapshot](c, taskUpstreamRetryErrorKey); ok {
+				c.Data(previous.status, previous.contentType, []byte(previous.body))
+				return
+			}
+		}
+		if taskErr.StatusCode == http.StatusBadGateway && (taskErr.Code == "plugin_submit_response_failed" || taskErr.Code == "plugin_submit_response_invalid") {
+			if raw, ok := seedanceSubmitBusinessError(c); ok && writeTaskUpstreamError(c, taskErr.StatusCode, raw, taskUpstreamErrorContext{}) {
+				return
+			}
+		}
+		if !taskErr.LocalError && taskErr.Code == "fail_to_fetch_task" && taskErr.Error != nil &&
+			taskErr.StatusCode >= http.StatusBadRequest && taskErr.StatusCode <= 599 {
+			raw := taskErr.Error.Error()
+			if strings.TrimSpace(raw) != "" && writeTaskUpstreamError(c, taskErr.StatusCode, raw, taskUpstreamErrorContext{}) {
+				return
+			}
+		}
+	}
 	if respondOriginOceanSubmissionError(c, taskErr) {
 		return
 	}
-	if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin); ok && pinned.Plugin != nil && pinned.Plugin.Engine.HasExport("publicErrorMessage") {
+	if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin); !seedance && ok && pinned.Plugin != nil && pinned.Plugin.Engine.HasExport("publicErrorMessage") {
 		value, err := pinned.Plugin.Engine.Call(c.Request.Context(), "publicErrorMessage", map[string]any{"httpStatus": taskErr.StatusCode, "code": taskErr.Code, "message": taskErr.Message, "local": taskErr.LocalError})
 		message, valid := value.(string)
 		if err == nil && valid && message != "" && len(message) <= 1024 {

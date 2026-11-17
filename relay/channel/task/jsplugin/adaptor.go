@@ -569,6 +569,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (_ *channel.TaskSubmitResponse, taskErr *dto.TaskError) {
 	started := time.Now()
 	var responseBody any
+	var rawResponse []byte
 	var err error
 	streaming := a.submit != nil && a.submit.ResponseType == "sse"
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
@@ -576,6 +577,10 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	defer func() {
 		if resp.StatusCode/100 == 2 && taskErr != nil {
 			taskErr.NoRetry = true
+			if route, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok &&
+				route.Route.Protocol == "seedance-v3" && len(rawResponse) > 0 && len(rawResponse) <= maxTaskPluginPersistedJSONBytes {
+				c.Set("task_submission_raw_response", json.RawMessage(rawResponse))
+			}
 			// 只在解析失败时保留恢复证据，正常热路径不重复序列化请求和响应。
 			if saved, saveErr := common.Marshal(map[string]any{"statusCode": resp.StatusCode, "headers": resp.Header, "body": responseBody}); saveErr == nil && len(saved) <= maxTaskPluginPersistedJSONBytes {
 				c.Set("task_submission_response", json.RawMessage(saved))
@@ -598,6 +603,9 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		body, err = io.ReadAll(io.LimitReader(resp.Body, maxTaskPluginPersistedJSONBytes+1))
 		if err == nil && len(body) > maxTaskPluginPersistedJSONBytes {
 			err = fmt.Errorf("task submit response exceeds size limit")
+		}
+		if err == nil {
+			rawResponse = body
 		}
 		responseBody = string(body)
 		var decoded any

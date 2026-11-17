@@ -685,7 +685,7 @@ func executeTaskPluginNativeDelete(
 	alreadyDeleted := (response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusGone) &&
 		(task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure)
 	if (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) && !alreadyDeleted {
-		respondTaskPluginUpstreamActionError(c, task, response, key)
+		respondTaskPluginUpstreamActionError(c, task, response, key, baseURL, channelModel)
 		return
 	}
 	var payload struct {
@@ -727,7 +727,7 @@ func executeTaskPluginNativeDelete(
 			}
 			payload.Action, payload.Status = "cancelled", "cancelled"
 		} else {
-			respondTaskPluginUpstreamActionError(c, task, &channel.TaskActionResponse{StatusCode: confirmation.StatusCode, Body: confirmationBody, RequestID: confirmation.Header.Get("X-Request-Id")}, key)
+			respondTaskPluginUpstreamActionError(c, task, &channel.TaskActionResponse{StatusCode: confirmation.StatusCode, Body: confirmationBody, RequestID: confirmation.Header.Get("X-Request-Id")}, key, baseURL, channelModel)
 			return
 		}
 	}
@@ -779,9 +779,8 @@ func executeTaskPluginNativeDelete(
 	})
 }
 
-// respondTaskPluginUpstreamActionError 保留上游 JSON 错误的诊断字段。
-// 原始响应、HTML、凭证和上游任务 ID 不得直接返回或记录；失败不会修改任务或触发退款。
-func respondTaskPluginUpstreamActionError(c *gin.Context, task *model.Task, response *channel.TaskActionResponse, key string) {
+// respondTaskPluginUpstreamActionError 脱敏后输出上游错误；失败不会修改任务或触发退款。
+func respondTaskPluginUpstreamActionError(c *gin.Context, task *model.Task, response *channel.TaskActionResponse, key, baseURL string, channelModel *model.Channel) {
 	const maxErrorBodyBytes = 64 * 1024
 	const maxErrorMessageRunes = 1024
 	const maxErrorIdentifierRunes = 128
@@ -828,12 +827,38 @@ func respondTaskPluginUpstreamActionError(c *gin.Context, task *model.Task, resp
 			}
 		}
 	}
+	var extra taskUpstreamErrorContext
+	var redactor taskUpstreamErrorRedactor
+	headersKnown := true
+	pinned, seedance := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute)
+	seedance = seedance && pinned.Route.Protocol == "seedance-v3"
+	if seedance {
+		headers, headerErr := task.GetTransportHeaderOverride(channelModel)
+		headersKnown = headerErr == nil
+		extra = taskUpstreamErrorContext{
+			baseURL: baseURL, channelName: channelModel.Name, key: key,
+			upstreamTask: task.GetUpstreamTaskID(), publicTask: task.TaskID,
+			publicModel: task.Properties.OriginModelName, privateModel: task.Properties.UpstreamModelName,
+			headerOverride: headers,
+		}
+		if !headersKnown {
+			code, message, requestID = "task_action_failed", "Task action failed", ""
+		}
+		redactor = newTaskUpstreamErrorRedactor(c, extra)
+	}
 	// 先移除完整凭证再截断，避免错误消息恰好在密钥中间截断而泄漏前缀。
 	secrets := []string{key, strings.TrimSpace(c.GetHeader("Authorization"))}
 	if fields := strings.Fields(c.GetHeader("Authorization")); len(fields) == 2 {
 		secrets = append(secrets, fields[1])
 	}
 	for _, value := range []*string{&code, &message, &requestID} {
+		if seedance {
+			field := "message"
+			if value == &code {
+				field = "code"
+			}
+			*value = redactor.text(*value, field)
+		}
 		for _, secret := range secrets {
 			if secret != "" {
 				*value = strings.ReplaceAll(*value, secret, "[REDACTED]")
@@ -871,6 +896,12 @@ func respondTaskPluginUpstreamActionError(c *gin.Context, task *model.Task, resp
 		c.Header("X-Upstream-Request-Id", requestID)
 	}
 	logger.LogWarn(c, fmt.Sprintf("task_plugin action=delete task=%s channel_id=%d upstream_status=%d upstream_code=%q upstream_request_id=%q message=%q", task.TaskID, task.ChannelId, response.StatusCode, code, requestID, message))
+	if seedance && headersKnown && len(response.Body) > 0 && len(response.Body) <= maxErrorBodyBytes {
+		c.Abort()
+		if writeTaskUpstreamError(c, status, string(response.Body), extra) {
+			return
+		}
+	}
 	message = service.PublicTaskModelText(message, task.Properties.OriginModelName, task.Properties.UpstreamModelName)
 	taskErr := &dto.TaskError{
 		Code: code, Message: message, StatusCode: status,
@@ -991,6 +1022,7 @@ func renderTaskPluginNativeResult(c *gin.Context, pinned pluginruntime.PinnedRou
 
 func respondTaskPluginNativeActionError(c *gin.Context, status int, code, message string) {
 	taskErr := service.TaskErrorWrapperLocal(errors.New(message), code, status)
+	c.Set(middleware.ContextKeyPublicTaskPluginError, true)
 	c.Abort()
 	if middleware.RespondTaskPluginError(c, taskErr) {
 		return

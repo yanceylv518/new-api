@@ -406,6 +406,18 @@ u("resolution") == "720p" && u("video_input") == "video"
 
 ## 错误响应
 
+提交错误响应若包含 `X-Task-ID` 响应头，可使用该本站任务 ID 查询处理状态；
+提交结果尚未确认时应先查询，避免重复创建任务。
+
+创建或管理请求收到上游 4xx、5xx 错误时，接口保留上游状态码和响应内容，并对
+凭证及渠道身份脱敏。管理错误响应为空或超过 64 KiB 时使用安全提示。本站未能选择
+可用渠道时返回实际原因；内部异常仍使用安全提示。
+上游返回非空且可重试的错误后，若重试阶段无法选择渠道，返回上一次上游错误的脱敏内容。
+
+上游以 2xx 返回不超过 1 MiB 的响应，其中有明确错误信息或 `success: false`，且常见
+数据字段中没有任务 ID 时，本站以 502 返回脱敏后的错误内容。无法识别时使用安全提示。
+这不能证明上游没有受理任务；如响应含 `X-Task-ID`，应先查询该任务再决定是否重试。
+
 Doubao 自定义路由的插件错误通常使用：
 
 ```json
@@ -422,6 +434,9 @@ Doubao 自定义路由的插件错误通常使用：
 | HTTP或错误信息 | 原因 |
 | --- | --- |
 | 400 `model is required` | 缺少模型 |
+| 503 `model_not_found` | 请求分组内没有可用渠道提供该模型 |
+| 503 `private_asset_sync_failed` | 素材同步失败 |
+| 503 `private_asset_service_unavailable` | 素材服务暂不可用 |
 | 400 `only supports 480p and 720p resolution` | Fast/Mini 使用了 1080p 或 4k |
 | 400 `duration must be -1 or an integer between 2 and 30` | 时长不是合法整数或超出范围 |
 | 400 `frames must be an integer between 29 and 289...` | 帧数超界或不满足 25+4n |

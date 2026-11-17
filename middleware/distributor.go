@@ -144,6 +144,7 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 				if selectErr.FilterKind == taskdto.FilterVideoRouting {
+					c.Set(ContextKeyPublicTaskPluginError, true)
 					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "No available channel supports the requested video resolution")
 					return
 				}
@@ -164,6 +165,7 @@ func Distribute() func(c *gin.Context) {
 				message := selectErr.Message
 				if selectErr.NoAvailableChannel {
 					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
+					c.Set(ContextKeyPublicTaskPluginError, true)
 				} else if selectErr.MessageID != "" {
 					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
 				}

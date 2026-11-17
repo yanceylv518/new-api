@@ -33,6 +33,7 @@ import (
 
 const contextKeyTaskPluginEndpointModel = "task_plugin_endpoint_model_request"
 const contextKeyTaskPluginDecodeFailures = "task_plugin_decode_failures"
+const ContextKeyPublicTaskPluginError = "task_plugin_public_error"
 
 type taskPluginDecodeFailure struct {
 	plugin     *pluginruntime.LoadedPlugin
@@ -1685,6 +1686,26 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 	if taskErr.UpstreamError != nil && !taskErr.LocalError {
 		sanitized.Code = taskErr.UpstreamError.Code
 		sanitized.Message = taskErr.UpstreamError.Message
+	}
+	if pinned.Route.Protocol == "seedance-v3" && taskErr.UpstreamError == nil &&
+		sanitized.HTTPStatus < http.StatusInternalServerError && taskErr.Code != "" {
+		sanitized.Code = taskErr.Code
+	}
+	if pinned.Route.Protocol == "seedance-v3" && taskErr.UpstreamError == nil && sanitized.HTTPStatus == http.StatusServiceUnavailable {
+		switch taskErr.Code {
+		case "private_asset_sync_failed":
+			sanitized.Code = taskErr.Code
+			sanitized.Message = errSeedanceAssetSynchronizationFailed.Error()
+		case "private_asset_service_unavailable":
+			sanitized.Code = taskErr.Code
+			sanitized.Message = service.ErrSeedanceAssetServiceTemporary.Error()
+		}
+	}
+	if pinned.Route.Protocol == "seedance-v3" && c.GetBool(ContextKeyPublicTaskPluginError) {
+		if taskErr.Code != "" {
+			sanitized.Code = taskErr.Code
+		}
+		sanitized.Message = taskErr.Message
 	}
 	publicModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 	if publicModel == "" {
