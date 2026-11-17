@@ -17,6 +17,7 @@ type ChannelSettings struct {
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	SeedanceAssetURL          string `json:"seedance_asset_url,omitempty"`
 	SeedanceAssetShareGroup   string `json:"seedance_asset_share_group,omitempty"`
+	TaskMediaProxyEnabled     bool   `json:"task_media_proxy_enabled,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
 	Proxy                     string `json:"proxy"`

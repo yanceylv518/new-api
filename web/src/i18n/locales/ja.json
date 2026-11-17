@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "動画結果をサイト経由にする",
+    "Return site links for video and frame files from this channel": "このチャネルの動画とフレームのリンクをサイトのリンクに置き換える",
     "Status check temporarily unavailable. Retrying automatically.": "一時的に状態を確認できません。自動で再試行しています。",
     "Asset service is temporarily unavailable. Please try again.": "素材サービスを一時的に利用できません。しばらくしてから再試行してください。",
     "Too many authentication requests. Please try again later.": "認証リクエストが多すぎます。しばらくしてから再試行してください。",

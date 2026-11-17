@@ -394,6 +394,17 @@ func TaskArtifactContent(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusConflict, "artifact_not_ready", "Task artifacts are not ready")
 		return
 	}
+	if source, recognized, sourceErr := service.TaskResponseMediaSource(task, artifactKey); recognized {
+		if sourceErr != nil || source == "" {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		descriptor := &relaychannel.TaskContentRequest{URL: source, Method: http.MethodGet, Credentialless: true}
+		if err := proxyTaskMedia(c, task, descriptor); err != nil {
+			writeTaskMediaProxyError(c, err)
+		}
+		return
+	}
 	if !taskHasPluginExecution(task) {
 		if artifactKey != "video" || !legacyVideoAvailable(task) {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
@@ -514,9 +525,22 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 				task.Username = user.Username
 			}
 		}
-		item := relay.TaskModel2Dto(task)
+		projected := *task
+		if task.Status == model.TaskStatusSuccess {
+			projected.PrivateData.ResultURL = ""
+			if taskFailReasonIsLegacyResultURL(task.FailReason) {
+				projected.FailReason = ""
+			}
+		}
+		item := relay.TaskModel2Dto(&projected)
 		if viewerRole >= common.RoleAdminUser {
-			item.Properties, item.Data, item.FailReason = task.Properties, task.Data, task.FailReason
+			item.Properties, item.FailReason = task.Properties, task.FailReason
+			data, err := service.ProjectTaskMediaData(task, task.Data)
+			if err != nil {
+				common.SysError(fmt.Sprintf("project task media failed: task_id=%s: %v", task.TaskID, err))
+				data = nil
+			}
+			item.Data = data
 		}
 		item.LegacyVideoAvailable = legacyVideoAvailable(task)
 		item.ResultDiscarded = task.PrivateData.ResultDiscarded

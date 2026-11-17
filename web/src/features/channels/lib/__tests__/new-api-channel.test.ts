@@ -99,6 +99,31 @@ describe('Channel settings patches and video routing', () => {
     expect(update).not.toHaveProperty('setting_patch')
     expect(update).not.toHaveProperty('settings_patch')
   })
+  test('video result proxy can be enabled and disabled without changing other settings', () => {
+    const form = transformChannelToFormDefaults(original)
+    expect(form.task_media_proxy_enabled).toBe(false)
+    form.task_media_proxy_enabled = true
+    expect(
+      transformFormDataToUpdatePayload(form, original.id, original)
+        .setting_patch
+    ).toEqual({ task_media_proxy_enabled: true })
+    const configured = {
+      ...original,
+      setting: '{"task_plugin_key":"doubao","task_media_proxy_enabled":true}',
+    }
+    const edited = transformChannelToFormDefaults(configured)
+    expect(edited.task_media_proxy_enabled).toBe(true)
+    edited.task_media_proxy_enabled = false
+    expect(
+      transformFormDataToUpdatePayload(edited, configured.id, configured)
+        .setting_patch
+    ).toEqual({ task_media_proxy_enabled: false })
+    expect(
+      JSON.parse(
+        transformFormDataToCreatePayload(edited).channel.setting ?? '{}'
+      )
+    ).toMatchObject({ task_media_proxy_enabled: false })
+  })
   test('routing edits patch only the rule, with the exact configuration baseline', () => {
     const form = transformChannelToFormDefaults(original)
     form.video_routing_rules = [

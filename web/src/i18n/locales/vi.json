@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "Dùng proxy cho video",
+    "Return site links for video and frame files from this channel": "Trả về liên kết của trang cho video và khung hình từ kênh này",
     "Status check temporarily unavailable. Retrying automatically.": "Tạm thời không thể kiểm tra trạng thái. Đang tự động thử lại.",
     "Asset service is temporarily unavailable. Please try again.": "Dịch vụ tài nguyên tạm thời không khả dụng. Vui lòng thử lại sau.",
     "Too many authentication requests. Please try again later.": "Quá nhiều yêu cầu xác thực. Vui lòng thử lại sau.",

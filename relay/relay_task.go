@@ -1021,6 +1021,19 @@ func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 		common.SysError(fmt.Sprintf("project public task model failed: task_id=%s: %v", task.TaskID, err))
 		data = nil
 	}
+	resultURL, err := service.PublicTaskResultURL(task)
+	if err != nil {
+		common.SysError(fmt.Sprintf("project task result URL failed: task_id=%s: %v", task.TaskID, err))
+		resultURL = ""
+	}
+	failReason := service.PublicTaskModelText(task.FailReason, task.Properties.OriginModelName, task.Properties.UpstreamModelName)
+	if task.Status == model.TaskStatusSuccess && resultURL != task.GetResultURL() &&
+		(strings.HasPrefix(task.FailReason, "https://") || strings.HasPrefix(task.FailReason, "http://")) {
+		failReason = ""
+		if task.FailReason == task.GetResultURL() {
+			failReason = resultURL
+		}
+	}
 	return &dto.TaskDto{
 		ID:         task.ID,
 		CreatedAt:  task.CreatedAt,
@@ -1033,8 +1046,8 @@ func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 		Quota:      task.Quota,
 		Action:     constant.NormalizeTaskAction(task.Action),
 		Status:     string(task.Status),
-		FailReason: service.PublicTaskModelText(task.FailReason, task.Properties.OriginModelName, task.Properties.UpstreamModelName),
-		ResultURL:  task.GetResultURL(),
+		FailReason: failReason,
+		ResultURL:  resultURL,
 		SubmitTime: task.SubmitTime,
 		StartTime:  task.StartTime,
 		FinishTime: task.FinishTime,

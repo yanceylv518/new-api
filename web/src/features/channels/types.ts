@@ -82,6 +82,7 @@ export type Channel = z.infer<typeof channelSchema>
 export interface ChannelSettings {
   video_routing_rules?: VideoRoutingRule[]
   task_plugin_key?: string
+  task_media_proxy_enabled?: boolean
   seedance_asset_url?: string
   seedance_asset_share_group?: string
   task_extend_plugin_keys?: string[]

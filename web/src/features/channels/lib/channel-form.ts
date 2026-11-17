@@ -211,6 +211,7 @@ export const channelFormSchema = z
     type: z.number().min(0, ERROR_MESSAGES.REQUIRED_TYPE),
     base_url: z.string().optional(),
     task_plugin_key: z.string().optional(),
+    task_media_proxy_enabled: z.boolean().optional(),
     seedance_asset_url: z.string().optional(),
     seedance_asset_share_group: z.string().optional(),
     task_extend_plugin_keys: z.array(z.string()).optional(),
@@ -504,6 +505,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   type: 1,
   base_url: '',
   task_plugin_key: '',
+  task_media_proxy_enabled: false,
   seedance_asset_url: '',
   seedance_asset_share_group: '',
   task_extend_plugin_keys: [],
@@ -574,6 +576,7 @@ export function transformChannelToFormDefaults(
   // Parse channel extra settings from setting field
   let extraSettings = {
     task_plugin_key: '',
+    task_media_proxy_enabled: false,
     seedance_asset_url: '',
     seedance_asset_share_group: '',
     task_extend_plugin_keys: [] as string[],
@@ -600,6 +603,7 @@ export function transformChannelToFormDefaults(
       )
       extraSettings = {
         task_plugin_key: parsed.task_plugin_key || '',
+        task_media_proxy_enabled: parsed.task_media_proxy_enabled === true,
         seedance_asset_url: supportsSeedanceAssetURL(
           channel.type,
           parsed.task_plugin_key
@@ -743,6 +747,7 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
     'seedance_asset_url',
     'seedance_asset_share_group',
     'task_plugin_key',
+    'task_media_proxy_enabled',
     'task_extend_plugin_keys',
     'force_format',
     'thinking_to_content',
@@ -759,6 +764,7 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   }
   const settingObj: Record<string, unknown> = {
     ...original,
+    task_media_proxy_enabled: formData.task_media_proxy_enabled === true,
     video_routing_rules: formData.video_routing_rules?.length
       ? formData.video_routing_rules
       : undefined,

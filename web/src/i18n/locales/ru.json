@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "Проксировать видео",
+    "Return site links for video and frame files from this channel": "Возвращать ссылки сайта для видео и кадров этого канала",
     "Status check temporarily unavailable. Retrying automatically.": "Проверка статуса временно недоступна. Повторяем автоматически.",
     "Asset service is temporarily unavailable. Please try again.": "Сервис медиаресурсов временно недоступен. Повторите попытку позже.",
     "Too many authentication requests. Please try again later.": "Слишком много запросов аутентификации. Повторите попытку позже.",

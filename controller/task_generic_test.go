@@ -14,6 +14,9 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -60,6 +63,169 @@ func allowPrivateTaskMediaTest(t *testing.T) {
 	system_setting.GetFetchSetting().AllowedPorts = []string{"1-65535"}
 	t.Cleanup(func() { *system_setting.GetFetchSetting() = originalFetchSetting })
 	service.InitHttpClient()
+}
+
+func TestChannelVideoResultProxy(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	allowPrivateTaskMediaTest(t)
+	oldMemory, oldAddress := common.MemoryCacheEnabled, system_setting.TaskPublicAddress
+	common.MemoryCacheEnabled = false
+	system_setting.TaskPublicAddress = "https://site.example"
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = oldMemory
+		system_setting.TaskPublicAddress = oldAddress
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Empty(t, r.Header.Get("Authorization"))
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", "bytes 0-3/4")
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		bodies := map[string]string{"/video": "vid1", "/first": "fir1", "/last": "las1", "/file": "fil1", "/top-video": "vid2", "/top-frame": "las2"}
+		_, _ = w.Write([]byte(bodies[r.URL.Path]))
+	}))
+	t.Cleanup(upstream.Close)
+
+	task.Platform = "qstart"
+	task.Action = constant.TaskActionTextToVideo
+	task.PrivateData.ResultURL = upstream.URL + "/video"
+	task.Data, _ = common.Marshal(map[string]any{"download_url": upstream.URL + "/top-video", "last_frame_url": upstream.URL + "/top-frame", "content": map[string]any{
+		"video_url": upstream.URL + "/video", "first_frame_url": upstream.URL + "/first",
+		"last_frame_url": upstream.URL + "/last", "file_url": upstream.URL + "/file",
+	}})
+	snapshot := string(task.Data)
+	require.NoError(t, model.DB.Save(task).Error)
+
+	withoutProxy, err := service.PublicTaskData(task)
+	require.NoError(t, err)
+	assert.JSONEq(t, snapshot, string(withoutProxy))
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).
+		Update("setting", `{"task_media_proxy_enabled":true}`).Error)
+	withProxy, err := service.PublicTaskData(task)
+	require.NoError(t, err)
+	assert.NotContains(t, string(withProxy), upstream.URL)
+	assert.JSONEq(t, snapshot, string(task.Data))
+	var output struct {
+		Content      map[string]string `json:"content"`
+		DownloadURL  string            `json:"download_url"`
+		LastFrameURL string            `json:"last_frame_url"`
+	}
+	require.NoError(t, common.Unmarshal(withProxy, &output))
+	view, err := service.BuildTaskPluginView(task)
+	require.NoError(t, err)
+	viewBytes, err := common.Marshal(view)
+	require.NoError(t, err)
+	assert.NotContains(t, string(viewBytes), upstream.URL)
+	source, err := builtinplugins.Source("qstart")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.CompilePlugin(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	viewValue, err := taskPluginProtocolJSONValue(view)
+	require.NoError(t, err)
+	native, err := plugin.Engine.CallPath(t.Context(), "native", []string{"taskStatus"}, map[string]any{}, viewValue)
+	require.NoError(t, err)
+	nativeJSON, err := common.Marshal(native)
+	require.NoError(t, err)
+	assert.NotContains(t, string(nativeJSON), upstream.URL)
+	assert.Contains(t, string(nativeJSON), "site.example")
+	callbackTask := *task
+	callbackTask.Status = model.TaskStatusQueued
+	callbackView, err := service.BuildTaskPluginView(&callbackTask)
+	require.NoError(t, err)
+	callbackJSON, err := common.Marshal(callbackView.Data)
+	require.NoError(t, err)
+	assert.NotContains(t, string(callbackJSON), upstream.URL)
+	publicTask := relay.TaskModel2Dto(task)
+	assert.NotContains(t, publicTask.ResultURL, upstream.URL)
+	assert.NotContains(t, string(publicTask.Data), upstream.URL)
+	adminTask := tasksToDto([]*model.Task{task}, false, common.RoleAdminUser)[0]
+	assert.NotContains(t, string(adminTask.Data), upstream.URL)
+	system_setting.TaskPublicAddress = "invalid"
+	_, err = service.PublicTaskData(task)
+	assert.Error(t, err)
+	system_setting.TaskPublicAddress = "https://site.example"
+
+	router := gin.New()
+	router.GET("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	router.HEAD("/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), TaskArtifactContent)
+	for _, result := range []struct{ name, link, body string }{
+		{"video_url", output.Content["video_url"], "vid1"},
+		{"first_frame_url", output.Content["first_frame_url"], "fir1"},
+		{"last_frame_url", output.Content["last_frame_url"], "las1"},
+		{"file_url", output.Content["file_url"], "fil1"},
+		{"download_url", output.DownloadURL, "vid2"},
+		{"top last_frame_url", output.LastFrameURL, "las2"},
+	} {
+		parsed, parseErr := url.Parse(result.link)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "site.example", parsed.Host)
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+		request.Header.Set("Range", "bytes=0-3")
+		router.ServeHTTP(recorder, request)
+		assert.Equal(t, http.StatusPartialContent, recorder.Code, result.name)
+		assert.Equal(t, result.body, recorder.Body.String(), result.name)
+	}
+	parsed, err := url.Parse(output.Content["video_url"])
+	require.NoError(t, err)
+	head := httptest.NewRecorder()
+	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, head.Code)
+	assert.Empty(t, head.Body.String())
+	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusQueued).Error)
+	pending := httptest.NewRecorder()
+	router.ServeHTTP(pending, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	require.Equal(t, http.StatusNotFound, pending.Code, pending.Body.String())
+	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusSuccess).Error)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Update("status", common.UserStatusDisabled).Error)
+	disabled := httptest.NewRecorder()
+	router.ServeHTTP(disabled, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, disabled.Code)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Update("status", common.UserStatusEnabled).Error)
+	values := parsed.Query()
+	values.Set("access", "invalid")
+	parsed.RawQuery = values.Encode()
+	invalid := httptest.NewRecorder()
+	router.ServeHTTP(invalid, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, invalid.Code)
+
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).
+		Update("setting", `{"task_media_proxy_enabled":false}`).Error)
+	withoutProxy, err = service.PublicTaskData(task)
+	require.NoError(t, err)
+	assert.JSONEq(t, snapshot, string(withoutProxy))
+	assert.Equal(t, upstream.URL+"/video", relay.TaskModel2Dto(task).ResultURL)
+
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).
+		Update("setting", `{"task_media_proxy_enabled":"invalid"}`).Error)
+	_, err = service.PublicTaskData(task)
+	assert.Error(t, err)
+	assert.Empty(t, relay.TaskModel2Dto(task).Data)
+	assert.Empty(t, relay.TaskModel2Dto(task).ResultURL)
+
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).
+		Update("setting", `{"task_media_proxy_enabled":true}`).Error)
+	task.Platform = "anyllm"
+	task.Data = []byte(`{"content":{"video_url":"/v1/videos/task_generic/content","last_frame_url":"/v1/tasks/task_generic/artifacts/last-frame/content"}}`)
+	task.PrivateData.PluginState, err = common.Marshal(map[string]any{"media": map[string]string{
+		"video": upstream.URL + "/video", "last_frame": upstream.URL + "/last",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Save(task).Error)
+	anyllmResponse, err := service.PublicTaskData(task)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(anyllmResponse, &output))
+	for _, field := range []string{"video_url", "last_frame_url"} {
+		parsed, parseErr := url.Parse(output.Content[field])
+		require.NoError(t, parseErr)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+		assert.Equal(t, http.StatusOK, recorder.Code, field)
+	}
+	require.NoError(t, model.DB.Delete(&model.Channel{}, task.ChannelId).Error)
+	_, err = service.PublicTaskData(task)
+	assert.Error(t, err)
 }
 
 func TestGetTaskDoesNotProjectArtifacts(t *testing.T) {

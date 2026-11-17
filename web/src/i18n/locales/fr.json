@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "Relayer les vidéos",
+    "Return site links for video and frame files from this channel": "Renvoyer des liens du site pour les vidéos et images de ce canal",
     "Status check temporarily unavailable. Retrying automatically.": "Vérification du statut indisponible. Nouvelle tentative automatique.",
     "Asset service is temporarily unavailable. Please try again.": "Le service de médias est temporairement indisponible. Réessayez plus tard.",
     "Too many authentication requests. Please try again later.": "Trop de demandes d’authentification. Réessayez plus tard.",

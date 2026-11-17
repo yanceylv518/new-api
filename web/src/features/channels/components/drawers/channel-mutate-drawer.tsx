@@ -303,6 +303,7 @@ const SENSITIVE_FORM_FIELDS = [
   'force_format',
   'thinking_to_content',
   'proxy',
+  'task_media_proxy_enabled',
   'http_protocol',
   'http2_connection_shards',
   'pass_through_body_enabled',
@@ -1947,6 +1948,32 @@ export function ChannelMutateDrawer({
             <FormDescription>
               {t(
                 'Do not wait one second between polling async tasks for this channel'
+              )}
+            </FormDescription>
+          </div>
+          <FormControl>
+            <Switch
+              disabled={sensitiveLocked}
+              checked={field.value}
+              onCheckedChange={field.onChange}
+            />
+          </FormControl>
+        </FormItem>
+      )}
+    />
+  )
+
+  const taskMediaProxyFields = (
+    <FormField
+      control={form.control}
+      name='task_media_proxy_enabled'
+      render={({ field }) => (
+        <FormItem className='flex items-center justify-between px-4 py-3'>
+          <div className='space-y-0.5'>
+            <FormLabel>{t('Proxy video results')}</FormLabel>
+            <FormDescription>
+              {t(
+                'Return site links for video and frame files from this channel'
               )}
             </FormDescription>
           </div>
@@ -4810,6 +4837,7 @@ export function ChannelMutateDrawer({
                 className='space-y-4 disabled:opacity-60'
               >
                 {taskPollingFields}
+                {taskMediaProxyFields}
                 {proxyFields}
                 {httpProtocolFields}
                 {httpShardsFields}

@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "Proxy video results",
+    "Return site links for video and frame files from this channel": "Return site links for video and frame files from this channel",
     "Status check temporarily unavailable. Retrying automatically.": "Status check temporarily unavailable. Retrying automatically.",
     "Asset service is temporarily unavailable. Please try again.": "Asset service is temporarily unavailable. Please try again.",
     "Too many authentication requests. Please try again later.": "Too many authentication requests. Please try again later.",

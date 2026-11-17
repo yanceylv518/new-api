@@ -1,5 +1,7 @@
 {
   "translation": {
+    "Proxy video results": "影片結果使用本站代理",
+    "Return site links for video and frame files from this channel": "將此渠道返回的影片和畫面連結替換為本站連結",
     "Status check temporarily unavailable. Retrying automatically.": "暫時無法查詢狀態，正在自動重試。",
     "Asset service is temporarily unavailable. Please try again.": "素材服務暫時無法使用，請稍後重試。",
     "Too many authentication requests. Please try again later.": "登入或工作階段續期請求過於頻繁，請稍後再試。",

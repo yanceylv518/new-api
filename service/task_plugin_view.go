@@ -51,6 +51,14 @@ func PublicTaskModelText(value, publicModel, upstreamModel string) string {
 
 // PublicTaskData 仅修改对外副本，不改变轮询与计费使用的任务快照。
 func PublicTaskData(task *model.Task) (json.RawMessage, error) {
+	data, err := taskDataWithoutMediaProxy(task)
+	if err != nil {
+		return nil, err
+	}
+	return ProjectTaskMediaData(task, data)
+}
+
+func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {
 	if task == nil {
 		return nil, nil
 	}
