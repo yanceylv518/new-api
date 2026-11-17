@@ -191,6 +191,20 @@ func originOceanVideoPublicData(raw json.RawMessage) (json.RawMessage, error) {
 	if err := common.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
+	if nested := fields["upstream_response"]; common.GetJsonType(nested) == "object" {
+		var upstream map[string]json.RawMessage
+		if err := common.Unmarshal(nested, &upstream); err != nil {
+			return nil, err
+		}
+		for field, value := range upstream {
+			switch field {
+			// 历史快照的顶层错误已经脱敏，不能用未经同样处理的内层错误覆盖。
+			case "id", "task_id", "model", "status", "upstream_response", "error", "failure_reason":
+				continue
+			}
+			fields[field] = value
+		}
+	}
 	for field := range fields {
 		switch field {
 		case "id", "model", "status", "error", "content", "usage", "created_at", "updated_at",

@@ -344,7 +344,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   requiredCapabilities: ["task-callback@1", "shared-native-routes@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -1529,6 +1529,24 @@ function originBaseParseTaskResult(ctx, body) {
   return { status: "UNKNOWN", reason: "unrecognized status: " + String(body.status || "") };
 }
 
+// 保留渠道任务的身份和状态，业务字段以实际生成响应为准。
+function originTaskFields(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const upstream = body.upstream_response;
+  if (!upstream || typeof upstream !== "object" || Array.isArray(upstream)) return body;
+  const merged = {};
+  for (const key of Object.keys(body)) {
+    if (["__proto__", "prototype", "constructor"].includes(key)) continue;
+    merged[key] = body[key];
+  }
+  for (const key of Object.keys(upstream)) {
+    if (["id", "task_id", "model", "status", "upstream_response", "__proto__", "prototype", "constructor"].includes(key)) continue;
+    merged[key] = upstream[key];
+  }
+  delete merged.upstream_response;
+  return merged;
+}
+
 // 错误详情保留业务原因与代码，只清理渠道身份、凭据和内部任务标识。
 function publicFailureValue(ctx, value) {
   if (Array.isArray(value)) return value.map((item) => publicFailureValue(ctx, item));
@@ -1612,6 +1630,7 @@ export function buildContentRequest(ctx) {
 
 export function extractUsageOnComplete(task, taskResult, body) {
   if (imageTask(task)) return imageUsage(body || {}, imageProfile(task));
+  body = originTaskFields(body);
   if (!body || body.status !== "succeeded") return {};
   const facts = {};
   const usage = body.usage || {};
@@ -1966,8 +1985,11 @@ function originPublicValue(value, credential) {
 
 function originTaskData(ctx, value) {
   const data = originPublicValue(value, trimmed(ctx.apiKey));
-  if (data && typeof data === "object" && !Array.isArray(data) && typeof data.model === "string" && trimmed(ctx.model)) {
-    data.model = ctx.model;
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    if (typeof data.model === "string" && trimmed(ctx.model)) data.model = ctx.model;
+    for (const key of ["error", "message", "reason", "failure_reason"]) {
+      if (data[key] !== undefined && data[key] !== null) data[key] = publicFailureValue(ctx, data[key]);
+    }
   }
   return data;
 }
@@ -1979,6 +2001,7 @@ export function parseSubmitResponse(ctx, response) {
 }
 
 export function parseTaskResult(ctx, body) {
+  body = originTaskFields(body);
   const result = originBaseParseTaskResult(ctx, body);
   if (result.status !== "UNKNOWN") result.taskData = originTaskData(ctx, result.taskData === undefined ? body : result.taskData);
   return result;
