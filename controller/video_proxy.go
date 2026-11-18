@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -329,6 +331,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 		c.Writer.Header().Set("Content-Type", contentType)
 		setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+		setTaskMediaDownloadHeaders(c, rawURL)
 		http.ServeContent(c.Writer, c.Request, "video", time.Time{}, bytes.NewReader(data))
 		return nil
 	}
@@ -352,6 +355,9 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 		copyTaskMediaResponseHeaders(c.Writer.Header(), resp.Header)
 		setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+			setTaskMediaDownloadHeaders(c, rawURL)
+		}
 		c.Status(resp.StatusCode)
 		c.Writer.WriteHeaderNow()
 		if c.Request.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified {
@@ -630,6 +636,45 @@ func setTaskMediaResponseSecurityHeaders(header http.Header) {
 	header.Set("X-Content-Type-Options", "nosniff")
 }
 
+func setTaskMediaDownloadHeaders(c *gin.Context, source string) {
+	key, responseMedia := strings.CutPrefix(c.Param("artifact_key"), service.TaskResponseMediaKeyPrefix)
+	if !responseMedia {
+		return
+	}
+	mediaType, _, _ := mime.ParseMediaType(c.Writer.Header().Get("Content-Type"))
+	var extension string
+	switch mediaType {
+	case "video/mp4":
+		extension = ".mp4"
+	case "video/quicktime":
+		extension = ".mov"
+	case "video/webm":
+		extension = ".webm"
+	case "image/jpeg":
+		extension = ".jpg"
+	case "image/png":
+		extension = ".png"
+	case "image/gif":
+		extension = ".gif"
+	case "image/webp":
+		extension = ".webp"
+	default:
+		// 部分媒体服务只返回二进制类型，扩展名从地址中取，文件名使用本站标识。
+		if !strings.HasPrefix(source, "data:") {
+			if parsed, err := url.Parse(source); err == nil {
+				extension = strings.ToLower(path.Ext(parsed.Path))
+			}
+		}
+		switch extension {
+		case ".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".gif", ".webp":
+		default:
+			extension = ".bin"
+		}
+	}
+	filename := c.Param("key") + "-" + key + extension
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+}
+
 func writeTaskMediaProxyError(c *gin.Context, err error) {
 	if c.Writer.Written() {
 		logger.LogError(c.Request.Context(), err.Error())
@@ -687,6 +732,7 @@ func writeVideoDataURL(c *gin.Context, dataURL string) error {
 	c.Writer.Header().Set("Content-Type", mimeType)
 	c.Writer.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+	setTaskMediaDownloadHeaders(c, dataURL)
 	c.Writer.WriteHeader(http.StatusOK)
 	if c.Request.Method == http.MethodHead {
 		return nil
