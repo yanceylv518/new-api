@@ -23,6 +23,25 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 	}
 }
 
+// SetUpstreamRequestID bounds the log value to its varchar(128) column without
+// cutting a UTF-8 character or modifying the upstream response header.
+func SetUpstreamRequestID(c *gin.Context, value string) {
+	if c == nil {
+		return
+	}
+	if len(value) > 128 {
+		characters := 0
+		for index := range value {
+			if characters == 128 {
+				value = strings.Clone(value[:index])
+				break
+			}
+			characters++
+		}
+	}
+	c.Set(common.UpstreamRequestIdKey, value)
+}
+
 // ShouldCopyUpstreamHeader 不复制 Content-Length 和上游的 X-Oneapi-Request-Id。
 // 记录上游请求 ID 时，X-Oneapi-Request-Id 优先于 X-Request-Id。
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
@@ -31,12 +50,12 @@ func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 	}
 	if strings.EqualFold(k, common.RequestIdKey) {
 		if c != nil && len(v) > 0 && v[0] != "" {
-			c.Set(common.UpstreamRequestIdKey, v[0])
+			SetUpstreamRequestID(c, v[0])
 		}
 		return false
 	}
 	if strings.EqualFold(k, "X-Request-Id") && c != nil && c.GetString(common.UpstreamRequestIdKey) == "" && len(v) > 0 && v[0] != "" {
-		c.Set(common.UpstreamRequestIdKey, v[0])
+		SetUpstreamRequestID(c, v[0])
 	}
 	return true
 }

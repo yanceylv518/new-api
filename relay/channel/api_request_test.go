@@ -5,64 +5,152 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDoRequestCapturesPreferredUpstreamRequestID(t *testing.T) {
 	service.InitHttpClient()
 	gin.SetMode(gin.TestMode)
+	require.NoError(t, requesttimeline.ConfigureRequestIDHeaders("x-maas-requestid, X-Custom-Trace"))
+	t.Cleanup(func() {
+		require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders))
+	})
 	for _, test := range []struct {
-		name       string
-		setPrimary bool
-		primary    string
-		fallback   string
-		want       string
+		name         string
+		headers      map[string]string
+		want         string
+		wantTimeline string
 	}{
-		{name: "fallback", fallback: "provider-request", want: "provider-request"},
-		{name: "preferred", setPrimary: true, primary: "oneapi-request", fallback: "provider-request", want: "oneapi-request"},
-		{name: "empty primary", setPrimary: true, fallback: "provider-request", want: "provider-request"},
+		{name: "fallback", headers: map[string]string{"X-Request-Id": "provider-request", "Request-Id": "legacy"}, want: "provider-request"},
+		{name: "preferred", headers: map[string]string{common.RequestIdKey: "oneapi-request", "X-Request-Id": "provider-request"}, want: "oneapi-request"},
+		{name: "empty primary", headers: map[string]string{common.RequestIdKey: "", "X-Request-Id": "provider-request"}, want: "provider-request"},
+		{name: "legacy", headers: map[string]string{"Request-Id": "legacy", "x-maas-requestid": "maas"}, want: "legacy"},
+		{name: "maas", headers: map[string]string{"x-MaAs-ReQuEsTiD": "maas", "X-Custom-Trace": "custom"}, want: "maas"},
+		{name: "configured", headers: map[string]string{"X-Custom-Trace": "custom"}, want: "custom"},
+		{name: "128 characters", headers: map[string]string{"X-Custom-Trace": strings.Repeat("x", 128)}, want: strings.Repeat("x", 128)},
+		{name: "long configured", headers: map[string]string{"X-Custom-Trace": strings.Repeat("x", 129)}, want: strings.Repeat("x", 128), wantTimeline: strings.Repeat("x", 129)},
+		{name: "long primary", headers: map[string]string{common.RequestIdKey: strings.Repeat("p", 129), "X-Request-Id": "fallback"}, want: strings.Repeat("p", 128), wantTimeline: strings.Repeat("p", 129)},
+		{name: "UTF-8 boundary", headers: map[string]string{"X-Custom-Trace": strings.Repeat("x", 127) + "界尾"}, want: strings.Repeat("x", 127) + "界", wantTimeline: strings.Repeat("x", 127) + "界尾"},
 		{name: "missing", want: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if test.setPrimary {
-					w.Header().Set(common.RequestIdKey, test.primary)
-				}
-				if test.fallback != "" {
-					w.Header().Set("X-Request-Id", test.fallback)
-				}
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
+			for _, status := range []int{http.StatusOK, http.StatusBadGateway} {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					for key, value := range test.headers {
+						w.Header()[key] = []string{value}
+					}
+					w.WriteHeader(status)
+				}))
+				defer upstream.Close()
 
-			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-			ctx.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewReader([]byte("request")))
-			req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewReader([]byte("request")))
-			require.NoError(t, err)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+				for _, timelineEnabled := range []bool{false, true} {
+					ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+					ctx.Set(common.UpstreamRequestIdKey, "previous-attempt")
+					ctx.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewReader([]byte("request")))
+					req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewReader([]byte("request")))
+					require.NoError(t, err)
+					info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+					if timelineEnabled {
+						info.Timeline = requesttimeline.New(time.Now(), "local-request", 1, "model")
+					}
 
-			resp, err := doRequest(ctx, req, info)
-			require.NoError(t, err)
-			defer resp.Body.Close()
-			require.Equal(t, test.want, ctx.GetString(common.UpstreamRequestIdKey))
+					resp, err := doRequest(ctx, req, info)
+					require.NoError(t, err)
+					defer resp.Body.Close()
+					assert.Equal(t, test.want, ctx.GetString(common.UpstreamRequestIdKey), "status=%d timeline=%t", status, timelineEnabled)
+					// Copying response headers must not restore an unbounded log ID.
+					for key, values := range resp.Header {
+						service.ShouldCopyUpstreamHeader(ctx, key, values)
+					}
+					assert.Equal(t, test.want, ctx.GetString(common.UpstreamRequestIdKey))
+					for key, value := range test.headers {
+						assert.Equal(t, value, resp.Header.Get(key), "forwarded headers must stay unchanged")
+					}
+					if timelineEnabled {
+						wantTimeline := test.wantTimeline
+						if wantTimeline == "" {
+							wantTimeline = test.want
+						}
+						assert.Equal(t, wantTimeline, info.Timeline.Freeze(nil).Data.UpstreamRequestID)
+					}
+				}
+			}
 		})
 	}
 }
 
 func TestCopiedUpstreamHeadersPreserveRequestIDPriority(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	require.True(t, service.ShouldCopyUpstreamHeader(ctx, "x-request-id", []string{"provider-request"}))
-	require.Equal(t, "provider-request", ctx.GetString(common.UpstreamRequestIdKey))
-	require.False(t, service.ShouldCopyUpstreamHeader(ctx, "x-oneapi-request-id", []string{"oneapi-request"}))
-	require.Equal(t, "oneapi-request", ctx.GetString(common.UpstreamRequestIdKey))
+	require.True(t, service.ShouldCopyUpstreamHeader(ctx, "x-request-id", []string{strings.Repeat("f", 129)}))
+	assert.Equal(t, strings.Repeat("f", 128), ctx.GetString(common.UpstreamRequestIdKey))
+	require.False(t, service.ShouldCopyUpstreamHeader(ctx, "x-oneapi-request-id", []string{strings.Repeat("p", 129)}))
+	assert.Equal(t, strings.Repeat("p", 128), ctx.GetString(common.UpstreamRequestIdKey))
 	require.True(t, service.ShouldCopyUpstreamHeader(ctx, "X-REQUEST-ID", []string{"later-provider-request"}))
-	require.Equal(t, "oneapi-request", ctx.GetString(common.UpstreamRequestIdKey))
+	assert.Equal(t, strings.Repeat("p", 128), ctx.GetString(common.UpstreamRequestIdKey))
+}
+
+func TestDoRequestKeepsRequestIDConfigurationSnapshot(t *testing.T) {
+	service.InitHttpClient()
+	require.NoError(t, requesttimeline.ConfigureRequestIDHeaders("X-Original-Trace"))
+	t.Cleanup(func() {
+		require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders))
+	})
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{},
+		Timeline:    requesttimeline.New(time.Now(), "local-request", 1, "model"),
+	}
+	require.NoError(t, requesttimeline.ConfigureRequestIDHeaders("X-New-Trace"))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Original-Trace", "original-id")
+		w.Header().Set("X-New-Trace", "new-id")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/relay", bytes.NewBufferString("request"))
+	req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewBufferString("request"))
+	require.NoError(t, err)
+	resp, err := doRequest(c, req, info)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, "original-id", c.GetString(common.UpstreamRequestIdKey))
+	assert.Equal(t, "original-id", info.Timeline.Freeze(nil).Data.UpstreamRequestID)
+
+	// A failed next attempt must clear the prior ID even without response headers.
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err = http.NewRequestWithContext(requestContext, http.MethodPost, upstream.URL, bytes.NewBufferString("request"))
+	require.NoError(t, err)
+	_, err = doRequest(c, req, info)
+	require.Error(t, err)
+	assert.Empty(t, c.GetString(common.UpstreamRequestIdKey))
+}
+
+func TestDoRequestClearsRequestIDBeforeZhipuPreflight(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(common.UpstreamRequestIdKey, "previous-attempt")
+	req, err := http.NewRequest(http.MethodPost, "ftp://provider.example/search", bytes.NewBufferString("request"))
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{},
+		RelayMode:   relayconstant.RelayModeZhipuWebSearch,
+	}
+	resp, err := doRequest(c, req, info)
+	require.ErrorContains(t, err, "upstream URL must use http or https")
+	assert.Nil(t, resp)
+	assert.Empty(t, c.GetString(common.UpstreamRequestIdKey))
+	assert.False(t, info.ZhipuWebSearchAttempted, "local validation must not prevent channel fallback")
 }
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {

@@ -80,6 +80,22 @@ func ConfigureRequestIDHeaders(raw string) error {
 	return err
 }
 
+// UpstreamRequestIDFromHeaders shares the same priority between logs and timelines.
+// A nil trace still captures IDs when timeline recording is disabled. An active
+// trace uses its immutable configuration snapshot for all fallback attempts.
+func (t *Trace) UpstreamRequestIDFromHeaders(header http.Header) string {
+	headers := requestIDHeaders.Load().([]string)
+	if t != nil {
+		headers = t.requestIDHeaders
+	}
+	for _, key := range headers {
+		if value := header.Get(key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 const Version = 1
 const MaxDataBytes = 16 << 10
 const MaxAttempts = 16
@@ -508,12 +524,7 @@ func (t *Trace) Response(resp *http.Response, err error) {
 			}
 		}
 		t.record.Data.UpstreamResponseHeaders = headers
-		for _, key := range t.requestIDHeaders {
-			if value := resp.Header.Get(key); value != "" {
-				t.record.Data.UpstreamRequestID = bounded(value, 256)
-				break
-			}
-		}
+		t.record.Data.UpstreamRequestID = bounded(t.UpstreamRequestIDFromHeaders(resp.Header), 256)
 		if status != http.StatusOK {
 			t.fail("failed", "upstream_http_error", "upstream_response", fmt.Sprint(status), "Upstream returned a non-success status")
 		}

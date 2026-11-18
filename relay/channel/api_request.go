@@ -524,6 +524,8 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	// A fallback without a response ID must not inherit the previous attempt's ID.
+	c.Set(common2.UpstreamRequestIdKey, "")
 	if info.RelayMode == constant.RelayModeZhipuWebSearch {
 		// 先完成本地校验，避免未发送请求就阻断备用渠道。
 		if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" {
@@ -612,13 +614,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		))
 	}
 
-	upID := resp.Header.Get(common2.RequestIdKey)
-	if upID == "" {
-		upID = resp.Header.Get("X-Request-Id")
-	}
-	if upID != "" {
-		c.Set(common2.UpstreamRequestIdKey, upID)
-	}
+	service.SetUpstreamRequestID(c, info.Timeline.UpstreamRequestIDFromHeaders(resp.Header))
 
 	_ = req.Body.Close()
 	_ = c.Request.Body.Close()
