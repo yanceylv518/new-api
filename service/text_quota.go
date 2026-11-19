@@ -272,6 +272,13 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	summary.CacheCreationTokens = usage.PromptTokensDetails.CacheCreationTokensTotal()
 	summary.CacheCreationTokens5m = usage.ClaudeCacheCreation5mTokens
 	summary.CacheCreationTokens1h = usage.ClaudeCacheCreation1hTokens
+	kimiSplit := usage.KimiCacheWriteBreakdown()
+	if kimiSplit != nil && !summary.IsClaudeUsageSemantic {
+		summary.CacheCreationTokens1h = kimiSplit.OneHourTokens
+		summary.CacheCreationTokens5m = kimiSplit.FiveMinuteTokens
+		summary.CacheCreationRatio5m = summary.CacheCreationRatio
+		summary.CacheCreationRatio1h = math.Max(0, math.Min(2*summary.CacheCreationRatio, math.MaxFloat64))
+	}
 	summary.ImageTokens = usage.PromptTokensDetails.ImageTokens
 	summary.AudioTokens = usage.PromptTokensDetails.AudioTokens
 	legacyClaudeDerived := isLegacyClaudeDerivedOpenAIUsage(relayInfo, usage)
@@ -316,10 +323,11 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	hasUserDiscount := relayInfo.PriceData.UserModelDiscountMultiplier() != 1
 	if !relayInfo.PriceData.UsePrice {
 		baseTokens := dPromptTokens
+		promptIncludesCache := !summary.IsClaudeUsageSemantic && !legacyClaudeDerived
 
 		var cachedTokensWithRatio decimal.Decimal
 		if !dCacheTokens.IsZero() {
-			if !summary.IsClaudeUsageSemantic && !legacyClaudeDerived {
+			if promptIncludesCache {
 				baseTokens = baseTokens.Sub(dCacheTokens)
 			}
 			cachedTokensWithRatio = dCacheTokens.Mul(dCacheRatio)
@@ -328,8 +336,10 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		var cachedCreationTokensWithRatio decimal.Decimal
 		hasSplitCacheCreationTokens := summary.CacheCreationTokens5m > 0 || summary.CacheCreationTokens1h > 0
 		if !dCachedCreationTokens.IsZero() || hasSplitCacheCreationTokens {
-			if !summary.IsClaudeUsageSemantic && !legacyClaudeDerived {
+			if promptIncludesCache {
 				baseTokens = baseTokens.Sub(dCachedCreationTokens)
+			}
+			if promptIncludesCache && kimiSplit == nil {
 				cachedCreationTokensWithRatio = dCachedCreationTokens.Mul(dCacheCreationRatio)
 			} else {
 				remaining := summary.CacheCreationTokens - summary.CacheCreationTokens5m - summary.CacheCreationTokens1h

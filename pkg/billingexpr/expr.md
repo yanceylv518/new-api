@@ -34,7 +34,7 @@ Powered by [expr-lang/expr](https://github.com/expr-lang/expr). Expressions are 
 | `len` | 输入上下文总长度（**条件判断用**）。不受自动排除影响，始终反映完整输入长度。非 Claude：等于原始 `prompt_tokens`；Claude：等于文本输入 + 缓存读取 + 缓存创建 |
 | `cr` | 缓存命中（读取）token 数 |
 | `cc` | 缓存创建 token 数（Claude 5分钟 TTL / 通用） |
-| `cc1h` | 缓存创建 token 数 — 1小时 TTL（Claude 专用） |
+| `cc1h` | 1 小时缓存写入 token 数（Claude 用量明细，或与 Kimi 上游写入总量相符的响应头） |
 | `img` | 图片输入 token 数 |
 | `ai` | 音频输入 token 数 |
 

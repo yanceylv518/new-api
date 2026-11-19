@@ -775,6 +775,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			usage, err = OpenaiHandler(c, info, resp)
 		}
 	}
+	if u, ok := usage.(*dto.Usage); ok && err == nil && resp != nil {
+		applyKimiCacheWriteHeaders(u, resp.Header)
+	}
 	return
 }
 

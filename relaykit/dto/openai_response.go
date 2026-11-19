@@ -233,6 +233,8 @@ type Usage struct {
 	UsageSemantic        string        `json:"usage_semantic,omitempty"`
 	UsageSource          string        `json:"usage_source,omitempty"`
 	BillingUsage         *BillingUsage `json:"billing_usage,omitempty"`
+	// Kimi reports the TTL split in HTTP response headers, outside the JSON usage.
+	KimiCacheWrite *CacheWriteBreakdown `json:"-"`
 
 	PromptTokensDetails    InputTokenDetails  `json:"prompt_tokens_details"`
 	CompletionTokenDetails OutputTokenDetails `json:"completion_tokens_details"`
@@ -246,6 +248,23 @@ type Usage struct {
 
 	// OpenRouter Params
 	Cost any `json:"cost,omitempty"`
+}
+
+type CacheWriteBreakdown struct {
+	FiveMinuteTokens int
+	OneHourTokens    int
+}
+
+// KimiCacheWriteBreakdown reconciles header counts against the normalized
+// billing usage. A missing or inconsistent split retains aggregate pricing.
+func (u *Usage) KimiCacheWriteBreakdown() *CacheWriteBreakdown {
+	split := u.KimiCacheWrite
+	writes := u.PromptTokensDetails.CacheWriteTokens
+	if split == nil || writes <= 0 || writes != u.PromptTokensDetails.CacheCreationTokensTotal() ||
+		split.OneHourTokens < 0 || split.OneHourTokens > writes || split.FiveMinuteTokens != writes-split.OneHourTokens {
+		return nil
+	}
+	return split
 }
 
 type OpenAIVideoResponse struct {

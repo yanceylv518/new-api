@@ -521,6 +521,60 @@ func TestCalculateTextQuotaSummaryHandlesLegacyClaudeDerivedOpenAIUsage(t *testi
 	require.Equal(t, 1624, summary.Quota)
 }
 
+func TestKimiCacheWriteAndHitLedger(t *testing.T) {
+	for _, pricing := range []string{"ratio", "expression"} {
+		t.Run(pricing, func(t *testing.T) {
+			truncate(t)
+			const id, initial = 46, 100000
+			seedUser(t, id, initial)
+			seedToken(t, id, id, "kimi-cache-test", initial)
+			seedChannel(t, id)
+			spent := 0
+			for _, tc := range []struct{ write, hit, quota int }{{1000, 0, 2014}, {0, 1000, 114}} {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+				info := &relaycommon.RelayInfo{
+					ChannelMeta: &relaycommon.ChannelMeta{ChannelId: id},
+					UserId:      id, TokenId: id, TokenKey: "kimi-cache-test",
+					UserQuota: initial - spent, StartTime: time.Now(),
+					RelayFormat: types.RelayFormatOpenAI, OriginModelName: "kimi-k3.1-pro",
+					PriceData: hosttypes.PriceData{
+						ModelRatio: 1, CompletionRatio: 2, CacheRatio: 0.1, CacheCreationRatio: 1,
+						GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+					},
+				}
+				if pricing == "expression" {
+					info.TieredBillingSnapshot = makeSnapshot(`tier("kimi", p*2 + c*4 + cr*0.2 + cc*2 + cc1h*4)`, 1, 0, 0)
+				}
+				u := &dto.Usage{PromptTokens: 1010, CompletionTokens: 2, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: tc.hit, CacheWriteTokens: tc.write}}
+				if tc.write > 0 {
+					u.KimiCacheWrite = &dto.CacheWriteBreakdown{OneHourTokens: tc.write}
+				}
+				u.BillingUsage = dto.NewOpenAIChatBillingUsage(u)
+				PostTextConsumeQuota(ctx, info, u, nil)
+				spent += tc.quota
+				entry := getLastLog(t)
+				require.NotNil(t, entry)
+				assert.Equal(t, tc.quota, entry.Quota)
+				var detail struct {
+					Write1h    int `json:"cache_creation_tokens_1h"`
+					Write5m    int `json:"cache_creation_tokens_5m"`
+					TotalWrite int `json:"cache_write_tokens"`
+					Hits       int `json:"cache_tokens"`
+				}
+				require.NoError(t, common.UnmarshalJsonStr(entry.Other, &detail))
+				assert.Equal(t, tc.write, detail.Write1h)
+				assert.Zero(t, detail.Write5m)
+				assert.Equal(t, tc.write, detail.TotalWrite)
+				assert.Equal(t, tc.hit, detail.Hits)
+				assert.Equal(t, initial-spent, getUserQuota(t, id))
+				assert.Equal(t, initial-spent, getTokenRemainQuota(t, id))
+				assert.EqualValues(t, spent, getChannelUsedQuota(t, id))
+			}
+		})
+	}
+}
+
 func TestCalculateTextQuotaSummaryBillsOpenAICacheWriteTokens(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

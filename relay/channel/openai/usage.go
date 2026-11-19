@@ -1,11 +1,33 @@
 package openai
 
 import (
+	"net/http"
+	"strconv"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
+
+// Keep Kimi's header breakdown alongside the usage selected for settlement.
+func applyKimiCacheWriteHeaders(usage *dto.Usage, headers http.Header) {
+	hour := headers.Values("Msh-Usage-Cache-Write-Tokens-1h")
+	short := headers.Values("Msh-Usage-Cache-Write-Tokens-5m")
+	if usage == nil || len(hour) != 1 || len(short) != 1 {
+		return
+	}
+	tokens1h, err1h := strconv.ParseUint(hour[0], 10, 31)
+	tokens5m, err5m := strconv.ParseUint(short[0], 10, 31)
+	if err1h != nil || err5m != nil || tokens1h+tokens5m == 0 {
+		return
+	}
+
+	usage.KimiCacheWrite = &dto.CacheWriteBreakdown{FiveMinuteTokens: int(tokens5m), OneHourTokens: int(tokens1h)}
+	if usage.BillingUsage != nil && usage.BillingUsage.OpenAIUsage != nil {
+		usage.BillingUsage.OpenAIUsage.KimiCacheWrite = usage.KimiCacheWrite
+	}
+}
 
 func applyUsagePostProcessing(info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
 	if info == nil || usage == nil {
