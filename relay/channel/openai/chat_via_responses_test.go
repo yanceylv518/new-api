@@ -9,9 +9,11 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,6 +40,62 @@ func newResponsesChatTestContext(t *testing.T, body string, isStream bool) (*gin
 		DisablePing:        true,
 	}
 	return c, recorder, resp, info
+}
+
+func TestConvertedResponsesSettleUpstreamCacheWrites(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	const responsesBody = `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":9333,"output_tokens":53,"total_tokens":9386,"input_tokens_details":{"cache_write_tokens":9216}}}`
+	const chatUsage = `{"prompt_tokens":9333,"completion_tokens":53,"total_tokens":9386,"prompt_tokens_details":{"cache_write_tokens":9216}}`
+	const chatBody = `{"id":"chatcmpl_1","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":` + chatUsage + `}`
+	const responsesStream = "data: " + `{"type":"response.completed","response":` + responsesBody + "}\n\ndata: [DONE]\n\n"
+	const chatStream = "data: " + `{"id":"chatcmpl_1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}` +
+		"\n\ndata: " + `{"id":"chatcmpl_1","choices":[],"usage":` + chatUsage + "}\n\ndata: [DONE]\n\n"
+	const expr = `tier("base", p*13 + c*68 + cr*1.3 + cc*13 + cc1h*26)`
+
+	for _, tc := range []struct {
+		name, body string
+		client     types.RelayFormat
+		stream     bool
+		handle     func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+	}{
+		{"responses to chat", responsesBody, types.RelayFormatOpenAI, false, OaiResponsesToChatHandler},
+		{"responses to messages", responsesBody, types.RelayFormatClaude, false, OaiResponsesToChatHandler},
+		{"responses to chat stream", responsesStream, types.RelayFormatOpenAI, true, OaiResponsesToChatStreamHandler},
+		{"responses to messages stream", responsesStream, types.RelayFormatClaude, true, OaiResponsesToChatStreamHandler},
+		{"responses stream to buffered chat", responsesStream, types.RelayFormatOpenAI, false, OaiResponsesToChatBufferedStreamHandler},
+		{"chat to responses", chatBody, types.RelayFormatOpenAIResponses, false, OaiChatToResponsesHandler},
+		{"chat to responses stream", chatStream, types.RelayFormatOpenAIResponses, true, OaiChatToResponsesStreamHandler},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, resp, info := newResponsesChatTestContext(t, tc.body, tc.stream)
+			info.RelayFormat = tc.client
+			info.UpstreamModelName = "kimi-k3.1-pro"
+			resp.Header.Set("Msh-Usage-Cache-Write-Tokens-5m", "0")
+			resp.Header.Set("Msh-Usage-Cache-Write-Tokens-1h", "9216")
+			usage, apiErr := tc.handle(c, info, resp)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			canonical, ok := usage.BillingUsage.CanonicalUsage()
+			require.True(t, ok, "conversion must retain the upstream billing snapshot")
+
+			params := service.BuildTieredTokenParams(canonical, canonical.UsageSemantic == dto.BillingUsageSemanticAnthropic, billingexpr.UsedVars(expr))
+			assert.Equal(t, 117.0, params.P)
+			assert.Equal(t, 53.0, params.C)
+			assert.Zero(t, params.CC)
+			assert.Equal(t, 9216.0, params.CC1h)
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+				BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr),
+				GroupRatio: 1, QuotaPerUnit: 500000,
+			}
+			applied, quota, result := service.TryTieredSettle(info, params)
+			require.True(t, applied)
+			require.NotNil(t, result)
+			assert.Equal(t, 122371, quota)
+		})
+	}
 }
 
 func TestOaiResponsesToChatStreamHandlerConvertsSSEOrderAndUsage(t *testing.T) {

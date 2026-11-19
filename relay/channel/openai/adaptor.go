@@ -776,7 +776,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		}
 	}
 	if u, ok := usage.(*dto.Usage); ok && err == nil && resp != nil {
-		applyKimiCacheWriteHeaders(u, resp.Header)
+		applyUpstreamUsageHeaders(u, resp.Header)
 	}
 	return
 }

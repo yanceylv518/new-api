@@ -12,6 +12,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestChatResponsesRoundTripPreservesPromptCacheOptions(t *testing.T) {
+	for _, options := range []string{"", `{"mode":"implicit","ttl":"1h"}`} {
+		chat := &dto.GeneralOpenAIRequest{Model: "kimi-k3.1-pro", Messages: []dto.Message{{Role: "user", Content: "OK"}}}
+		if options != "" {
+			chat.PromptCacheOptions = []byte(options)
+		}
+		responses, err := ConvertRequest(nil, nil, types.RelayFormatOpenAIResponses, chat)
+		require.NoError(t, err)
+		responseRequest := responses.Value.(*dto.OpenAIResponsesRequest)
+		assert.Equal(t, chat.PromptCacheOptions, responseRequest.PromptCacheOptions)
+		back, err := ConvertRequest(nil, nil, types.RelayFormatOpenAI, responseRequest)
+		require.NoError(t, err)
+		assert.Equal(t, chat.PromptCacheOptions, back.Value.(*dto.GeneralOpenAIRequest).PromptCacheOptions)
+	}
+}
+
 func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 	tests := []struct {
 		converter      string

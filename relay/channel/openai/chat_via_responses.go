@@ -41,7 +41,7 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
-	responseValue, usage, err := convertResponsesResponseForClient(c, info, &responsesResp)
+	responseValue, usage, err := convertResponsesResponseForClient(c, info, &responsesResp, resp.Header)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
@@ -127,7 +127,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	}
 	accumulator.SupplementResponseOutput(finalResponse)
 
-	responseValue, usage, err := convertResponsesResponseForClient(c, info, finalResponse)
+	responseValue, usage, err := convertResponsesResponseForClient(c, info, finalResponse, resp.Header)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
@@ -140,11 +140,12 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	return usage, nil
 }
 
-func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayInfo, response *dto.OpenAIResponsesResponse) (any, *dto.Usage, error) {
+func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayInfo, response *dto.OpenAIResponsesResponse, headers http.Header) (any, *dto.Usage, error) {
 	if responseID := helper.GetResponseID(c); responseID != "" {
 		response.ID = responseID
 	}
 
+	applyUpstreamUsageHeaders(response.Usage, headers)
 	usage := relayconvert.UsageFromResponsesUsage(response.Usage)
 	if usage == nil || usage.TotalTokens == 0 {
 		text := service.ExtractOutputTextFromResponses(response)
@@ -271,6 +272,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		if streamResp.Response != nil {
+			applyUpstreamUsageHeaders(streamResp.Response.Usage, resp.Header)
+		}
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &streamResp)
 		if err != nil {
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)

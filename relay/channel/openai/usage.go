@@ -10,11 +10,14 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
-// Keep Kimi's header breakdown alongside the usage selected for settlement.
-func applyKimiCacheWriteHeaders(usage *dto.Usage, headers http.Header) {
+// Attach upstream metering to the usage that protocol converters snapshot for settlement.
+func applyUpstreamUsageHeaders(usage *dto.Usage, headers http.Header) {
+	if usage == nil {
+		return
+	}
 	hour := headers.Values("Msh-Usage-Cache-Write-Tokens-1h")
 	short := headers.Values("Msh-Usage-Cache-Write-Tokens-5m")
-	if usage == nil || len(hour) != 1 || len(short) != 1 {
+	if len(hour) != 1 || len(short) != 1 {
 		return
 	}
 	tokens1h, err1h := strconv.ParseUint(hour[0], 10, 31)

@@ -38,6 +38,7 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if responseID := helper.GetResponseID(c); responseID != "" {
 		chatResp.Id = responseID
 	}
+	applyUpstreamUsageHeaders(&chatResp.Usage, resp.Header)
 	convertResult, err := service.ConvertResponse(c, info, types.RelayFormatOpenAIResponses, &chatResp)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -141,6 +142,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		applyUpstreamUsageHeaders(chunk.Usage, resp.Header)
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &chunk)
 		if err != nil {
 			if failResponsesStream(err) {
