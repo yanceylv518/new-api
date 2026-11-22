@@ -129,21 +129,18 @@ func extractSeedanceAssetIDsFromMultipart(c *gin.Context) ([]string, error) {
 		field = strings.ToLower(strings.TrimSpace(field))
 		for _, value := range values {
 			value = strings.TrimSpace(value)
-			if seedanceAssetField(field) {
-				if err := appendSeedanceAssetReference(value, &ids, seen); err != nil {
+			mediaField := seedanceAssetField(field)
+			if (mediaField || seedanceAssetJSONContainer(field)) && len(value) > 0 && (value[0] == '{' || value[0] == '[') {
+				var parsed any
+				if err := common.Unmarshal([]byte(value), &parsed); err != nil {
 					return nil, err
 				}
-				continue
-			}
-			if !seedanceAssetJSONContainer(field) || (len(value) == 0 || (value[0] != '{' && value[0] != '[')) {
-				continue
-			}
-			parsed, parseErr := extractSeedanceAssetIDsFromJSON([]byte(value))
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			for _, assetID := range parsed {
-				if err := appendSeedanceAssetReference(seedanceAssetReferencePrefix+assetID, &ids, seen); err != nil {
+				// images 等表单数组的字符串成员仍是媒体引用，不能丢掉字段语义。
+				if err := collectSeedanceAssetReferences(parsed, mediaField, &ids, seen); err != nil {
+					return nil, err
+				}
+			} else if mediaField {
+				if err := appendSeedanceAssetReference(value, &ids, seen); err != nil {
 					return nil, err
 				}
 			}
@@ -414,19 +411,18 @@ func rewriteSeedanceRouteSnapshot(request pluginruntime.RouteRequestContext, pre
 func rewriteSeedanceRequestValue(value any, mediaField, jsonContainer bool, previousMapping, newMapping map[string]string) (any, error) {
 	switch current := value.(type) {
 	case string:
-		if mediaField {
-			rewritten, _, err := rewriteSeedanceAssetReference(current, previousMapping, newMapping)
-			return rewritten, err
-		}
 		trimmed := strings.TrimSpace(current)
-		if jsonContainer && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-			rewritten, changed, err := rewriteSeedanceJSON([]byte(trimmed), previousMapping, newMapping)
+		if (mediaField || jsonContainer) && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			rewritten, changed, err := rewriteSeedanceJSONValue(json.RawMessage(trimmed), mediaField, previousMapping, newMapping)
 			if err != nil {
 				return nil, err
 			}
 			if changed {
 				return string(rewritten), nil
 			}
+		} else if mediaField {
+			rewritten, _, err := rewriteSeedanceAssetReference(current, previousMapping, newMapping)
+			return rewritten, err
 		}
 	case map[string]any:
 		cloned := maps.Clone(current)
@@ -589,27 +585,12 @@ func rewriteSeedanceMultipart(c *gin.Context, previousMapping, newMapping map[st
 	changed := false
 	for field, values := range form.Value {
 		for index, value := range values {
-			if seedanceAssetField(field) {
-				rewritten, valueChanged, err := rewriteSeedanceAssetReference(value, previousMapping, newMapping)
-				if err != nil {
-					return nil, "", false, err
-				}
-				if valueChanged {
-					values[index] = rewritten
-					changed = true
-				}
-				continue
-			}
-			trimmed := strings.TrimSpace(value)
-			if !seedanceAssetJSONContainer(field) || len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
-				continue
-			}
-			rewritten, valueChanged, err := rewriteSeedanceJSON([]byte(value), previousMapping, newMapping)
+			rewritten, err := rewriteSeedanceRequestValue(value, seedanceAssetField(field), seedanceAssetJSONContainer(field), previousMapping, newMapping)
 			if err != nil {
 				return nil, "", false, err
 			}
-			if valueChanged {
-				values[index] = string(rewritten)
+			if text := rewritten.(string); text != value {
+				values[index] = text
 				changed = true
 			}
 		}
