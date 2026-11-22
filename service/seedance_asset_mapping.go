@@ -458,7 +458,7 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 
 	now := common.GetTimestamp()
 	leaseUntil := now + int64(seedanceAssetPollLease.Seconds())
-	if client.jsonAction || client.originREST {
+	if client.jsonAction || client.originREST || client.zzengineREST {
 		// 导入可能同步等待十分钟，租约必须覆盖请求期限，避免并发请求重复导入。
 		leaseUntil = now + int64((seedanceAssetJSONImportTimeout + seedanceAssetRequestTimeout).Seconds())
 	}

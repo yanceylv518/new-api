@@ -1271,7 +1271,7 @@ func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStrea
 }
 
 func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError) {
-	if respondOriginOceanSubmissionError(c, taskErr) {
+	if respondSeedanceAdapterSubmissionError(c, taskErr) {
 		return
 	}
 	status := http.StatusInternalServerError

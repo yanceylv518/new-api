@@ -20,11 +20,11 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 		return nil
 	}
 	// 共享别名可能被其他插件接受；只对本次解码通过的 Seedance 候选启用规则。
-	supported := pinned.Plugin != nil && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "anyllm" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart")
+	supported := pinned.Plugin != nil && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "anyllm" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart" || pinned.Plugin.Meta.Key == "zzengine")
 	if endpoint, exists := common.GetContextKeyType[jsplugin.PinnedEndpoint](c, jsplugin.ContextKeyPinnedEndpoint); exists && len(endpoint.Candidates) > 0 {
 		supported = false
 		for _, candidate := range endpoint.Candidates {
-			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart") {
+			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart" || candidate.Plugin.Meta.Key == "zzengine") {
 				supported = true
 				break
 			}
@@ -33,7 +33,7 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 	if route, exists := common.GetContextKeyType[jsplugin.PinnedRoute](c, jsplugin.ContextKeyPinnedRoute); exists {
 		supported = false
 		for _, candidate := range route.Bindings() {
-			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart") {
+			if candidate.Plugin != nil && (candidate.Plugin.Meta.Key == "doubao" || candidate.Plugin.Meta.Key == "anyllm" || candidate.Plugin.Meta.Key == "originocean" || candidate.Plugin.Meta.Key == "qstart" || candidate.Plugin.Meta.Key == "zzengine") {
 				supported = true
 				break
 			}
@@ -54,7 +54,8 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 		groups = service.GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
 	}
 	channelModels := make(map[int]string)
-	video := strings.HasPrefix(strings.ToLower(logical), "doubao-seedance-")
+	video := strings.HasPrefix(strings.ToLower(logical), "doubao-seedance-") ||
+		pinned.Plugin != nil && pinned.Plugin.Meta.Key == "zzengine" && strings.HasPrefix(strings.ToLower(logical), "seedance-")
 	for _, target := range model.ResolveTaskModelAliasesForGroups(pinned.Generation, publicModel, groups) {
 		if target.PluginKey == "originocean" && strings.EqualFold(target.Declared, "maas-doubao-seedance-2.0") {
 			channelModels[target.ChannelID] = "doubao-seedance-2-0-260128"
@@ -66,7 +67,8 @@ func prepareVideoRouting(c *gin.Context, publicModel string) error {
 			video = true
 			continue
 		}
-		if (target.PluginKey == "doubao" || target.PluginKey == "anyllm" || target.PluginKey == "originocean" || target.PluginKey == "qstart") && strings.HasPrefix(strings.ToLower(target.Declared), "doubao-seedance-") {
+		if ((target.PluginKey == "doubao" || target.PluginKey == "anyllm" || target.PluginKey == "originocean" || target.PluginKey == "qstart" || target.PluginKey == "zzengine") && strings.HasPrefix(strings.ToLower(target.Declared), "doubao-seedance-")) ||
+			(target.PluginKey == "zzengine" && strings.HasPrefix(strings.ToLower(target.Declared), "seedance-")) {
 			channelModels[target.ChannelID] = target.Declared
 			video = true
 		}

@@ -12,7 +12,7 @@ func (channel *Channel) matchesVideoRouting(publicModel string, filter dto.Chann
 	settings := channel.GetSetting()
 	if channel.Type != constant.ChannelTypeDoubaoVideo &&
 		!((channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI) &&
-			(settings.BindsTaskPlugin("doubao") || settings.BindsTaskPlugin("anyllm") || settings.BindsTaskPlugin("originocean") || settings.BindsTaskPlugin("qstart"))) {
+			(settings.BindsTaskPlugin("doubao") || settings.BindsTaskPlugin("anyllm") || settings.BindsTaskPlugin("originocean") || settings.BindsTaskPlugin("qstart") || settings.BindsTaskPlugin("zzengine"))) {
 		return true
 	}
 	if len(settings.VideoRoutingRules) == 0 {
@@ -26,7 +26,8 @@ func (channel *Channel) matchesVideoRouting(publicModel string, filter dto.Chann
 		logicalModel = target
 	}
 	// 规则只作用于视频，避免同一插件内的 Seedream 图片请求被筛掉。
-	if !strings.HasPrefix(strings.ToLower(logicalModel), "doubao-seedance-") {
+	if !strings.HasPrefix(strings.ToLower(logicalModel), "doubao-seedance-") &&
+		!(settings.BindsTaskPlugin("zzengine") && strings.HasPrefix(strings.ToLower(logicalModel), "seedance-")) {
 		return true
 	}
 	// 显式别名规则优先，未配置别名时继承该渠道对应原模型的路由条件。

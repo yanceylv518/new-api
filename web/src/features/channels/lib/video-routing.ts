@@ -28,8 +28,10 @@ export function videoRoutingModels(
         mapping = parsed as Record<string, unknown>
       }
     } catch {
-      return models.filter((model) =>
-        model.toLowerCase().startsWith('doubao-seedance-')
+      return models.filter(
+        (model) =>
+          model.toLowerCase().startsWith('doubao-seedance-') ||
+          model.toLowerCase().startsWith('seedance-')
       )
     }
   }
@@ -39,7 +41,10 @@ export function videoRoutingModels(
     const visited = new Set<string>()
     while (!visited.has(current)) {
       visited.add(current)
-      if (current.toLowerCase().startsWith('doubao-seedance-')) {
+      if (
+        current.toLowerCase().startsWith('doubao-seedance-') ||
+        current.toLowerCase().startsWith('seedance-')
+      ) {
         result.add(model)
         result.add(current)
       }

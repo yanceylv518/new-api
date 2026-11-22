@@ -2266,7 +2266,8 @@ export function ChannelMutateDrawer({
               key === 'doubao' ||
               key === 'anyllm' ||
               key === 'originocean' ||
-              key === 'qstart'
+              key === 'qstart' ||
+              key === 'zzengine'
           )) ||
         Boolean(formValues.video_routing_rules?.length)) && (
         <FormField
@@ -4292,9 +4293,13 @@ export function ChannelMutateDrawer({
                         />
                       </FormControl>
                       <FormDescription>
-                        {t(
-                          'Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.'
-                        )}
+                        {currentTaskPluginKey === 'zzengine'
+                          ? t(
+                              'Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.'
+                            )
+                          : t(
+                              'Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.'
+                            )}
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

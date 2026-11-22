@@ -781,13 +781,14 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 				pinned.Plugin = candidate.Plugin
 				pinned.Protocol = candidate.Protocol
 				pinned.Operation = candidate.Operation
+				pinned.MappedModel = ""
 				if len(candidate.ChannelIDs) > 0 {
 					pinned.MappedModel = candidate.Model
-					if protocolValue, exists := c.Get(jsplugin.ContextKeyProtocolRequest); exists {
-						if protocolContext, valid := protocolValue.(jsplugin.ProtocolRequestContext); valid {
-							protocolContext.UpstreamModel = candidate.Model
-							c.Set(jsplugin.ContextKeyProtocolRequest, protocolContext)
-						}
+				}
+				if protocolValue, exists := c.Get(jsplugin.ContextKeyProtocolRequest); exists {
+					if protocolContext, valid := protocolValue.(jsplugin.ProtocolRequestContext); valid {
+						protocolContext.UpstreamModel = pinned.MappedModel
+						c.Set(jsplugin.ContextKeyProtocolRequest, protocolContext)
 					}
 				}
 				c.Set(jsplugin.ContextKeyPinnedEndpoint, pinned)

@@ -7204,6 +7204,7 @@
     "Within validity period": "Within validity period",
     "Asset service URL": "URL сервиса материалов",
     "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.": "Укажите полный URL сервиса материалов. Путь не добавляется. Оставьте пустым, чтобы отключить приватные материалы для этого канала.",
+    "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.": "Укажите базовый URL шлюза. Пути к материалам добавляются автоматически. Оставьте пустым, чтобы отключить приватные материалы для этого канала.",
     "Enter a complete HTTP(S) URL without credentials, query, or fragment": "Укажите полный HTTP(S) URL без учётных данных, параметров запроса и фрагмента",
     "Deletion delayed": "Удаление заблокировано",
     "Retry deletion": "Повторить удаление",

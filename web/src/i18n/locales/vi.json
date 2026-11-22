@@ -7204,6 +7204,7 @@
     "Within validity period": "Within validity period",
     "Asset service URL": "URL dịch vụ tài nguyên",
     "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.": "Nhập URL đầy đủ của dịch vụ tài nguyên. Hệ thống không thêm đường dẫn. Để trống để tắt tài nguyên riêng tư trên kênh này.",
+    "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.": "Nhập URL gốc của cổng. Đường dẫn tài nguyên được thêm tự động. Để trống để tắt tài nguyên riêng tư trên kênh này.",
     "Enter a complete HTTP(S) URL without credentials, query, or fragment": "Nhập URL HTTP(S) đầy đủ không chứa thông tin đăng nhập, tham số truy vấn hoặc đoạn định danh",
     "Deletion delayed": "Xóa bị gián đoạn",
     "Retry deletion": "Thử xóa lại",

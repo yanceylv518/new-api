@@ -28,6 +28,7 @@ var (
 
 const (
 	taskUpstreamErrorHeadersKey = "task_upstream_error_headers"
+	taskUpstreamErrorModelKey   = "task_upstream_error_model"
 	taskUpstreamRetryErrorKey   = "task_upstream_retry_error"
 )
 
@@ -37,8 +38,8 @@ type taskUpstreamErrorSnapshot struct {
 	body        string
 }
 
-// 保留 OriginOcean 非原生入口的上游提交错误，结果不确定时公开本站任务 ID。
-func respondOriginOceanSubmissionError(c *gin.Context, taskErr *dto.TaskError) bool {
+// 保留 Seedance 适配器非原生入口的上游提交错误，结果不确定时公开本站任务 ID。
+func respondSeedanceAdapterSubmissionError(c *gin.Context, taskErr *dto.TaskError) bool {
 	if taskErr == nil || taskErr.LocalError || taskErr.Code != "fail_to_fetch_task" || taskErr.Error == nil ||
 		taskErr.StatusCode < http.StatusBadRequest || taskErr.StatusCode > 599 {
 		return false
@@ -47,7 +48,7 @@ func respondOriginOceanSubmissionError(c *gin.Context, taskErr *dto.TaskError) b
 		return false
 	}
 	pinned, ok := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin)
-	if !ok || pinned.Plugin == nil || pinned.Plugin.Meta.Key != "originocean" {
+	if !ok || pinned.Plugin == nil || (pinned.Plugin.Meta.Key != "originocean" && pinned.Plugin.Meta.Key != "zzengine") {
 		return false
 	}
 	route, native := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute)
@@ -72,7 +73,7 @@ func writeTaskUpstreamError(c *gin.Context, status int, raw string, extra taskUp
 	if !ok {
 		return false
 	}
-	if !json.Valid([]byte(raw)) {
+	if !json.Valid([]byte(sanitized)) {
 		c.Data(status, "text/plain; charset=utf-8", []byte(sanitized))
 	} else {
 		c.Data(status, "application/json; charset=utf-8", []byte(sanitized))
@@ -82,8 +83,17 @@ func writeTaskUpstreamError(c *gin.Context, status int, raw string, extra taskUp
 
 func sanitizeTaskUpstreamMessage(c *gin.Context, raw string, extra taskUpstreamErrorContext) (string, bool) {
 	redactor := newTaskUpstreamErrorRedactor(c, extra)
+	pinned, _ := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin)
+	if route, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok && route.Plugin != nil {
+		pinned.Plugin = route.Plugin
+	}
+	zzengine := pinned.Plugin != nil && pinned.Plugin.Meta.Key == "zzengine"
 	if !json.Valid([]byte(raw)) {
-		return redactor.text(raw, ""), true
+		message := redactor.text(raw, "")
+		if zzengine {
+			return marshalZZEngineAPIError(message)
+		}
+		return message, true
 	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.UseNumber()
@@ -92,6 +102,9 @@ func sanitizeTaskUpstreamMessage(c *gin.Context, raw string, extra taskUpstreamE
 		return "", false
 	}
 	sanitized := redactor.value(body, "", 0)
+	if zzengine {
+		return marshalZZEngineAPIError(sanitized)
+	}
 	if reflect.DeepEqual(body, sanitized) {
 		return raw, true
 	}
@@ -100,6 +113,43 @@ func sanitizeTaskUpstreamMessage(c *gin.Context, raw string, extra taskUpstreamE
 		return "", false
 	}
 	return string(encoded), true
+}
+
+// 上游诊断字段不进入方舟错误体；只保留错误详情和官方可选的 type、param。
+func marshalZZEngineAPIError(value any) (string, bool) {
+	problem := map[string]any{"code": "upstream_error", "message": "Upstream request failed"}
+	switch body := value.(type) {
+	case string:
+		if strings.TrimSpace(body) != "" {
+			problem["message"] = body
+		}
+	case map[string]any:
+		if message, ok := body["message"].(string); ok && strings.TrimSpace(message) != "" {
+			problem["message"] = message
+		}
+		source := body
+		if failure, ok := body["error"].(map[string]any); ok {
+			source = failure
+		}
+		for _, field := range []string{"code", "message", "type", "param"} {
+			value, exists := source[field]
+			if !exists {
+				continue
+			}
+			if text, ok := value.(string); ok && (field == "param" || strings.TrimSpace(text) != "") {
+				problem[field] = text
+			} else if code, ok := value.(json.Number); ok && field == "code" {
+				problem[field] = string(code)
+			} else if field == "param" && value == nil {
+				problem[field] = nil
+			}
+		}
+		if message, ok := body["error"].(string); ok && strings.TrimSpace(message) != "" {
+			problem["message"] = message
+		}
+	}
+	encoded, err := common.Marshal(map[string]any{"error": problem})
+	return string(encoded), err == nil
 }
 
 // 提交响应已被受理但解析失败时，仅展示明确的业务错误，不推断任务或退款状态。
@@ -242,7 +292,7 @@ func newTaskUpstreamErrorRedactor(c *gin.Context, extra taskUpstreamErrorContext
 	if redactor.publicModel == "" {
 		redactor.publicModel = common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 	}
-	redactor.privateModels = append(redactor.privateModels, extra.privateModel)
+	redactor.privateModels = append(redactor.privateModels, extra.privateModel, c.GetString(taskUpstreamErrorModelKey))
 	for _, headers := range []map[string]any{common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride), c.GetStringMap(taskUpstreamErrorHeadersKey), extra.headerOverride} {
 		for name, rawValue := range headers {
 			name = strings.ToLower(strings.TrimSpace(name))

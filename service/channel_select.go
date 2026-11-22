@@ -40,7 +40,43 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 		TaskPluginChannelTypes: channelTypes,
 		TaskPluginKeys:         pluginKeys,
 		TaskPluginChannelIDs:   pinnedTaskPluginChannelIDs(c),
+		TaskPluginBindings:     pinnedMixedTaskPluginBindings(c),
 	})
+}
+
+// 普通候选与别名候选并存时，别名的渠道限制不能被其他插件的普通候选清空。
+func pinnedMixedTaskPluginBindings(c *gin.Context) []dto.TaskPluginChannelBinding {
+	var bindings []dto.TaskPluginChannelBinding
+	restricted, unrestricted := false, false
+	appendBinding := func(plugin *jsplugin.LoadedPlugin, channelIDs []int) {
+		if plugin == nil {
+			return
+		}
+		binding := dto.TaskPluginChannelBinding{PluginKey: plugin.Meta.Key, ChannelTypes: plugin.Meta.ChannelTypes}
+		if len(channelIDs) == 0 {
+			unrestricted = true
+		} else {
+			restricted = true
+			binding.ChannelIDs = make(map[int]struct{}, len(channelIDs))
+			for _, id := range channelIDs {
+				binding.ChannelIDs[id] = struct{}{}
+			}
+		}
+		bindings = append(bindings, binding)
+	}
+	if pinned, ok := common.GetContextKeyType[jsplugin.PinnedRoute](c, jsplugin.ContextKeyPinnedRoute); ok {
+		for _, candidate := range pinned.Candidates {
+			appendBinding(candidate.Plugin, candidate.ChannelIDs)
+		}
+	} else if pinned, ok := common.GetContextKeyType[jsplugin.PinnedEndpoint](c, jsplugin.ContextKeyPinnedEndpoint); ok {
+		for _, candidate := range pinned.Candidates {
+			appendBinding(candidate.Plugin, candidate.ChannelIDs)
+		}
+	}
+	if !restricted || !unrestricted {
+		return nil
+	}
+	return bindings
 }
 
 func pinnedTaskPluginChannelIDs(c *gin.Context) map[int]struct{} {

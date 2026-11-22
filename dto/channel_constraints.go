@@ -44,6 +44,13 @@ const (
 	FilterVideoRouting         ChannelFilterKind = "video_routing"
 )
 
+// TaskPluginChannelBinding 保留各插件的独立范围；ChannelIDs 为空表示该插件的普通候选。
+type TaskPluginChannelBinding struct {
+	PluginKey    string
+	ChannelTypes []int
+	ChannelIDs   map[int]struct{}
+}
+
 type ChannelFilter struct {
 	VideoRoutingResolution          string
 	VideoRoutingModel               string
@@ -54,6 +61,7 @@ type ChannelFilter struct {
 	TaskPluginKeys                  []string
 	TaskPluginChannelTypes          []int
 	TaskPluginChannelIDs            map[int]struct{}
+	TaskPluginBindings              []TaskPluginChannelBinding
 	SeedanceAssetAccountFingerprint string
 	SeedanceAssetKeyFingerprint     string
 	SeedanceAssetReadyKeys          map[int]map[string]map[string]struct{}

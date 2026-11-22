@@ -7204,6 +7204,7 @@
     "Within validity period": "Within validity period",
     "Asset service URL": "Asset service URL",
     "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.": "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.",
+    "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.": "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.",
     "Enter a complete HTTP(S) URL without credentials, query, or fragment": "Enter a complete HTTP(S) URL without credentials, query, or fragment",
     "Deletion delayed": "Deletion delayed",
     "Retry deletion": "Retry deletion",

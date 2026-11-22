@@ -123,6 +123,24 @@ func channelMatchesFilter(ch *Channel, modelName, abilityModel, group string, fi
 				return false
 			}
 		}
+		if len(filter.TaskPluginBindings) > 0 {
+			setting := ch.GetSetting()
+			for _, binding := range filter.TaskPluginBindings {
+				if len(binding.ChannelIDs) > 0 {
+					if _, allowed := binding.ChannelIDs[ch.Id]; !allowed {
+						continue
+					}
+				}
+				if ch.Type == constant.ChannelTypeTaskPlugin || ch.Type == constant.ChannelTypeNewAPI {
+					if setting.BindsTaskPlugin(binding.PluginKey) {
+						return true
+					}
+				} else if slices.Contains(binding.ChannelTypes, ch.Type) {
+					return true
+				}
+			}
+			return false
+		}
 		if filter.TaskPluginKey == "" {
 			return ch.Type != constant.ChannelTypeTaskPlugin
 		}

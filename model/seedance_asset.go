@@ -36,6 +36,9 @@ func SeedanceAssetAccountFingerprint(channel *Channel, keyFingerprint string) st
 	if channel.Type == constant.ChannelTypeTaskPlugin && settings.TaskPluginKey == "originocean" {
 		return seedanceAssetAccountFingerprint(baseURL, "origin-rest", identity)
 	}
+	if channel.Type == constant.ChannelTypeTaskPlugin && settings.TaskPluginKey == "zzengine" {
+		return seedanceAssetAccountFingerprint(baseURL, "zzengine-assets", identity)
+	}
 	if legacyBase, found := strings.CutSuffix(baseURL, "/v2/assets"); found {
 		return seedanceAssetAccountFingerprint(legacyBase, "/v2/assets", identity)
 	}
@@ -58,6 +61,8 @@ func SeedanceAssetAccountFingerprints(channel *Channel, keyFingerprint string) [
 		protocol = "json-action"
 	} else if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "originocean" {
 		protocol = "origin-rest"
+	} else if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "zzengine" {
+		protocol = "zzengine-assets"
 	}
 	for _, endpoint := range []string{baseURL, strings.TrimRight(baseURL, "/")} {
 		fingerprint := seedanceAssetAccountFingerprint(endpoint, protocol, keyFingerprint)

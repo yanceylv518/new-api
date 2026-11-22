@@ -244,7 +244,7 @@ func GenerateTaskID() string {
 
 // PublicTaskPlatform 将内部协议适配器归入原模型平台，不向用户公开供应商身份。
 func PublicTaskPlatform(platform constant.TaskPlatform) constant.TaskPlatform {
-	if platform == "anyllm" || platform == "originocean" || platform == "qstart" {
+	if platform == "anyllm" || platform == "originocean" || platform == "qstart" || platform == "zzengine" {
 		return "doubao"
 	}
 	return platform
@@ -253,7 +253,7 @@ func PublicTaskPlatform(platform constant.TaskPlatform) constant.TaskPlatform {
 // taskPlatformsForFilter 让公开平台筛选覆盖适配器任务，仍允许管理员指定内部平台。
 func taskPlatformsForFilter(platform constant.TaskPlatform) []constant.TaskPlatform {
 	if platform == "doubao" {
-		return []constant.TaskPlatform{"doubao", "anyllm", "originocean", "qstart"}
+		return []constant.TaskPlatform{"doubao", "anyllm", "originocean", "qstart", "zzengine"}
 	}
 	return []constant.TaskPlatform{platform}
 }
@@ -395,7 +395,7 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 
 func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQueryParams) []*Task {
 	// 普通用户仅使用公开平台名，不能借内部适配器名称探查任务来源。
-	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" || queryParams.Platform == "qstart" {
+	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" || queryParams.Platform == "qstart" || queryParams.Platform == "zzengine" {
 		return nil
 	}
 	var tasks []*Task
@@ -958,7 +958,7 @@ func TaskCountAllTasks(queryParams SyncTaskQueryParams) int64 {
 
 // TaskCountAllUserTask returns total tasks for given user
 func TaskCountAllUserTask(userId int, queryParams SyncTaskQueryParams) int64 {
-	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" || queryParams.Platform == "qstart" {
+	if queryParams.Platform == "anyllm" || queryParams.Platform == "originocean" || queryParams.Platform == "qstart" || queryParams.Platform == "zzengine" {
 		return 0
 	}
 	var total int64

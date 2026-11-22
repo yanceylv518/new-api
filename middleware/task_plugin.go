@@ -154,7 +154,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				queryModel = value
 			}
 			if alias, bindings := taskPluginNativeAliasBindings(c, pinned, queryModel); len(bindings) > 0 {
-				listAliasModel = alias
+				if bindings[0].DeclaredModel != "" {
+					listAliasModel = alias
+				}
 				pinned.Plugin, pinned.Route, pinned.DeclaredModel = bindings[0].Plugin, bindings[0].Route, bindings[0].DeclaredModel
 				c.Set(pluginruntime.ContextKeyPinnedRoute, pinned)
 				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: pinned.Generation, Plugin: pinned.Plugin})
@@ -667,10 +669,10 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 			if claimedModel != declared {
 				rewriteTo = declared
 			}
-		} else if alias, bindings := taskPluginProtocolAliasBindings(c, generation, claimedModel); len(bindings) > 0 {
+		}
+		if alias, bindings := taskPluginProtocolAliasBindings(c, generation, claimedModel); len(bindings) > 0 {
 			lookupModel = bindings[0].Model
 			pinModel = alias
-			mappedModel = bindings[0].Model
 			aliasBindings = bindings
 			if claimedModel != alias {
 				rewriteTo = alias
@@ -737,6 +739,9 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 			binding = candidates[0]
 		}
 
+		if len(binding.ChannelIDs) > 0 {
+			mappedModel = binding.Model
+		}
 		pin := pluginruntime.PinnedPlugin{Generation: generation, Plugin: binding.Plugin}
 		pinnedEndpoint := pluginruntime.PinnedEndpoint{
 			Generation:  generation,
@@ -929,7 +934,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		if len(candidates) == 0 {
 			candidates = []pluginruntime.ProtocolBinding{{Plugin: pinned.Plugin, Protocol: pinned.Protocol, Operation: pinned.Operation, Model: pinned.Model}}
 		}
-		if pinned.MappedModel != "" {
+		if slices.ContainsFunc(candidates, func(candidate pluginruntime.ProtocolBinding) bool { return len(candidate.ChannelIDs) > 0 }) {
 			if err := validateTaskAliasModelFields(requestContext); err != nil {
 				abortWithOpenAiMessage(c, http.StatusBadRequest, err.Error())
 				return
@@ -947,6 +952,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			candidateContext.RouteRequestContext = requestContext
 			candidateContext.Protocol = candidate.Protocol
 			candidateContext.Operation = candidate.Operation.Name
+			candidateContext.UpstreamModel = ""
 			if len(candidate.ChannelIDs) > 0 {
 				candidateContext.RouteRequestContext, err = requestContext.WithModel(pinned.Model, candidate.Model)
 				if err != nil {
@@ -987,7 +993,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			} else if model, _ := result["model"].(string); strings.TrimSpace(model) == "" {
 				reason = "invalid_model"
 				detail = "decoded request is missing a model"
-			} else if model != pinned.Model || (pinned.MappedModel == "" && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
+			} else if model != pinned.Model || (len(candidate.ChannelIDs) == 0 && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
 				reason = "resolved_model_not_owned"
 				detail = fmt.Sprintf("model %q is not served by this plugin", model)
 			}
@@ -1027,6 +1033,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		pinned.Plugin = accepted[0].Plugin
 		pinned.Protocol = accepted[0].Protocol
 		pinned.Operation = accepted[0].Operation
+		pinned.MappedModel = ""
 		if len(accepted[0].ChannelIDs) > 0 {
 			pinned.MappedModel = accepted[0].Model
 		}
@@ -1638,7 +1645,7 @@ func renderTaskPluginQuery(
 		time.Since(renderStarted).Milliseconds(),
 	)
 	path, compatible := SeedanceCompatVideoRequestPath(c.Request)
-	if (compatible || strings.HasPrefix(path, "/doubao/api/v3/contents/generations/tasks/")) && !multiple && pinned.Route.Protocol == "seedance-v3" && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart") {
+	if (compatible || strings.HasPrefix(path, "/doubao/api/v3/contents/generations/tasks/")) && !multiple && pinned.Route.Protocol == "seedance-v3" && (pinned.Plugin.Meta.Key == "doubao" || pinned.Plugin.Meta.Key == "originocean" || pinned.Plugin.Meta.Key == "qstart" || pinned.Plugin.Meta.Key == "zzengine") {
 		rendered, ok := result.(map[string]any)
 		if !ok {
 			abortTaskPluginRouteError(c, http.StatusInternalServerError)
@@ -1753,6 +1760,10 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 	message := sanitized.Message
 	if requestID != "" {
 		message = common.MessageWithRequestId(sanitized.Message, requestID)
+	}
+	if pinned.Plugin.Meta.Key == "zzengine" {
+		c.JSON(sanitized.HTTPStatus, gin.H{"error": gin.H{"code": sanitized.Code, "message": message}})
+		return true
 	}
 	c.JSON(sanitized.HTTPStatus, &dto.TaskError{
 		Code:       sanitized.Code,

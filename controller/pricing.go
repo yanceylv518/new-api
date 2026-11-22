@@ -50,7 +50,7 @@ func pricingForViewer(pricing []model.Pricing, admin bool) []model.Pricing {
 		}
 		variants := append([]model.PricingPluginVariant(nil), pricing[i].BillingPluginVariants...)
 		for j := range variants {
-			if variants[j].PluginKey == "anyllm" || variants[j].PluginKey == "originocean" || variants[j].PluginKey == "qstart" {
+			if variants[j].PluginKey == "anyllm" || variants[j].PluginKey == "originocean" || variants[j].PluginKey == "qstart" || variants[j].PluginKey == "zzengine" {
 				variants[j].PluginKey = fmt.Sprintf("video-%d", j+1)
 				variants[j].PluginName, variants[j].Icon = "Doubao Video", "text:SD"
 			}

@@ -44,7 +44,8 @@ export function supportsSeedanceAssetURL(
     ? pluginKey === 'doubao' ||
       pluginKey === 'anyllm' ||
       pluginKey === 'originocean' ||
-      pluginKey === 'qstart'
+      pluginKey === 'qstart' ||
+      pluginKey === 'zzengine'
     : LEGACY_TASK_PLUGIN_KEYS[channelType] === 'doubao'
 }
 

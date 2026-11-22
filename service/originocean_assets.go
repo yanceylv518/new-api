@@ -66,7 +66,7 @@ var (
 )
 
 // 普通素材组由本站持久化，上传使用上游账号的当前素材库。
-func createOriginLocalAssetGroup(groupType string, response any) error {
+func createLocalSeedanceAssetGroup(groupType string, response any) error {
 	if groupType != "" && !strings.EqualFold(groupType, "AIGC") {
 		return errors.New("real-person groups require a validation session")
 	}
@@ -74,7 +74,7 @@ func createOriginLocalAssetGroup(groupType string, response any) error {
 	if err != nil {
 		return err
 	}
-	payload, err := common.Marshal(map[string]any{"Result": map[string]string{"Id": "group-local-" + id}})
+	payload, err := common.Marshal(map[string]any{"Result": map[string]string{"Id": seedanceLocalGroupIDPrefix + id}})
 	if err != nil {
 		return err
 	}

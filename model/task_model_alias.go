@@ -178,9 +178,7 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 			if _, exposed := inModels[alias]; !exposed {
 				continue
 			}
-			if _, declared := generation.CanonicalModel(alias); declared {
-				continue
-			}
+			publicModel, globallyDeclared := generation.CanonicalModel(alias)
 			tail, cyclic := followChannelModelMapping(modelMap, alias)
 			if cyclic {
 				common.SysError(fmt.Sprintf("task alias mapping cycle dropped: channel=%d key=%q", channel.Id, alias))
@@ -205,6 +203,10 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 				if !bound {
 					continue
 				}
+				// 新插件声明同名模型不能吞掉旧渠道别名；已支持该名称的插件仍自行处理模型映射。
+				if globallyDeclared && slices.Contains(candidate.Meta.Models, publicModel) {
+					continue
+				}
 				for _, group := range channel.GetGroups() {
 					if group == "" {
 						continue
@@ -216,6 +218,10 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 						Alias: alias, Declared: declared, PluginKey: candidate.Meta.Key, ChannelID: channel.Id,
 					})
 				}
+			}
+			// 同名映射仅补充渠道路由，不能覆盖直接模型的全局定价身份。
+			if globallyDeclared {
+				continue
 			}
 			draft := drafts[fold]
 			if draft == nil {

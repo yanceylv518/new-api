@@ -7206,6 +7206,7 @@
     "Within validity period": "有效期内",
     "Asset service URL": "素材服務位址",
     "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.": "填寫完整素材介面位址，程式不附加路徑。留空則此渠道不使用私域素材庫。",
+    "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.": "填寫閘道基礎位址，素材介面路徑會自動附加。留空則此渠道不使用私域素材庫。",
     "Enter a complete HTTP(S) URL without credentials, query, or fragment": "請填寫完整 HTTP(S) 位址，不含帳號密碼、查詢參數或片段",
     "Deletion delayed": "刪除受阻",
     "Retry deletion": "重試刪除",

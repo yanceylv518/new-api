@@ -686,6 +686,7 @@ func executeTaskSubmissionWith(
 		if taskErr != nil && ((!taskErr.LocalError && taskErr.Code == "fail_to_fetch_task") ||
 			taskErr.Code == "plugin_submit_response_failed" || taskErr.Code == "plugin_submit_response_invalid") {
 			c.Set(taskUpstreamErrorHeadersKey, relaycommon.GetEffectiveHeaderOverride(relayInfo))
+			c.Set(taskUpstreamErrorModelKey, relayInfo.UpstreamModelName)
 		}
 		if taskErr != nil && taskErr.LocalError && taskErr.Code == "task_submission_intent_failed" {
 			taskErr.NoRetry = true
@@ -741,7 +742,7 @@ func executeTaskSubmissionWith(
 				if strings.TrimSpace(raw) != "" {
 					if body, valid := sanitizeTaskUpstreamMessage(c, raw, taskUpstreamErrorContext{}); valid {
 						contentType := "text/plain; charset=utf-8"
-						if json.Valid([]byte(raw)) {
+						if json.Valid([]byte(body)) {
 							contentType = "application/json; charset=utf-8"
 						}
 						c.Set(taskUpstreamRetryErrorKey, taskUpstreamErrorSnapshot{status: taskErr.StatusCode, contentType: contentType, body: body})
@@ -1031,7 +1032,7 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 			}
 		}
 	}
-	if respondOriginOceanSubmissionError(c, taskErr) {
+	if respondSeedanceAdapterSubmissionError(c, taskErr) {
 		return
 	}
 	if pinned, ok := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin); !seedance && ok && pinned.Plugin != nil && pinned.Plugin.Engine.HasExport("publicErrorMessage") {

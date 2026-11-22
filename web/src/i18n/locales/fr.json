@@ -7204,6 +7204,7 @@
     "Within validity period": "Within validity period",
     "Asset service URL": "URL du service de médias",
     "Enter the complete asset endpoint. No path is added. Leave blank to disable private assets on this channel.": "Saisissez l’URL complète du service de médias. Aucun chemin n’est ajouté. Laissez vide pour désactiver les médias privés sur ce canal.",
+    "Enter the gateway base URL. Asset paths are added automatically. Leave blank to disable private assets on this channel.": "Saisissez l’URL de base de la passerelle. Les chemins des médias sont ajoutés automatiquement. Laissez vide pour désactiver les médias privés sur ce canal.",
     "Enter a complete HTTP(S) URL without credentials, query, or fragment": "Saisissez une URL HTTP(S) complète sans identifiants, paramètres ni fragment",
     "Deletion delayed": "Suppression bloquée",
     "Retry deletion": "Réessayer la suppression",

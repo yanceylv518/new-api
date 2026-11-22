@@ -33,9 +33,6 @@ func taskPluginAliasesForRequest(c *gin.Context, generation *jsplugin.RoutingGen
 	if generation == nil || name == "" {
 		return nil
 	}
-	if _, declared := generation.CanonicalModel(name); declared {
-		return nil
-	}
 	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	groups := []string{usingGroup}
 	if usingGroup == "auto" {
@@ -71,7 +68,20 @@ func taskPluginNativeAliasBindings(c *gin.Context, pinned jsplugin.PinnedRoute, 
 	if len(bindings) == 0 {
 		return "", nil
 	}
-	return targets[0].Alias, bindings
+	alias := targets[0].Alias
+	if declared, exists := pinned.Generation.CanonicalModel(alias); exists {
+		alias = declared
+		for _, candidate := range pinned.Bindings() {
+			if candidate.Plugin != nil && slices.Contains(candidate.Plugin.Meta.Models, declared) &&
+				(len(candidate.Route.Models) == 0 || slices.Contains(candidate.Route.Models, declared)) {
+				bindings = append(bindings, candidate)
+			}
+		}
+		slices.SortStableFunc(bindings, func(left, right jsplugin.RouteBinding) int {
+			return cmp.Compare(left.Plugin.Meta.Key, right.Plugin.Meta.Key)
+		})
+	}
+	return alias, bindings
 }
 
 func taskPluginProtocolAliasBindings(c *gin.Context, generation *jsplugin.RoutingGeneration, name string) (string, []jsplugin.ProtocolBinding) {
@@ -96,13 +106,18 @@ func taskPluginProtocolAliasBindings(c *gin.Context, generation *jsplugin.Routin
 	if len(bindings) == 0 {
 		return "", nil
 	}
+	alias := targets[0].Alias
+	if declared, exists := generation.CanonicalModel(alias); exists {
+		alias = declared
+		bindings = append(bindings, generation.LookupEndpointCandidates(c.Request.Method, c.Request.URL.Path, declared)...)
+	}
 	slices.SortStableFunc(bindings, func(left, right jsplugin.ProtocolBinding) int {
 		if order := cmp.Compare(left.Plugin.Meta.Key, right.Plugin.Meta.Key); order != 0 {
 			return order
 		}
 		return cmp.Compare(left.Model, right.Model)
 	})
-	return targets[0].Alias, bindings
+	return alias, bindings
 }
 
 // rewriteTaskPluginJSONModel patches the top-level JSON "model" field and

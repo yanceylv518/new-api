@@ -119,11 +119,12 @@ func requireMeasuredVideoUsage(task *model.Task, result *relaycommon.TaskInfo) e
 	}
 	// 未声明的上游接入点按提交模型识别；明确的图片模型不继承视频要求。
 	seedance := strings.HasPrefix(upstreamModel, "doubao-seedance-") ||
+		(plugin == "zzengine" && (strings.HasPrefix(upstreamModel, "seedance-") || strings.HasPrefix(originModel, "seedance-"))) ||
 		(plugin == "originocean" && (upstreamModel == "maas-doubao-seedance-2.0" || upstreamModel == "maas-doubao-seedance-2.5" || upstreamModel == "wb-seedance-2-5" ||
 			originModel == "maas-doubao-seedance-2.0" || originModel == "maas-doubao-seedance-2.5" || originModel == "wb-seedance-2-5")) ||
 		(!strings.HasPrefix(upstreamModel, "doubao-seedream-") && strings.HasPrefix(originModel, "doubao-seedance-"))
 	required := []string{}
-	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean" || plugin == "qstart") && seedance {
+	if (plugin == "doubao" || plugin == "anyllm" || plugin == "originocean" || plugin == "qstart" || plugin == "zzengine") && seedance {
 		if keys["tokens"] || discountUses("task_tokens") {
 			required = append(required, "tokens")
 		}

@@ -1053,14 +1053,14 @@ func (channel *Channel) ValidateSettings() error {
 	}
 	if len(channelParams.VideoRoutingRules) > 0 && channel.Type != constant.ChannelTypeDoubaoVideo &&
 		!((channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI) &&
-			(channelParams.BindsTaskPlugin("doubao") || channelParams.BindsTaskPlugin("anyllm") || channelParams.BindsTaskPlugin("originocean") || channelParams.BindsTaskPlugin("qstart"))) {
+			(channelParams.BindsTaskPlugin("doubao") || channelParams.BindsTaskPlugin("anyllm") || channelParams.BindsTaskPlugin("originocean") || channelParams.BindsTaskPlugin("qstart") || channelParams.BindsTaskPlugin("zzengine"))) {
 		return errors.New("video routing rules are only supported by Seedance video plugins")
 	}
 	if err := channelParams.ValidateSeedanceAssetURL(); err != nil {
 		return err
 	}
 	if (channelParams.SeedanceAssetURL != "" || channelParams.SeedanceAssetShareGroup != "") && channel.Type != constant.ChannelTypeDoubaoVideo &&
-		!(channel.Type == constant.ChannelTypeTaskPlugin && (channelParams.TaskPluginKey == "doubao" || channelParams.TaskPluginKey == "anyllm" || channelParams.TaskPluginKey == "originocean" || channelParams.TaskPluginKey == "qstart")) {
+		!(channel.Type == constant.ChannelTypeTaskPlugin && (channelParams.TaskPluginKey == "doubao" || channelParams.TaskPluginKey == "anyllm" || channelParams.TaskPluginKey == "originocean" || channelParams.TaskPluginKey == "qstart" || channelParams.TaskPluginKey == "zzengine")) {
 		return errors.New("seedance_asset_url is only supported by Seedance video plugins")
 	}
 	channelOtherSettings := &dto.ChannelOtherSettings{}

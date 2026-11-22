@@ -42,11 +42,12 @@ type SeedanceAssetClient struct {
 	sharedAccount       bool
 	jsonAction          bool
 	originREST          bool
+	zzengineREST        bool
 }
 
 // UsesLocalAssetID 避免将上游素材 URI 作为本站公开 ID。
 func (client *SeedanceAssetClient) UsesLocalAssetID() bool {
-	return client != nil && client.originREST
+	return client != nil && (client.originREST || client.zzengineREST)
 }
 
 // ForSeedanceModel 对未配置共享组的渠道区分模型及密钥。
@@ -87,7 +88,9 @@ const (
 	seedanceAssetURLStoreTimeout    = 20 * time.Minute
 	seedanceAssetResponseBodyLimit  = 1 << 20
 	seedanceAssetErrorPreviewLimit  = 4096
+	seedanceAssetIDMaxLength        = 128
 	seedanceNativeGroupIDPrefix     = "group-"
+	seedanceLocalGroupIDPrefix      = "group-local-"
 )
 
 // privateAssetOSSStorageFactory 为素材流程提供统一的存储客户端创建入口。
@@ -723,6 +726,7 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 		sharedAccount:       settings.SeedanceAssetShareGroup != "",
 		jsonAction:          settings.TaskPluginKey == "anyllm",
 		originREST:          settings.TaskPluginKey == "originocean",
+		zzengineREST:        settings.TaskPluginKey == "zzengine",
 	}, nil
 }
 
@@ -888,14 +892,21 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		ctx = context.Background()
 	}
 	requestTimeout := seedanceAssetRequestTimeout
-	if client.jsonAction && action == "CreateAsset" {
-		// JSON Action 素材协议的导入同步等待处理，客户端期限按协议保留十分钟。
+	defaultAsset := client.zzengineREST && action == "CreateDefaultAsset"
+	if client.jsonAction && action == "CreateAsset" || defaultAsset {
+		// 导入可能同步等待处理，客户端期限与副本创建租约一致。
 		requestTimeout = seedanceAssetJSONImportTimeout
 	}
 	// 请求级截止时间覆盖直连、代理、响应头及响应体读取，不依赖通用 Relay 超时。
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	requestURL := client.baseURL
+	if client.zzengineREST {
+		requestURL = strings.TrimRight(requestURL, "/") + "/api/assets/"
+		if defaultAsset {
+			requestURL = strings.TrimRight(client.baseURL, "/") + "/api/v1/asset/create"
+		}
+	}
 	parsedURL, err := url.Parse(requestURL)
 	if err != nil {
 		return err
@@ -920,7 +931,7 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		if err != nil {
 			return err
 		}
-	} else {
+	} else if !defaultAsset {
 		query := parsedURL.Query()
 		query.Set("Action", action)
 		query.Set("Version", "2024-01-01")
@@ -959,6 +970,42 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 	}
 	if len(raw) > seedanceAssetResponseBodyLimit {
 		return fmt.Errorf("seedance asset API response body exceeds %d bytes", seedanceAssetResponseBodyLimit)
+	}
+	if defaultAsset {
+		var created struct {
+			Code    *int   `json:"code"`
+			Message string `json:"msg"`
+			Data    struct {
+				AssetID string `json:"asset_id"`
+			} `json:"data"`
+		}
+		decodeErr := common.Unmarshal(raw, &created)
+		if decodeErr == nil && created.Code != nil && *created.Code != 0 {
+			message := strings.TrimSpace(strings.ReplaceAll(created.Message, client.apiKey, "[redacted]"))
+			if message == "" {
+				message = "asset service rejected the request"
+			}
+			return &seedanceAssetUpstreamError{
+				code: fmt.Sprint(*created.Code), message: message,
+				action: action, httpStatus: resp.StatusCode,
+			}
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return seedanceAssetHTTPError(resp.StatusCode, raw, client.apiKey)
+		}
+		if decodeErr != nil {
+			return fmt.Errorf("%w: %w", errSeedanceAssetResponse, decodeErr)
+		}
+		assetID := strings.TrimSpace(created.Data.AssetID)
+		if created.Code == nil || assetID == "" || len(assetID) > seedanceAssetIDMaxLength {
+			return fmt.Errorf("%w: asset service returned no valid asset ID", errSeedanceAssetResponse)
+		}
+		// 上游 group_id 属于账号默认库，不写入本站组映射，避免组清理误删共享库。
+		payload, err := common.Marshal(map[string]any{"Result": map[string]string{"Id": assetID}})
+		if err != nil {
+			return err
+		}
+		return common.Unmarshal(payload, response)
 	}
 	var envelope seedanceAssetResponseEnvelope
 	decodeErr := common.Unmarshal(raw, &envelope)
@@ -1302,7 +1349,14 @@ func (client *SeedanceAssetClient) CreateSeedanceAsset(ctx context.Context, grou
 		return client.createOriginAsset(ctx, sourceURL, assetType, name)
 	}
 	var response seedanceAssetResponse
-	err := client.call(ctx, "CreateAsset", map[string]string{"GroupId": groupID, "URL": sourceURL, "AssetType": assetType, "Name": name}, &response)
+	action := "CreateAsset"
+	request := map[string]string{"GroupId": groupID, "URL": sourceURL, "AssetType": assetType, "Name": name}
+	if client.zzengineREST && strings.HasPrefix(groupID, seedanceLocalGroupIDPrefix) {
+		// 普通素材使用默认库；已认证真人组仍走携带 GroupId 的 Action，不降级报备。
+		action = "CreateDefaultAsset"
+		request = map[string]string{"url": sourceURL, "asset_type": assetType, "name": name}
+	}
+	err := client.call(ctx, action, request, &response)
 	if err == nil {
 		err = response.businessError()
 	}
@@ -1390,8 +1444,8 @@ func EnsureSeedanceAssetGroupReady(ctx context.Context, client *SeedanceAssetCli
 
 // CreateSeedanceAssetGroup 创建上游素材组并返回组 ID；GroupType 由上游决定是否支持。
 func (client *SeedanceAssetClient) CreateSeedanceAssetGroup(ctx context.Context, name, groupType string, response any) error {
-	if client.originREST {
-		return createOriginLocalAssetGroup(groupType, response)
+	if client.originREST || client.zzengineREST {
+		return createLocalSeedanceAssetGroup(groupType, response)
 	}
 	request := map[string]string{"Name": name}
 	// GroupType 不做本地枚举校验，避免把上游新增或渠道自定义类型拦截在网关内。
@@ -1506,7 +1560,7 @@ func (client *SeedanceAssetClient) DeleteSeedanceAsset(ctx context.Context, asse
 
 // DeleteSeedanceAssetGroup 删除上游素材组。
 func (client *SeedanceAssetClient) DeleteSeedanceAssetGroup(ctx context.Context, groupID string) error {
-	if client.originREST {
+	if client.originREST || client.zzengineREST && strings.HasPrefix(groupID, seedanceLocalGroupIDPrefix) {
 		return nil
 	}
 	err := client.call(ctx, "DeleteAssetGroup", map[string]string{"Id": groupID}, &struct{}{})
@@ -1543,7 +1597,7 @@ func isSeedanceAssetDeleteNotFoundError(err error) bool {
 
 // UpdateSeedanceAssetGroup 更新上游素材组名称。
 func (client *SeedanceAssetClient) UpdateSeedanceAssetGroup(ctx context.Context, groupID, name string, response any) error {
-	if client.jsonAction {
+	if client.jsonAction || client.zzengineREST {
 		return errors.New("upstream does not support renaming asset groups")
 	}
 	return client.call(ctx, "UpdateAssetGroup", map[string]string{"Id": groupID, "Name": name}, response)
@@ -1551,7 +1605,7 @@ func (client *SeedanceAssetClient) UpdateSeedanceAssetGroup(ctx context.Context,
 
 // SupportsGroupRename 区分远端改名与仅保存站内名称，避免调用上游未提供的 Action。
 func (client *SeedanceAssetClient) SupportsGroupRename() bool {
-	return !client.jsonAction && !client.originREST
+	return !client.jsonAction && !client.originREST && !client.zzengineREST
 }
 
 // isSeedanceAssetChannel 识别支持站内 Seedance 素材映射的渠道。
@@ -1561,7 +1615,7 @@ func isSeedanceAssetChannel(channel *model.Channel) bool {
 		return true
 	case constant.ChannelTypeTaskPlugin:
 		key := channel.GetSetting().TaskPluginKey
-		return key == "doubao" || key == "anyllm" || key == "originocean" || key == "qstart"
+		return key == "doubao" || key == "anyllm" || key == "originocean" || key == "qstart" || key == "zzengine"
 	default:
 		return false
 	}

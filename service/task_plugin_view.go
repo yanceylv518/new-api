@@ -74,7 +74,7 @@ func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {
 	if len(data) == 0 {
 		return data, nil
 	}
-	if (task.Platform == "doubao" || task.Platform == "originocean" || task.Platform == "qstart") && common.GetJsonType(data) == "object" {
+	if (task.Platform == "doubao" || task.Platform == "originocean" || task.Platform == "qstart" || task.Platform == "zzengine") && common.GetJsonType(data) == "object" {
 		var fields map[string]json.RawMessage
 		if err := common.Unmarshal(data, &fields); err != nil {
 			return nil, err
@@ -107,9 +107,9 @@ func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {
 			}
 		}
 	}
-	if task.Platform == "originocean" || task.Properties.OriginModelName != "" && task.Properties.UpstreamModelName != "" && task.Properties.OriginModelName != task.Properties.UpstreamModelName {
+	if task.Platform == "originocean" || task.Platform == "zzengine" || task.Properties.OriginModelName != "" && task.Properties.UpstreamModelName != "" && task.Properties.OriginModelName != task.Properties.UpstreamModelName {
 		var err error
-		data, err = publicTaskJSON(data, task.Properties.OriginModelName, task.Properties.UpstreamModelName, 0, task.Platform == "originocean")
+		data, err = publicTaskJSON(data, task.Properties.OriginModelName, task.Properties.UpstreamModelName, 0, task.Platform == "originocean" || task.Platform == "zzengine")
 		if err != nil {
 			return nil, err
 		}
@@ -120,6 +120,9 @@ func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if task.Platform == "zzengine" {
+		return zzengineVideoPublicData(data)
 	}
 	if task.Platform != "anyllm" || task.Status != model.TaskStatusSuccess {
 		return data, nil
@@ -236,6 +239,120 @@ func originOceanVideoPublicData(raw json.RawMessage) (json.RawMessage, error) {
 		fields["content"] = encoded
 	}
 	return common.Marshal(fields)
+}
+
+// 查询、列表和回调只公开方舟视频字段，原始快照仍用于轮询和结算。
+func zzengineVideoPublicData(raw json.RawMessage) (json.RawMessage, error) {
+	var response struct {
+		ID      *string         `json:"id,omitempty"`
+		Model   *string         `json:"model,omitempty"`
+		Status  string          `json:"status,omitempty"`
+		Error   json.RawMessage `json:"error,omitempty"`
+		Content *struct {
+			VideoURL     *string `json:"video_url,omitempty"`
+			LastFrameURL *string `json:"last_frame_url,omitempty"`
+		} `json:"content,omitempty"`
+		Usage *struct {
+			CompletionTokens *int64 `json:"completion_tokens,omitempty"`
+			TotalTokens      *int64 `json:"total_tokens,omitempty"`
+			ToolUsage        *struct {
+				WebSearch *int64 `json:"web_search,omitempty"`
+			} `json:"tool_usage,omitempty"`
+		} `json:"usage,omitempty"`
+		CreatedAt             *int64  `json:"created_at,omitempty"`
+		UpdatedAt             *int64  `json:"updated_at,omitempty"`
+		Seed                  *int64  `json:"seed,omitempty"`
+		Resolution            *string `json:"resolution,omitempty"`
+		Ratio                 *string `json:"ratio,omitempty"`
+		Duration              *int64  `json:"duration,omitempty"`
+		Frames                *int64  `json:"frames,omitempty"`
+		FramesPerSecond       *int64  `json:"framespersecond,omitempty"`
+		ServiceTier           *string `json:"service_tier,omitempty"`
+		ExecutionExpiresAfter *int64  `json:"execution_expires_after,omitempty"`
+		GenerateAudio         *bool   `json:"generate_audio,omitempty"`
+		Draft                 *bool   `json:"draft,omitempty"`
+		DraftTaskID           *string `json:"draft_task_id,omitempty"`
+		Priority              *int64  `json:"priority,omitempty"`
+		OutputFormat          *string `json:"output_format,omitempty"`
+		SafetyIdentifier      *string `json:"safety_identifier,omitempty"`
+		Tools                 *[]struct {
+			Type string `json:"type"`
+		} `json:"tools,omitempty"`
+	}
+	if common.GetJsonType(raw) != "object" {
+		return nil, fmt.Errorf("invalid ZZEngine task response")
+	}
+	if err := common.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("invalid ZZEngine task response: %w", err)
+	}
+	switch response.Status {
+	case "pending":
+		response.Status = "queued"
+	case "processing":
+		response.Status = "running"
+	case "", "queued", "running", "succeeded", "failed", "cancelled", "expired":
+	default:
+		return nil, fmt.Errorf("invalid ZZEngine task status")
+	}
+	if response.Tools != nil {
+		for _, tool := range *response.Tools {
+			if tool.Type != "web_search" {
+				return nil, fmt.Errorf("invalid ZZEngine video tool")
+			}
+		}
+	}
+	var problem struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	switch common.GetJsonType(response.Error) {
+	case "object":
+		if err := common.Unmarshal(response.Error, &problem); err != nil {
+			return nil, fmt.Errorf("invalid ZZEngine task error: %w", err)
+		}
+	case "string":
+		if err := common.Unmarshal(response.Error, &problem.Message); err != nil {
+			return nil, err
+		}
+	case "null", "unknown":
+	default:
+		return nil, fmt.Errorf("invalid ZZEngine task error")
+	}
+	if problem.Message == "" && (response.Status == "failed" || response.Status == "expired") {
+		var failure struct {
+			FailureReason json.RawMessage `json:"failure_reason"`
+			Reason        json.RawMessage `json:"reason"`
+			Message       json.RawMessage `json:"message"`
+		}
+		if err := common.Unmarshal(raw, &failure); err != nil {
+			return nil, fmt.Errorf("invalid ZZEngine failure reason: %w", err)
+		}
+		for _, rawMessage := range []json.RawMessage{failure.FailureReason, failure.Reason, failure.Message} {
+			if common.GetJsonType(rawMessage) != "string" {
+				continue
+			}
+			var message string
+			if err := common.Unmarshal(rawMessage, &message); err != nil {
+				return nil, err
+			}
+			if message != "" {
+				problem.Message = message
+				break
+			}
+		}
+	}
+	if response.Status == "succeeded" {
+		response.Error = json.RawMessage("null")
+	} else if problem.Code != "" || problem.Message != "" {
+		encoded, err := common.Marshal(problem)
+		if err != nil {
+			return nil, err
+		}
+		response.Error = encoded
+	} else {
+		response.Error = nil
+	}
+	return common.Marshal(response)
 }
 
 func publicTaskJSON(raw json.RawMessage, publicModel, upstreamModel string, depth int, redactSecrets bool) (json.RawMessage, error) {
