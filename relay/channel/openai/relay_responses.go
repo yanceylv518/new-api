@@ -76,10 +76,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var responseTextBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
+	streamStarted := false
+	responseFailed := false
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
-		// 检查当前数据是否包含 completed 状态和 usage 信息
 		streamResponse, err := decodeTimelineResponsesFrame(data, info.Timeline)
 		if err != nil {
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
@@ -88,13 +89,34 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		info.Timeline.ObserveResponses(streamResponse, streamResponse.Code, streamResponse.Message)
 		sendResponsesStreamData(c, streamResponse, data)
+		streamStarted = true
+		var responseStatus string
+		if streamResponse.Response != nil {
+			_ = common.Unmarshal(streamResponse.Response.Status, &responseStatus)
+		}
+		if streamResponse.Type == "response.failed" || streamResponse.Type == "response.error" ||
+			streamResponse.Type == "error" || responseStatus == "failed" {
+			responseFailed = true
+		}
+
+		// All terminal events can carry billable usage, even when generation
+		// stopped before any body text. Keep this independent of image billing.
 		switch streamResponse.Type {
-		case "response.completed", "response.done":
+		case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
 					usage = dto.MergeUsageNonZero(usage, incomingUsage)
 				}
+				if responseTextBuilder.Len() == 0 {
+					responseTextBuilder.WriteString(relayconvert.ExtractOutputTextFromResponses(streamResponse.Response))
+				}
+			}
+		}
+
+		switch streamResponse.Type {
+		case "response.completed", "response.done":
+			if streamResponse.Response != nil {
 				if !imageCommitted {
 					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {
 						imageCounter.Reset()
@@ -119,8 +141,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
-		case "response.output_text.delta":
-			// 处理输出文本
+		case "response.output_text.delta", "response.function_call_arguments.delta",
+			"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
+			// Missing-usage estimates include generated reasoning and tool arguments.
 			responseTextBuilder.WriteString(streamResponse.Delta)
 		case dto.ResponsesOutputTypeItemDone:
 			if streamResponse.Item != nil {
@@ -150,7 +173,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	}
 
-	if usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
+	// A started stream can consume input before producing visible output.
+	// An explicit failure without output must not trigger an input estimate.
+	billsPrompt := usage.CompletionTokens != 0 || (streamStarted && !responseFailed)
+	if usage.PromptTokens == 0 && billsPrompt {
 		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 

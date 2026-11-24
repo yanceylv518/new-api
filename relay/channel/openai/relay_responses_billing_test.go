@@ -7,11 +7,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -264,4 +269,151 @@ func TestOaiResponsesStreamHandlerDoesNotCountPartialImageEvent(t *testing.T) {
 	)
 
 	assert.Equal(t, 0, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+}
+
+func TestResponsesStreamTerminalUsageAccounting(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name, event, status string
+		timeline, snapshot  bool
+	}{
+		{"completed", "response.completed", "completed", false, false},
+		{"done", "response.done", "completed", false, false},
+		{"incomplete", "response.incomplete", "incomplete", false, false},
+		{"incomplete with timeline and billing snapshot", "response.incomplete", "incomplete", true, true},
+		{"failed", "response.failed", "failed", false, false},
+		{"cancelled", "response.cancelled", "cancelled", false, false},
+		{"canceled", "response.canceled", "cancelled", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &dto.Usage{
+				InputTokens: 120, OutputTokens: 30, TotalTokens: 150,
+				InputTokensDetails:     &dto.InputTokenDetails{CachedTokens: 40, CacheWriteTokens: 60},
+				CompletionTokenDetails: dto.OutputTokenDetails{ReasoningTokens: 30},
+			}
+			if tc.snapshot {
+				upstream.BillingUsage = dto.NewOpenAIResponsesBillingUsage(upstream)
+			}
+			status, err := common.Marshal(tc.status)
+			require.NoError(t, err)
+			terminal, err := common.Marshal(dto.ResponsesStreamResponse{
+				Type: tc.event, Response: &dto.OpenAIResponsesResponse{Status: status, Usage: upstream},
+			})
+			require.NoError(t, err)
+			// No body text: this is the reasoning-only truncation regression.
+			// A later empty snapshot must not erase the terminal's metering.
+			body := "data: " + string(terminal) + "\n\ndata: " +
+				`{"type":"` + tc.event + `","response":{"status":"` + tc.status + `","usage":{}}}` + "\n\n"
+			c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info.RelayMode = relayconstant.RelayModeResponses
+			info.RelayFormat = types.RelayFormatOpenAIResponses
+			info.SetEstimatePromptTokens(999)
+			if tc.timeline {
+				info.Timeline = requesttimeline.New(time.Now(), "responses-usage-test", 1, "gpt-test")
+				info.Timeline.BeginAttempt(0)
+			}
+			resp.Header.Set("Msh-Usage-Cache-Write-Tokens-5m", "0")
+			resp.Header.Set("Msh-Usage-Cache-Write-Tokens-1h", "60")
+			value, apiErr := (&Adaptor{}).DoResponse(c, resp, info)
+			require.Nil(t, apiErr)
+			usage, ok := value.(*dto.Usage)
+			require.True(t, ok)
+			require.NotNil(t, usage)
+			assert.Equal(t, 120, usage.PromptTokens)
+			assert.Equal(t, 30, usage.CompletionTokens)
+			assert.Equal(t, 150, usage.TotalTokens)
+			assert.Equal(t, 40, usage.PromptTokensDetails.CachedTokens)
+			assert.Equal(t, 60, usage.PromptTokensDetails.CacheWriteTokens)
+			assert.Equal(t, 30, usage.CompletionTokenDetails.ReasoningTokens)
+			assert.Equal(t, &dto.CacheWriteBreakdown{OneHourTokens: 60}, usage.KimiCacheWriteBreakdown())
+			assert.Contains(t, recorder.Body.String(), string(terminal), "forward the original event unchanged")
+			if tc.snapshot {
+				require.NotNil(t, usage.BillingUsage)
+				assert.False(t, usage.BillingUsage.Estimated)
+				canonical, ok := usage.BillingUsage.CanonicalUsage()
+				require.True(t, ok)
+				assert.Equal(t, 120, canonical.PromptTokens)
+				assert.Equal(t, 30, canonical.CompletionTokens)
+				assert.Equal(t, 40, canonical.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, &dto.CacheWriteBreakdown{OneHourTokens: 60}, canonical.KimiCacheWriteBreakdown())
+			} else {
+				assert.Nil(t, usage.BillingUsage, "native passthrough must not introduce a conversion snapshot")
+			}
+			if tc.timeline {
+				record := info.Timeline.Freeze(nil)
+				require.NotNil(t, record)
+				assert.Equal(t, "response.incomplete", record.Data.FinishReason)
+				assert.Equal(t, "captured", record.Data.UpstreamUsageCapture)
+			}
+		})
+	}
+}
+
+func TestResponsesStreamMissingUsageEstimation(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	const created = `{"type":"response.created","response":{"status":"in_progress"}}`
+	const incomplete = `{"type":"response.incomplete","response":{"status":"incomplete"}}`
+	const failed = `{"type":"response.failed","response":{"status":"failed"}}`
+	const output = `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}`
+	for _, tc := range []struct {
+		name            string
+		events          []string
+		prompt          int
+		estimatedText   string
+		billingSnapshot bool
+	}{
+		{name: "reasoning summary before incomplete", events: []string{created, `{"type":"response.reasoning_summary_text.delta","delta":"hello"}`, incomplete}, prompt: 100, estimatedText: "hello"},
+		{name: "reasoning text before EOF", events: []string{created, `{"type":"response.reasoning_text.delta","delta":"hello"}`}, prompt: 100, estimatedText: "hello"},
+		{name: "tool arguments before EOF", events: []string{created, `{"type":"response.function_call_arguments.delta","delta":"hello"}`}, prompt: 100, estimatedText: "hello"},
+		{name: "refusal before EOF", events: []string{created, `{"type":"response.refusal.delta","delta":"hello"}`}, prompt: 100, estimatedText: "hello"},
+		{name: "body before EOF", events: []string{created, `{"type":"response.output_text.delta","delta":"hello"}`}, prompt: 100, estimatedText: "hello"},
+		{name: "created only before EOF", events: []string{created}, prompt: 100},
+		{name: "incomplete without usage or text", events: []string{created, incomplete}, prompt: 100},
+		{name: "terminal output without deltas", events: []string{`{"type":"response.completed","response":{"status":"completed","output":[` + output + `]}}`}, prompt: 100, estimatedText: "hello"},
+		{name: "terminal output must not duplicate delta", events: []string{`{"type":"response.output_text.delta","delta":"hello"}`, `{"type":"response.completed","response":{"output":[` + output + `]}}`}, prompt: 100, estimatedText: "hello"},
+		{name: "explicit failure without output", events: []string{created, failed}},
+		{name: "flat error without output", events: []string{created, `{"type":"error","code":"server_error"}`}},
+		{name: "response error without output", events: []string{created, `{"type":"response.error"}`}},
+		{name: "done with failed status", events: []string{created, `{"type":"response.done","response":{"status":"failed"}}`}},
+		{name: "failure after generated output", events: []string{`{"type":"response.reasoning_text.delta","delta":"hello"}`, failed}, prompt: 100, estimatedText: "hello"},
+		{name: "no upstream events"},
+		{name: "malformed first event", events: []string{`{"type":`}},
+		{name: "partial billing snapshot", events: []string{`{"type":"response.reasoning_text.delta","delta":"hello"}`, `{"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":4},"billing_usage":{"source":"oai_responses","semantic":"openai","openai_usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":4}}}}}}`}, prompt: 20, estimatedText: "hello", billingSnapshot: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body strings.Builder
+			for _, event := range tc.events {
+				body.WriteString("data: " + event + "\n\n")
+			}
+			c, _, resp, info := newResponsesChatTestContext(t, body.String(), true)
+			info.UpstreamModelName = "test-model"
+			info.SetEstimatePromptTokens(100)
+			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			completion := service.CountTextToken(tc.estimatedText, info.UpstreamModelName)
+			if tc.estimatedText != "" {
+				require.Positive(t, completion)
+			}
+			assert.Equal(t, tc.prompt, usage.PromptTokens)
+			assert.Equal(t, completion, usage.CompletionTokens)
+			assert.Equal(t, tc.prompt+completion, usage.TotalTokens)
+			if tc.billingSnapshot {
+				require.NotNil(t, usage.BillingUsage)
+				assert.True(t, usage.BillingUsage.Estimated)
+				canonical, ok := usage.BillingUsage.CanonicalUsage()
+				require.True(t, ok)
+				assert.Equal(t, tc.prompt, canonical.PromptTokens)
+				assert.Equal(t, completion, canonical.CompletionTokens)
+				assert.Equal(t, 4, canonical.PromptTokensDetails.CachedTokens)
+			}
+		})
+	}
 }
