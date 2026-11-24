@@ -179,6 +179,7 @@ type Failure struct {
 
 type Data struct {
 	Version                 int               `json:"version"`
+	NonStreaming            bool              `json:"non_streaming,omitempty"`
 	StartedAtMS             int64             `json:"started_at_ms"`
 	RequestSentMS           *int64            `json:"request_sent_ms"`
 	FirstResponseMS         *int64            `json:"first_response_ms"`
@@ -414,7 +415,7 @@ func (t *Trace) nextAttempt() {
 	}
 	t.attempts = append(t.attempts, t.snapshotAttempt())
 	t.record = Record{RequestID: t.record.RequestID, UserID: t.record.UserID, Result: "unknown", Data: Data{
-		Version: Version, StartedAtMS: t.start.UnixMilli(), RequestModel: t.record.Data.RequestModel, TimingValid: true,
+		Version: Version, NonStreaming: t.record.Data.NonStreaming, StartedAtMS: t.start.UnixMilli(), RequestModel: t.record.Data.RequestModel, TimingValid: true,
 	}}
 	t.attemptNumber++
 	t.attemptBegun = true
@@ -508,6 +509,10 @@ func (t *Trace) Response(resp *http.Response, err error) {
 	if resp != nil {
 		status := resp.StatusCode
 		t.record.UpstreamStatus = &status
+		if t.record.Data.NonStreaming && t.record.Data.FirstResponseMS == nil {
+			first := t.offset(time.Now())
+			t.record.Data.FirstResponseMS = &first
+		}
 		// 只记录指定的缓存写入响应头；缺失值省略，原始字符串和显式 0 保留。
 		var headers map[string]string
 		for _, key := range []string{"Msh-Usage-Cache-Write-Tokens-5m", "Msh-Usage-Cache-Write-Tokens-1h"} {

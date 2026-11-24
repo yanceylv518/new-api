@@ -85,6 +85,7 @@ func xAIHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	var xaiResponse ChatCompletionResponse
+	info.Timeline.ObserveJSONResponse(responseBody)
 	err = common.Unmarshal(responseBody, &xaiResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)

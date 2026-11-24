@@ -72,7 +72,7 @@ func EnqueueRequestTimeline(record *requesttimeline.Record) {
 // change IsStream. Channel tests never enter controller.Relay, and this guard
 // also protects callers which already have an explicit test identity.
 func BeginRequestTimeline(c *gin.Context, info *relaycommon.RelayInfo) *requesttimeline.Trace {
-	if !RequestTimelineEnabled() || info == nil || !info.IsStream || info.IsChannelTest {
+	if !RequestTimelineEnabled() || info == nil || info.IsChannelTest {
 		return nil
 	}
 	// Admission follows the client protocol, not the provider/channel label.
@@ -91,7 +91,11 @@ func BeginRequestTimeline(c *gin.Context, info *relaycommon.RelayInfo) *requestt
 	default:
 		return nil
 	}
-	return requesttimeline.New(info.StartTime, c.GetString(common.RequestIdKey), info.UserId, info.OriginModelName)
+	trace := requesttimeline.New(info.StartTime, c.GetString(common.RequestIdKey), info.UserId, info.OriginModelName)
+	if !info.IsStream {
+		trace.SetNonStreaming()
+	}
+	return trace
 }
 
 type RequestTimelineWriter struct {

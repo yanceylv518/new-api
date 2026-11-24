@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
@@ -85,6 +86,10 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool, knownKeys ...string) (newApiErr *types.NewAPIError) {
+	return RelayErrorHandlerWithTimeline(ctx, resp, showBodyWhenFail, nil, knownKeys...)
+}
+
+func RelayErrorHandlerWithTimeline(ctx context.Context, resp *http.Response, showBodyWhenFail bool, trace *requesttimeline.Trace, knownKeys ...string) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
 	defer CloseResponseBodyGracefully(resp)
@@ -94,6 +99,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		newApiErr.SetLogError(fmt.Errorf("%w, partial body: %s", newApiErr.Err, common.SanitizeErrorLogContent(string(responseBody), knownKeys...)))
 		return
 	}
+	trace.ObserveJSONResponse(responseBody, "data.usage", "metadata.usage", "Response.Usage")
 	var errResponse dto.GeneralErrorResponse
 	// 分别脱敏消息和正文，避免未闭合引号在拼接后改变 JSON 片段的识别边界。
 	responseBodyText := common.SanitizeErrorLogContent(string(responseBody), knownKeys...)

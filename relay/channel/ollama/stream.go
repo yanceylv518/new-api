@@ -223,6 +223,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		aggContent       strings.Builder
 		reasoningBuilder strings.Builder
 		lastChunk        ollamaChatStreamChunk
+		lastRawChunk     string
 		parsedAny        bool
 		toolCallIndex    int
 		toolCalls        []dto.ToolCallResponse
@@ -241,6 +242,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		parsedAny = true
 		lastChunk = ck
+		lastRawChunk = ln
 		if ck.Message != nil && len(ck.Message.Thinking) > 0 {
 			raw := strings.TrimSpace(string(ck.Message.Thinking))
 			if raw != "" && raw != "null" {
@@ -272,6 +274,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 		}
 		lastChunk = single
+		lastRawChunk = raw
 		if single.Message != nil {
 			if len(single.Message.Thinking) > 0 {
 				raw := strings.TrimSpace(string(single.Message.Thinking))
@@ -302,6 +305,9 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		model = info.UpstreamModelName
 	}
 	created := toUnix(lastChunk.CreatedAt)
+	if info.Timeline != nil {
+		info.Timeline.ObserveJSONResponse([]byte(lastRawChunk), "{prompt_eval_count,eval_count}")
+	}
 	usage := &dto.Usage{PromptTokens: lastChunk.PromptEvalCount, CompletionTokens: lastChunk.EvalCount, TotalTokens: lastChunk.PromptEvalCount + lastChunk.EvalCount}
 	content := aggContent.String()
 	finishReason := lastChunk.DoneReason

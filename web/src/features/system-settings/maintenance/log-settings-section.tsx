@@ -456,11 +456,11 @@ export function LogSettingsSection({
               <SettingsSwitchItem>
                 <SettingsSwitchContent>
                   <FormLabel>
-                    {t('Record streaming request timeline')}
+                    {t('Record request timelines')}
                   </FormLabel>
                   <FormDescription>
                     {t(
-                      'Collect timing and selected response fields for supported streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.'
+                      'Collect timing and selected response fields for supported streaming and non-streaming requests, excluding model tests. Saving affects new requests; existing timelines remain available.'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>

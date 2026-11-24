@@ -21,6 +21,8 @@ import { render, screen } from '@testing-library/react'
 import i18next from 'i18next'
 import { afterEach, beforeAll, describe, expect, test } from 'vitest'
 
+import { useAuthStore } from '@/stores/auth-store'
+
 import type { UsageLog } from '../../data/schema'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
@@ -64,7 +66,7 @@ function makeLog(other: LogOtherData): UsageLog {
   }
 }
 
-function renderDetails(other: LogOtherData): QueryClient {
+function renderDetails(other: LogOtherData, isAdmin = false): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -80,7 +82,7 @@ function renderDetails(other: LogOtherData): QueryClient {
     <QueryClientProvider client={queryClient}>
       <DetailsDialog
         log={makeLog(other)}
-        isAdmin={false}
+        isAdmin={isAdmin}
         isRoot={false}
         open
         onOpenChange={() => undefined}
@@ -102,10 +104,21 @@ describe('usage facts billing details', () => {
   })
 
   afterEach(() => {
+    useAuthStore.getState().auth.reset()
     for (const queryClient of queryClients) {
       queryClient.clear()
     }
     queryClients.length = 0
+  })
+
+  test('offers the recorded timeline for a non-streaming admin log', () => {
+    useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 10 })
+    queryClients.push(
+      renderDetails({ admin_info: { timeline_candidate: true } }, true)
+    )
+    expect(
+      screen.getByRole('button', { name: /Request timeline/ })
+    ).toBeVisible()
   })
 
   test('renders one raw-key row per usage fact before total cost', () => {

@@ -23,6 +23,7 @@ import { api } from '@/lib/api'
 const milliseconds = z.number().int().nullable()
 const spanSchema = z.object({
   version: z.literal(1),
+  non_streaming: z.boolean().optional(),
   started_at_ms: z.number().int().positive(),
   request_sent_ms: milliseconds,
   first_response_ms: milliseconds,
@@ -39,7 +40,7 @@ const spanSchema = z.object({
   finish_reason: z.string().optional(),
   end_reason: z.string().optional(),
   end_marker_received: z.boolean(),
-  upstream_usage: z.record(z.string(), z.unknown()).optional(),
+  upstream_usage: z.record(z.string(), z.unknown()).nullable().optional(),
   upstream_usage_capture: z.enum(['captured', 'truncated']).optional(),
   upstream_usage_preview: z.string().optional(),
   upstream_usage_bytes: z.number().int().nonnegative().optional(),

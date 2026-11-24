@@ -99,6 +99,37 @@ afterEach(() => {
 describe('request timeline', () => {
   it.each([
     {
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0, vendor_detail: null },
+    },
+    { output_tokens: 2, vendor_counter: 17 },
+    null,
+  ])('retains non-streaming upstream usage exactly: %j', async (usage) => {
+    const response = recordedResponse()
+    response.timeline.non_streaming = true
+    response.timeline.upstream_usage = usage
+    response.timeline.upstream_usage_capture = 'captured'
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { data: response } })
+    const user = userEvent.setup()
+    mountTimeline()
+    await user.click(screen.getByRole('button', { name: 'Request timeline' }))
+    await user.click(
+      await screen.findByRole('button', { name: 'Completion recorded fields' })
+    )
+    const fields = screen.getByLabelText('Completion recorded fields', {
+      selector: 'pre',
+    })
+    expect(JSON.parse(fields.textContent ?? '').usage).toEqual(usage)
+    expect(screen.queryByText('Upstream end marker')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(
+        'The first frame may contain only role information; identifiers and the model may arrive later.'
+      )
+    ).not.toBeInTheDocument()
+  })
+
+  it.each([
+    {
       name: 'reported values including zero',
       headers: {
         'Msh-Usage-Cache-Write-Tokens-5m': '5120',

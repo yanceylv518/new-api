@@ -90,7 +90,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if info.IsStream {
 		usage, err = xunfeiStreamHandler(c, *a.request, splits[0], splits[1], splits[2])
 	} else {
-		usage, err = xunfeiHandler(c, *a.request, splits[0], splits[1], splits[2])
+		usage, err = xunfeiHandler(c, *a.request, splits[0], splits[1], splits[2], info.Timeline)
 	}
 	return
 }

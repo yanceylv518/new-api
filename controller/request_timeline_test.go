@@ -26,8 +26,14 @@ import (
 	"github.com/QuantumNous/new-api/pkg/requesttimeline"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
+	"github.com/QuantumNous/new-api/relay/channel/baidu"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/cohere"
+	"github.com/QuantumNous/new-api/relay/channel/dify"
+	"github.com/QuantumNous/new-api/relay/channel/gemini"
+	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
+	"github.com/QuantumNous/new-api/relay/channel/tencent"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu_4v"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -340,7 +346,7 @@ func TestRequestTimelineAdminLookupAndCandidateGate(t *testing.T) {
 	info.IsChannelTest = true
 	assert.Nil(t, service.BeginRequestTimeline(c, info))
 	info.IsChannelTest, info.IsStream = false, false
-	assert.Nil(t, service.BeginRequestTimeline(c, info))
+	assert.NotNil(t, service.BeginRequestTimeline(c, info))
 	info.IsStream = true
 	info.RelayFormat = types.RelayFormatOpenAIRealtime
 	assert.Nil(t, service.BeginRequestTimeline(c, info))
@@ -438,7 +444,9 @@ func TestRequestTimelineDatabaseRoundtrip(t *testing.T) {
 	var savedOption model.Option
 	require.NoError(t, model.DB.Where(&model.Option{Key: "RequestTimelineEnabled"}).Take(&savedOption).Error)
 	assert.Equal(t, "true", savedOption.Value)
-	t.Cleanup(func() { require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders)) })
+	t.Cleanup(func() {
+		require.NoError(t, requesttimeline.ConfigureRequestIDHeaders(requesttimeline.DefaultRequestIDHeaders))
+	})
 	require.NoError(t, model.UpdateOption(requesttimeline.RequestIDHeadersOption, "X-Provider-Trace"))
 	require.Error(t, model.UpdateOption(requesttimeline.RequestIDHeadersOption, "Set-Cookie"))
 	var headerOption model.Option
@@ -1650,6 +1658,203 @@ func TestRequestTimelineClaudeFailuresAndCaptureBounds(t *testing.T) {
 	}
 }
 
+func TestRequestTimelineNonStreamingUsage(t *testing.T) {
+	setupAccessTokenAudit(t)
+	preserveTimelineOption(t)
+	model.RequestTimelineCaptureEnabled.Store(true)
+	writer := service.InitRequestTimeline()
+	require.NotNil(t, writer)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, writer.Shutdown(ctx))
+	})
+	const chatUsage = `{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"completion_tokens_details":{"reasoning_tokens":0,"vendor_detail":null},"vendor_counter":17}`
+	const responsesUsage = `{"input_tokens":5,"output_tokens":3,"total_tokens":8,"output_tokens_details":{"reasoning_tokens":2,"vendor_detail":0},"vendor_counter":17}`
+	const chatBody = `{"id":"r1","model":"model","choices":[{"message":{"role":"assistant","content":"private-output"},"finish_reason":"stop"}],"usage":` + chatUsage + `}`
+	const responsesBody = `{"id":"r1","model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"private-output"}]}],"usage":` + responsesUsage + `}`
+	const geminiUsage = `{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8,"thoughtsTokenCount":0,"vendor_counter":17}`
+	const geminiBody = `{"responseId":"r1","modelVersion":"model","candidates":[{"content":{"role":"model","parts":[{"text":"private-output"}]},"finishReason":"STOP"}],"usageMetadata":` + geminiUsage + `}`
+	for _, tc := range []struct {
+		name, body, raw string
+		format          types.RelayFormat
+		handle          func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+	}{
+		{"numeric status", strings.Replace(chatBody, `"model":`, `"status":200,"model":`, 1), chatUsage, types.RelayFormatOpenAI, openai.OpenaiHandler},
+		{"malformed optional choices", `{"status":"completed","choices":{},"usage":` + responsesUsage + `}`, responsesUsage, types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+		{"baidu adapter", `{"id":"stable","result":"private-output","usage":` + chatUsage + `}`, chatUsage, types.RelayFormatOpenAI, func(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+			u, e := (&baidu.Adaptor{}).DoResponse(c, resp, info)
+			if e != nil {
+				return nil, e
+			}
+			return u.(*dto.Usage), nil
+		}},
+		{"gemini blocked", `{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":` + geminiUsage + `}`, geminiUsage, types.RelayFormatOpenAI, gemini.GeminiChatHandler},
+		{"gemini max tokens", strings.Replace(geminiBody, "STOP", "MAX_TOKENS", 1), geminiUsage, types.RelayFormatOpenAI, gemini.GeminiChatHandler},
+		{"chat", chatBody, chatUsage, types.RelayFormatOpenAI, openai.OpenaiHandler},
+		{"responses", responsesBody, responsesUsage, types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+		{"responses to chat", responsesBody, responsesUsage, types.RelayFormatOpenAI, openai.OaiResponsesToChatHandler},
+		{"chat to responses", chatBody, chatUsage, types.RelayFormatOpenAIResponses, openai.OaiChatToResponsesHandler},
+		{"buffered responses stream", "data: {\"type\":\"response.completed\",\"response\":" + responsesBody + "}\n\n", responsesUsage, types.RelayFormatOpenAI, openai.OaiResponsesToChatBufferedStreamHandler},
+		{"messages", `{"id":"r1","model":"model","type":"message","role":"assistant","content":[{"type":"text","text":"private-output"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3,"vendor_counter":17}}`, `{"input_tokens":5,"output_tokens":3,"vendor_counter":17}`, types.RelayFormatClaude, func(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+			return claude.ClaudeHandler(c, resp, info)
+		}},
+		{"gemini to responses", geminiBody, geminiUsage, types.RelayFormatOpenAIResponses, gemini.GeminiResponsesHandler},
+		{"gemini to chat", geminiBody, geminiUsage, types.RelayFormatOpenAI, gemini.GeminiChatHandler},
+		{"missing reasoning details", `{"id":"r1","status":"completed","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}`, `{"input_tokens":5,"output_tokens":3,"total_tokens":8}`, types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+		{"missing usage", `{"id":"r1","status":"completed","output":[]}`, "", types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+		{"null usage", `{"id":"r1","status":"completed","usage":null}`, `null`, types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+		{"empty usage", `{"id":"r1","status":"completed","usage":{}}`, `{}`, types.RelayFormatOpenAIResponses, openai.OaiResponsesHandler},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outputs []string
+			var usages []*dto.Usage
+			for _, enabled := range []bool{false, true} {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+				c.Set(common.RequestIdKey, "nonstream-usage")
+				info := &relaycommon.RelayInfo{StartTime: time.Now(), OriginModelName: "model", RelayFormat: tc.format, RelayMode: relayconstant.RelayModeResponses, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "model"}}
+				if tc.format == types.RelayFormatOpenAI {
+					info.RelayMode = relayconstant.RelayModeChatCompletions
+				}
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}, "X-Request-Id": {"upstream-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}
+				if enabled {
+					info.Timeline = service.BeginRequestTimeline(c, info)
+					require.NotNil(t, info.Timeline)
+					info.Timeline.BeginAttempt(0)
+					info.Timeline.Response(resp, nil)
+					restore := helper.ObserveRequestTimelineWriter(c, info.Timeline)
+					defer restore()
+				}
+				usage, apiErr := tc.handle(c, info, resp)
+				require.Nil(t, apiErr)
+				outputs = append(outputs, w.Body.String())
+				usages = append(usages, usage)
+				if enabled {
+					info.Timeline.ResponseCompleted(nil)
+					record := info.Timeline.Freeze(nil)
+					require.NotNil(t, record)
+					if tc.name == "gemini blocked" {
+						assert.Equal(t, "failed", record.Result)
+					} else {
+						assert.Equal(t, "success", record.Result)
+					}
+					assert.True(t, record.Data.NonStreaming)
+					switch tc.name {
+					case "gemini max tokens":
+						assert.Equal(t, "MAX_TOKENS", record.Data.FinishReason)
+					case "gemini to responses", "gemini to chat":
+						assert.Equal(t, "STOP", record.Data.FinishReason)
+					}
+					assert.Equal(t, "upstream-id", record.Data.UpstreamRequestID)
+					require.NotNil(t, record.Data.FirstResponseMS)
+					require.NotNil(t, record.Data.FirstWriteMS)
+					if tc.raw == "" {
+						assert.Empty(t, record.Data.UpstreamUsage)
+					} else {
+						assert.JSONEq(t, tc.raw, string(record.Data.UpstreamUsage))
+					}
+					encoded, err := record.MarshalData()
+					require.NoError(t, err)
+					assert.NotContains(t, string(encoded), "private-output")
+				}
+			}
+			assert.Equal(t, usages[0], usages[1], "diagnostics must not alter accounting")
+			// Converters generate timestamps and Gemini output item IDs per invocation.
+			timestamps := regexp.MustCompile(`"created(?:_at)?":\d+`)
+			itemIDs := regexp.MustCompile(`chatcmpl-[a-f0-9]{32}_msg_\d+`)
+			for i := range outputs {
+				outputs[i] = timestamps.ReplaceAllString(outputs[i], `"created":0`)
+				if tc.name == "gemini to responses" {
+					outputs[i] = itemIDs.ReplaceAllString(outputs[i], "generated-message-id")
+				}
+			}
+			assert.JSONEq(t, outputs[0], outputs[1], "diagnostics must not alter the response")
+		})
+	}
+}
+
+func TestRequestTimelineNativeUsageEnvelopes(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, usage string
+		adapter           channel.Adaptor
+	}{
+		{"dify", `{"answer":"private-output","metadata":{"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5,"extra":null}}}`, `{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5,"extra":null}`, &dify.Adaptor{}},
+		{"tencent", `{"Response":{"Choices":[{"Message":{"Role":"assistant","Content":"private-output"}}],"Usage":{"PromptTokens":5,"CompletionTokens":0,"TotalTokens":5,"Extra":null}}}`, `{"PromptTokens":5,"CompletionTokens":0,"TotalTokens":5,"Extra":null}`, &tencent.Adaptor{}},
+		{"cohere", `{"text":"private-output","meta":{"api_version":{"note":"private-output"},"tokens":{"input_tokens":7},"billed_units":{"input_tokens":5,"output_tokens":0,"extra":null}}}`, `{"tokens":{"input_tokens":7},"billed_units":{"input_tokens":5,"output_tokens":0,"extra":null}}`, &cohere.Adaptor{}},
+		{"ollama", `{"message":{"content":"private-output"},"done":false}
+{"done":true,"prompt_eval_count":5,"eval_count":0}`, `{"prompt_eval_count":5,"eval_count":0}`, &ollama.Adaptor{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			tr := requesttimeline.New(time.Now(), tc.name, 1, "model")
+			tr.SetNonStreaming()
+			restore := helper.ObserveRequestTimelineWriter(c, tr)
+			defer restore()
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeChatCompletions, RelayFormat: types.RelayFormatOpenAI, Timeline: tr, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "model"}}
+			resp := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}
+			tc.adapter.Init(info)
+			billed, apiErr := tc.adapter.DoResponse(c, resp, info)
+			require.Nil(t, apiErr)
+			require.Equal(t, 5, billed.(*dto.Usage).TotalTokens)
+			r := tr.Freeze(nil)
+			assert.Equal(t, "success", r.Result)
+			assert.JSONEq(t, tc.usage, string(r.Data.UpstreamUsage))
+			raw, err := r.MarshalData()
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), "private-output")
+		})
+	}
+}
+
+func TestRequestTimelineNonStreamingCaptureBoundsAndRetries(t *testing.T) {
+	for _, tc := range []struct{ name, body, result string }{
+		{"incomplete", `{"status":"incomplete","usage":{"output_tokens_details":{"reasoning_tokens":2}}}`, "unknown"},
+		{"failed", `{"status":"failed","error":{"code":"overloaded","message":"try later"},"usage":{"output_tokens":0}}`, "failed"},
+		{"cancelled", `{"status":"cancelled","usage":{"output_tokens":0}}`, "unknown"},
+		{"malformed", `{"usage":`, "unknown"},
+		{"oversized", `{"status":"completed","usage":{"provider":"` + strings.Repeat("x", 9000) + `"}}`, "success"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := requesttimeline.New(time.Now(), tc.name, 7, "model")
+			trace.SetNonStreaming()
+			trace.BeginAttempt(0)
+			trace.ObserveJSONResponse([]byte(tc.body))
+			trace.PayloadWritten(nil)
+			trace.EndAttempt(nil)
+			trace.BeginAttempt(1)
+			trace.ObserveJSONResponse([]byte(`{"status":"completed","usage":{"input_tokens":5,"output_tokens":0}}`))
+			trace.PayloadWritten(nil)
+			trace.ResponseCompleted(nil)
+			record := trace.Freeze(nil)
+			require.NotNil(t, record)
+			assert.Equal(t, "success", record.Result)
+			assert.True(t, record.Data.NonStreaming)
+			require.Len(t, record.Data.Attempts, 2)
+			first := record.Data.Attempts[0]
+			assert.True(t, first.Data.NonStreaming)
+			assert.Equal(t, tc.result, first.Result)
+			assert.JSONEq(t, `{"input_tokens":5,"output_tokens":0}`, string(record.Data.UpstreamUsage))
+			if tc.name == "oversized" {
+				assert.Equal(t, "truncated", first.Data.UpstreamUsageCapture)
+				assert.Empty(t, first.Data.UpstreamUsage)
+				assert.Greater(t, first.Data.UpstreamUsageBytes, 8192)
+				assert.NotEmpty(t, first.Data.UpstreamUsagePreview)
+			}
+			encoded, err := record.MarshalData()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, len(encoded), requesttimeline.MaxDataBytes)
+			var decoded requesttimeline.Data
+			require.NoError(t, common.Unmarshal(encoded, &decoded))
+			assert.True(t, decoded.NonStreaming)
+			assert.JSONEq(t, string(record.Data.UpstreamUsage), string(decoded.UpstreamUsage))
+		})
+	}
+}
+
 func TestRequestTimelineProtocolRoutes(t *testing.T) {
 	setupAccessTokenAudit(t)
 	preserveTimelineOption(t)
@@ -1772,8 +1977,9 @@ func TestRequestTimelineProtocolRoutes(t *testing.T) {
 }
 
 func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
-	for _, allFail := range []bool{false, true} {
-		t.Run(fmt.Sprintf("all_fail=%v", allFail), func(t *testing.T) {
+	for _, tc := range []struct{ allFail, stream bool }{{false, true}, {true, true}, {false, false}} {
+		allFail, stream := tc.allFail, tc.stream
+		t.Run(fmt.Sprintf("all_fail=%v/stream=%v", allFail, stream), func(t *testing.T) {
 			previousCache := common.MemoryCacheEnabled
 			t.Cleanup(func() {
 				common.MemoryCacheEnabled = previousCache
@@ -1814,8 +2020,18 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 					w.Header().Set("Msh-Usage-Cache-Write-Tokens-1h", "17")
 				}
 				if index == 1 || allFail {
-					w.WriteHeader(http.StatusBadGateway)
-					_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"type":"upstream_error","message":"provider rejected %s"}}`, r.Header.Get("Authorization")))
+					if stream {
+						w.WriteHeader(http.StatusBadGateway)
+					} else {
+						w.WriteHeader(http.StatusTooManyRequests)
+					}
+					_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"type":"upstream_error","message":"provider rejected %s"},"usage":{"input_tokens":1,"vendor":0}}`, r.Header.Get("Authorization")))
+					return
+				}
+				if !stream {
+					w.Header().Set("Content-Type", "application/json")
+					assert.Contains(t, r.URL.Path, "/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/")
+					_, _ = io.WriteString(w, `{"id":"stable","result":"hello","usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"provider_counter":0}}`)
 					return
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -1825,6 +2041,20 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 			channels := []model.Channel{
 				{Id: 101, Name: "first", Type: constant.ChannelTypeOpenAI, Key: "sk-first-secret", BaseURL: &upstream.URL, Models: "gpt-3.5-turbo", Group: "default", Priority: common.GetPointer(int64(100)), AutoBan: common.GetPointer(0)},
 				{Id: 102, Name: "fallback", Type: constant.ChannelTypeOpenAI, Key: "sk-second-secret", BaseURL: &upstream.URL, Models: "gpt-3.5-turbo", Group: "default", Priority: common.GetPointer(int64(90)), AutoBan: common.GetPointer(0)},
+			}
+			if !stream {
+				channels[1].Type = constant.ChannelTypeBaidu
+				channels[1].Key = "test-client|test-secret"
+				// Keep the real Baidu conversion and HTTP path. Stub only the external OAuth endpoint.
+				client := service.GetHttpClient()
+				transport := client.Transport
+				client.Transport = imageFetchTransport(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Host == "aip.baidubce.com" && r.URL.Path == "/oauth/2.0/token" {
+						return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"test-token","expires_in":86400}`))}, nil
+					}
+					return transport.RoundTrip(r)
+				})
+				t.Cleanup(func() { client.Transport = transport })
 			}
 			require.NoError(t, model.BatchInsertChannels(channels))
 			model.InitChannelCache()
@@ -1849,7 +2079,7 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 				}
 				w := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(w)
-				c.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-3.5-turbo","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`))
+				c.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":"gpt-3.5-turbo","stream":%t,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, stream)))
 				c.Request.Header.Set("Content-Type", "application/json")
 				c.Set(common.RequestIdKey, "fallback-relay")
 				common.SetContextKey(c, constant.ContextKeyUserId, user.Id)
@@ -1917,8 +2147,14 @@ func TestRequestTimelineFallbackRelayPreservesBillingAndResponse(t *testing.T) {
 						assert.Equal(t, "success", entry.Result)
 						assert.Equal(t, "success", data.Attempts[1].Result)
 						assert.Nil(t, data.FirstError)
-						require.NotNil(t, data.ReturnedUsage)
-						assert.Equal(t, 150, data.ReturnedUsage.TotalTokens)
+						if stream {
+							require.NotNil(t, data.ReturnedUsage)
+							assert.Equal(t, 150, data.ReturnedUsage.TotalTokens)
+						} else {
+							require.Equal(t, http.StatusTooManyRequests, *data.Attempts[0].UpstreamStatus)
+							assert.JSONEq(t, `{"input_tokens":1,"vendor":0}`, string(data.Attempts[0].Data.UpstreamUsage))
+							assert.JSONEq(t, `{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"provider_counter":0}`, string(data.UpstreamUsage))
+						}
 						assert.Greater(t, charges[len(charges)-1], 0, "successful fallback must actually settle paid usage")
 					}
 				}

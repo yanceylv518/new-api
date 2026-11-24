@@ -1217,7 +1217,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
 
-        {props.open && props.isAdmin && props.log.is_stream && adminInfo?.timeline_candidate && props.log.request_id && (
+        {props.open && props.isAdmin && adminInfo?.timeline_candidate && props.log.request_id && (
           <RequestTimeline key={props.log.request_id} requestId={props.log.request_id} />
         )}
 

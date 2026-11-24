@@ -97,6 +97,7 @@ func cfHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response)
 	}
 	service.CloseResponseBodyGracefully(resp)
 	var response dto.TextResponse
+	info.Timeline.ObserveJSONResponse(responseBody, "result.usage")
 	err = json.Unmarshal(responseBody, &response)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil

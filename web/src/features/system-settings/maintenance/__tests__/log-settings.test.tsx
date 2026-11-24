@@ -122,9 +122,10 @@ describe('stream timeline system option', () => {
     const user = userEvent.setup()
     mountLogSettings()
     const timeline = screen.getByRole('switch', {
-      name: 'Record streaming request timeline',
+      name: 'Record request timelines',
     })
     expect(timeline).toHaveAttribute('aria-checked', 'false')
+    expect(screen.getByText(/supported streaming and non-streaming requests/)).toBeVisible()
     expect(
       screen.getByRole('switch', { name: 'Record quota usage' })
     ).toHaveAttribute('aria-checked', 'true')
@@ -148,7 +149,7 @@ describe('stream timeline system option', () => {
     const user = userEvent.setup()
     mountLogSettings(true)
     const timeline = screen.getByRole('switch', {
-      name: 'Record streaming request timeline',
+      name: 'Record request timelines',
     })
     expect(timeline).toHaveAttribute('aria-checked', 'true')
     await user.click(timeline)
@@ -170,7 +171,7 @@ describe('stream timeline system option', () => {
     const user = userEvent.setup()
     mountLogSettings()
     await user.click(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     )
     await user.click(screen.getByRole('button', { name: 'Save log settings' }))
     await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
@@ -179,7 +180,7 @@ describe('stream timeline system option', () => {
     })
     await waitFor(() => expect(save).toBeEnabled())
     expect(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     ).toHaveAttribute('aria-checked', 'true')
     await user.click(save)
     await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
@@ -238,7 +239,7 @@ describe('saving both log options with real query refreshes', () => {
     await screen.findByText('saved=true/false')
     await user.click(screen.getByRole('switch', { name: 'Record quota usage' }))
     await user.click(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     )
     await user.click(screen.getByRole('button', { name: 'Save log settings' }))
     await screen.findByText('saved=false/false')
@@ -254,7 +255,7 @@ describe('saving both log options with real query refreshes', () => {
       screen.getByRole('switch', { name: 'Record quota usage' })
     ).toHaveAttribute('aria-checked', 'false')
     expect(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     ).toHaveAttribute('aria-checked', 'true')
     await user.click(save)
     await screen.findByText('saved=false/true')
@@ -289,7 +290,7 @@ describe('saving both log options with real query refreshes', () => {
     await screen.findByText('saved=true/false')
     await user.click(screen.getByRole('switch', { name: 'Record quota usage' }))
     await user.click(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     )
     await user.click(screen.getByRole('button', { name: 'Save log settings' }))
     await screen.findByText('saved=false/true')
@@ -303,7 +304,7 @@ describe('saving both log options with real query refreshes', () => {
       screen.getByRole('switch', { name: 'Record quota usage' })
     ).toHaveAttribute('aria-checked', 'false')
     expect(
-      screen.getByRole('switch', { name: 'Record streaming request timeline' })
+      screen.getByRole('switch', { name: 'Record request timelines' })
     ).toHaveAttribute('aria-checked', 'true')
   })
 })

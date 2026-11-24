@@ -14,15 +14,16 @@ import (
 // payloads. The relay's existing write mutex still owns write serialization.
 type timelineResponseWriter struct {
 	gin.ResponseWriter
-	trace      *requesttimeline.Trace
-	ctx        context.Context
-	pending    bool
-	writeError error
+	trace        *requesttimeline.Trace
+	ctx          context.Context
+	nonStreaming bool
+	pending      bool
+	writeError   error
 }
 
 func ObserveRequestTimelineWriter(c *gin.Context, trace *requesttimeline.Trace) func() {
 	original := c.Writer
-	c.Writer = &timelineResponseWriter{ResponseWriter: original, trace: trace, ctx: c.Request.Context()}
+	c.Writer = &timelineResponseWriter{ResponseWriter: original, trace: trace, nonStreaming: trace.IsNonStreaming(), ctx: c.Request.Context()}
 	return func() { c.Writer = original }
 }
 
@@ -30,6 +31,9 @@ func (w *timelineResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	if n > 0 {
 		w.pending = true
+		if w.nonStreaming && err == nil {
+			w.trace.PayloadWritten(w.ctx.Err())
+		}
 	}
 	if err != nil {
 		w.writeError = err
@@ -41,6 +45,9 @@ func (w *timelineResponseWriter) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
 	if n > 0 {
 		w.pending = true
+		if w.nonStreaming && err == nil {
+			w.trace.PayloadWritten(w.ctx.Err())
+		}
 	}
 	if err != nil {
 		w.writeError = err

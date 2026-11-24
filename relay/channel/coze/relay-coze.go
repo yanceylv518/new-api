@@ -248,6 +248,7 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 	}
 	if cozeResponse.Data.Status == "completed" {
 		// 在上下文设置 usage
+		info.Timeline.ObserveJSONResponse(responseBody, "data.usage")
 		c.Set("coze_token_count", cozeResponse.Data.Usage.TokenCount)
 		c.Set("coze_output_count", cozeResponse.Data.Usage.OutputCount)
 		c.Set("coze_input_count", cozeResponse.Data.Usage.InputCount)

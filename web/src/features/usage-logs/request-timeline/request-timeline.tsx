@@ -420,9 +420,13 @@ function TimelineDetails(props: {
   let usageSummary = t('No upstream usage was recorded')
   if (data.upstream_usage) {
     usageSummary = t('Input {{input}} · Output {{output}} · Total {{total}}', {
-      input: upstreamCount('prompt_tokens', 'input_tokens'),
-      output: upstreamCount('completion_tokens', 'output_tokens'),
-      total: upstreamCount('total_tokens'),
+      input: upstreamCount('prompt_tokens', 'input_tokens', 'promptTokenCount'),
+      output: upstreamCount(
+        'completion_tokens',
+        'output_tokens',
+        'candidatesTokenCount'
+      ),
+      total: upstreamCount('total_tokens', 'totalTokenCount'),
     })
   } else if (data.upstream_usage_capture === 'truncated') {
     usageSummary = t(
@@ -580,11 +584,13 @@ function TimelineDetails(props: {
             label={t('Returned model')}
             value={data.response_model || absent}
           />
-          <p className='text-muted-foreground text-xs'>
-            {t(
-              'The first frame may contain only role information; identifiers and the model may arrive later.'
-            )}
-          </p>
+          {!data.non_streaming && (
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'The first frame may contain only role information; identifiers and the model may arrive later.'
+              )}
+            </p>
+          )}
           <RecordedFields
             label={t('Upstream response recorded fields')}
             value={{
@@ -603,11 +609,13 @@ function TimelineDetails(props: {
           offset={data.first_write_ms}
           previous={data.first_response_ms}
         >
-          <p className='text-muted-foreground text-xs'>
-            {t(
-              'First payload write and flush completed. Heartbeats are excluded.'
-            )}
-          </p>
+          {!data.non_streaming && (
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'First payload write and flush completed. Heartbeats are excluded.'
+              )}
+            </p>
+          )}
           <p className='text-muted-foreground text-xs'>
             {t(
               'Recorded inside this service. A completed write does not confirm receipt by the client.'
@@ -629,16 +637,18 @@ function TimelineDetails(props: {
             label={t('Finish reason')}
             value={data.finish_reason || absent}
           />
-          <DetailRow
-            label={t('Upstream end marker')}
-            value={
-              data.end_marker_received
-                ? t('End marker received')
-                : t('Not received')
-            }
-          />
+          {!data.non_streaming && (
+            <DetailRow
+              label={t('Upstream end marker')}
+              value={
+                data.end_marker_received
+                  ? t('End marker received')
+                  : t('Not received')
+              }
+            />
+          )}
           <DetailRow label={t('Upstream usage summary')} value={usageSummary} />
-          {data.upstream_usage && (
+          {data.upstream_usage && !data.non_streaming && (
             <p className='text-muted-foreground text-xs'>
               {hasUsageEvents
                 ? t(
