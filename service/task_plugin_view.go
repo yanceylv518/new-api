@@ -80,6 +80,26 @@ func taskDataWithoutMediaProxy(task *model.Task) (json.RawMessage, error) {
 			return nil, err
 		}
 		changed := false
+		if task.Platform == "zzengine" {
+			// 回调不经过插件轮询，统一从提交状态回显，保留用户显式传入的空字符串。
+			var state struct {
+				SafetyIdentifier *string `json:"safety_identifier"`
+			}
+			if len(task.PrivateData.PluginState) > 0 {
+				if err := common.Unmarshal(task.PrivateData.PluginState, &state); err != nil {
+					return nil, err
+				}
+			}
+			delete(fields, "safety_identifier")
+			if state.SafetyIdentifier != nil {
+				encoded, err := common.Marshal(*state.SafetyIdentifier)
+				if err != nil {
+					return nil, err
+				}
+				fields["safety_identifier"] = encoded
+			}
+			changed = true
+		}
 		if marker, exists := fields["_seedance_inferred_service_tier"]; exists {
 			var inferred bool
 			if err := common.Unmarshal(marker, &inferred); err != nil {

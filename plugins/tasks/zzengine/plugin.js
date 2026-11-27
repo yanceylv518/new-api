@@ -113,7 +113,7 @@ export const meta = {
   name: "Doubao Video（ZZEngine）",
   icon: "Doubao.Color",
   description: { en: "Seedance video generation through ZZEngine", zh: "通过 ZZEngine 生成 Seedance 视频" },
-  version: "1.0.0",
+  version: "1.0.1",
   requiredCapabilities: ["json-clone@1", "task-callback@1", "shared-native-routes@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   baseUrl: "https://model-relay-api.zzengine.net",
@@ -839,6 +839,8 @@ export function buildSubmitRequest(ctx) {
   validateDoubaoOptions(capabilityModel, body, contentInfo, false);
   const callbackURL = body.callback_url;
   delete body.callback_url;
+  // 用户标识由本站保存并回显，不发送给上游。
+  delete body.safety_identifier;
   const hasReference = contentInfo.hasMedia;
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
@@ -866,7 +868,9 @@ export function parseSubmitResponse(ctx, resp) {
   const content = requestContent(req, false);
   // 受理恢复可能没有原任务上下文，不阻止已受理任务重新进入轮询。
   if (!draftTaskIds(content).length || Array.isArray(ctx.originTasks)) state.video_input = videoInputKind(ctx, content);
-  // 只返回上游实际结果，不以请求值补齐格式、优先级或用户标识。
+  const safetyIdentifier = requestField(req, "safety_identifier");
+  if (safetyIdentifier.present) state.safety_identifier = safetyIdentifier.value;
+  // 用户标识从私有状态回显，其他结果字段仍取上游响应。
   const taskData = utils.json.clone(resp.body);
   const serviceTier = requestField(req, "service_tier");
   delete taskData._seedance_inferred_service_tier;
