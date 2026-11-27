@@ -52,7 +52,7 @@ func UpdateSeedanceAssetGroup(c *gin.Context) {
 		return
 	}
 	if group.Status == "Deleting" {
-		seedanceAssetAPIErrorMsg(c, "asset group is being deleted")
+		seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": "asset group is being deleted"})
 		return
 	}
 	client, err := service.ResolveSeedanceAssetClient(c.Request.Context(), group.ChannelID, group.KeyFingerprint, group.AccountFingerprint)
@@ -365,7 +365,7 @@ func CreateSeedanceAssetGroup(c *gin.Context) {
 		group.Description = strings.TrimSpace(*req.Description)
 	}
 	if group.GroupID == "" {
-		seedanceAssetAPIErrorI18n(c, "invalid_params")
+		seedanceAssetAPIResponse(c, http.StatusBadGateway, gin.H{"success": false, "message": "asset service returned no group ID", "code": "InvalidUpstreamResponse"})
 		return
 	}
 	if err := model.CreateSeedanceAssetGroup(c.Request.Context(), group); err != nil {
@@ -571,7 +571,7 @@ func RefreshSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if asset.Status == "Deleting" {
-		seedanceAssetAPIErrorMsg(c, "asset is being deleted")
+		seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": "asset is being deleted"})
 		return
 	}
 	if asset.IsReplicaManaged() {
@@ -703,7 +703,7 @@ func DeleteSeedanceAssetBatch(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req seedanceAssetBatchDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 || len(req.IDs) > seedanceAssetBatchDeleteLimit {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 
@@ -711,7 +711,7 @@ func DeleteSeedanceAssetBatch(c *gin.Context) {
 	seen := make(map[uint]struct{}, len(req.IDs))
 	for _, id := range req.IDs {
 		if id == 0 {
-			common.ApiErrorI18n(c, "invalid_params")
+			seedanceAssetAPIErrorI18n(c, "invalid_params")
 			return
 		}
 		if _, exists := seen[id]; exists {
@@ -725,7 +725,7 @@ func DeleteSeedanceAssetBatch(c *gin.Context) {
 	if err := model.DB.WithContext(c.Request.Context()).
 		Where("user_id = ? AND id IN ?", c.GetInt("id"), ids).
 		Find(&assets).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	assetsByID := make(map[uint]*model.SeedanceAsset, len(assets))
@@ -748,11 +748,11 @@ func DeleteSeedanceAssetBatch(c *gin.Context) {
 		result.PendingIDs = append(result.PendingIDs, id)
 	}
 	if len(jobs) == 0 {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	if err := model.QueueSeedanceAssetDeletion(c.Request.Context(), jobs); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	service.EnqueueSeedanceAssetCleanup()
@@ -772,10 +772,10 @@ func UploadSeedanceAsset(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodySize)
 	if err := c.Request.ParseMultipartForm(2 << 20); err != nil {
 		if common.IsRequestBodyTooLargeError(err) {
-			common.ApiErrorMsg(c, "seedance asset upload is too large")
+			seedanceAssetAPIError(c, service.ErrSeedanceAssetTooLarge)
 			return
 		}
-		common.ApiErrorMsg(c, "invalid seedance asset upload")
+		seedanceAssetAPIErrorMsg(c, "invalid seedance asset upload")
 		return
 	}
 	if c.Request.MultipartForm != nil {
@@ -784,12 +784,12 @@ func UploadSeedanceAsset(c *gin.Context) {
 
 	groupID := strings.TrimSpace(c.PostForm("group_id"))
 	if groupID == "" {
-		common.ApiErrorI18n(c, "invalid_params")
+		seedanceAssetAPIErrorI18n(c, "invalid_params")
 		return
 	}
 	fileHeader, err := c.FormFile("file")
 	if err != nil || fileHeader == nil {
-		common.ApiErrorMsg(c, "seedance asset file is required")
+		seedanceAssetAPIErrorMsg(c, "seedance asset file is required")
 		return
 	}
 	name := strings.TrimSpace(c.PostForm("name"))
@@ -797,21 +797,21 @@ func UploadSeedanceAsset(c *gin.Context) {
 		name = filepath.Base(strings.TrimSpace(fileHeader.Filename))
 	}
 	if utf8.RuneCountInString(name) > 64 {
-		common.ApiErrorMsg(c, "seedance asset name is too long")
+		seedanceAssetAPIErrorMsg(c, "seedance asset name is too long")
 		return
 	}
 
 	var group model.SeedanceAssetGroup
 	if err := model.DB.Where("user_id = ? AND group_id = ?", c.GetInt("id"), groupID).First(&group).Error; err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if group.Status == "Deleting" {
-		common.ApiErrorMsg(c, "asset group is being deleted")
+		seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": "asset group is being deleted"})
 		return
 	}
 	if err := model.CheckSeedanceAssetCapacity(c.Request.Context(), c.GetInt("id"), fileHeader.Size); err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	var client *service.SeedanceAssetClient
@@ -823,17 +823,13 @@ func UploadSeedanceAsset(c *gin.Context) {
 			return
 		}
 		if err := service.EnsureSeedanceAssetGroupReady(c.Request.Context(), client, &group); err != nil {
-			if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
-				seedanceAssetAPIError(c, err)
-				return
-			}
-			seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+			seedanceAssetAPIError(c, err)
 			return
 		}
 	}
 	file, err := fileHeader.Open()
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	defer file.Close()
@@ -847,7 +843,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 			fileHeader.Header.Get("Content-Type"), strings.TrimSpace(c.PostForm("asset_type")), fileHeader.Size, c.GetInt("id"))
 	}
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if client == nil {
@@ -856,7 +852,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 			if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 				cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
 			}
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 			return
 		}
 		c.JSON(http.StatusAccepted, gin.H{"success": true, "data": asset})
@@ -865,7 +861,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 	assetID, err := client.CreateSeedanceAsset(c.Request.Context(), group.GroupID, upload.URL, upload.AssetType, name)
 	if err != nil {
 		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, "", upload.ObjectKey, upload)
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	publicID, upstreamID := assetID, ""
@@ -873,7 +869,7 @@ func UploadSeedanceAsset(c *gin.Context) {
 		publicID, err = newSeedanceAssetPublicID()
 		if err != nil {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 			return
 		}
 		upstreamID = assetID
@@ -898,14 +894,14 @@ func UploadSeedanceAsset(c *gin.Context) {
 	previewURL, err := seedanceAssetPreviewURL(c.Request.Context(), asset)
 	if err != nil {
 		cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	if err := service.CreateSeedanceAssetWithSynchronization(c.Request.Context(), asset, seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c)); err != nil {
 		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), client, assetID, upload.ObjectKey, upload)
 		}
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	asset.PreviewURL = previewURL
@@ -931,7 +927,7 @@ func CreateSeedanceAsset(c *gin.Context) {
 		return
 	}
 	if group.Status == "Deleting" {
-		seedanceAssetAPIErrorMsg(c, "asset group is being deleted")
+		seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": "asset group is being deleted"})
 		return
 	}
 	var client *service.SeedanceAssetClient
@@ -944,11 +940,7 @@ func CreateSeedanceAsset(c *gin.Context) {
 			return
 		}
 		if err := service.EnsureSeedanceAssetGroupReady(c.Request.Context(), client, &group); err != nil {
-			if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
-				seedanceAssetAPIError(c, err)
-				return
-			}
-			seedanceAssetAPIResponse(c, http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+			seedanceAssetAPIError(c, err)
 			return
 		}
 	}

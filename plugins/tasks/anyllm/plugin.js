@@ -168,7 +168,7 @@ export const meta = {
   key: "anyllm",
   name: "Doubao Video（AnyLLM）",
   icon: "text:SD",
-  version: "1.2.5",
+  version: "1.2.6",
   author: { name: "PinduCloud" },
   description: { en: "Seedance video generation, Seedream image generation and private assets", zh: "Seedance 视频生成、Seedream 图片生成与私域素材" },
   requiredCapabilities: ["shared-native-routes@1", "poll-task-data@1"],
@@ -1158,7 +1158,7 @@ export const native = {
   error(ctx, error) {
     if (ctx.method === "GET" && ctx.params && ctx.params.task_id && error.httpStatus === 404 && error.code === "task_not_found")
       return { code: "task_not_exist", message: "task_not_exist", data: null };
-    return { error: { code: error.code, message: error.httpStatus >= 500 ? "Generation request failed" : error.message } };
+    return { error: { code: error.code, message: error.message } };
   },
 };
 

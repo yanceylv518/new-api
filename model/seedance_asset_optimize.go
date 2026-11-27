@@ -9,6 +9,8 @@ import (
 	"gorm.io/gorm"
 )
 
+var ErrSeedanceAssetChanged = errors.New("asset changed while optimization was starting")
+
 // PromoteLocalSeedanceAsset 在持有组锁时将通用素材切换为真实的上游审核任务。
 func PromoteLocalSeedanceAsset(ctx context.Context, userID int, assetID uint, groupID string, expectedUpdatedAt time.Time,
 	channelID int, keyFingerprint, accountFingerprint, upstreamID, syncScope string) error {
@@ -38,7 +40,7 @@ func PromoteLocalSeedanceAsset(ctx context.Context, userID int, assetID uint, gr
 				return nil
 			}
 			if asset.LocalOnly == nil || !*asset.LocalOnly || asset.Status == "Deleting" || !asset.UpdatedAt.Equal(expectedUpdatedAt) {
-				return errors.New("asset changed while optimization was starting")
+				return ErrSeedanceAssetChanged
 			}
 			if err := tx.Model(&asset).Updates(map[string]any{
 				"local_only": false, "primary_upstream_id": upstreamID, "primary_sync_scope": syncScope,

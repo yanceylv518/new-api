@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -21,9 +22,10 @@ import (
 )
 
 var (
-	taskErrorBearerPattern = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[^\s"',;<>]+`)
-	taskErrorAPIKeyPattern = regexp.MustCompile(`(?i)\bsk-[a-z0-9_-]+`)
-	taskErrorSecretPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|authorization|cookie|credentials?)["']?\s*[:=]\s*["']?[^\s"',;<>]+`)
+	taskErrorBearerPattern    = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[^\s"',;<>]+`)
+	taskErrorAPIKeyPattern    = regexp.MustCompile(`(?i)\bsk-[a-z0-9_-]+`)
+	taskErrorIPAddressPattern = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	taskErrorSecretPattern    = regexp.MustCompile(`(?i)\b(?:api[_-]?key|(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|authorization|cookie|credentials?)["']?\s*[:=]\s*["']?[^\s"',;<>]+`)
 )
 
 const (
@@ -48,7 +50,12 @@ func respondSeedanceAdapterSubmissionError(c *gin.Context, taskErr *dto.TaskErro
 		return false
 	}
 	pinned, ok := common.GetContextKeyType[pluginruntime.PinnedPlugin](c, pluginruntime.ContextKeyPinnedPlugin)
-	if !ok || pinned.Plugin == nil || (pinned.Plugin.Meta.Key != "originocean" && pinned.Plugin.Meta.Key != "zzengine") {
+	if !ok || pinned.Plugin == nil {
+		return false
+	}
+	switch pinned.Plugin.Meta.Key {
+	case "doubao", "anyllm", "originocean", "qstart", "zzengine":
+	default:
 		return false
 	}
 	route, native := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute)
@@ -448,6 +455,10 @@ func (r taskUpstreamErrorRedactor) value(value any, field string, depth int) any
 					name = privateName.ReplaceAllString(name, "[redacted]")
 				}
 				name = taskErrorAPIKeyPattern.ReplaceAllString(name, "[redacted]")
+				name = common.MaskSensitiveInfo(name)
+				if net.ParseIP(name) != nil {
+					name = "[redacted]"
+				}
 			}
 			if _, exists := result[name]; exists {
 				base := name
@@ -532,7 +543,11 @@ func (r taskUpstreamErrorRedactor) text(value, field string) string {
 	value = taskErrorBearerPattern.ReplaceAllString(value, "[redacted]")
 	value = taskErrorAPIKeyPattern.ReplaceAllString(value, "[redacted]")
 	value = taskErrorSecretPattern.ReplaceAllString(value, "[redacted]")
-	if !strings.EqualFold(field, "code") && !strings.EqualFold(field, "type") && field != "key" {
+	if net.ParseIP(value) != nil {
+		return "[redacted]"
+	}
+	if !strings.EqualFold(field, "code") && !strings.EqualFold(field, "type") && field != "key" ||
+		strings.Contains(value, "://") || taskErrorIPAddressPattern.MatchString(value) {
 		value = common.MaskSensitiveInfo(value)
 	}
 	return value

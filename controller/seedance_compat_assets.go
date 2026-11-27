@@ -67,6 +67,7 @@ func (w *seedanceCompatWriter) Written() bool { return w.status != 0 }
 type seedanceCompatResult struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
+	Code    string          `json:"code"`
 	Data    json.RawMessage `json:"data"`
 }
 
@@ -135,37 +136,40 @@ func seedanceCompatError(c *gin.Context, status int, message string) {
 }
 
 func seedanceCompatChannelError(c *gin.Context, err error) {
-	code := ""
-	switch {
-	case errors.Is(err, errSeedanceAssetModelNotPermitted):
-		code = "AssetModelNotPermitted"
-	case errors.Is(err, errSeedanceAssetNoChannel):
-		code = "NoPermittedAssetChannel"
-	default:
-		common.SysError("seedance asset channel selection failed: " + err.Error())
-		seedanceCompatError(c, http.StatusServiceUnavailable, "asset service is temporarily unavailable")
-		return
+	seedanceCompatOperationError(c, err)
+}
+
+func seedanceCompatOperationError(c *gin.Context, err error) {
+	status, code, message := seedanceAssetErrorDetails(err)
+	if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
+		c.Header("Retry-After", "5")
 	}
-	c.JSON(http.StatusForbidden, struct {
-		Error string `json:"error"`
-		Code  string `json:"code"`
-	}{Error: "model is unavailable", Code: code})
+	if status >= 500 {
+		common.SysError("Seedance compatible asset operation failed: " + code + ": " + message)
+	}
+	c.JSON(status, gin.H{"error": message, "code": code})
 }
 
 func seedanceCompatResultError(c *gin.Context, result seedanceCompatResult, status int, err error) bool {
 	if err == nil && result.Success {
 		return false
 	}
-	if status < 400 {
-		status = http.StatusBadRequest
+	if err != nil {
+		seedanceCompatError(c, http.StatusInternalServerError, "asset response could not be decoded")
+		return true
 	}
-	message := "asset request failed"
-	if status == http.StatusNotFound {
-		message = "asset resource not found"
-	} else if status == http.StatusServiceUnavailable {
-		message = "asset service is temporarily unavailable"
+	if status < 400 || status > 599 {
+		status = http.StatusInternalServerError
 	}
-	seedanceCompatError(c, status, message)
+	message := strings.TrimSpace(result.Message)
+	if message == "" {
+		message = "asset operation failed"
+	}
+	response := gin.H{"error": message}
+	if result.Code != "" {
+		response["code"] = result.Code
+	}
+	c.JSON(status, response)
 	return true
 }
 
@@ -240,7 +244,7 @@ func seedanceCompatLookupError(c *gin.Context, err error) {
 		seedanceCompatError(c, http.StatusNotFound, "asset resource not found")
 		return
 	}
-	seedanceCompatError(c, http.StatusInternalServerError, "asset lookup failed")
+	seedanceCompatOperationError(c, err)
 }
 
 func seedanceCompatGroupView(group model.SeedanceAssetGroup, count int64) seedanceCompatGroupData {

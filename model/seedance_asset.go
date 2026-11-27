@@ -291,6 +291,9 @@ type SeedanceAssetSize struct {
 	Bytes   int64 `gorm:"not null"`
 }
 
+var ErrSeedanceAssetCountLimit = errors.New("private asset count limit exceeded")
+var ErrSeedanceAssetStorageLimit = errors.New("private asset storage limit exceeded")
+
 func CheckSeedanceAssetCapacity(ctx context.Context, userID int, incomingBytes int64) error {
 	return checkSeedanceAssetCapacity(DB.WithContext(ctx), userID, incomingBytes, common.GetManagementRateLimits().AssetLimits)
 }
@@ -305,7 +308,7 @@ func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64, li
 			return err
 		}
 		if count >= limits.UserMaxCount {
-			return errors.New("private asset count limit exceeded")
+			return ErrSeedanceAssetCountLimit
 		}
 	}
 	if limits.UserStorageMiB > 0 {
@@ -318,7 +321,7 @@ func checkSeedanceAssetCapacity(tx *gorm.DB, userID int, incomingBytes int64, li
 			return err
 		}
 		if incomingBytes > maxBytes || used > maxBytes-incomingBytes {
-			return errors.New("private asset storage limit exceeded")
+			return ErrSeedanceAssetStorageLimit
 		}
 	}
 	return nil

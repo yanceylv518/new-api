@@ -42,6 +42,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -283,6 +284,11 @@ func TestSeedanceJSONActionAssetsUseExplicitEndpointAndIsolateAccounts(t *testin
 		var body map[string]string
 		require.NoError(t, common.DecodeJson(r.Body, &body))
 		actions = append(actions, body["Action"])
+		if body["Name"] == "invalid-name" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"InvalidParameter.Name","Message":"name contains unsupported characters"}}}`)
+			return
+		}
 		if body["Name"] == "fail" {
 			_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"NotFound.fixture","Message":"AnyLLM https://private.example/internal"}}}`)
 			return
@@ -330,6 +336,13 @@ func TestSeedanceJSONActionAssetsUseExplicitEndpointAndIsolateAccounts(t *testin
 	require.ErrorAs(t, err, &upstream)
 	assert.Equal(t, "NotFound.fixture", upstream.code)
 	assert.Equal(t, "GetVisualValidateResult", upstream.action)
+	err = client.CreateSeedanceAssetGroup(t.Context(), "invalid-name", "AIGC", &struct{}{})
+	require.Error(t, err)
+	status, code, message := SeedanceAssetErrorDetails(err)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "InvalidParameter.Name", code)
+	assert.Equal(t, "name contains unsupported characters", message)
+	assert.NotContains(t, err.Error(), "Asset service rejected")
 	channel.Setting = nil
 	_, err = NewSeedanceAssetClient(channel)
 	assert.Error(t, err)
@@ -1552,8 +1565,10 @@ func TestSeedanceAssetUploadUsesConfiguredFileLimits(t *testing.T) {
 	assert.EqualValues(t, 5<<20, SeedanceCompatMaxMultipartBodySize())
 	_, err = StoreSeedanceAssetUpload(t.Context(), bytes.NewReader(nil), "image.png", "image/png", "Image", (1<<20)+1, 1)
 	require.ErrorContains(t, err, "1 MB upload limit")
+	require.ErrorIs(t, err, ErrSeedanceAssetTooLarge)
 	_, err = StoreSeedanceCompatImageUpload(t.Context(), bytes.NewReader(nil), "image.png", "image/png", (4<<20)+1, 1)
 	require.ErrorContains(t, err, "4 MB upload limit")
+	require.ErrorIs(t, err, ErrSeedanceAssetTooLarge)
 }
 
 // 可定位的视频流应直接写入 OSS，避免先复制到第二份临时文件。
@@ -1684,13 +1699,58 @@ func TestSeedanceProgressiveJPEGMarkerParsing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			progressive, err := isProgressiveJPEG(bytes.NewReader(tc.data))
 			if tc.invalid {
-				require.Error(t, err)
+				require.ErrorIs(t, err, ErrSeedanceAssetInvalidInput)
 				return
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tc.progressive, progressive)
 		})
 	}
+}
+
+func TestSeedanceAssetInputErrorsKeepClientStatus(t *testing.T) {
+	storage := useFakePrivateAssetOSSStorage(t)
+	for _, data := range [][]byte{
+		{0xff, 0xd8},
+		{0xff, 0xd8, 1},
+		{0xff, 0xd8, 0xff, 0xe0, 0, 4, 1},
+		{0xff, 0xd8, 0xff, 0xc2},
+	} {
+		_, err := StoreSeedanceAssetUpload(t.Context(), bytes.NewReader(data), "damaged.jpg", "image/jpeg", "Image", int64(len(data)), 1)
+		require.ErrorIs(t, err, ErrSeedanceAssetInvalidInput)
+		status, code, message := SeedanceAssetErrorDetails(err)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "ValidationError", code)
+		assert.Contains(t, message, "JPEG")
+		assert.Nil(t, storage.putRequest)
+	}
+	for _, tc := range []struct{ callback, reason string }{
+		{"ftp://example.org/return", "must use http or https"},
+		{"https://credential@example.org/return", "is invalid"},
+		{":invalid", "is invalid"},
+		{"", "is required"},
+		{"https://example.org/" + strings.Repeat("a", 2048), "must not exceed 2048 bytes"},
+	} {
+		err := ValidateSeedanceAssetValidationCallbackURL(tc.callback)
+		require.ErrorIs(t, err, ErrSeedanceAssetInvalidInput)
+		status, code, message := SeedanceAssetErrorDetails(err)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "ValidationError", code)
+		assert.Contains(t, message, "callback URL")
+		assert.Contains(t, message, tc.reason)
+		assert.NotContains(t, message, "credential")
+	}
+	require.NoError(t, ValidateSeedanceAssetValidationCallbackURL("https://example.org/return"))
+	_, err := isProgressiveJPEG(io.MultiReader(bytes.NewReader([]byte{0xff, 0xd8}), iotest.ErrReader(assert.AnError)))
+	require.ErrorIs(t, err, assert.AnError)
+	assert.NotErrorIs(t, err, ErrSeedanceAssetInvalidInput)
+	status, _, _ := SeedanceAssetErrorDetails(err)
+	assert.Equal(t, http.StatusInternalServerError, status)
+	_, err = normalizeSeedanceProgressiveJPEG(t.Context(), filepath.Join(t.TempDir(), "missing.jpg"), 1024)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrSeedanceAssetInvalidInput)
+	status, _, _ = SeedanceAssetErrorDetails(err)
+	assert.Equal(t, http.StatusInternalServerError, status)
 }
 
 func TestSeedanceImageValidationCancelsWhileDecodeSlotsAreBusy(t *testing.T) {
@@ -1727,15 +1787,17 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.SystemTask{},
+		&model.SeedanceAssetCleanupJob{},
 		&model.SeedanceAssetGroup{},
 		&model.SeedanceAssetGroupReplica{},
 		&model.SeedanceAsset{},
+		&model.SeedanceAssetSize{},
 		&model.SeedanceAssetReplica{},
 	))
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = previousDB
-		assert.NoError(t, db.Migrator().DropTable(&model.SeedanceAssetReplica{}, &model.SeedanceAsset{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetGroup{}, &model.SystemTask{}))
+		assert.NoError(t, db.Migrator().DropTable(&model.SeedanceAssetReplica{}, &model.SeedanceAssetSize{}, &model.SeedanceAsset{}, &model.SeedanceAssetGroupReplica{}, &model.SeedanceAssetGroup{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}))
 		sqlDB, dbErr := db.DB()
 		if dbErr == nil {
 			_ = sqlDB.Close()
@@ -1915,6 +1977,26 @@ func TestMapSeedanceAssetsToSelectedAccountCreatesAndReusesReplica(t *testing.T)
 	_, err = MapSeedanceAssetsToAccount(t.Context(), primaryGroup.UserID, clientB, []string{primaryAsset.AssetID})
 	assert.ErrorContains(t, err, "require verification on the selected upstream account")
 	assert.Len(t, actions, actionsBeforeVerificationCheck, "copying media cannot substitute for upstream real-person verification")
+
+	for _, tc := range []struct {
+		lastError string
+		attempts  int
+		want      error
+		code      string
+	}{
+		{"", 0, ErrSeedanceAssetRejected, "AssetRejected"},
+		{model.SeedanceAssetReviewTimeoutCode, model.SeedanceAssetSyncMaxAttempts, ErrSeedanceAssetReviewTimeout, "AssetReviewTimeout"},
+	} {
+		require.NoError(t, db.Model(&model.SeedanceAssetReplica{}).Where("local_asset_id = ? AND account_fingerprint = ?", asset.ID, clientB.AccountFingerprint).
+			Updates(map[string]any{"status": "Failed", "provision_status": model.SeedanceAssetReplicaReady, "last_error": tc.lastError, "poll_attempts": tc.attempts, "next_poll_at": 0}).Error)
+		_, err := MapSeedanceAssetsToAccount(t.Context(), group.UserID, clientB, []string{asset.AssetID})
+		require.ErrorIs(t, err, tc.want)
+		status, code, message := SeedanceAssetErrorDetails(err)
+		assert.Equal(t, http.StatusConflict, status)
+		assert.Equal(t, tc.code, code)
+		assert.Equal(t, tc.want.Error(), message)
+		assert.Len(t, actions, actionsBeforeVerificationCheck)
+	}
 }
 
 func TestMapSeedanceAssetsToSelectedAccountHandlesMultipleAssetsInOneRequest(t *testing.T) {

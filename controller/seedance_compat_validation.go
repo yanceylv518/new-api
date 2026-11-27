@@ -57,16 +57,7 @@ func CreateSeedanceCompatValidationSession(c *gin.Context) {
 	}
 	choices, err := selectSeedanceAssetValidationCandidates(c, request.Model, true, true)
 	if err != nil {
-		if errors.Is(err, errSeedanceAssetModelNotPermitted) || errors.Is(err, errSeedanceAssetNoChannel) {
-			c.JSON(http.StatusForbidden, struct {
-				Success bool   `json:"success"`
-				Error   string `json:"error"`
-				Message string `json:"message"`
-			}{Success: false, Error: "model_no_permission", Message: "no available channel for this model"})
-		} else {
-			common.SysError("seedance validation channel selection failed: " + err.Error())
-			seedanceCompatError(c, http.StatusServiceUnavailable, "validation service is temporarily unavailable")
-		}
+		seedanceCompatChannelError(c, err)
 		return
 	}
 	channels := make([]*model.Channel, 0, len(choices))
@@ -101,7 +92,7 @@ func CreateSeedanceCompatValidationSession(c *gin.Context) {
 	started, err := service.StartSeedanceAssetValidationSessionWithFallback(c.Request.Context(), c.GetInt("id"), channels,
 		service.SeedanceAssetValidationGroupDetails{}, "", callback.String())
 	if err != nil {
-		seedanceCompatError(c, http.StatusBadGateway, "validation session creation failed")
+		seedanceCompatOperationError(c, err)
 		return
 	}
 	suggestedModel := ""

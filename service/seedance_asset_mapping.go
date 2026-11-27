@@ -12,6 +12,8 @@ import (
 )
 
 var ErrSeedanceAssetMappingPending = errors.New("private asset is syncing to the selected upstream account")
+var ErrSeedanceAssetRejected = errors.New("private asset was rejected by the selected upstream account")
+var ErrSeedanceAssetReviewTimeout = errors.New("private asset review timed out; retry later")
 
 const (
 	seedanceAssetMappingWorkerSize    = 4
@@ -445,10 +447,10 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 			}
 			if status != "active" {
 				if status == model.SeedanceAssetReviewTimeoutCode {
-					return "", false, errors.New("private asset review timed out; retry later")
+					return "", false, ErrSeedanceAssetReviewTimeout
 				}
 				if status == "failed" {
-					return "", false, errors.New("private asset was rejected by the selected upstream account")
+					return "", false, ErrSeedanceAssetRejected
 				}
 				return "", true, ErrSeedanceAssetMappingPending
 			}
@@ -485,11 +487,11 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 			}
 			status = normalizeSeedanceAssetStatus(refreshed.Status)
 			if refreshed.LastError == model.SeedanceAssetReviewTimeoutCode && refreshed.PollAttempts >= model.SeedanceAssetSyncMaxAttempts {
-				return "", false, errors.New("private asset review timed out; retry later")
+				return "", false, ErrSeedanceAssetReviewTimeout
 			}
 		}
 		if status == "failed" {
-			return "", false, errors.New("private asset was rejected by the selected upstream account")
+			return "", false, ErrSeedanceAssetRejected
 		}
 		if status != "active" {
 			return "", true, ErrSeedanceAssetMappingPending
@@ -539,7 +541,7 @@ func ensureSeedanceAssetReplica(ctx context.Context, client *SeedanceAssetClient
 		return "", true, fmt.Errorf("%w: %v", ErrSeedanceAssetMappingPending, refreshErr)
 	}
 	if normalizeSeedanceAssetStatus(refreshed.Status) == "failed" {
-		return "", false, errors.New("private asset was rejected by the selected upstream account")
+		return "", false, ErrSeedanceAssetRejected
 	}
 	if normalizeSeedanceAssetStatus(refreshed.Status) != "active" {
 		return "", true, ErrSeedanceAssetMappingPending

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,242 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestSeedanceAssetErrorSurfaces(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		status  int
+		code    string
+		message string
+	}{
+		{"input", fmt.Errorf("%w: unsupported image format", service.ErrSeedanceAssetInvalidInput), 400, "ValidationError", "unsupported image format"},
+		{"permission", errSeedanceAssetModelNotPermitted, 403, "AssetModelNotPermitted", "API key does not allow this model"},
+		{"channel", errSeedanceAssetNoChannel, 503, "NoPermittedAssetChannel", "no available Seedance asset channel"},
+		{"missing", gorm.ErrRecordNotFound, 404, "ResourceNotFound", "asset resource not found"},
+		{"pending", service.ErrSeedanceAssetMappingPending, 409, "OperationPending", "syncing"},
+		{"callback", service.ValidateSeedanceAssetValidationCallbackURL("ftp://example.org/return"), 400, "ValidationError", "must use http or https"},
+		{"review_rejected", service.ErrSeedanceAssetRejected, 409, "AssetRejected", "was rejected"},
+		{"review_timeout", service.ErrSeedanceAssetReviewTimeout, 409, "AssetReviewTimeout", "review timed out"},
+		{"size", service.ErrSeedanceAssetTooLarge, 413, "RequestTooLarge", "size limit"},
+		{"count", model.ErrSeedanceAssetCountLimit, 409, "AssetCountLimitExceeded", "count limit"},
+		{"storage_quota", model.ErrSeedanceAssetStorageLimit, 409, "AssetStorageLimitExceeded", "storage limit"},
+		{"changed", errors.Join(model.ErrSeedanceAssetCleanupScheduled, model.ErrSeedanceAssetChanged), 409, "ResourceChanged", "asset changed"},
+		{"storage_service", service.ErrSeedanceAssetStorageUnavailable, 503, "StorageUnavailable", "storage is unavailable"},
+		{"source", service.ErrSeedanceAssetSourceUnavailable, 502, "AssetSourceUnavailable", "could not be downloaded"},
+		{"timeout", context.DeadlineExceeded, 504, "RequestTimeout", "timed out"},
+		{"internal", errors.New("password=private-test-value"), 500, "InternalError", "internal error"},
+	} {
+		for _, surface := range []string{"rest", "action", "compat"} {
+			t.Run(tc.name+"/"+surface, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/assets", nil)
+				if surface == "action" {
+					c.Set(seedanceAssetActionContextKey, "CreateAsset")
+				}
+				if surface == "compat" {
+					result, status, err := seedanceCompatCall(c, func(c *gin.Context) { seedanceAssetAPIError(c, tc.err) })
+					require.True(t, seedanceCompatResultError(c, result, status, err))
+				} else {
+					seedanceAssetAPIError(c, tc.err)
+				}
+				assert.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Body.String(), tc.code)
+				assert.Contains(t, recorder.Body.String(), tc.message)
+				assert.NotContains(t, recorder.Body.String(), "private-test-value")
+			})
+		}
+	}
+}
+
+func TestSeedanceAssetUpstreamHTTPStatus(t *testing.T) {
+	status := 400
+	codeOverride := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		code := "ProviderRejected"
+		if status == 402 {
+			code = "fixture-upstream-secret"
+		}
+		if codeOverride != "" {
+			code = codeOverride
+		}
+		_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"asset operation rejected; AnyLLM bearer fixture-upstream-secret"}}`, code)
+	}))
+	t.Cleanup(upstream.Close)
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeDoubaoVideo, BaseURL: &upstream.URL, Key: "fixture-upstream-secret", Status: common.ChannelStatusEnabled}
+	require.NoError(t, channel.SetSetting(kitdto.ChannelSettings{SeedanceAssetURL: upstream.URL}))
+	client, err := service.NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	for _, upstreamStatus := range []int{200, 400, 401, 402, 403, 404, 429, 500, 502, 503, 504} {
+		status = upstreamStatus
+		wantStatus := upstreamStatus
+		if wantStatus == 200 {
+			wantStatus = http.StatusBadGateway
+		}
+		err = client.CreateSeedanceAssetGroup(t.Context(), "fixture", "AIGC", &struct{}{})
+		require.Error(t, err)
+		for _, surface := range []string{"rest", "action", "compat", "dashboard"} {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/assets/groups", nil)
+			if surface == "dashboard" {
+				c.Request.URL.Path = "/api/user/seedance/asset-groups"
+			}
+			if surface == "action" {
+				c.Set(seedanceAssetActionContextKey, "CreateAssetGroup")
+			}
+			if surface == "compat" {
+				result, capturedStatus, callErr := seedanceCompatCall(c, func(c *gin.Context) { seedanceAssetAPIError(c, err) })
+				require.True(t, seedanceCompatResultError(c, result, capturedStatus, callErr))
+			} else {
+				seedanceAssetAPIError(c, err)
+			}
+			expectedStatus := wantStatus
+			if surface == "dashboard" && upstreamStatus == 401 {
+				expectedStatus = http.StatusBadGateway
+			}
+			assert.Equal(t, expectedStatus, recorder.Code, surface+": "+recorder.Body.String())
+			if upstreamStatus == 402 {
+				assert.Contains(t, recorder.Body.String(), "UpstreamError")
+			} else {
+				assert.Contains(t, recorder.Body.String(), "ProviderRejected")
+			}
+			assert.Contains(t, recorder.Body.String(), "asset operation rejected")
+			assert.NotContains(t, recorder.Body.String(), "fixture-upstream-secret")
+			assert.NotContains(t, strings.ToLower(recorder.Body.String()), "anyllm")
+		}
+	}
+	status = http.StatusInternalServerError
+	for _, tc := range []struct{ code, want string }{
+		{"10.20.30.40:8080", "UpstreamError"},
+		{"10.20.30.40", "UpstreamError"},
+		{"fd00::abcd", "UpstreamError"},
+		{"InvalidParameter.Name", "InvalidParameter.Name"},
+	} {
+		codeOverride = tc.code
+		err := client.CreateSeedanceAssetGroup(t.Context(), "fixture", "AIGC", &struct{}{})
+		require.Error(t, err)
+		actualStatus, code, message := service.SeedanceAssetErrorDetails(err)
+		assert.Equal(t, http.StatusInternalServerError, actualStatus)
+		assert.Equal(t, tc.want, code)
+		assert.Contains(t, message, "asset operation rejected")
+	}
+}
+
+func TestSeedanceErrorFieldNamesAreRedacted(t *testing.T) {
+	const raw = `{"error":{"code":"InternalError","message":"storage unavailable"},"causes":{"http://10.23.0.7:9000/internal":"first failure","http://10.24.0.7:9000/internal":"second failure","fd00::abcd":"ipv6 failure"}}`
+	for _, key := range []string{"doubao", "anyllm", "qstart"} {
+		for _, errorCode := range []string{"InternalError", "InvalidParameter.Name", "10.20.30.40:8080", "fd00::abcd"} {
+			t.Run(key+"/"+errorCode, func(t *testing.T) {
+				source, err := builtinplugins.Source(key)
+				require.NoError(t, err)
+				plugin, err := pluginruntime.CompilePlugin(source, pluginruntime.Options{})
+				require.NoError(t, err)
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				c.Set("task_action", "text_to_video")
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+				respondPluginProtocolSubmissionError(c, &dto.TaskError{Code: "fail_to_fetch_task", StatusCode: 500, Error: errors.New(strings.Replace(raw, "InternalError", errorCode, 1))})
+				require.Equal(t, http.StatusInternalServerError, recorder.Code)
+				var body struct {
+					Error  struct{ Code, Message string } `json:"error"`
+					Causes map[string]string              `json:"causes"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				if errorCode == "InternalError" || errorCode == "InvalidParameter.Name" {
+					assert.Equal(t, errorCode, body.Error.Code)
+				} else {
+					assert.NotEmpty(t, body.Error.Code)
+					assert.NotContains(t, body.Error.Code, errorCode)
+				}
+				assert.Equal(t, "storage unavailable", body.Error.Message)
+				require.Len(t, body.Causes, 3)
+				values := make([]string, 0, len(body.Causes))
+				for _, value := range body.Causes {
+					values = append(values, value)
+				}
+				assert.ElementsMatch(t, []string{"first failure", "second failure", "ipv6 failure"}, values)
+				assert.NotContains(t, recorder.Body.String(), "10.23.0.7")
+				assert.NotContains(t, recorder.Body.String(), "10.24.0.7")
+				assert.NotContains(t, recorder.Body.String(), "fd00::abcd")
+			})
+		}
+	}
+}
+
+func TestSeedanceValidationLookupErrorsMySQL(t *testing.T) {
+	setupNativeActionTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.SeedanceAssetValidationSession{}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Migrator().DropTable(&model.SeedanceAssetValidationSession{})) })
+	for _, tc := range []struct {
+		id      string
+		status  int
+		message string
+	}{
+		{"invalid", 400, "invalid validation session id"},
+		{"100", 404, "validation session not found"},
+	} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("id", 1)
+		c.Params = gin.Params{{Key: "id", Value: tc.id}}
+		c.Request = httptest.NewRequest(http.MethodGet, "/validation/"+tc.id, nil)
+		GetSeedanceAssetValidationSession(c)
+		assert.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+		assert.Contains(t, recorder.Body.String(), tc.message)
+	}
+}
+
+func TestSeedancePluginErrorReasons(t *testing.T) {
+	for _, key := range []string{"doubao", "anyllm", "originocean", "qstart", "zzengine"} {
+		source, err := builtinplugins.Source(key)
+		require.NoError(t, err)
+		plugin, err := pluginruntime.CompilePlugin(source, pluginruntime.Options{})
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			status        int
+			code, message string
+		}{
+			{400, "invalid_request", "reference_image is invalid"},
+			{403, "permission_denied", "API key does not allow this model"},
+			{404, "resource_not_found", "asset resource not found"},
+			{409, "private_asset_mapping_pending", "private asset is syncing to the selected upstream account"},
+			{413, "request_too_large", "asset file exceeds the size limit"},
+			{429, "rate_limit_exceeded", "asset creation rate limit exceeded"},
+			{503, "model_not_found", "no available channel for the requested model in the current group"},
+			{503, "private_asset_sync_failed", "private asset synchronization failed; retry after the issue is resolved"},
+			{504, "request_timeout", "asset operation timed out"},
+		} {
+			t.Run(key+"/"+tc.code, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", nil)
+				c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Plugin: plugin, Route: pluginruntime.Route{Protocol: "seedance-v3"}})
+				c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{Method: http.MethodPost, Path: c.Request.URL.Path})
+				c.Set(middleware.ContextKeyPublicTaskPluginError, true)
+				require.True(t, middleware.RespondTaskPluginError(c, &dto.TaskError{Code: tc.code, Message: tc.message, StatusCode: tc.status, LocalError: true}))
+				assert.Equal(t, tc.status, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), tc.code)
+				assert.Contains(t, recorder.Body.String(), tc.message)
+				assert.NotContains(t, recorder.Body.String(), "Generation request failed")
+			})
+		}
+		for _, path := range []string{"/v1/videos", "/v1/responses"} {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, path, nil)
+			c.Set("task_action", "text_to_video")
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+			require.True(t, respondSeedanceAdapterSubmissionError(c, &dto.TaskError{Code: "fail_to_fetch_task", StatusCode: 429, Error: errors.New(`{"error":{"code":"QuotaExceeded","message":"asset quota exceeded"}}`)}))
+			assert.Equal(t, 429, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "QuotaExceeded")
+			assert.Contains(t, recorder.Body.String(), "asset quota exceeded")
+		}
+	}
+}
 
 func TestSeedanceValidationCallbackUsesBoundSession(t *testing.T) {
 	setupNativeActionTestDB(t)

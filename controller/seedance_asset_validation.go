@@ -78,7 +78,7 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 		if official {
 			writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "CreateVisualValidateSession", "Invalid validation session request")
 		} else {
-			common.ApiErrorI18n(c, "invalid_params")
+			seedanceAssetAPIErrorI18n(c, "invalid_params")
 		}
 		return
 	}
@@ -95,9 +95,10 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 	channels, err := selectSeedanceAssetValidationChannels(c, request.Model)
 	if err != nil {
 		if official {
-			writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "CreateVisualValidateSession", err.Error())
+			status, code, message := seedanceAssetErrorDetails(err)
+			writeSeedanceAssetOfficialErrorWithCode(c, status, "CreateVisualValidateSession", code, message)
 		} else {
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 		}
 		return
 	}
@@ -116,9 +117,10 @@ func createSeedanceAssetValidationSession(c *gin.Context, official bool) {
 	)
 	if err != nil {
 		if official {
-			writeSeedanceAssetOfficialUpstreamError(c, http.StatusBadGateway, "CreateVisualValidateSession", err.Error())
+			status, code, message := seedanceAssetErrorDetails(err)
+			writeSeedanceAssetOfficialErrorWithCode(c, status, "CreateVisualValidateSession", code, message)
 		} else {
-			common.ApiError(c, err)
+			seedanceAssetAPIError(c, err)
 		}
 		return
 	}
@@ -149,16 +151,12 @@ func CreateSeedanceAssetValidationSession(c *gin.Context) {
 func GetSeedanceAssetValidationSession(c *gin.Context) {
 	id, err := parseSeedanceValidationSessionID(c)
 	if err != nil {
-		common.ApiError(c, err)
+		seedanceAssetAPIErrorMsg(c, err.Error())
 		return
 	}
 	session, err := service.RefreshSeedanceAssetValidationSession(c.Request.Context(), c.GetInt("id"), id)
 	if err != nil {
-		if errors.Is(err, model.ErrSeedanceAssetValidationSessionNotFound) {
-			common.ApiError(c, err)
-			return
-		}
-		common.ApiError(c, err)
+		seedanceAssetAPIError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": service.BuildSeedanceAssetValidationSessionView(session)})
@@ -362,7 +360,8 @@ func SeedanceAssetV2Action(c *gin.Context) {
 				writeSeedanceAssetOfficialError(c, http.StatusBadRequest, "GetVisualValidateResult", err.Error())
 				return
 			}
-			writeSeedanceAssetOfficialUpstreamError(c, http.StatusBadGateway, "GetVisualValidateResult", err.Error())
+			status, code, message := seedanceAssetErrorDetails(err)
+			writeSeedanceAssetOfficialErrorWithCode(c, status, "GetVisualValidateResult", code, message)
 			return
 		}
 		if session.Status != model.SeedanceAssetValidationStatusSucceeded || session.UpstreamGroupID == "" {

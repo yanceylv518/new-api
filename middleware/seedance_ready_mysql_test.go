@@ -19,6 +19,8 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -298,6 +300,93 @@ func TestSeedanceAssetReadyRoutingMySQL(t *testing.T) {
 	response = fixture.submitWith(`{"model":"doubao-seedance-2-0-260128","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`, "aaa", "102")
 	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
 	require.Empty(t, response.Header().Get("X-Test-Channel"))
+}
+
+func TestSeedanceAssetRoutingErrorsMySQL(t *testing.T) {
+	fixture := newSeedanceReadyFixture(t)
+	const modelName = "doubao-seedance-2-0-260128"
+	for _, requested := range []string{"doubao-seedance-2-0", "doubao-seedance-2-0-fast-260128"} {
+		response := fixture.submitWith(`{"model":"`+requested+`","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`, "vip", "", requested)
+		require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), `"code":"model_not_found"`)
+		require.NotContains(t, response.Body.String(), "sync_failed")
+		require.Empty(t, response.Header().Get("X-Test-Channel"))
+	}
+	response := fixture.submit()
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, "102", response.Header().Get("X-Test-Channel"))
+
+	require.NoError(t, fixture.db.Model(fixture.asset).Update("status", "Failed").Error)
+	require.NoError(t, fixture.db.Model(fixture.replica).Updates(map[string]any{
+		"provision_status": model.SeedanceAssetReplicaReady, "status": "Failed", "upstream_asset_id": "asset-reviewed", "next_poll_at": 0,
+	}).Error)
+	response = fixture.submit()
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"code":"private_asset_unavailable"`)
+	require.NotContains(t, response.Body.String(), "sync_failed")
+	require.NoError(t, fixture.db.Model(fixture.asset).Update("status", "Active").Error)
+
+	var channels []model.Channel
+	require.NoError(t, fixture.db.Order("id").Find(&channels).Error)
+	for _, channel := range channels {
+		settings := channel.GetSetting()
+		settings.VideoRoutingRules = []kitdto.VideoRoutingRule{{Model: modelName, Mode: "allow", Resolutions: []string{"720p"}}}
+		setSeedanceReadyChannelSetting(t, &channel, settings)
+		require.NoError(t, channel.Update())
+	}
+	fixture.engine.POST("/doubao/api/v3/contents/generations/tasks", func(c *gin.Context) {
+		service.GetChannelConstraints(c).AddFilter(dto.ChannelFilter{Kind: dto.FilterVideoRouting, VideoRoutingResolution: "480p", VideoRoutingModel: modelName})
+	}, Distribute(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	request := httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", strings.NewReader(`{"model":"`+modelName+`","resolution":"480p","content":[{"type":"image_url","image_url":{"url":"asset://asset-test"}}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"code":"video_resolution_unavailable"`)
+	require.NotContains(t, response.Body.String(), "sync_failed")
+
+	for _, channel := range channels {
+		settings := channel.GetSetting()
+		settings.VideoRoutingRules = nil
+		settings.SeedanceAssetURL = ""
+		setSeedanceReadyChannelSetting(t, &channel, settings)
+		require.NoError(t, channel.Update())
+	}
+	response = fixture.submit()
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"code":"private_asset_channel_unavailable"`)
+	require.NotContains(t, response.Body.String(), "sync_failed")
+}
+
+func TestSeedanceAssetRejectedParametersMySQL(t *testing.T) {
+	fixture := newSeedanceReadyFixture(t)
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	plugin, err := registry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	body := map[string]any{"model": "doubao-seedance-2-0-260128", "duration": 0,
+		"content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://asset-test"}}}}
+	_, decodeErr := plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, map[string]any{"body": map[string]any{"kind": "json", "value": body}})
+	require.Error(t, decodeErr)
+	detail := taskPluginHookDetail(decodeErr)
+	require.NotEmpty(t, detail)
+	const path = "/doubao/api/v3/contents/generations/tasks"
+	fixture.engine.POST(path, func(c *gin.Context) {
+		common.SetContextKey(c, jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Plugin: plugin, Generation: registry.Generation()})
+		c.Set(contextKeyTaskPluginDecodeFailures, []taskPluginDecodeFailure{{plugin: plugin, detail: detail, channelIDs: []int{101, 102}}})
+		service.GetChannelConstraints(c).AddFilter(dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginChannelIDs: map[int]struct{}{999: {}}})
+	}, Distribute(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	encoded, err := common.Marshal(body)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(encoded)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "duration")
+	require.Contains(t, response.Body.String(), `"code":"model_request_unsupported"`)
+	require.NotContains(t, response.Body.String(), "sync_failed")
 }
 
 func TestSeedanceModelModifierReadyFallbackMySQL(t *testing.T) {

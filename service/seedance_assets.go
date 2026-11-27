@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -78,6 +79,15 @@ var ErrSeedanceAssetGroupPending = errors.New("the verified asset group is still
 var ErrSeedanceAssetServiceTemporary = errors.New("Asset service is temporarily unavailable. Please try again.")
 
 var ErrSeedanceAssetChannelUnavailable = errors.New("no enabled Seedance channel available")
+
+var ErrSeedanceAssetInvalidInput = errors.New("invalid asset input")
+var ErrSeedanceAssetTooLarge = errors.New("asset upload exceeds the size limit")
+var ErrSeedanceAssetSourceUnavailable = errors.New("asset source could not be downloaded")
+var ErrSeedanceAssetStorageUnavailable = errors.New("asset storage is unavailable")
+
+var seedanceAssetPrivateProviderPattern = regexp.MustCompile(`(?i)anyllm|originocean|zzengine|qstart`)
+var seedanceAssetPublicCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+var seedanceAssetIPCodePattern = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 
 var errSeedanceAssetResponse = errors.New("invalid Seedance asset response")
 
@@ -200,20 +210,20 @@ func isProgressiveJPEG(source io.Reader) (bool, error) {
 	for offset := int64(2); ; {
 		prefix, err := reader.ReadByte()
 		if errors.Is(err, io.EOF) {
-			return false, fmt.Errorf("truncated JPEG data")
+			return false, fmt.Errorf("%w: truncated JPEG data", ErrSeedanceAssetInvalidInput)
 		}
 		if err != nil {
 			return false, err
 		}
 		if prefix != 0xff {
-			return false, fmt.Errorf("invalid JPEG marker at offset %d", offset)
+			return false, fmt.Errorf("%w: invalid JPEG marker at offset %d", ErrSeedanceAssetInvalidInput, offset)
 		}
 		offset++
 		marker := byte(0xff)
 		for marker == 0xff {
 			marker, err = reader.ReadByte()
 			if errors.Is(err, io.EOF) {
-				return false, fmt.Errorf("truncated JPEG marker")
+				return false, fmt.Errorf("%w: truncated JPEG marker", ErrSeedanceAssetInvalidInput)
 			}
 			if err != nil {
 				return false, err
@@ -234,20 +244,30 @@ func isProgressiveJPEG(source io.Reader) (bool, error) {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				return false, err
 			}
-			return false, fmt.Errorf("truncated JPEG segment length")
+			return false, fmt.Errorf("%w: truncated JPEG segment length", ErrSeedanceAssetInvalidInput)
 		}
 		segmentLength := int(lengthBytes[0])<<8 | int(lengthBytes[1])
 		if segmentLength < 2 {
-			return false, fmt.Errorf("invalid JPEG segment length")
+			return false, fmt.Errorf("%w: invalid JPEG segment length", ErrSeedanceAssetInvalidInput)
 		}
 		if _, err := io.CopyN(io.Discard, reader, int64(segmentLength-2)); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return false, fmt.Errorf("invalid JPEG segment length")
+				return false, fmt.Errorf("%w: invalid JPEG segment length", ErrSeedanceAssetInvalidInput)
 			}
 			return false, err
 		}
 		offset += int64(segmentLength)
 	}
+}
+
+// 图片格式和截断错误属于用户输入，磁盘等读取故障仍保留原错误类型。
+func seedanceJPEGDecodeError(err error) error {
+	var formatErr jpeg.FormatError
+	var unsupportedErr jpeg.UnsupportedError
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &formatErr) || errors.As(err, &unsupportedErr) {
+		return fmt.Errorf("%w: %w", ErrSeedanceAssetInvalidInput, err)
+	}
+	return err
 }
 
 // normalizeSeedanceProgressiveJPEG 将上游实际无法处理的 progressive JPEG 规范化为 baseline JPEG。
@@ -276,10 +296,10 @@ func normalizeSeedanceProgressiveJPEG(ctx context.Context, path string, maxSize 
 	}
 	config, err := jpeg.DecodeConfig(file)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read progressive JPEG dimensions: %w", err)
+		return 0, fmt.Errorf("failed to read progressive JPEG dimensions: %w", seedanceJPEGDecodeError(err))
 	}
 	if config.Width > seedanceAssetImageMaxDimension || config.Height > seedanceAssetImageMaxDimension {
-		return 0, fmt.Errorf("JPEG dimensions exceed the %d px limit", seedanceAssetImageMaxDimension)
+		return 0, fmt.Errorf("%w: JPEG dimensions exceed the %d px limit", ErrSeedanceAssetInvalidInput, seedanceAssetImageMaxDimension)
 	}
 	release, err := acquireSeedanceImageDecode(ctx, config)
 	if err != nil {
@@ -291,7 +311,7 @@ func normalizeSeedanceProgressiveJPEG(ctx context.Context, path string, maxSize 
 	}
 	decoded, err := jpeg.Decode(file)
 	if err != nil {
-		return 0, fmt.Errorf("failed to decode progressive JPEG: %w", err)
+		return 0, fmt.Errorf("failed to decode progressive JPEG: %w", seedanceJPEGDecodeError(err))
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -316,7 +336,7 @@ func normalizeSeedanceProgressiveJPEG(ctx context.Context, path string, maxSize 
 		return 0, closeErr
 	}
 	if info.Size() > maxSize {
-		return 0, fmt.Errorf("normalized Image asset exceeds the %d MB upload limit", maxSize>>20)
+		return 0, fmt.Errorf("%w: normalized Image exceeds %d MB", ErrSeedanceAssetTooLarge, maxSize>>20)
 	}
 	return info.Size(), nil
 }
@@ -330,7 +350,7 @@ func StoreSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 // StoreSeedanceAssetURL 固化外部素材，避免账号同步依赖临时地址。
 func StoreSeedanceAssetURL(ctx context.Context, sourceURL, assetType string, userID int) (*SeedanceAssetUpload, error) {
 	if err := ValidateSeedanceAssetSourceURL(sourceURL); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: invalid or disallowed asset source URL", ErrSeedanceAssetInvalidInput)
 	}
 	parsed, err := url.Parse(sourceURL)
 	if err != nil {
@@ -348,15 +368,15 @@ func StoreSeedanceAssetURL(ctx context.Context, sourceURL, assetType string, use
 	client.Timeout = 0
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, errors.New("unable to fetch asset source")
+		return nil, errors.Join(ErrSeedanceAssetSourceUnavailable, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("asset source returned status %d", response.StatusCode)
+		return nil, fmt.Errorf("%w: source returned HTTP %d", ErrSeedanceAssetSourceUnavailable, response.StatusCode)
 	}
 	size := max(response.ContentLength, 0)
 	if size > SeedanceAssetMaxUploadSize(assetType) {
-		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+		return nil, fmt.Errorf("%w: %s exceeds the %s upload limit", ErrSeedanceAssetTooLarge, assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
 	}
 	if err := model.CheckSeedanceAssetCapacity(ctx, userID, size); err != nil {
 		return nil, err
@@ -372,18 +392,21 @@ func StoreSeedanceCompatImageUpload(ctx context.Context, reader io.Reader, filen
 func storeSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, contentType, declaredType string, size int64, userID int, imageLimit int64) (*SeedanceAssetUpload, error) {
 	assetType, err := inferSeedanceAssetType(filename, contentType, declaredType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrSeedanceAssetInvalidInput, err)
 	}
 	maxSize := SeedanceAssetMaxUploadSize(assetType)
 	if assetType == "Image" && imageLimit > 0 {
 		maxSize = imageLimit
 	}
-	if size < 0 || size > maxSize {
-		return nil, fmt.Errorf("%s asset exceeds the %d MB upload limit", assetType, maxSize>>20)
+	if size < 0 {
+		return nil, fmt.Errorf("%w: invalid asset size", ErrSeedanceAssetInvalidInput)
+	}
+	if size > maxSize {
+		return nil, fmt.Errorf("%w: %s exceeds the %d MB upload limit", ErrSeedanceAssetTooLarge, assetType, maxSize>>20)
 	}
 	storage, err := privateAssetOSSStorageFactory()
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(ErrSeedanceAssetStorageUnavailable, err)
 	}
 
 	extension := strings.ToLower(filepath.Ext(filepath.Base(filename)))
@@ -415,10 +438,10 @@ func storeSeedanceAssetUpload(ctx context.Context, reader io.Reader, filename, c
 		return nil, fmt.Errorf("failed to close seedance asset upload: %w", closeErr)
 	}
 	if written == 0 {
-		return nil, fmt.Errorf("seedance asset file is empty")
+		return nil, fmt.Errorf("%w: asset file is empty", ErrSeedanceAssetInvalidInput)
 	}
 	if written > maxSize {
-		return nil, fmt.Errorf("%s asset exceeds the %d MB upload limit", assetType, maxSize>>20)
+		return nil, fmt.Errorf("%w: %s exceeds the %d MB upload limit", ErrSeedanceAssetTooLarge, assetType, maxSize>>20)
 	}
 	if assetType == "Image" {
 		written, err = normalizeSeedanceProgressiveJPEG(ctx, path, maxSize)
@@ -490,10 +513,10 @@ func storeSeedanceAssetUploadStream(ctx context.Context, reader io.ReadSeeker, f
 		return nil, fmt.Errorf("failed to determine seedance asset size: %w", err)
 	}
 	if actualSize <= 0 {
-		return nil, fmt.Errorf("seedance asset file is empty")
+		return nil, fmt.Errorf("%w: asset file is empty", ErrSeedanceAssetInvalidInput)
 	}
 	if actualSize > SeedanceAssetMaxUploadSize(assetType) {
-		return nil, fmt.Errorf("%s asset exceeds the %s upload limit", assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
+		return nil, fmt.Errorf("%w: %s exceeds the %s upload limit", ErrSeedanceAssetTooLarge, assetType, SeedanceAssetUploadMaxSizeLabel(assetType))
 	}
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to rewind seedance asset upload: %w", err)
@@ -894,7 +917,7 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		var upstream *seedanceAssetUpstreamError
 		if errors.As(callErr, &upstream) {
 			clean := *upstream
-			clean.message = "Asset service rejected " + action
+			_, clean.code, clean.message = SeedanceAssetErrorDetails(callErr)
 			if errors.Is(callErr, ErrSeedanceAssetNotFound) {
 				callErr = errors.Join(ErrSeedanceAssetNotFound, &clean)
 			} else {
@@ -1197,6 +1220,85 @@ func (err *seedanceAssetUpstreamError) Error() string {
 }
 
 type seedanceAssetTemporaryError struct{ cause error }
+
+// SeedanceAssetErrorDetails 让 REST、Action 和兼容入口共用错误分类，内部故障只公开安全原因。
+func SeedanceAssetErrorDetails(err error) (int, string, string) {
+	var upstream *seedanceAssetUpstreamError
+	if errors.As(err, &upstream) {
+		status := upstream.httpStatus
+		if status < 400 || status > 599 {
+			status = http.StatusBadGateway
+			if errors.Is(err, ErrSeedanceAssetNotFound) {
+				status = http.StatusNotFound
+			}
+		}
+		code := strings.TrimSpace(upstream.code)
+		if !seedanceAssetPublicCodePattern.MatchString(code) || originAssetKeyPattern.MatchString(code) || seedanceAssetPrivateProviderPattern.MatchString(code) || seedanceAssetIPCodePattern.MatchString(code) || net.ParseIP(code) != nil {
+			code = "UpstreamError"
+		}
+		message := originAssetKeyPattern.ReplaceAllString(upstream.message, "[redacted]")
+		message = originAssetSecretPattern.ReplaceAllString(message, "[redacted]")
+		message = seedanceAssetPrivateProviderPattern.ReplaceAllString(message, "[redacted]")
+		message = common.MaskSensitiveInfo(message)
+		if len(message) > seedanceAssetErrorPreviewLimit {
+			message = message[:seedanceAssetErrorPreviewLimit] + "..."
+		}
+		if strings.TrimSpace(message) == "" {
+			message = "asset service rejected the operation"
+		}
+		return status, code, message
+	}
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, ErrSeedanceAssetNotFound), errors.Is(err, model.ErrSeedanceAssetUnavailable):
+		return http.StatusNotFound, "ResourceNotFound", "asset resource not found"
+	case errors.Is(err, model.ErrSeedanceAssetValidationSessionNotFound):
+		return http.StatusNotFound, "ResourceNotFound", "validation session not found"
+	case errors.Is(err, ErrSeedanceAssetScopeUnavailable):
+		return http.StatusForbidden, "AccessDenied", "asset account is unavailable for this credential"
+	case errors.Is(err, ErrSeedanceAssetChannelUnavailable):
+		return http.StatusServiceUnavailable, "NoAvailableChannel", "no available asset channel for the current model and group"
+	case errors.Is(err, ErrSeedanceAssetGroupPending):
+		return http.StatusConflict, "OperationPending", ErrSeedanceAssetGroupPending.Error()
+	case errors.Is(err, ErrSeedanceAssetMappingPending):
+		return http.StatusConflict, "OperationPending", ErrSeedanceAssetMappingPending.Error()
+	case errors.Is(err, ErrSeedanceAssetRejected):
+		return http.StatusConflict, "AssetRejected", ErrSeedanceAssetRejected.Error()
+	case errors.Is(err, ErrSeedanceAssetReviewTimeout):
+		return http.StatusConflict, "AssetReviewTimeout", ErrSeedanceAssetReviewTimeout.Error()
+	case errors.Is(err, ErrSeedanceAssetValidationPending):
+		return http.StatusConflict, "OperationPending", ErrSeedanceAssetValidationPending.Error()
+	case errors.Is(err, ErrSeedanceAssetValidationExpired):
+		return http.StatusBadRequest, "ValidationExpired", ErrSeedanceAssetValidationExpired.Error()
+	case errors.Is(err, ErrSeedanceAssetValidationFailed):
+		return http.StatusBadRequest, "ValidationFailed", ErrSeedanceAssetValidationFailed.Error()
+	case errors.Is(err, ErrSeedanceAssetValidationUnsupported):
+		return http.StatusBadRequest, "UnsupportedOperation", ErrSeedanceAssetValidationUnsupported.Error()
+	case errors.Is(err, ErrSeedanceAssetValidationProject):
+		return http.StatusBadRequest, "ValidationError", ErrSeedanceAssetValidationProject.Error()
+	case errors.Is(err, ErrSeedanceAssetInvalidInput):
+		return http.StatusBadRequest, "ValidationError", err.Error()
+	case errors.Is(err, ErrSeedanceAssetTooLarge):
+		return http.StatusRequestEntityTooLarge, "RequestTooLarge", err.Error()
+	case errors.Is(err, model.ErrSeedanceAssetCountLimit):
+		return http.StatusConflict, "AssetCountLimitExceeded", model.ErrSeedanceAssetCountLimit.Error()
+	case errors.Is(err, model.ErrSeedanceAssetStorageLimit):
+		return http.StatusConflict, "AssetStorageLimitExceeded", model.ErrSeedanceAssetStorageLimit.Error()
+	case errors.Is(err, model.ErrSeedanceAssetChanged):
+		return http.StatusConflict, "ResourceChanged", model.ErrSeedanceAssetChanged.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "RequestTimeout", "asset operation timed out"
+	case errors.Is(err, ErrSeedanceAssetStorageUnavailable):
+		return http.StatusServiceUnavailable, "StorageUnavailable", ErrSeedanceAssetStorageUnavailable.Error()
+	case errors.Is(err, ErrSeedanceAssetSourceUnavailable):
+		return http.StatusBadGateway, "AssetSourceUnavailable", ErrSeedanceAssetSourceUnavailable.Error()
+	case errors.Is(err, ErrSeedanceAssetServiceTemporary):
+		return http.StatusServiceUnavailable, "ServiceUnavailable", ErrSeedanceAssetServiceTemporary.Error()
+	case errors.Is(err, errSeedanceAssetResponse):
+		return http.StatusBadGateway, "InvalidUpstreamResponse", "asset service returned an invalid response"
+	default:
+		return http.StatusInternalServerError, "InternalError", "asset operation failed due to an internal error"
+	}
+}
 
 func (err *seedanceAssetTemporaryError) Error() string {
 	return ErrSeedanceAssetServiceTemporary.Error()

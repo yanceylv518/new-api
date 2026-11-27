@@ -18,7 +18,11 @@ import (
 func UploadSeedanceCompatAsset(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, service.SeedanceCompatMaxMultipartBodySize())
 	if err := c.Request.ParseMultipartForm(2 << 20); err != nil {
-		seedanceCompatError(c, http.StatusBadRequest, "invalid or oversized asset upload")
+		if common.IsRequestBodyTooLargeError(err) {
+			seedanceCompatError(c, http.StatusRequestEntityTooLarge, "asset upload exceeds the size limit")
+		} else {
+			seedanceCompatError(c, http.StatusBadRequest, "invalid asset upload")
+		}
 		return
 	}
 	if c.Request.MultipartForm != nil {
@@ -32,8 +36,12 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
 	limits := common.GetManagementRateLimits().AssetLimits
 	maxImageMiB := limits.CompatImageMiB
-	if err != nil || fileHeader == nil || fileHeader.Size <= 0 || fileHeader.Size > maxImageMiB<<20 {
+	if err != nil || fileHeader == nil || fileHeader.Size <= 0 {
 		seedanceCompatError(c, http.StatusBadRequest, fmt.Sprintf("a non-empty image of at most %d MB is required", maxImageMiB))
+		return
+	}
+	if fileHeader.Size > maxImageMiB<<20 {
+		seedanceCompatError(c, http.StatusRequestEntityTooLarge, fmt.Sprintf("image exceeds the %d MB upload limit", maxImageMiB))
 		return
 	}
 	extension := strings.ToLower(filepath.Ext(fileHeader.Filename))
@@ -64,7 +72,7 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 	}
 	file, err := fileHeader.Open()
 	if err != nil {
-		seedanceCompatError(c, http.StatusBadRequest, "unable to read image")
+		seedanceCompatError(c, http.StatusInternalServerError, "unable to read uploaded image")
 		return
 	}
 	defer file.Close()
@@ -96,12 +104,12 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 		return
 	}
 	if err := model.CheckSeedanceAssetCapacity(c.Request.Context(), c.GetInt("id"), fileHeader.Size); err != nil {
-		seedanceCompatError(c, http.StatusBadRequest, err.Error())
+		seedanceCompatOperationError(c, err)
 		return
 	}
 	upload, err := service.StoreSeedanceCompatImageUpload(c.Request.Context(), file, fileHeader.Filename, fileHeader.Header.Get("Content-Type"), fileHeader.Size, c.GetInt("id"))
 	if err != nil {
-		seedanceCompatError(c, http.StatusBadGateway, "asset upload failed")
+		seedanceCompatOperationError(c, err)
 		return
 	}
 	localOnly := true
@@ -135,7 +143,7 @@ func UploadSeedanceCompatAsset(c *gin.Context) {
 		if !errors.Is(err, model.ErrSeedanceAssetCommitUncertain) && !errors.Is(err, model.ErrSeedanceAssetCleanupScheduled) {
 			cleanupSeedanceAssetAfterFailure(c.Request.Context(), nil, "", upload.ObjectKey, upload)
 		}
-		seedanceCompatError(c, http.StatusBadGateway, "asset upload failed")
+		seedanceCompatOperationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, seedanceCompatDataResponse{Data: seedanceCompatAssetGroupView(*asset)})

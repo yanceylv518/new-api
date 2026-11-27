@@ -19,6 +19,11 @@ const seedanceReadyScopeKey = "seedance_asset_ready_scope"
 
 var errSeedanceAssetChannelOutsideGroup = errors.New("selected channel is unavailable for this model and group")
 var errSeedanceAssetSynchronizationFailed = errors.New("private asset synchronization failed; retry after the issue is resolved")
+var errSeedanceAssetNotUsable = errors.New("private asset is failed or unavailable for the requested model; check its status in the asset library")
+var errSeedanceAssetModelUnavailable = errors.New("no available channel for the requested model in the current group")
+var errSeedanceAssetChannelUnavailable = errors.New("no available channel supports private assets for the requested model and options")
+var errSeedanceAssetVideoRoutingUnavailable = errors.New("no available channel supports the requested video resolution")
+var errSeedanceAssetProtocolUnavailable = errors.New("no available channel supports this API and the requested model parameters")
 
 type seedanceReadyScope struct {
 	keys          map[int]map[string]map[string]struct{}
@@ -27,6 +32,7 @@ type seedanceReadyScope struct {
 	selectedModel string
 	pending       bool
 	failed        bool
+	blocked       bool
 }
 
 type seedanceReadyIdentity struct {
@@ -93,13 +99,10 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		channelGroups[ability.ChannelId][ability.Model][ability.Group] = struct{}{}
 	}
 	if len(channelIDs) == 0 {
-		if humanAccount {
-			return errSeedanceAssetAccountUnavailable
-		}
 		if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned {
 			return errSeedanceAssetChannelOutsideGroup
 		}
-		return errSeedanceAssetSynchronizationFailed
+		return errSeedanceAssetModelUnavailable
 	}
 	var candidates []model.Channel
 	if err := model.DB.WithContext(ctx).Where("id IN ?", channelIDs).Find(&candidates).Error; err != nil {
@@ -119,10 +122,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 		return errSeedanceAssetChannelOutsideGroup
 	}
 	if len(candidates) == 0 {
-		if humanAccount {
-			return errSeedanceAssetAccountUnavailable
-		}
-		return errSeedanceAssetSynchronizationFailed
+		return errSeedanceAssetModelUnavailable
 	}
 	channelsByID := make(map[int]*model.Channel, len(candidates))
 	for index := range candidates {
@@ -164,14 +164,21 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 	targets := make([]model.SeedanceAssetReplica, 0)
 	seenTargets := make(map[string]struct{})
 	candidateAccounts := 0
+	eligibleChannels := 0
+	rejectedKinds := make(map[dto.ChannelFilterKind]struct{})
 	needsAuthorization := false
 	for index := range candidates {
 		channel := &candidates[index]
 		channelID := channel.Id
-		if channel.Status != common.ChannelStatusEnabled || !service.SupportsSeedanceAssets(channel) || pinned && pin.ChannelId != channelID {
+		if channel.Status != common.ChannelStatusEnabled || pinned && pin.ChannelId != channelID {
 			continue
 		}
-		if ok, _ := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
+		if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
+			rejectedKinds[kind] = struct{}{}
+			continue
+		}
+		eligibleChannels++
+		if !service.SupportsSeedanceAssets(channel) {
 			continue
 		}
 		for _, abilityModel := range channelModels[channelID] {
@@ -188,7 +195,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 					continue
 				}
 				candidateAccounts++
-				ready, pending, failed := true, false, false
+				ready, pending, failed, blocked := true, false, false, false
 				for _, asset := range assets {
 					group := groupsByID[asset.GroupID]
 					assetFingerprints := fingerprints
@@ -202,13 +209,13 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 						}
 						if groupAccount != "" && !slices.Contains(fingerprints, groupAccount) ||
 							groupAccount == "" && (group.ChannelID != channelID || group.KeyFingerprint != keyFingerprint) {
-							ready, failed = false, true
+							ready, blocked = false, true
 							continue
 						}
 					}
 					if asset.LocalOnly != nil && *asset.LocalOnly {
 						if !strings.EqualFold(asset.Status, "Active") {
-							ready, failed = false, true
+							ready, blocked = false, true
 						}
 						continue
 					}
@@ -224,13 +231,13 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 							(strings.EqualFold(group.GroupType, "LivenessFace") || channel.GetSetting().SeedanceAssetShareGroup != "")
 					if originMatches && asset.UpstreamAssetID() != "" {
 						if asset.UpstreamDeletedAt != 0 {
-							ready, failed = false, true
+							ready, blocked = false, true
 							continue
 						}
 						switch strings.ToLower(strings.TrimSpace(asset.Status)) {
 						case "active", "success", "succeeded":
 						case "failed":
-							ready, failed = false, true
+							ready, blocked = false, true
 						default:
 							ready, pending = false, true
 						}
@@ -253,7 +260,9 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 						if replica.SyncScope != syncScope {
 							needsAuthorization = true
 						}
-						if replica.UpstreamDeletedAt != 0 || strings.EqualFold(replica.Status, "Failed") || replica.ProvisionStatus == model.SeedanceAssetReplicaFailed && (replica.NextPollAt == 0 || replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts) ||
+						if replica.UpstreamDeletedAt != 0 || strings.EqualFold(replica.Status, "Failed") && replica.ProvisionStatus != model.SeedanceAssetReplicaFailed {
+							blocked = true
+						} else if replica.ProvisionStatus == model.SeedanceAssetReplicaFailed && (replica.NextPollAt == 0 || replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts) ||
 							replica.ProvisionStatus == model.SeedanceAssetReplicaReady && replica.LastError != "" && replica.PollAttempts >= model.SeedanceAssetSyncMaxAttempts {
 							failed = true
 						} else {
@@ -262,7 +271,7 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 						continue
 					}
 					if strings.EqualFold(group.GroupType, "LivenessFace") {
-						failed = true
+						blocked = true
 						continue
 					}
 					pending = true
@@ -285,19 +294,37 @@ func prepareSeedanceReadyChannels(c *gin.Context, modelName string, assetIDs []s
 					}
 					scope.keys[channelID][abilityModel][keyFingerprint] = struct{}{}
 					scope.accounts[seedanceReadyIdentity{channelID, abilityModel, keyFingerprint}] = model.SeedanceAssetModelScopeFingerprint(channel, abilityModel, keyFingerprint)
-				} else if pending && !failed {
+				} else if pending && !failed && !blocked {
 					scope.pending = true
-				} else {
+				} else if failed {
 					scope.failed = true
+				} else {
+					scope.blocked = true
 				}
 			}
 		}
 	}
 	if candidateAccounts == 0 {
-		if humanAccount {
-			return errSeedanceAssetAccountUnavailable
+		if eligibleChannels == 0 && len(rejectedKinds) == 1 {
+			for kind := range rejectedKinds {
+				switch kind {
+				case dto.FilterVideoRouting:
+					return errSeedanceAssetVideoRoutingUnavailable
+				case dto.FilterTaskPluginIdentity:
+					if detail := rejectedTaskPluginError(c, modelName, usingGroup); detail != "" {
+						return fmt.Errorf("%w: %s", errSeedanceAssetProtocolUnavailable, detail)
+					}
+					return errSeedanceAssetProtocolUnavailable
+				case dto.FilterRequestPath:
+					return errSeedanceAssetProtocolUnavailable
+				case dto.FilterSeedanceAssetAccount:
+					if humanAccount {
+						return errSeedanceAssetAccountUnavailable
+					}
+				}
+			}
 		}
-		return errSeedanceAssetSynchronizationFailed
+		return errSeedanceAssetChannelUnavailable
 	}
 	if needsAuthorization {
 		if err := service.EnsureSeedanceAssetSynchronization(ctx, userID, assets, requestGroups, models, pinnedChannel); err != nil {

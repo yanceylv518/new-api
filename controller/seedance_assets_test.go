@@ -386,23 +386,20 @@ func TestSeedanceAssetV2ActionUsesOfficialValidationContract(t *testing.T) {
 	assert.Len(t, received, 3)
 }
 
-// 每个回归用独立内存库与回环上游，避免碰触实际账号、文件或数据库。
+// 每个回归使用独立表和回环上游，不接触实际账号与云端。
 func setupSeedanceControllerRegression(t *testing.T, upstream http.HandlerFunc) (*gorm.DB, *model.SeedanceAssetGroup, *model.SeedanceAsset) {
 	t.Helper()
 	previousDB := model.DB
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	db, dialect := openTaskDialectDatabase(t,
 		&model.Channel{Type: constant.ChannelTypeDoubaoVideo},
 		&model.User{}, &model.Ability{},
 		&model.SeedanceAssetGroup{}, &model.SeedanceAssetGroupReplica{},
-		&model.SeedanceAsset{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SeedanceAssetValidationSession{},
-	))
+		&model.SeedanceAsset{}, &model.SeedanceAssetSize{}, &model.SeedanceAssetReplica{}, &model.SeedanceAssetDiscovery{}, &model.SeedanceAssetCleanupJob{}, &model.SystemTask{}, &model.SeedanceAssetValidationSession{},
+	)
 	model.DB = db
-	t.Cleanup(func() { model.DB = previousDB; _ = sqlDB.Close() })
+	common.SetDatabaseTypes(dialect, previousLog)
+	t.Cleanup(func() { model.DB = previousDB; common.SetDatabaseTypes(previousMain, previousLog) })
 	server := httptest.NewServer(upstream)
 	t.Cleanup(server.Close)
 	require.NoError(t, db.Create(&model.User{Id: 9, Username: "seedance-owner", AffCode: "seedance-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
@@ -445,11 +442,12 @@ func TestUploadSeedanceAssetMultipartFailureBoundaries(t *testing.T) {
 	for _, scenario := range []struct {
 		name, groupID, assetType, expected string
 		userID                             int
+		status                             int
 	}{
-		{"missing group", "", "Image", "", 9},
-		{"foreign group", group.GroupID, "Image", "record not found", 10},
-		{"type mismatch", group.GroupID, "Video", "does not match", 9},
-		{"OSS unavailable", group.GroupID, "Image", "OSS is not configured", 9},
+		{"missing group", "", "Image", "", 9, 400},
+		{"foreign group", group.GroupID, "Image", "asset resource not found", 10, 404},
+		{"type mismatch", group.GroupID, "Video", "does not match", 9, 400},
+		{"OSS unavailable", group.GroupID, "Image", "asset storage is unavailable", 9, 503},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			var body bytes.Buffer
@@ -467,6 +465,7 @@ func TestUploadSeedanceAssetMultipartFailureBoundaries(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/api/user/seedance/assets/upload", &body)
 			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
 			UploadSeedanceAsset(c)
+			assert.Equal(t, scenario.status, response.Code, response.Body.String())
 			var payload seedanceRegressionResponse
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
 			assert.False(t, payload.Success)

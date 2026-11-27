@@ -182,6 +182,7 @@ func (client *SeedanceAssetClient) originAssetRequest(ctx context.Context, actio
 		}
 		if client.apiKey != "" {
 			message = strings.ReplaceAll(message, client.apiKey, "[redacted]")
+			code = strings.ReplaceAll(code, client.apiKey, "[redacted]")
 		}
 		message = originAssetBrandPattern.ReplaceAllString(message, "[redacted]")
 		message = originAssetKeyPattern.ReplaceAllString(message, "[redacted]")

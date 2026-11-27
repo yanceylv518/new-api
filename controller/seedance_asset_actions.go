@@ -18,7 +18,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 const seedanceAssetActionContextKey = "seedance_asset_library_action"
@@ -473,36 +472,39 @@ func seedanceAssetActionError(c *gin.Context, status int, code, message string) 
 	writeSeedanceAssetOfficialErrorWithCode(c, status, c.GetString(seedanceAssetActionContextKey), code, message)
 }
 
-// seedanceAssetAPIError 保留原 REST 契约，仅在 Action 入口转换错误外形。
+func seedanceAssetErrorDetails(err error) (int, string, string) {
+	if errors.Is(err, errSeedanceAssetModelNotPermitted) {
+		return http.StatusForbidden, "AssetModelNotPermitted", errSeedanceAssetModelNotPermitted.Error()
+	}
+	if errors.Is(err, errSeedanceAssetNoChannel) {
+		return http.StatusServiceUnavailable, "NoPermittedAssetChannel", errSeedanceAssetNoChannel.Error()
+	}
+	return service.SeedanceAssetErrorDetails(err)
+}
+
+// seedanceAssetAPIError 保留各入口外形，错误状态与实际失败阶段一致。
 func seedanceAssetAPIError(c *gin.Context, err error) {
-	if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
+	status, code, message := seedanceAssetErrorDetails(err)
+	// 网页将 401 当作本站会话失效并重放请求，渠道鉴权失败不能触发重复上传。
+	if status == http.StatusUnauthorized && strings.HasPrefix(c.Request.URL.Path, "/api/user/seedance/") {
+		status = http.StatusBadGateway
+	}
+	if status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests {
 		c.Header("Retry-After", "5")
-		message := service.ErrSeedanceAssetServiceTemporary.Error()
-		if upstream, ok := service.OriginAssetPublicError(err); ok {
-			message = upstream
-		}
-		if c.GetString(seedanceAssetActionContextKey) != "" {
-			seedanceAssetActionError(c, http.StatusServiceUnavailable, "ServiceUnavailable", message)
-		} else {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": message, "code": "asset_service_unavailable"})
-		}
+	}
+	if status >= 500 {
+		common.SysError("Seedance asset operation failed: " + code + ": " + message)
+	}
+	if c.GetString(seedanceAssetActionContextKey) != "" {
+		seedanceAssetActionError(c, status, code, message)
 		return
 	}
-	if c.GetString(seedanceAssetActionContextKey) == "" {
-		common.ApiError(c, err)
-		return
-	}
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		seedanceAssetActionError(c, http.StatusNotFound, "ResourceNotFound", "resource not found")
-		return
-	}
-	common.SysError("Seedance asset Action failed: " + err.Error())
-	seedanceAssetActionError(c, http.StatusBadGateway, "OperationFailed", err.Error())
+	c.JSON(status, gin.H{"success": false, "message": message, "code": code})
 }
 
 func seedanceAssetAPIErrorMsg(c *gin.Context, message string) {
 	if c.GetString(seedanceAssetActionContextKey) == "" {
-		common.ApiErrorMsg(c, message)
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": message, "code": "ValidationError"})
 		return
 	}
 	seedanceAssetActionError(c, http.StatusBadRequest, "ValidationError", message)
@@ -525,7 +527,26 @@ func seedanceAssetAPIResponse(c *gin.Context, status int, response gin.H) {
 	}
 	if success, _ := response["success"].(bool); !success {
 		message, _ := response["message"].(string)
-		seedanceAssetActionError(c, status, "ValidationError", message)
+		code, _ := response["code"].(string)
+		if code == "" {
+			switch status {
+			case http.StatusBadRequest:
+				code = "ValidationError"
+			case http.StatusForbidden:
+				code = "AccessDenied"
+			case http.StatusNotFound:
+				code = "ResourceNotFound"
+			case http.StatusConflict:
+				code = "OperationConflict"
+			case http.StatusRequestEntityTooLarge:
+				code = "RequestTooLarge"
+			case http.StatusTooManyRequests:
+				code = "Throttling"
+			default:
+				code = "OperationFailed"
+			}
+		}
+		seedanceAssetActionError(c, status, code, message)
 		return
 	}
 	result := gin.H{}

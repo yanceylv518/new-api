@@ -49,6 +49,25 @@ func newSeedanceAssetMappingError(c *gin.Context, err error) *types.NewAPIError 
 	} else if errors.Is(err, errSeedanceAssetSynchronizationFailed) {
 		statusCode = http.StatusServiceUnavailable
 		code = types.ErrorCode("private_asset_sync_failed")
+	} else if errors.Is(err, errSeedanceAssetNotUsable) || errors.Is(err, service.ErrSeedanceAssetRejected) || errors.Is(err, service.ErrSeedanceAssetReviewTimeout) {
+		statusCode = http.StatusConflict
+		code = types.ErrorCode("private_asset_unavailable")
+	} else if errors.Is(err, errSeedanceAssetModelUnavailable) {
+		statusCode = http.StatusServiceUnavailable
+		code = types.ErrorCodeModelNotFound
+		c.Set(ContextKeyPublicTaskPluginError, true)
+	} else if errors.Is(err, errSeedanceAssetVideoRoutingUnavailable) {
+		statusCode = http.StatusServiceUnavailable
+		code = types.ErrorCode("video_resolution_unavailable")
+		c.Set(ContextKeyPublicTaskPluginError, true)
+	} else if errors.Is(err, errSeedanceAssetProtocolUnavailable) {
+		statusCode = http.StatusBadRequest
+		code = types.ErrorCode("model_request_unsupported")
+		c.Set(ContextKeyPublicTaskPluginError, true)
+	} else if errors.Is(err, errSeedanceAssetChannelUnavailable) {
+		statusCode = http.StatusServiceUnavailable
+		code = types.ErrorCode("private_asset_channel_unavailable")
+		c.Set(ContextKeyPublicTaskPluginError, true)
 	} else if errors.Is(err, service.ErrSeedanceAssetServiceTemporary) {
 		statusCode = http.StatusServiceUnavailable
 		code = types.ErrorCode("private_asset_service_unavailable")
@@ -133,10 +152,12 @@ func Distribute() func(c *gin.Context) {
 			})
 			if selectErr != nil {
 				if scope, ok := c.Get(seedanceReadyScopeKey); ok && (selectErr.NoAvailableChannel || selectErr.FilterKind == taskdto.FilterSeedanceAssetReady) {
-					if ready, valid := scope.(*seedanceReadyScope); valid {
+					if ready, valid := scope.(*seedanceReadyScope); valid && len(ready.keys) == 0 && (ready.pending || ready.failed || ready.blocked) {
 						mappingErr := error(service.ErrSeedanceAssetMappingPending)
 						if !ready.pending && ready.failed {
 							mappingErr = errSeedanceAssetSynchronizationFailed
+						} else if !ready.pending && ready.blocked {
+							mappingErr = errSeedanceAssetNotUsable
 						}
 						assetErr := newSeedanceAssetMappingError(c, mappingErr)
 						abortWithOpenAiMessage(c, assetErr.StatusCode, assetErr.Error(), assetErr.GetErrorCode())

@@ -128,15 +128,18 @@ func BuildSeedanceAssetValidationSessionView(session *model.SeedanceAssetValidat
 // ValidateSeedanceAssetValidationCallbackURL 校验官方要求的跳转地址，不对其发起网络请求。
 func ValidateSeedanceAssetValidationCallbackURL(raw string) error {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || len(raw) > 2048 {
-		return errors.New("validation callback URL is required")
+	if raw == "" {
+		return fmt.Errorf("%w: validation callback URL is required", ErrSeedanceAssetInvalidInput)
+	}
+	if len(raw) > 2048 {
+		return fmt.Errorf("%w: validation callback URL must not exceed 2048 bytes", ErrSeedanceAssetInvalidInput)
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed == nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
-		return errors.New("validation callback URL is invalid")
+		return fmt.Errorf("%w: validation callback URL is invalid", ErrSeedanceAssetInvalidInput)
 	}
 	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return errors.New("validation callback URL must use http or https")
+		return fmt.Errorf("%w: validation callback URL must use http or https", ErrSeedanceAssetInvalidInput)
 	}
 	return nil
 }

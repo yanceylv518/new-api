@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func OptimizeSeedanceCompatAsset(c *gin.Context) {
@@ -23,7 +24,7 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 		return
 	}
 	if strings.EqualFold(group.GroupType, "LivenessFace") {
-		seedanceCompatError(c, http.StatusBadRequest, "real-person assets require verification")
+		seedanceCompatError(c, http.StatusBadRequest, "real-person assets cannot be optimized through this endpoint")
 		return
 	}
 	var request struct {
@@ -41,19 +42,19 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 	channel := choices[0].channel
 	client, err := service.NewSeedanceAssetClient(channel)
 	if err != nil {
-		seedanceCompatError(c, http.StatusServiceUnavailable, "asset service is unavailable")
+		seedanceCompatOperationError(c, err)
 		return
 	}
 	scopedClient := client.ForSeedanceModel(channel, choices[0].model)
 	if asset.LocalOnly != nil && *asset.LocalOnly {
 		scope, err := service.EncodeSeedanceAssetSyncScope(seedanceAssetSynchronizationGroups(c), seedanceAssetSynchronizationModels(c), seedanceAssetSynchronizationChannel(c))
 		if err != nil {
-			seedanceCompatError(c, http.StatusServiceUnavailable, "asset optimization is temporarily unavailable")
+			seedanceCompatOperationError(c, err)
 			return
 		}
 		upstreamGroupID, err := service.EnsureSeedanceAssetGroupForAccount(c.Request.Context(), c.GetInt("id"), asset.GroupID, scopedClient)
 		if err != nil {
-			seedanceCompatError(c, http.StatusServiceUnavailable, "asset optimization is temporarily unavailable")
+			seedanceCompatOperationError(c, err)
 			return
 		}
 		source := strings.TrimSpace(asset.SourceURL)
@@ -66,7 +67,7 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 		}
 		upstreamID, err := client.CreateSeedanceAsset(c.Request.Context(), upstreamGroupID, source, asset.AssetType, asset.Name)
 		if err != nil {
-			seedanceCompatError(c, http.StatusBadGateway, "asset optimization failed")
+			seedanceCompatOperationError(c, err)
 			return
 		}
 		err = model.PromoteLocalSeedanceAsset(c.Request.Context(), c.GetInt("id"), asset.ID, asset.GroupID, asset.UpdatedAt,
@@ -77,7 +78,7 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 					common.SysError("seedance asset optimization rollback failed: " + rollbackErr.Error())
 				}
 			}
-			seedanceCompatError(c, http.StatusConflict, "asset changed while optimization was starting")
+			seedanceCompatOperationError(c, err)
 			return
 		}
 		localOnly := false
@@ -127,7 +128,7 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 	}
 	_, mapErr := service.MapSeedanceAssetsToModelAccount(c.Request.Context(), c.GetInt("id"), client, channel, choices[0].model, []string{asset.AssetID})
 	if mapErr != nil && !errors.Is(mapErr, service.ErrSeedanceAssetMappingPending) {
-		seedanceCompatError(c, http.StatusBadGateway, "asset optimization failed")
+		seedanceCompatOperationError(c, mapErr)
 		return
 	}
 	replica, err := model.FindSeedanceAssetReplica(c.Request.Context(), c.GetInt("id"), asset.ID, scopedClient.AccountFingerprint)
@@ -139,12 +140,17 @@ func OptimizeSeedanceCompatAsset(c *gin.Context) {
 		Where("id = ? AND user_id = ? AND group_id = ? AND status <> ?", asset.ID, c.GetInt("id"), asset.GroupID, "Deleting").
 		Update("compat_optimize_replica_id", replica.ID)
 	if result.Error != nil {
-		seedanceCompatError(c, http.StatusConflict, "asset changed while optimization was starting")
+		seedanceCompatOperationError(c, result.Error)
 		return
 	}
 	if result.RowsAffected == 0 {
 		var current model.SeedanceAsset
-		if err := model.DB.WithContext(c.Request.Context()).Where("id = ? AND user_id = ? AND group_id = ? AND status <> ?", asset.ID, c.GetInt("id"), asset.GroupID, "Deleting").First(&current).Error; err != nil || current.CompatOptimizeReplicaID != replica.ID {
+		err := model.DB.WithContext(c.Request.Context()).Where("id = ? AND user_id = ? AND group_id = ? AND status <> ?", asset.ID, c.GetInt("id"), asset.GroupID, "Deleting").First(&current).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			seedanceCompatOperationError(c, err)
+			return
+		}
+		if err != nil || current.CompatOptimizeReplicaID != replica.ID {
 			seedanceCompatError(c, http.StatusConflict, "asset changed while optimization was starting")
 			return
 		}
