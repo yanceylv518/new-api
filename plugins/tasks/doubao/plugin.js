@@ -343,7 +343,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.2.17",
+  version: "1.2.18",
   requiredCapabilities: ["task-callback@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
@@ -1193,6 +1193,7 @@ function nativeTask(task) {
   if (!output.created_at && task.created_at) output.created_at = task.created_at;
   if (!output.updated_at && task.updated_at) output.updated_at = task.updated_at;
   if (task.fail_reason && output.status === "failed" && !output.error) output.error = { message: task.fail_reason };
+  if (output.status === "succeeded" && output.error === undefined) output.error = null;
   return output;
 }
 
