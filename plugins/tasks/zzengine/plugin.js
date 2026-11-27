@@ -1,16 +1,11 @@
 const SEEDANCE_20_MODELS = [
-  "seedance-2.0",
-  "seedance-2.0-fast",
-  "seedance-2.0-mini",
   "doubao-seedance-2-0-260128",
-  "doubao-seedance-2-0",
+  "doubao-seedance-2-0-260128-ob",
   "doubao-seedance-2-0-fast-260128",
-  "doubao-seedance-2-0-fast",
   "doubao-seedance-2-0-mini-260615",
-  "doubao-seedance-2-0-mini",
 ];
-const SEEDANCE_25_FLASH_MODELS = ["doubao-seedance-2-5-flash-261115", "doubao-seedance-2-5-flash"];
-const SEEDANCE_25_MODELS = ["seedance-2.5", "doubao-seedance-2-5-260628", "doubao-seedance-2-5", ...SEEDANCE_25_FLASH_MODELS];
+const SEEDANCE_25_FLASH_MODELS = ["doubao-seedance-2-5-flash-261115"];
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5-260628", "doubao-seedance-2-5-260628-ob", ...SEEDANCE_25_FLASH_MODELS];
 const DOUBAO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 const DOUBAO_COMPATIBILITY_FIELDS = [
   "content",
@@ -32,32 +27,14 @@ const DOUBAO_COMPATIBILITY_FIELDS = [
   "callback_url",
   "moderation_options",
 ];
-const UPSTREAM_MODELS = {
-  "doubao-seedance-2-0-260128": "seedance-2.0",
-  "doubao-seedance-2-0": "seedance-2.0",
-  "doubao-seedance-2-0-fast-260128": "seedance-2.0-fast",
-  "doubao-seedance-2-0-fast": "seedance-2.0-fast",
-  "doubao-seedance-2-0-mini-260615": "seedance-2.0-mini",
-  "doubao-seedance-2-0-mini": "seedance-2.0-mini",
-  "doubao-seedance-2-5-260628": "seedance-2.5",
-  "doubao-seedance-2-5": "seedance-2.5",
-  "doubao-seedance-2-5-flash-261115": "doubao-seedance-2-5-flash",
-};
 const VIDEO_MODELS = {
-  "seedance-2.0": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
-  "seedance-2.0-fast": { resolutions: ["480p", "720p"], videoInput: true },
-  "seedance-2.0-mini": { resolutions: ["480p", "720p"], videoInput: true },
-  "seedance-2.5": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
   "doubao-seedance-2-0-260128": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
-  "doubao-seedance-2-0": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "doubao-seedance-2-0-260128-ob": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
   "doubao-seedance-2-0-fast-260128": { resolutions: ["480p", "720p"], videoInput: true },
-  "doubao-seedance-2-0-fast": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-0-mini-260615": { resolutions: ["480p", "720p"], videoInput: true },
-  "doubao-seedance-2-0-mini": { resolutions: ["480p", "720p"], videoInput: true },
   "doubao-seedance-2-5-260628": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
-  "doubao-seedance-2-5": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
+  "doubao-seedance-2-5-260628-ob": { resolutions: ["480p", "720p", "1080p", "4k"], videoInput: true },
   "doubao-seedance-2-5-flash-261115": { resolutions: ["480p", "720p"], videoInput: true },
-  "doubao-seedance-2-5-flash": { resolutions: ["480p", "720p"], videoInput: true },
 };
 const SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p", "4k"];
 const DEFAULT_VIDEO_PROFILE = { resolutions: SEEDANCE_RESOLUTIONS, videoInput: true };
@@ -113,7 +90,7 @@ export const meta = {
   name: "Doubao Video（ZZEngine）",
   icon: "Doubao.Color",
   description: { en: "Seedance video generation through ZZEngine", zh: "通过 ZZEngine 生成 Seedance 视频" },
-  version: "1.0.1",
+  version: "1.0.2",
   requiredCapabilities: ["json-clone@1", "task-callback@1", "shared-native-routes@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   baseUrl: "https://model-relay-api.zzengine.net",
@@ -825,11 +802,8 @@ export function buildSubmitRequest(ctx) {
     const field = requestField(req, key);
     if (field.present) body[key] = integerFieldValue(field.value, true);
   }
-  // 厂商使用独立模型编码；New API 上游保留管理员配置的模型映射。
+  // 上游型号统一使用渠道模型映射结果。
   body.model = model;
-  if ((!ctx.upstream || ctx.upstream.kind !== "new_api") && Object.prototype.hasOwnProperty.call(UPSTREAM_MODELS, modelKey(model))) {
-    body.model = UPSTREAM_MODELS[modelKey(model)];
-  }
   // 渠道别名映射后再次校验；兼容接口的 size/resolution 必须与实际发往上游的值一致。
   const resolutionField = requestField(req, "resolution");
   const sizeField = requestField(req, "size");
