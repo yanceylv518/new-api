@@ -22,8 +22,11 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
@@ -740,6 +743,84 @@ func TestCreateSeedanceAssetGroupForwardsGroupType(t *testing.T) {
 
 // TestSeedanceAssetValidationActionsUseOfficialPayloads verifies the two official
 // action names and preserves the upstream BytedToken/H5Link/GroupId fields.
+func TestSeedanceAssetOptionalAKSK(t *testing.T) {
+	const key = "fixture-api-key|AKFixture123|fixture-secret-key"
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.Equal(t, "/assets", r.URL.Path)
+		assert.Equal(t, "2024-01-01", r.URL.Query().Get("Version"))
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		if r.Header.Get("Authorization") != "Bearer fixture-api-key" {
+			date := r.Header.Get("X-Date")
+			_, err := time.Parse("20060102T150405Z", date)
+			require.NoError(t, err)
+			payloadHash := fmt.Sprintf("%x", sha256.Sum256(body))
+			assert.Equal(t, payloadHash, r.Header.Get("X-Content-Sha256"))
+			canonical := "POST\n/assets\nAction=" + r.URL.Query().Get("Action") + "&Version=2024-01-01\ncontent-type:application/json\nhost:" + r.Host + "\nx-content-sha256:" + payloadHash + "\nx-date:" + date + "\n\ncontent-type;host;x-content-sha256;x-date\n" + payloadHash
+			scope := date[:8] + "/cn-beijing/ark/request"
+			derived := []byte("fixture-secret-key")
+			for _, component := range []string{date[:8], "cn-beijing", "ark", "request", "HMAC-SHA256\n" + date + "\n" + scope + "\n" + fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))} {
+				mac := hmac.New(sha256.New, derived)
+				_, _ = mac.Write([]byte(component))
+				derived = mac.Sum(nil)
+			}
+			expected := "HMAC-SHA256 Credential=AKFixture123/" + scope + ", SignedHeaders=content-type;host;x-content-sha256;x-date, Signature=" + hex.EncodeToString(derived)
+			assert.Equal(t, expected, r.Header.Get("Authorization"))
+			assert.NotContains(t, r.Header.Get("Authorization"), "fixture-api-key")
+		}
+		if r.URL.Query().Get("Action") == "GetAsset" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"AccessDenied","Message":"fixture-api-key AKFixture123 fixture-secret-key"}}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"Result":{"Id":"asset-fixture","Status":"Active","GroupId":"group-fixture","BytedToken":"validation-fixture","H5Link":"https://example.com/verify"}}`)
+	}))
+	t.Cleanup(server.Close)
+	previous := seedanceAssetHTTPClient
+	seedanceAssetHTTPClient = server.Client()
+	t.Cleanup(func() { seedanceAssetHTTPClient = previous })
+	settings := `{"task_plugin_key":"doubao","seedance_asset_url":"` + server.URL + `/assets"}`
+	channel := &model.Channel{Id: 123, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: key, BaseURL: &server.URL, Setting: &settings}
+	client, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	for _, action := range []string{"CreateAssetGroup", "CreateAsset", "GetAssetGroup", "DeleteAsset", "CreateVisualValidateSession", "GetVisualValidateResult"} {
+		var response seedanceAssetResponse
+		require.NoError(t, client.call(t.Context(), action, map[string]string{"Name": "素材 & sample", "Id": "asset-fixture"}, &response))
+	}
+	_, _, err = client.GetSeedanceAsset(t.Context(), "asset-fixture")
+	require.Error(t, err)
+	var upstream *seedanceAssetUpstreamError
+	require.ErrorAs(t, err, &upstream)
+	assert.Equal(t, "AccessDenied", upstream.code)
+	assert.Equal(t, http.StatusForbidden, upstream.httpStatus)
+	for _, value := range strings.Split(key, "|") {
+		assert.NotContains(t, err.Error(), value)
+	}
+	channel.Key = "fixture-api-key"
+	plain, err := NewSeedanceAssetClient(channel)
+	require.NoError(t, err)
+	assert.NotEqual(t, plain.AccountFingerprint, client.AccountFingerprint)
+	var response seedanceAssetResponse
+	require.NoError(t, plain.call(t.Context(), "CreateAssetGroup", map[string]string{"Name": "plain"}, &response))
+	assert.EqualValues(t, 8, calls.Load())
+	for _, invalid := range []string{"fixture-api-key|AKFixture123", "fixture-api-key||fixture-secret-key", "fixture-api-key|AKFixture123|fixture-secret-key|bad/region", "fixture-api-key|AKFixture123|secret\nheader"} {
+		channel.Key = invalid
+		_, err := NewSeedanceAssetClient(channel)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "fixture-api-key")
+		assert.NotContains(t, err.Error(), "fixture-secret-key")
+	}
+	channel.Key = key
+	settings = strings.Replace(settings, "https://", "http://", 1)
+	_, err = NewSeedanceAssetClient(channel)
+	assert.ErrorContains(t, err, "HTTPS")
+	assert.EqualValues(t, 8, calls.Load())
+}
+
 func TestSeedanceAssetValidationActionsUseOfficialPayloads(t *testing.T) {
 	var actions []string
 	expectedPath := "/seedance"

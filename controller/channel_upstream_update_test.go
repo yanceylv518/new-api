@@ -37,6 +37,27 @@ func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath 
 	return channel
 }
 
+func TestDoubaoOptionalAKSKChannelConfiguration(t *testing.T) {
+	baseURL := "https://ark.cn-beijing.volces.com"
+	for _, key := range []string{"fixture-api-key", "fixture-api-key|AKFixture123|fixture-secret-key", "fixture-api-key|AKFixture123|fixture-secret-key|cn-beijing"} {
+		channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: key}
+		require.NoError(t, validateChannel(channel, true))
+		headers, err := buildFetchModelsHeaders(channel, key)
+		require.NoError(t, err)
+		assert.Equal(t, "Bearer fixture-api-key", headers.Get("Authorization"))
+	}
+	for _, key := range []string{"fixture-api-key|AKFixture123", "fixture-api-key|AKFixture123||cn-beijing"} {
+		channel := &model.Channel{Type: constant.ChannelTypeDoubaoVideo, BaseURL: &baseURL, Key: key}
+		err := validateChannel(channel, true)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "fixture-api-key")
+	}
+	key := "fixture-api-key|AKFixture123|fixture-secret-key"
+	err := sanitizeFetchModelsError(errors.New("rejected fixture-api-key AKFixture123 fixture-secret-key"), key)
+	require.Error(t, err)
+	assert.Equal(t, "rejected [redacted] [redacted] [redacted]", err.Error())
+}
+
 func TestParseOpenAIModelIDsStrictResponseContract(t *testing.T) {
 	tests := []struct {
 		name      string

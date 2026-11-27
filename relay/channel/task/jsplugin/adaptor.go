@@ -341,6 +341,21 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	return nil
 }
 
+// 组合凭证不能通过 {api_key} 发出；原始凭证仍供任务恢复和账号绑定使用。
+func (a *TaskAdaptor) ApplyTaskHeaderOverrides(req *http.Request, info *relaycommon.RelayInfo, c *gin.Context, allowHost bool) error {
+	if info != nil && info.ChannelMeta != nil && a.plugin.Meta.Key == "doubao" && strings.Contains(info.ApiKey, "|") {
+		credentials, err := common.ParseDoubaoCredentials(info.ApiKey)
+		if err != nil {
+			return err
+		}
+		copyInfo, copyMeta := *info, *info.ChannelMeta
+		copyInfo.ChannelMeta = &copyMeta
+		copyInfo.ApiKey = credentials.APIKey
+		info = &copyInfo
+	}
+	return channel.ApplyTaskHeaderOverrides(req, info, c, allowHost)
+}
+
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
 	descriptor, err := a.buildSubmit(c, info)
 	if err != nil {
@@ -789,7 +804,7 @@ func (a *TaskAdaptor) doFetchDescriptorWithContext(ctx context.Context, baseURL,
 		meta := *a.info.ChannelMeta
 		info.ChannelMeta = &meta
 		info.ApiKey = key
-		if err := channel.ApplyTaskHeaderOverrides(req, &info, nil, true); err != nil {
+		if err := a.ApplyTaskHeaderOverrides(req, &info, nil, true); err != nil {
 			return nil, err
 		}
 	}
@@ -1180,7 +1195,7 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 		for name, value := range descriptor.Headers {
 			req.Header.Set(name, value)
 		}
-		if err := channel.ApplyTaskHeaderOverrides(req, a.info, nil, false); err != nil {
+		if err := a.ApplyTaskHeaderOverrides(req, a.info, nil, false); err != nil {
 			return nil, err
 		}
 		descriptor.Headers = make(map[string]string, len(req.Header))

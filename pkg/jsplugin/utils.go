@@ -19,7 +19,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type volcSignRequest struct {
+type VolcSignRequest struct {
 	Method    string            `json:"method"`
 	URL       string            `json:"url"`
 	Headers   map[string]string `json:"headers"`
@@ -29,6 +29,11 @@ type volcSignRequest struct {
 	Region    string            `json:"region"`
 	Service   string            `json:"service"`
 	Timestamp int64             `json:"timestamp"`
+}
+
+// SignVolcV4 供宿主素材客户端复用插件的火山签名实现。
+func SignVolcV4(request VolcSignRequest) (map[string]string, error) {
+	return signVolcV4(request, time.Now)
 }
 
 func injectGlobals(runtime *moejs.Runtime, identity func() string, now func() time.Time, logOutput func(string)) error {
@@ -127,7 +132,7 @@ func injectGlobals(runtime *moejs.Runtime, identity func() string, now func() ti
 		"volcSignV4": runtime.Function("volcSignV4", 1, func(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
 			// Fields are read by their Go names, as plugins have always
 			// passed them.
-			var request volcSignRequest
+			var request VolcSignRequest
 			argument := moejs.Arg(args, 0)
 			if !argument.IsNullish() && !argument.IsObject() {
 				return moejs.Undefined(), r.TypeError("volcSignV4 request must be an object")
@@ -233,7 +238,7 @@ func stringValue(r *moejs.Realm, value moejs.Value) (string, error) {
 	return text.GoString(), nil
 }
 
-func signVolcV4(request volcSignRequest, now func() time.Time) (map[string]string, error) {
+func signVolcV4(request VolcSignRequest, now func() time.Time) (map[string]string, error) {
 	parsedURL, err := url.Parse(request.URL)
 	if err != nil || parsedURL.Host == "" {
 		return nil, fmt.Errorf("invalid Volcengine signing URL")
@@ -279,7 +284,7 @@ func signVolcV4(request volcSignRequest, now func() time.Time) (map[string]strin
 	}
 	signedHeaders := strings.Join(keys, ";")
 	canonicalRequest := strings.Join([]string{
-		strings.ToUpper(request.Method), requestPath, parsedURL.Query().Encode(),
+		strings.ToUpper(request.Method), requestPath, strings.ReplaceAll(parsedURL.Query().Encode(), "+", "%20"),
 		canonicalHeaders.String(), signedHeaders, hex.EncodeToString(bodyHash[:]),
 	}, "\n")
 	canonicalHash := sha256.Sum256([]byte(canonicalRequest))

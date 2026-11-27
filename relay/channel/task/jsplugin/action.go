@@ -87,7 +87,7 @@ func (a *TaskAdaptor) ExecuteTaskAction(ctx context.Context, operation string, t
 	for name, headerValue := range descriptor.Headers {
 		request.Header.Set(name, headerValue)
 	}
-	if err := channel.ApplyTaskHeaderOverrides(request, a.info, nil, true); err != nil {
+	if err := a.ApplyTaskHeaderOverrides(request, a.info, nil, true); err != nil {
 		return nil, err
 	}
 	client, err := service.GetHttpClientWithProxy(proxy)

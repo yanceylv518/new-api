@@ -295,7 +295,7 @@ func sanitizeFetchModelsError(err error, key string) error {
 		err = urlErr.Err
 	}
 
-	message := err.Error()
+	message := common.MaskDoubaoCredentials(err.Error(), key)
 	key = strings.TrimSpace(key)
 	if key != "" {
 		message = strings.ReplaceAll(message, key, "[REDACTED]")

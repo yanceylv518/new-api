@@ -641,7 +641,14 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	if err := ApplyTaskHeaderOverrides(req, info, c, true); err != nil {
+	if custom, ok := a.(interface {
+		ApplyTaskHeaderOverrides(*http.Request, *common.RelayInfo, *gin.Context, bool) error
+	}); ok {
+		err = custom.ApplyTaskHeaderOverrides(req, info, c, true)
+	} else {
+		err = ApplyTaskHeaderOverrides(req, info, c, true)
+	}
+	if err != nil {
 		return nil, err
 	}
 	resp, err := doRequest(c, req, info)

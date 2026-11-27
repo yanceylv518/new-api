@@ -58,6 +58,43 @@ func TestDoubaoResolutionProfiles(t *testing.T) {
 	assert.Contains(t, schema["resolution"].Enum, "4k")
 }
 
+func TestDoubaoOptionalAKSKKeepsVideoBearer(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	for _, key := range []string{"fixture-api-key", "fixture-api-key|AKFixture123|fixture-secret-key", "fixture-api-key|AKFixture123|fixture-secret-key|cn-beijing"} {
+		adaptor := taskplugin.New(plugin)
+		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: key, HeadersOverride: map[string]any{"Authorization": "Bearer {api_key}", "X-API-Key": "{api_key}"}}}
+		adaptor.Init(info)
+		for _, hook := range []string{"buildSubmitRequest", "buildQueryRequest", "buildTaskActionRequest"} {
+			value, err := plugin.Engine.Call(t.Context(), hook, map[string]any{
+				"apiKey": key, "baseUrl": "https://example.com", "model": "doubao-seedance-2-0-260128",
+				"upstreamModel": "doubao-seedance-2-0-260128", "operation": "delete", "taskId": "cgt-fixture",
+				"requestBody": map[string]any{"model": "doubao-seedance-2-0-260128", "prompt": "a paper boat", "duration": 4, "resolution": "480p"},
+			})
+			require.NoError(t, err)
+			encoded, err := common.Marshal(value)
+			require.NoError(t, err)
+			var descriptor struct {
+				Headers map[string]string `json:"headers"`
+			}
+			require.NoError(t, common.Unmarshal(encoded, &descriptor))
+			assert.Equal(t, "Bearer fixture-api-key", descriptor.Headers["Authorization"])
+			assert.NotContains(t, string(encoded), "AKFixture123")
+			assert.NotContains(t, string(encoded), "fixture-secret-key")
+			request := httptest.NewRequest(http.MethodPost, "https://example.com", nil)
+			for name, value := range descriptor.Headers {
+				request.Header.Set(name, value)
+			}
+			require.NoError(t, adaptor.ApplyTaskHeaderOverrides(request, info, nil, true))
+			assert.Equal(t, "Bearer fixture-api-key", request.Header.Get("Authorization"))
+			assert.Equal(t, "fixture-api-key", request.Header.Get("X-API-Key"))
+			assert.Equal(t, key, info.ApiKey)
+		}
+	}
+}
+
 func TestDoubaoOpenAIImageTransport(t *testing.T) {
 	source, err := builtinplugins.Source("doubao")
 	require.NoError(t, err)
@@ -953,7 +990,7 @@ func TestDoubaoCompatibilityPreservesOfficialContent(t *testing.T) {
 	require.NoError(t, err)
 	intent = decoded.(map[string]any)
 	built, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
-		"requestBody": intent["requestBody"], "upstreamModel": "doubao-seedance-2-0-260128", "baseUrl": "https://upstream.example",
+		"requestBody": intent["requestBody"], "upstreamModel": "doubao-seedance-2-0-260128", "baseUrl": "https://upstream.example", "apiKey": "fixture-key",
 	})
 	require.NoError(t, err)
 	body = built.(map[string]any)["body"].(map[string]any)
@@ -970,7 +1007,7 @@ func TestDoubaoCompatibilityPreservesOfficialContent(t *testing.T) {
 	})
 	require.NoError(t, err)
 	built, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
-		"requestBody": native.(map[string]any)["requestBody"], "upstreamModel": "doubao-seedance-2-0-oinone", "baseUrl": "https://upstream.example",
+		"requestBody": native.(map[string]any)["requestBody"], "upstreamModel": "doubao-seedance-2-0-oinone", "baseUrl": "https://upstream.example", "apiKey": "fixture-key",
 	})
 	require.NoError(t, err)
 	body = built.(map[string]any)["body"].(map[string]any)

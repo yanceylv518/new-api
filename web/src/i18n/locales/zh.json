@@ -7228,6 +7228,7 @@
     "No video routing rules configured.": "未配置视频路由规则。",
     "{{count}} video routing rules configured": "已配置 {{count}} 条视频路由规则",
     "Channel settings changed. Reload the channel before saving.": "渠道设置已变更，请重新加载渠道后再保存。",
-    "Resolution": "分辨率"
+    "Resolution": "分辨率",
+    "Use an API Key by default. For optional AK/SK asset authentication, enter APIKey|AccessKey|SecretKey or APIKey|AccessKey|SecretKey|Region. Region defaults to cn-beijing. Video requests still use the API Key. Enter one complete credential set per line in batch mode.": "默认只填 API Key。如素材及真人认证需要 AK/SK，可填 APIKey|AccessKey|SecretKey，也可在末尾添加 |Region，地域默认 cn-beijing。视频仍使用 API Key。批量模式每行填写一套完整凭证。"
   }
 }

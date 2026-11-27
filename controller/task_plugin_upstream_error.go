@@ -326,6 +326,16 @@ func newTaskUpstreamErrorRedactor(c *gin.Context, extra taskUpstreamErrorContext
 			}
 		}
 	}
+	for _, key := range redactor.secrets {
+		parts := strings.Split(key, "|")
+		if len(parts) == 3 || len(parts) == 4 {
+			for _, part := range parts[:3] {
+				if secret := strings.TrimSpace(part); secret != "" {
+					redactor.secrets = append(redactor.secrets, secret)
+				}
+			}
+		}
+	}
 	sort.SliceStable(redactor.secrets, func(i, j int) bool { return len(redactor.secrets[i]) > len(redactor.secrets[j]) })
 	sort.SliceStable(redactor.headerValues, func(i, j int) bool { return len(redactor.headerValues[i].value) > len(redactor.headerValues[j].value) })
 	var mapping map[string]string

@@ -4500,6 +4500,15 @@ export function ChannelMutateDrawer({
                       <FormDescription>
                         <span className='flex flex-col gap-2'>
                           <span>{keyDescription}</span>
+                          {(currentType === 54 ||
+                            (currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+                              currentTaskPluginKey === 'doubao')) && (
+                            <span>
+                              {t(
+                                'Use an API Key by default. For optional AK/SK asset authentication, enter APIKey|AccessKey|SecretKey or APIKey|AccessKey|SecretKey|Region. Region defaults to cn-beijing. Video requests still use the API Key. Enter one complete credential set per line in batch mode.'
+                              )}
+                            </span>
+                          )}
                           {!isEditing && isBatchMode && (
                             <Button
                               type='button'

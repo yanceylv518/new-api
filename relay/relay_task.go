@@ -646,7 +646,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
 		responseBody, _ := io.ReadAll(resp.Body)
-		failure := service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		failure := service.TaskErrorWrapper(errors.New(common.MaskDoubaoCredentials(string(responseBody), info.ApiKey)), "fail_to_fetch_task", resp.StatusCode)
 		if resp.StatusCode/100 == 5 || resp.StatusCode == http.StatusRequestTimeout {
 			failure.NoRetry = true
 		} else {

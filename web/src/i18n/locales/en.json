@@ -7226,6 +7226,7 @@
     "No video routing rules configured.": "No video routing rules configured.",
     "{{count}} video routing rules configured": "{{count}} video routing rules configured",
     "Channel settings changed. Reload the channel before saving.": "Channel settings changed. Reload the channel before saving.",
-    "Resolution": "Resolution"
+    "Resolution": "Resolution",
+    "Use an API Key by default. For optional AK/SK asset authentication, enter APIKey|AccessKey|SecretKey or APIKey|AccessKey|SecretKey|Region. Region defaults to cn-beijing. Video requests still use the API Key. Enter one complete credential set per line in batch mode.": "Use an API Key by default. For optional AK/SK asset authentication, enter APIKey|AccessKey|SecretKey or APIKey|AccessKey|SecretKey|Region. Region defaults to cn-beijing. Video requests still use the API Key. Enter one complete credential set per line in batch mode."
   }
 }

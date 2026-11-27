@@ -343,7 +343,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.2.16",
+  version: "1.2.17",
   requiredCapabilities: ["task-callback@1", "poll-task-data@1"],
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
@@ -402,6 +402,19 @@ function trimmed(value) {
 // 服务前缀由管理员在渠道 BaseURL 中配置。
 function apiRoot(ctx) {
   return trimmed(ctx.baseUrl).replace(/\/+$/, "");
+}
+
+// 视频数据面只发送 API Key；其余字段留给宿主的素材与真人认证签名。
+function videoAPIKey(ctx) {
+  const parts = trimmed(ctx.apiKey)
+    .split("|")
+    .map((part) => part.trim());
+  if (![1, 3, 4].includes(parts.length) || parts.some((part) => !part || part.length > 4096 || /[^\x21-\x7e]/.test(part)))
+    throw new Error("Doubao credentials must be APIKey or APIKey|AccessKey|SecretKey[|Region]");
+  if (parts.length > 1 && !/^[A-Za-z0-9_-]+$/.test(parts[1])) throw new Error("Doubao AccessKey has invalid characters");
+  if (parts.length === 4 && !/^[a-z0-9-]{1,64}$/.test(parts[3])) throw new Error("Doubao region is invalid");
+  if (parts.length > 1 && !/^https:\/\//i.test(apiRoot(ctx))) throw new Error("Doubao AK/SK credentials require HTTPS");
+  return parts[0];
 }
 
 function objectValue(value, name) {
@@ -1331,7 +1344,7 @@ export function buildSubmitRequest(ctx) {
     return {
       url: apiRoot(ctx) + "/api/v3/images/generations",
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+      headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + videoAPIKey(ctx) },
       body: converted.body,
       action: converted.action,
       rewriteModel: converted.body.model,
@@ -1374,7 +1387,7 @@ export function buildSubmitRequest(ctx) {
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + videoAPIKey(ctx) },
     body: body,
     action: hasReference ? "image_to_video" : "text_to_video",
     rewriteModel: body.model,
@@ -1479,7 +1492,7 @@ export function buildQueryRequest(ctx) {
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks/" + encodeURIComponent(ctx.taskId),
     method: "GET",
-    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + videoAPIKey(ctx) },
   };
 }
 
@@ -1489,7 +1502,7 @@ export function buildTaskActionRequest(ctx) {
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks/" + encodeURIComponent(ctx.taskId),
     method: "DELETE",
-    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: "Bearer " + videoAPIKey(ctx) },
   };
 }
 
@@ -1552,6 +1565,12 @@ function publicFailureValue(ctx, value) {
   const privateId = String(ctx.taskId || "");
   const upstreamModel = String(ctx.upstreamModel || "");
   if (key) message = message.split(key).join("[redacted]");
+  const parts = key.split("|");
+  if (parts.length === 3 || parts.length === 4) {
+    for (const part of parts.slice(0, 3).sort((a, b) => b.length - a.length)) {
+      if (part.trim()) message = message.split(part.trim()).join("[redacted]");
+    }
+  }
   if (privateId && privateId !== ctx.publicTaskId) message = message.split(privateId).join(ctx.publicTaskId || "[redacted]");
   if (upstreamModel && upstreamModel !== ctx.model) message = message.split(upstreamModel).join(ctx.model || "[redacted]");
   message = message.replace(/https?:\/\/[^\s<>]+/gi, "[redacted URL]");

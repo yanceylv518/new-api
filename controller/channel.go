@@ -286,6 +286,16 @@ func GetAllChannels(c *gin.Context) {
 }
 
 func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, error) {
+	if channel.Type == constant.ChannelTypeDoubaoVideo || channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "doubao" {
+		credentials, err := common.ParseDoubaoCredentials(key)
+		if err != nil {
+			return nil, err
+		}
+		if credentials.AccessKey != "" && !strings.HasPrefix(channel.GetBaseURL(), "https://") {
+			return nil, errors.New("Doubao AK/SK credentials require HTTPS")
+		}
+		key = credentials.APIKey
+	}
 	var headers http.Header
 	switch channel.Type {
 	case constant.ChannelTypeAnthropic:
@@ -577,6 +587,22 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 	}
 
 	setting := channel.GetSetting()
+	if channel.Type == constant.ChannelTypeDoubaoVideo || channel.Type == constant.ChannelTypeTaskPlugin && setting.TaskPluginKey == "doubao" {
+		for key := range strings.SplitSeq(channel.Key, "\n") {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			credentials, err := common.ParseDoubaoCredentials(key)
+			if err != nil {
+				return err
+			}
+			if credentials.AccessKey != "" {
+				if !strings.HasPrefix(channel.GetBaseURL(), "https://") || setting.SeedanceAssetURL != "" && !strings.HasPrefix(setting.SeedanceAssetURL, "https://") {
+					return errors.New("Doubao AK/SK credentials require HTTPS video and asset service URLs")
+				}
+			}
+		}
+	}
 	if channel.Type != constant.ChannelTypeNewAPI && len(setting.TaskExtendPluginKeys) > 0 {
 		return fmt.Errorf("task_extend_plugin_keys is only supported on New API channels")
 	}

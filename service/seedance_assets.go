@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
@@ -34,6 +35,7 @@ type SeedanceAssetClient struct {
 	ChannelID           int
 	baseURL             string
 	apiKey              string
+	volcCredentials     *common.DoubaoCredentials
 	proxy               string
 	KeyFingerprint      string
 	AccountFingerprint  string
@@ -712,12 +714,26 @@ func NewSeedanceAssetClient(channel *model.Channel, binding ...string) (*Seedanc
 		return nil, fmt.Errorf("bound Seedance account is unavailable")
 	}
 	baseURL := strings.TrimSpace(settings.SeedanceAssetURL)
+	var volcCredentials *common.DoubaoCredentials
+	if channel.Type == constant.ChannelTypeDoubaoVideo || channel.Type == constant.ChannelTypeTaskPlugin && settings.TaskPluginKey == "doubao" {
+		credentials, err := common.ParseDoubaoCredentials(key)
+		if err != nil {
+			return nil, err
+		}
+		if credentials.AccessKey != "" {
+			if !strings.HasPrefix(baseURL, "https://") {
+				return nil, errors.New("Doubao AK/SK asset service requires HTTPS")
+			}
+			volcCredentials = &credentials
+		}
+	}
 	keyFingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
 	account := SeedanceAssetAccountFingerprint(channel, keyFingerprint)
 	return &SeedanceAssetClient{
 		ChannelID:           channel.Id,
 		baseURL:             baseURL,
 		apiKey:              key,
+		volcCredentials:     volcCredentials,
 		proxy:               channel.GetSetting().Proxy,
 		KeyFingerprint:      keyFingerprint,
 		AccountFingerprint:  account,
@@ -859,7 +875,7 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 			return
 		}
 		if client.jsonAction {
-			common.SysError("private asset action " + action + " failed: " + strings.ReplaceAll(callErr.Error(), client.apiKey, "[redacted]"))
+			common.SysError("private asset action " + action + " failed: " + common.MaskDoubaoCredentials(callErr.Error(), client.apiKey))
 		}
 		if errors.Is(callErr, context.Canceled) {
 			return
@@ -941,8 +957,22 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+client.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if credentials := client.volcCredentials; credentials != nil {
+		signed, err := jsplugin.SignVolcV4(jsplugin.VolcSignRequest{
+			Method: req.Method, URL: req.URL.String(), Body: string(body),
+			Headers:   map[string]string{"Content-Type": req.Header.Get("Content-Type")},
+			AccessKey: credentials.AccessKey, SecretKey: credentials.SecretKey, Region: credentials.Region, Service: "ark",
+		})
+		if err != nil {
+			return fmt.Errorf("sign Seedance asset request: %w", err)
+		}
+		for name, value := range signed {
+			req.Header.Set(name, value)
+		}
+	} else {
+		req.Header.Set("Authorization", "Bearer "+client.apiKey)
+	}
 	httpClient := seedanceAssetHTTPClient
 	if strings.TrimSpace(client.proxy) != "" {
 		httpClient, err = GetHttpClientWithProxy(client.proxy)
@@ -981,7 +1011,7 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		}
 		decodeErr := common.Unmarshal(raw, &created)
 		if decodeErr == nil && created.Code != nil && *created.Code != 0 {
-			message := strings.TrimSpace(strings.ReplaceAll(created.Message, client.apiKey, "[redacted]"))
+			message := strings.TrimSpace(common.MaskDoubaoCredentials(created.Message, client.apiKey))
 			if message == "" {
 				message = "asset service rejected the request"
 			}
@@ -1013,12 +1043,13 @@ func (client *SeedanceAssetClient) call(ctx context.Context, action string, requ
 		if err := envelope.businessError(); err != nil {
 			var upstream *seedanceAssetUpstreamError
 			if !errors.As(err, &upstream) {
-				return errors.New(strings.ReplaceAll(err.Error(), client.apiKey, "[redacted]"))
+				return errors.New(common.MaskDoubaoCredentials(err.Error(), client.apiKey))
 			}
 			clean := *upstream
 			clean.action = action
 			clean.httpStatus = resp.StatusCode
-			clean.message = strings.ReplaceAll(clean.message, client.apiKey, "[redacted]")
+			clean.code = common.MaskDoubaoCredentials(clean.code, client.apiKey)
+			clean.message = common.MaskDoubaoCredentials(clean.message, client.apiKey)
 			// 兼容旧代理把稳定错误码嵌入消息、但留空 code 的返回。
 			if action == "GetVisualValidateResult" && clean.code == "" {
 				for word := range strings.FieldsSeq(clean.message) {
@@ -1249,7 +1280,7 @@ func newSeedanceAssetBusinessError(code, message string) error {
 // seedanceAssetHTTPError 为未识别的非 2xx 响应保留有限正文，并过滤渠道凭证。
 func seedanceAssetHTTPError(status int, body []byte, apiKey string) error {
 	message := strings.TrimSpace(string(body))
-	message = strings.ReplaceAll(message, apiKey, "[redacted]")
+	message = common.MaskDoubaoCredentials(message, apiKey)
 	if len(message) > seedanceAssetErrorPreviewLimit {
 		message = message[:seedanceAssetErrorPreviewLimit] + "..."
 	}
@@ -1264,7 +1295,7 @@ func seedanceAssetInvalidJSONError(status int, contentType string, body []byte, 
 		return fmt.Errorf("seedance asset API returned invalid JSON (status %d, content-type %s): the configured asset service URL returned an HTML page; check the complete asset endpoint", status, contentType)
 	}
 	message := strings.TrimSpace(string(body))
-	message = strings.ReplaceAll(message, apiKey, "[redacted]")
+	message = common.MaskDoubaoCredentials(message, apiKey)
 	if len(message) > seedanceAssetErrorPreviewLimit {
 		message = message[:seedanceAssetErrorPreviewLimit] + "..."
 	}
