@@ -836,6 +836,8 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 	for _, tc := range []struct {
 		status   int
 		wantCode string
+		body     string
+		rejected bool
 	}{
 		{status: http.StatusOK},
 		{status: http.StatusCreated},
@@ -848,6 +850,13 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 		{status: http.StatusServiceUnavailable, wantCode: "fail_to_fetch_task"},
 		{status: http.StatusGatewayTimeout, wantCode: "fail_to_fetch_task"},
 		{status: 524, wantCode: "fail_to_fetch_task"},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"}}`, rejected: true},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"}},"data":null`, rejected: false},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"},"data":null,"request_id":"request-1"}`, rejected: true},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"},"id":"accepted-job"}`},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"},"output":{"task_id":"accepted-job"}}`},
+		{status: 503, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"server_error","type":"server_error","message":"model_not_found"}}`},
+		{status: 408, wantCode: "fail_to_fetch_task", body: `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"}}`},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			saveBillingConfig(t)
@@ -858,7 +867,11 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(`{"id":"job-42","message":"upstream body"}`))
+				body := tc.body
+				if body == "" {
+					body = `{"id":"job-42","message":"upstream body"}`
+				}
+				_, _ = w.Write([]byte(body))
 			}))
 			defer server.Close()
 
@@ -876,8 +889,12 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 				require.NotNil(t, taskErr)
 				assert.Equal(t, tc.wantCode, taskErr.Code)
 				assert.Equal(t, tc.status, taskErr.StatusCode)
-				assert.Contains(t, taskErr.Message, "upstream body")
-				uncertain := tc.status/100 == 5 || tc.status == http.StatusRequestTimeout
+				if tc.body == "" {
+					assert.Contains(t, taskErr.Message, "upstream body")
+				} else {
+					assert.Equal(t, tc.body, taskErr.Message)
+				}
+				uncertain := (tc.status/100 == 5 || tc.status == http.StatusRequestTimeout) && !tc.rejected
 				assert.Equal(t, uncertain, taskErr.NoRetry)
 				assert.Equal(t, !uncertain, c.GetBool("task_submission_rejected"))
 				assert.Nil(t, result)

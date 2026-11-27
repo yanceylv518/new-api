@@ -19,6 +19,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
@@ -604,6 +605,149 @@ func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.Data
 	return db, dialect
 }
 
+func TestTaskSubmissionRejectionRefundMySQL(t *testing.T) {
+	if os.Getenv("TEST_TASK_DB_DIALECT") != string(common.DatabaseTypeMySQL) {
+		t.Skip("TEST_TASK_DB_DIALECT=mysql is required")
+	}
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.Log{})
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
+	oldRetries, oldErrors := common.RetryTimes, constant.ErrorLogEnabled
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(dialect, dialect)
+	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled = false, false, false
+	common.LogConsumeEnabled, common.DataExportEnabled, constant.ErrorLogEnabled = true, false, true
+	common.RetryTimes = 0
+	t.Cleanup(func() {
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMain, oldLog)
+		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled = oldRedis, oldMemory, oldBatch
+		common.LogConsumeEnabled, common.DataExportEnabled, constant.ErrorLogEnabled = oldConsume, oldExport, oldErrors
+		common.RetryTimes = oldRetries
+	})
+	service.InitHttpClient()
+	withTieredBillingConfig(t, map[string]string{"refund-model": "tiered_expr"}, map[string]string{"refund-model": `tier("flat", 0.02)`})
+	plugin, err := pluginruntime.CompilePlugin(`
+export const meta={apiVersion:1,key:"refund-check",name:"Refund Check",version:"1.0.0",author:{name:"Test"},models:["refund-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",body:{model:ctx.model},action:"text_to_video"};}
+export function parseSubmitResponse(ctx,resp){return {taskId:resp.body.id};}
+export function buildQueryRequest(){throw new Error("rejection must not query upstream");}
+export function parseTaskResult(){throw new Error("rejection must not query upstream");}
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	for index, tc := range []struct {
+		name, body string
+		status     int
+		rejected   bool
+	}{
+		{"explicit rejection", `{"error":{"code":"model_not_found","type":"server_error","message":"no available channel"}}`, 503, true},
+		{"uncertain failure", `{"error":{"code":"server_error","type":"server_error","message":"internal error"}}`, 503, false},
+		{"contradictory response", `{"id":"accepted-job","error":{"code":"model_not_found","type":"server_error","message":"no available channel"}}`, 503, false},
+		{"accepted task", `{"id":"accepted-job"}`, 202, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			const initial = 1000000
+			user := model.User{Username: fmt.Sprintf("refund_user_%d", index), AffCode: fmt.Sprintf("refund_aff_%d", index), Quota: initial, Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("refund-test-token-%d", index), RemainQuota: initial}
+			require.NoError(t, db.Create(&token).Error)
+			ch := model.Channel{Name: "test provider", Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled}
+			require.NoError(t, db.Create(&ch).Error)
+			c := taskSubmissionTestContext()
+			c.Set("id", user.Id)
+			c.Set("token_id", token.Id)
+			c.Set("group", "default")
+			c.Set("username", user.Username)
+			c.Set("task_request", map[string]any{"model": "refund-model"})
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "refund-model")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelId, ch.Id)
+			common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
+			info := taskSubmissionRelayInfo(nil)
+			info.UserId, info.TokenId, info.TokenKey = user.Id, token.Id, token.Key
+			info.RelayFormat, info.OriginModelName = relaytypes.RelayFormatTask, "refund-model"
+			info.UserGroup, info.UsingGroup = "default", "default"
+			info.UserSetting.BillingPreference = "wallet_only"
+			info.PublicTaskID, info.LockedChannel = model.GenerateTaskID(), &ch
+			outcome, taskErr := executeTaskSubmission(c, info)
+			if tc.status == 202 {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+			} else {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, tc.status, taskErr.StatusCode)
+				assert.Equal(t, tc.body, taskErr.Message)
+				assert.Nil(t, outcome)
+			}
+			assert.Equal(t, 1, calls)
+			var stored model.Task
+			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&stored).Error)
+			want := common.QuotaRound(0.02 * common.QuotaPerUnit)
+			if tc.rejected {
+				want = 0
+				assert.EqualValues(t, model.TaskStatusFailure, stored.Status)
+				assert.False(t, stored.PrivateData.SubmissionPending)
+				assert.False(t, stored.PrivateData.ReconciliationRequired)
+				assert.Empty(t, stored.PrivateData.SubmissionResponse)
+				assert.Empty(t, stored.PrivateData.UpstreamTaskID)
+				assert.Contains(t, stored.FailReason, "model_not_found")
+				assert.Positive(t, stored.FinishTime)
+				won, err := service.FinalizeVideoTaskBilling(t.Context(), &stored, model.TaskStatusUnknown, 0, stored.FailReason, nil)
+				require.NoError(t, err)
+				assert.False(t, won, "terminal replay must not refund twice")
+			} else if tc.status != 202 {
+				assert.EqualValues(t, model.TaskStatusUnknown, stored.Status)
+				assert.True(t, stored.PrivateData.SubmissionPending)
+				assert.Empty(t, stored.PrivateData.SubmissionResponse)
+			}
+			assert.Equal(t, want, stored.Quota)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			require.NoError(t, db.First(&ch, ch.Id).Error)
+			assert.Equal(t, initial-want, user.Quota)
+			assert.Equal(t, want, user.UsedQuota)
+			assert.Equal(t, initial-want, token.RemainQuota)
+			assert.Equal(t, want, token.UsedQuota)
+			assert.EqualValues(t, want, ch.UsedQuota)
+			var logs []model.Log
+			require.NoError(t, db.Where("user_id = ?", user.Id).Order("id").Find(&logs).Error)
+			refunds, errors := 0, 0
+			for _, entry := range logs {
+				if entry.Type == model.LogTypeRefund {
+					refunds++
+					assert.Equal(t, common.QuotaRound(0.02*common.QuotaPerUnit), entry.Quota)
+				}
+				if entry.Type == model.LogTypeError {
+					errors++
+					var other map[string]any
+					require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+					assert.Equal(t, true, other["is_task"])
+					assert.NotEqual(t, true, other["task_sync"])
+				}
+			}
+			if tc.rejected {
+				assert.Equal(t, 1, refunds)
+			} else {
+				assert.Zero(t, refunds)
+			}
+			if tc.status != 202 {
+				assert.Equal(t, 1, errors)
+			}
+		})
+	}
+}
+
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
 	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}, &model.BillingRefund{}, &model.VideoTaskPendingLog{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
@@ -1108,12 +1252,12 @@ func TestSubmissionJournalSurvivesClientDisconnectAndRejectionCleanupFailure(t *
 			defer cancel()
 			c.Request = c.Request.WithContext(client)
 			if rejected {
-				require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("journal-delete-failure", func(tx *gorm.DB) {
-					if tx.Statement.Table == db.NamingStrategy.TableName("tasks") {
-						tx.AddError(errors.New("delete unavailable"))
+				require.NoError(t, db.Callback().Update().After("gorm:update").Register("journal-refund-failure", func(tx *gorm.DB) {
+					if tx.Statement.Table == db.NamingStrategy.TableName("users") && strings.Contains(tx.Statement.SQL.String(), "`quota`") {
+						tx.AddError(errors.New("refund unavailable"))
 					}
 				}))
-				t.Cleanup(func() { require.NoError(t, db.Callback().Delete().Remove("journal-delete-failure")) })
+				t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove("journal-refund-failure")) })
 			}
 			attempts := 0
 			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {

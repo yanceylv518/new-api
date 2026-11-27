@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -645,9 +646,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
-		responseBody, _ := io.ReadAll(resp.Body)
+		responseBody, readErr := io.ReadAll(resp.Body)
 		failure := service.TaskErrorWrapper(errors.New(common.MaskDoubaoCredentials(string(responseBody), info.ApiKey)), "fail_to_fetch_task", resp.StatusCode)
-		if resp.StatusCode/100 == 5 || resp.StatusCode == http.StatusRequestTimeout {
+		if (resp.StatusCode/100 == 5 || resp.StatusCode == http.StatusRequestTimeout) &&
+			(readErr != nil || !taskSubmissionExplicitlyRejected(resp.StatusCode, responseBody)) {
 			failure.NoRetry = true
 		} else {
 			c.Set("task_submission_rejected", true)
@@ -755,6 +757,41 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		Immediate:      parsed.Immediate,
 		PluginState:    parsed.PluginState,
 	}, nil
+}
+
+// 仅识别已确认的提交前拒绝协议；未知字段可能携带受理证据，继续保留预扣。
+func taskSubmissionExplicitlyRejected(status int, body []byte) bool {
+	if status/100 != 5 {
+		return false
+	}
+	var envelope map[string]json.RawMessage
+	if common.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	for key, value := range envelope {
+		switch key {
+		case "error":
+		case "request_id", "requestId":
+			var requestID string
+			if common.Unmarshal(value, &requestID) != nil {
+				return false
+			}
+		case "data":
+			if !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	var upstreamError struct {
+		Code    string `json:"code"`
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	return common.Unmarshal(envelope["error"], &upstreamError) == nil &&
+		upstreamError.Code == "model_not_found" && upstreamError.Type == "server_error" &&
+		strings.TrimSpace(upstreamError.Message) != ""
 }
 
 // mergeInheritedTaskBillingRatios 合并原任务的请求倍率，并拒绝旧任务快照覆盖当前用户折扣。

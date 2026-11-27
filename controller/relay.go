@@ -505,6 +505,7 @@ func executeTaskSubmissionWith(
 	durable := false
 	stage := "start"
 	var staged *model.Task
+	var rejectionReason string
 	clientRequest := c.Request
 	var cancelSubmission context.CancelFunc
 	defer func() {
@@ -553,11 +554,12 @@ func executeTaskSubmissionWith(
 			return err
 		}
 		staged = next
+		rejectionReason = ""
+		c.Set("task_submission_rejected", false)
+		c.Set("task_submission_response", nil)
 		if err := model.MarkTaskSubmissionDispatched(c.Request.Context(), staged); err != nil {
 			return err
 		}
-		c.Set("task_submission_rejected", false)
-		c.Set("task_submission_response", nil)
 		if route, ok := common.GetContextKeyType[pluginruntime.PinnedRoute](c, pluginruntime.ContextKeyPinnedRoute); ok && route.Route.Protocol == "seedance-v3" {
 			c.Set("task_submission_raw_response", nil)
 		}
@@ -595,9 +597,13 @@ func executeTaskSubmissionWith(
 			}
 			staged.PrivateData.ReconciliationRequired = true
 			staged.PrivateData.ReconciliationReason = "submission outcome is uncertain; reserved quota retained"
+			if rejectionReason != "" {
+				staged.PrivateData.ReconciliationReason = "upstream rejected submission; refund pending"
+			}
 			recoveryContext, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
 			defer cancel()
-			if _, err := model.PersistTaskSubmission(recoveryContext, staged, false); err != nil {
+			persisted, err := model.PersistTaskSubmission(recoveryContext, staged, false)
+			if err != nil {
 				logger.LogError(c, "persist submission recovery evidence failed: "+err.Error())
 			}
 			if billing, ok := relayInfo.Billing.(*service.BillingSession); ok {
@@ -614,6 +620,23 @@ func executeTaskSubmissionWith(
 				service.LogTaskConsumption(c, relayInfo, staged)
 			}
 			relayInfo.PriceData = price
+			if persisted && rejectionReason != "" {
+				// 拒绝证据先落库，再原子结束任务和退款；失败时仍可由恢复流程接管。
+				if err := service.RecoverTaskInitialAccounting(recoveryContext, staged); err != nil {
+					logger.LogError(c, "recover rejected task accounting failed: "+err.Error())
+				} else {
+					final := *staged
+					final.Status, final.Progress, final.FailReason = model.TaskStatusFailure, taskcommon.ProgressComplete, rejectionReason
+					final.FinishTime = time.Now().Unix()
+					final.PrivateData.SubmissionPending = false
+					final.PrivateData.SubmissionResponse, final.PrivateData.SubmissionContext = nil, nil
+					final.PrivateData.ReconciliationRequired, final.PrivateData.ReconciliationReason = false, ""
+					final.PrivateData.PollFailures, final.PrivateData.NextPollAt = 0, 0
+					if _, err := service.FinalizeVideoTaskBilling(recoveryContext, &final, staged.Status, 0, rejectionReason, nil); err != nil {
+						logger.LogError(c, "finalize rejected task refund failed: "+err.Error())
+					}
+				}
+			}
 			if taskErr != nil {
 				taskErr.Data = map[string]any{"task_id": staged.TaskID}
 				taskErr.NoRetry = true
@@ -707,7 +730,11 @@ func executeTaskSubmissionWith(
 		}
 		if taskErr != nil && staged != nil && c.GetBool("task_submission_rejected") {
 			// 已拒绝的意图仍负责恢复预扣；下一次尝试只能在事务中替换它。
-			evidence, _ := common.Marshal(map[string]any{"parsed": map[string]any{"taskId": staged.TaskID, "immediate": map[string]any{"status": model.TaskStatusFailure, "reason": "upstream rejected submission"}}})
+			rejectionReason, _ = sanitizeTaskUpstreamMessage(c, taskErr.Message, taskUpstreamErrorContext{})
+			if strings.TrimSpace(rejectionReason) == "" {
+				rejectionReason = "upstream rejected submission"
+			}
+			evidence, _ := common.Marshal(map[string]any{"parsed": map[string]any{"taskId": staged.TaskID, "immediate": map[string]any{"status": model.TaskStatusFailure, "reason": rejectionReason}}})
 			c.Set("task_submission_response", json.RawMessage(evidence))
 		}
 		if taskErr == nil && result != nil && c.Request.Context().Err() != nil {

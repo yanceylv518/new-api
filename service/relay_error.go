@@ -80,6 +80,12 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		tokenId := c.GetInt("token_id")
 		userGroup := c.GetString("group")
 		other := model.NewLogOther()
+		if relayInfo != nil && relayInfo.RelayFormat == types.RelayFormatTask {
+			other.SetPublic("is_task", true)
+			if taskDeliveredInline(c, nil) {
+				other.SetPublic("task_sync", true)
+			}
+		}
 		if c.Request != nil && c.Request.URL != nil {
 			other.SetPublic("request_path", c.Request.URL.Path)
 		}
